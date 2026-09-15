@@ -62,11 +62,13 @@ Pystacks provides Python stack tracing via BPF. It is always compiled in but onl
 
 Key modules:
 - `types.rs` - `#[repr(C)]` structs matching BPF map key/value layouts
-- `offsets.rs` - Python version-specific struct offset configurations (3.8-3.13)
+- `offsets.rs` - Python version-specific struct offset configurations (3.8-3.14): `OffsetConfig` shared with BPF, `ObjectOffsets` for user-space object reads
 - `discovery.rs` - Detects Python processes, parses ELF binaries for version and runtime info
 - `symbols.rs` - Resolves BPF symbol IDs to function names and source locations
 - `linetable.rs` - Parses Python line number tables (3.10 lnotab and 3.11+ location table formats)
 - `process.rs` - Reads process memory via `/proc/pid/mem`
+- `pyobject.rs` - Reads Python objects out of a process: a dict's items, an instance's attributes, str and int (3.13+)
+- `thread_names.rs` - The names a process gave its threads, via sys.modules → `threading._active`
 - `stack_walker.rs` - High-level API integrating all components
 
 No C++ dependencies or external submodules required.

@@ -363,6 +363,131 @@ pub fn py314() -> OffsetConfig {
     c
 }
 
+/// Offsets for reading Python objects out of a process from user space: a
+/// dict, an instance's attributes, a module, an int, a string (see
+/// `pyobject.rs`). BPF does none of this, so these are not part of the
+/// `OffsetConfig` it shares; they come from the same generated bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectOffsets {
+    // _PyRuntimeState and PyInterpreterState: the way in. PyInterpreterState
+    // grows in patch releases, so these two are what the release the bindings
+    // were generated from has; a process says its own in the table it keeps
+    // at `runtime_debug_offsets` (_Py_DebugOffsets, 3.13+), at these two
+    // places in it. The table has `interpreters.head` only, and the list that
+    // starts there is newest first; the main interpreter is
+    // `interpreters.main`, the next field, found from head by where the two
+    // are in the bindings.
+    pub runtime_interpreters_head: usize,
+    pub runtime_interpreters_main: usize,
+    pub interp_modules: usize,
+    pub runtime_debug_offsets: usize,
+    pub debug_interpreters_head: usize,
+    pub debug_imports_modules: usize,
+
+    // PyObject, and the bytes ahead of it where its managed dict pointer sits
+    pub ob_type: usize,
+    pub managed_dict_before: usize,
+
+    // PyTypeObject / PyHeapTypeObject
+    pub type_basicsize: usize,
+    pub type_flags: usize,
+    pub type_dictoffset: usize,
+    pub heap_type_cached_keys: usize,
+
+    // PyASCIIObject / PyCompactUnicodeObject
+    pub ascii_length: usize,
+    pub ascii_state: usize,
+    pub ascii_size: usize,
+    pub compact_unicode_size: usize,
+
+    // PyLongObject
+    pub long_lv_tag: usize,
+    pub long_ob_digit: usize,
+
+    // PyModuleObject
+    pub module_md_dict: usize,
+
+    // PyDictObject
+    pub dict_ma_keys: usize,
+    pub dict_ma_values: usize,
+
+    // PyDictKeysObject: its header, then the index table, then the entries
+    pub keys_log2_index_bytes: usize,
+    pub keys_kind: usize,
+    pub keys_nentries: usize,
+    pub keys_indices: usize,
+
+    // PyDictKeyEntry and PyDictUnicodeEntry
+    pub key_entry_size: usize,
+    pub key_entry_key: usize,
+    pub key_entry_value: usize,
+    pub unicode_entry_size: usize,
+    pub unicode_entry_key: usize,
+    pub unicode_entry_value: usize,
+
+    // PyDictValues
+    pub values_valid: usize,
+    pub values_values: usize,
+}
+
+macro_rules! object_offsets {
+    ($version:ident) => {{
+        use bindings::$version::*;
+        ObjectOffsets {
+            runtime_interpreters_head: PYRUNTIME_INTERPRETERS_HEAD_OFFSET,
+            runtime_interpreters_main: PYRUNTIME_INTERPRETERS_MAIN_OFFSET,
+            interp_modules: PYINTERP_MODULES_OFFSET,
+            runtime_debug_offsets: PYRUNTIME_DEBUG_OFFSETS_OFFSET,
+            debug_interpreters_head: PY_DEBUG_OFFSETS_RUNTIME_INTERPRETERS_HEAD,
+            debug_imports_modules: PY_DEBUG_OFFSETS_INTERP_IMPORTS_MODULES,
+            ob_type: PY_OBJECT_OB_TYPE,
+            managed_dict_before: PY_OBJECT_MANAGED_DICT_BEFORE,
+            type_basicsize: PY_TYPE_OBJECT_TP_BASICSIZE,
+            type_flags: PY_TYPE_OBJECT_TP_FLAGS,
+            type_dictoffset: PY_TYPE_OBJECT_TP_DICTOFFSET,
+            heap_type_cached_keys: PY_HEAP_TYPE_OBJECT_HT_CACHED_KEYS,
+            ascii_length: PY_ASCII_OBJECT_LENGTH,
+            ascii_state: PY_ASCII_OBJECT_STATE,
+            ascii_size: PY_ASCII_OBJECT_SIZE,
+            compact_unicode_size: PY_COMPACT_UNICODE_OBJECT_SIZE,
+            long_lv_tag: PY_LONG_OBJECT_LV_TAG,
+            long_ob_digit: PY_LONG_OBJECT_OB_DIGIT,
+            module_md_dict: PY_MODULE_OBJECT_MD_DICT,
+            dict_ma_keys: PY_DICT_OBJECT_MA_KEYS,
+            dict_ma_values: PY_DICT_OBJECT_MA_VALUES,
+            keys_log2_index_bytes: PY_DICT_KEYS_DK_LOG2_INDEX_BYTES,
+            keys_kind: PY_DICT_KEYS_DK_KIND,
+            keys_nentries: PY_DICT_KEYS_DK_NENTRIES,
+            keys_indices: PY_DICT_KEYS_DK_INDICES,
+            key_entry_size: PY_DICT_KEY_ENTRY_SIZE,
+            key_entry_key: PY_DICT_KEY_ENTRY_ME_KEY,
+            key_entry_value: PY_DICT_KEY_ENTRY_ME_VALUE,
+            unicode_entry_size: PY_DICT_UNICODE_ENTRY_SIZE,
+            unicode_entry_key: PY_DICT_UNICODE_ENTRY_ME_KEY,
+            unicode_entry_value: PY_DICT_UNICODE_ENTRY_ME_VALUE,
+            values_valid: PY_DICT_VALUES_VALID,
+            values_values: PY_DICT_VALUES_VALUES,
+        }
+    }};
+}
+
+/// The `ObjectOffsets` for a Python (major, minor), `None` for a version with
+/// no table. 3.13 and 3.14 have one. An older version needs its own block in
+/// `scripts/generate_python_bindings.py` first, and `pyobject.rs` taught its
+/// layouts where they differ: up to 3.10 the index table's size comes from
+/// `dk_size` and there are no unicode-only entries, and 3.11 and 3.12 keep an
+/// instance's values behind a pointer ahead of the object, not inline.
+pub fn object_offsets_for_version(major: i32, minor: i32) -> Option<ObjectOffsets> {
+    if major != 3 {
+        return None;
+    }
+    match minor {
+        13 => Some(object_offsets!(v3_13_0)),
+        m if m >= 14 => Some(object_offsets!(v3_14_0)), // the latest known
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +509,26 @@ mod tests {
     fn test_for_version_future_fallback() {
         let future = for_version(3, 15).unwrap();
         assert_eq!(future.py_version_minor, 14); // falls back to 3.14
+    }
+
+    #[test]
+    fn test_object_offsets_are_for_313_and_up() {
+        assert!(object_offsets_for_version(3, 12).is_none());
+        assert!(object_offsets_for_version(2, 7).is_none());
+        let o = object_offsets_for_version(3, 13).unwrap();
+        assert_eq!((o.dict_ma_keys, o.dict_ma_values), (32, 40));
+        assert_eq!((o.keys_nentries, o.keys_indices), (24, 32));
+        assert_eq!((o.key_entry_size, o.unicode_entry_size), (24, 16));
+        assert_eq!((o.values_valid, o.values_values), (3, 8));
+        assert_eq!(o.managed_dict_before, 24);
+        assert_eq!(o.interp_modules, 7656);
+        // 3.14 moved the interpreter state's fields, not the objects'.
+        let p = object_offsets_for_version(3, 14).unwrap();
+        assert_eq!(p.interp_modules, 7664);
+        // Nor is the process's own table of offsets laid out the same.
+        assert_eq!((o.debug_imports_modules, p.debug_imports_modules), (88, 96));
+        assert_eq!(p.heap_type_cached_keys, o.heap_type_cached_keys);
+        assert_eq!(object_offsets_for_version(3, 15), Some(p));
     }
 
     #[test]
