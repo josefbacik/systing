@@ -300,6 +300,17 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.network_syscalls = true;
     });
 
+    // The opt-in raw-tracepoint form (`--kernel-hooks raw-tracepoint`): the
+    // tp_btf sys_enter/sys_exit pair loads beside its classic fallback, so
+    // the pair meets the verifier at the agent's memory shape even though no
+    // shipped configuration selects it by default. (A kernel whose BTF lacks
+    // the pair's typedefs selects the classic set here instead — the probe
+    // decides at load, as it does for the trampoline rows.)
+    add("memory-raw-tracepoint", &|c| {
+        c.memory = true;
+        c.kernel_hooks = KernelHooks::RawTracepoint;
+    });
+
     // The opt-in trampoline form (`--kernel-hooks trampoline`): the
     // fentry/fexit syscall hooks and the fentry TIME_WAIT trio load beside
     // their classic fallbacks, so the trampoline programs meet the verifier
@@ -607,14 +618,19 @@ R0 unbounded memory access\n\
             .iter()
             .any(|s| s.config.network && s.legs == LegSelection::NetworkTwKprobeOnly));
         // The shipped shapes take the default (classic) form; the opt-in
-        // trampoline form has its own rows for both legs, so the trampoline
-        // programs still meet the verifier on every run of the gate.
+        // raw-tracepoint form has its row for the memory leg and the opt-in
+        // trampoline form its rows for both legs, so the raw pair and the
+        // trampoline programs still meet the verifier on every run of the
+        // gate.
         assert!(shapes
             .iter()
             .any(|s| s.name == "memory-default" && s.config.kernel_hooks == KernelHooks::Classic));
         assert!(shapes
             .iter()
             .any(|s| s.name == "network" && s.config.kernel_hooks == KernelHooks::Classic));
+        assert!(shapes.iter().any(|s| s.config.memory
+            && s.config.kernel_hooks == KernelHooks::RawTracepoint
+            && s.legs == LegSelection::Host));
         assert!(shapes.iter().any(|s| s.config.memory
             && s.config.kernel_hooks == KernelHooks::Trampoline
             && s.legs == LegSelection::Host));
