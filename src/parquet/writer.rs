@@ -48,6 +48,16 @@ const DEFAULT_BATCH_SIZE: usize = 200_000;
 /// row groups to keep that bounded.
 const STACK_BATCH_SIZE: usize = 20_000;
 
+/// Rows a packet buffer is sized to hold past its flush bound: the most a
+/// ring consumer hands over in one batch. A buffer sized to the bound alone
+/// regrew — a copy of the whole buffer — on the append that crossed it.
+const PACKET_BATCH_HEADROOM: usize = crate::systing_core::CONSUME_BATCH;
+
+/// Rows a `sched_slice` / `thread_state` buffer is sized to hold past its
+/// flush bound: one shard's flush. The shards all append under the shared
+/// writer lock, so a regrow there is a copy every other shard waits on.
+const SCHED_BATCH_HEADROOM: usize = crate::sched::STREAMING_SCHED_FLUSH_THRESHOLD;
+
 /// Build the shared `WriterProperties` used for all parquet files.
 ///
 /// Tuned for size: ZSTD level 3 plus DELTA_BINARY_PACKED on the high-cardinality
@@ -175,11 +185,11 @@ pub struct StreamingParquetWriter {
     network_syscall_writer: Option<TableWriter>,
     /// The network_packet table encodes off the flushing thread: see
     /// [`EncodeLane`]. Started on the first flush, finished with the others.
+    /// A fresh packet buffer is sized to `batch_size` plus the consumers'
+    /// batch bound ([`PACKET_BATCH_HEADROOM`]), so the append that carries
+    /// the buffer past the flush bound never regrows it — the first one
+    /// included, whatever size the first batch happened to be.
     network_packet_lane: Option<EncodeLane<NetworkPacketRecord>>,
-    /// The largest packet batch a consumer has handed over. A fresh packet
-    /// buffer is sized to `batch_size` plus this, so the append that carries
-    /// the buffer past the flush bound never regrows it.
-    network_packet_headroom: usize,
     network_socket_writer: Option<TableWriter>,
     network_poll_writer: Option<TableWriter>,
     network_dns_writer: Option<TableWriter>,
@@ -307,7 +317,6 @@ impl StreamingParquetWriter {
             socket_connection_writer: None,
             network_syscall_writer: None,
             network_packet_lane: None,
-            network_packet_headroom: 0,
             network_socket_writer: None,
             network_poll_writer: None,
             network_dns_writer: None,
@@ -349,6 +358,17 @@ impl StreamingParquetWriter {
     fn reserve_if_empty<T>(buffer: &mut Vec<T>, capacity: usize) {
         if buffer.is_empty() {
             buffer.reserve(capacity);
+        }
+    }
+
+    /// Refuse an append to a table whose encode lane has stopped: the rows
+    /// would sit in the buffer and be dropped whole by the next flush's
+    /// failed push, counted as recorded meanwhile. The error is the lane's
+    /// own outcome, so every append after a lane death reports why.
+    fn refuse_if_stopped<R: Send + Sync + 'static>(lane: &mut Option<EncodeLane<R>>) -> Result<()> {
+        match lane {
+            Some(lane) if lane.stopped() => Err(lane.stop_error()),
+            _ => Ok(()),
         }
     }
 
@@ -450,12 +470,16 @@ impl StreamingParquetWriter {
     // Flush sched_slices buffer: the rows go whole to the table's encode
     // lane and this thread returns with a fresh buffer. The sched consumers
     // all flush through one shared writer lock, so what happens here is
-    // what every shard waits on.
+    // what every shard waits on — the fresh buffer is sized for the bound
+    // plus one shard's flush, so the crossing append never regrows it here.
     fn flush_sched_slices(&mut self) -> Result<()> {
         if self.sched_slices.is_empty() {
             return Ok(());
         }
-        let rows = std::mem::replace(&mut self.sched_slices, Vec::with_capacity(self.batch_size));
+        let rows = std::mem::replace(
+            &mut self.sched_slices,
+            Vec::with_capacity(self.batch_size + SCHED_BATCH_HEADROOM),
+        );
         Self::push_to_lane(
             &mut self.sched_slice_lane,
             &self.sink,
@@ -473,7 +497,10 @@ impl StreamingParquetWriter {
         if self.thread_states.is_empty() {
             return Ok(());
         }
-        let rows = std::mem::replace(&mut self.thread_states, Vec::with_capacity(self.batch_size));
+        let rows = std::mem::replace(
+            &mut self.thread_states,
+            Vec::with_capacity(self.batch_size + SCHED_BATCH_HEADROOM),
+        );
         Self::push_to_lane(
             &mut self.thread_state_lane,
             &self.sink,
@@ -952,7 +979,7 @@ impl StreamingParquetWriter {
         }
         let rows = std::mem::replace(
             &mut self.network_packets,
-            Vec::with_capacity(self.batch_size + self.network_packet_headroom),
+            Vec::with_capacity(self.batch_size + PACKET_BATCH_HEADROOM),
         );
         Self::push_to_lane(
             &mut self.network_packet_lane,
@@ -1403,22 +1430,30 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_sched_slice(&mut self, record: SchedSliceRecord) -> Result<()> {
-        Self::reserve_if_empty(&mut self.sched_slices, self.batch_size);
+        Self::refuse_if_stopped(&mut self.sched_slice_lane)?;
+        Self::reserve_if_empty(
+            &mut self.sched_slices,
+            self.batch_size + SCHED_BATCH_HEADROOM,
+        );
         self.sched_slices.push(record);
-        self.total_records += 1;
         if Self::should_flush(&self.sched_slices, self.batch_size) {
             self.flush_sched_slices()?;
         }
+        self.total_records += 1;
         Ok(())
     }
 
     fn add_thread_state(&mut self, record: ThreadStateRecord) -> Result<()> {
-        Self::reserve_if_empty(&mut self.thread_states, self.batch_size);
+        Self::refuse_if_stopped(&mut self.thread_state_lane)?;
+        Self::reserve_if_empty(
+            &mut self.thread_states,
+            self.batch_size + SCHED_BATCH_HEADROOM,
+        );
         self.thread_states.push(record);
-        self.total_records += 1;
         if Self::should_flush(&self.thread_states, self.batch_size) {
             self.flush_thread_states()?;
         }
+        self.total_records += 1;
         Ok(())
     }
 
@@ -1426,55 +1461,87 @@ impl RecordCollector for StreamingParquetWriter {
     /// `Vec` appends (one flush check each) instead of a push per record —
     /// this runs under the shared writer lock every other shard waits on —
     /// and the five small tables go through the per-record adds as before.
+    /// The count returned is in RECORDS, like the trait's default and the
+    /// small tables' per-record adds: a batch refused because its lane has
+    /// stopped counts every row it carried, and a flush that failed counts
+    /// every row the lane dropped with it.
     fn add_sched_batch(&mut self, batch: crate::record::SchedRecordBatch<'_>) -> usize {
         let mut failed = 0usize;
-        let mut warn = |what: &str, e: anyhow::Error| {
-            eprintln!("Warning: Failed to stream {what}: {e}");
-            failed += 1;
+        let mut warn = |what: &str, rows: usize, e: anyhow::Error| {
+            eprintln!("Warning: Failed to stream {what} ({rows} records): {e}");
+            failed += rows;
         };
         if !batch.slices.is_empty() {
-            Self::reserve_if_empty(&mut self.sched_slices, self.batch_size);
-            self.total_records += batch.slices.len();
-            self.sched_slices.append(batch.slices);
-            if Self::should_flush(&self.sched_slices, self.batch_size) {
-                if let Err(e) = self.flush_sched_slices() {
-                    warn("sched slice batch", e);
+            let rows = batch.slices.len();
+            if let Err(e) = Self::refuse_if_stopped(&mut self.sched_slice_lane) {
+                batch.slices.clear();
+                warn("sched slice batch", rows, e);
+            } else {
+                Self::reserve_if_empty(
+                    &mut self.sched_slices,
+                    self.batch_size + SCHED_BATCH_HEADROOM,
+                );
+                self.sched_slices.append(batch.slices);
+                let pending = self.sched_slices.len();
+                if Self::should_flush(&self.sched_slices, self.batch_size) {
+                    if let Err(e) = self.flush_sched_slices() {
+                        // The failed push dropped the whole buffer, this
+                        // batch and what earlier ones had left in it.
+                        warn("sched slice batch", pending, e);
+                    } else {
+                        self.total_records += rows;
+                    }
+                } else {
+                    self.total_records += rows;
                 }
             }
         }
         if !batch.thread_states.is_empty() {
-            Self::reserve_if_empty(&mut self.thread_states, self.batch_size);
-            self.total_records += batch.thread_states.len();
-            self.thread_states.append(batch.thread_states);
-            if Self::should_flush(&self.thread_states, self.batch_size) {
-                if let Err(e) = self.flush_thread_states() {
-                    warn("thread state batch", e);
+            let rows = batch.thread_states.len();
+            if let Err(e) = Self::refuse_if_stopped(&mut self.thread_state_lane) {
+                batch.thread_states.clear();
+                warn("thread state batch", rows, e);
+            } else {
+                Self::reserve_if_empty(
+                    &mut self.thread_states,
+                    self.batch_size + SCHED_BATCH_HEADROOM,
+                );
+                self.thread_states.append(batch.thread_states);
+                let pending = self.thread_states.len();
+                if Self::should_flush(&self.thread_states, self.batch_size) {
+                    if let Err(e) = self.flush_thread_states() {
+                        warn("thread state batch", pending, e);
+                    } else {
+                        self.total_records += rows;
+                    }
+                } else {
+                    self.total_records += rows;
                 }
             }
         }
         for record in batch.irq_slices.drain(..) {
             if let Err(e) = self.add_irq_slice(record) {
-                warn("IRQ slice", e);
+                warn("IRQ slice", 1, e);
             }
         }
         for record in batch.softirq_slices.drain(..) {
             if let Err(e) = self.add_softirq_slice(record) {
-                warn("softirq slice", e);
+                warn("softirq slice", 1, e);
             }
         }
         for record in batch.wakeup_news.drain(..) {
             if let Err(e) = self.add_wakeup_new(record) {
-                warn("wakeup_new", e);
+                warn("wakeup_new", 1, e);
             }
         }
         for record in batch.sched_migrates.drain(..) {
             if let Err(e) = self.add_sched_migrate(record) {
-                warn("sched_migrate", e);
+                warn("sched_migrate", 1, e);
             }
         }
         for record in batch.process_exits.drain(..) {
             if let Err(e) = self.add_process_exit(record) {
-                warn("process_exit", e);
+                warn("process_exit", 1, e);
             }
         }
         failed
@@ -1652,30 +1719,38 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_network_packet(&mut self, record: NetworkPacketRecord) -> Result<()> {
-        Self::reserve_if_empty(&mut self.network_packets, self.batch_size);
+        Self::refuse_if_stopped(&mut self.network_packet_lane)?;
+        Self::reserve_if_empty(
+            &mut self.network_packets,
+            self.batch_size + PACKET_BATCH_HEADROOM,
+        );
         self.network_packets.push(record);
-        self.total_records += 1;
         if Self::should_flush(&self.network_packets, self.batch_size) {
             self.flush_network_packets()?;
         }
+        self.total_records += 1;
         Ok(())
     }
 
+    /// A consumer's batch, taken whole or not at all: refused up front once
+    /// the lane has stopped (the caller keeps its ids exact), and counted
+    /// in `total_records` only after the flush it may trigger succeeded.
     fn add_network_packet_batch(&mut self, records: Vec<NetworkPacketRecord>) -> Result<()> {
+        Self::refuse_if_stopped(&mut self.network_packet_lane)?;
         // The buffer crosses the flush bound by up to one consumer batch, so
-        // it is sized for the bound plus the largest batch seen: the crossing
-        // append then fits, where a buffer sized to the bound alone regrew
-        // (a copy of the whole buffer) on nearly every cycle.
-        self.network_packet_headroom = self.network_packet_headroom.max(records.len());
+        // it is sized for the bound plus the consumers' batch bound: the
+        // crossing append then fits, where a buffer sized to the bound alone
+        // regrew (a copy of the whole buffer) on nearly every cycle.
         Self::reserve_if_empty(
             &mut self.network_packets,
-            self.batch_size + self.network_packet_headroom,
+            self.batch_size + PACKET_BATCH_HEADROOM,
         );
-        self.total_records += records.len();
+        let rows = records.len();
         self.network_packets.extend(records);
         if Self::should_flush(&self.network_packets, self.batch_size) {
             self.flush_network_packets()?;
         }
+        self.total_records += rows;
         Ok(())
     }
 
@@ -4507,6 +4582,179 @@ mod sched_lane_tests {
         assert!(!dir.path().join("sched_slice.parquet").exists());
         assert!(!dir.path().join("thread_state.parquet").exists());
     }
+
+    /// A shard's batch for a table whose lane has died is refused whole and
+    /// counted in ROWS — the shard's bail then says how many records were
+    /// lost, not "1" — while the other table's rows still land; nothing of
+    /// the refused batch is buffered or counted as recorded.
+    #[test]
+    fn a_stopped_sched_lane_refuses_its_batches_and_counts_the_rows() {
+        fn fail_build(_: &[SchedSliceRecord], _: &Arc<Schema>) -> Result<RecordBatch> {
+            Err(anyhow::anyhow!("lane down"))
+        }
+        let dir = TempDir::new().unwrap();
+        let sink = ParquetSink::directory(dir.path()).unwrap();
+        let mut writer = StreamingParquetWriter::with_sink(sink, 25);
+        let out = writer.sink.open("sched_slice").unwrap();
+        writer.sched_slice_lane = Some(
+            EncodeLane::start(
+                "sched_slice",
+                out,
+                trace::sched_slice_schema(),
+                writer.writer_props.clone(),
+                Some(sort_sched_slice_batch),
+                fail_build,
+                2,
+                1_000_000,
+            )
+            .unwrap(),
+        );
+        let slices = |n: i64| -> Vec<SchedSliceRecord> {
+            (0..n)
+                .map(|i| SchedSliceRecord {
+                    ts: 1_000 + i,
+                    dur: 5,
+                    cpu: 0,
+                    utid: 100,
+                    end_state: None,
+                    priority: 120,
+                })
+                .collect()
+        };
+        let states = |n: i64| -> Vec<ThreadStateRecord> {
+            (0..n)
+                .map(|i| ThreadStateRecord {
+                    ts: 1_000 + i,
+                    dur: 0,
+                    utid: 200,
+                    state: 0,
+                    cpu: Some(3),
+                })
+                .collect()
+        };
+        let hand_over = |writer: &mut StreamingParquetWriter,
+                         mut s: Vec<SchedSliceRecord>,
+                         mut t: Vec<ThreadStateRecord>|
+         -> usize {
+            let (mut irq, mut softirq, mut wake, mut mig, mut exits) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            writer.add_sched_batch(SchedRecordBatch {
+                slices: &mut s,
+                thread_states: &mut t,
+                irq_slices: &mut irq,
+                softirq_slices: &mut softirq,
+                wakeup_news: &mut wake,
+                sched_migrates: &mut mig,
+                process_exits: &mut exits,
+            })
+        };
+        // 30 slices cross the 25-row bound: the flush hands them to the lane,
+        // which dies on them.
+        assert_eq!(hand_over(&mut writer, slices(30), Vec::new()), 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !writer.sched_slice_lane.as_ref().unwrap().stopped() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lane never stopped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let counted = writer.total_records();
+        // Ten slices and six thread states: the slices are refused and
+        // counted as ten failed records, the states go to their own lane.
+        assert_eq!(hand_over(&mut writer, slices(10), states(6)), 10);
+        assert!(
+            writer.sched_slices.is_empty(),
+            "nothing buffered for a dead lane"
+        );
+        assert_eq!(writer.thread_states.len(), 6);
+        assert_eq!(writer.total_records(), counted + 6);
+        assert_eq!(hand_over(&mut writer, slices(7), Vec::new()), 7);
+        let err = writer.finish().unwrap_err();
+        assert!(format!("{err:#}").contains("lane down"), "{err:#}");
+        // The thread_state file was closed by the same finish.
+        let (states, _) = read_rows(dir.path(), "thread_state", 0, 2);
+        assert_eq!(states.len(), 6);
+    }
+
+    /// The production file identity for the two biggest tables: 1,000,001
+    /// `sched_slice` rows handed over in shard-sized batches through
+    /// `with_sink` at the default flush bound land in a file whose row
+    /// groups close at exactly the 1,000,000-row bound, and DuckDB reads
+    /// every row back through the same import the tool runs.
+    #[test]
+    fn a_million_lane_written_sched_rows_read_back_through_duckdb() {
+        use crate::duckdb::parquet_to_duckdb;
+        use duckdb::Connection;
+
+        const ROWS: i64 = 1_000_001;
+        const SHARD_BATCH: i64 = 5_000;
+
+        let dir = TempDir::new().unwrap();
+        let sink = ParquetSink::directory(dir.path()).unwrap();
+        let mut writer = StreamingParquetWriter::with_sink(sink, DEFAULT_BATCH_SIZE);
+        let mut next = 0i64;
+        while next < ROWS {
+            let end = (next + SHARD_BATCH).min(ROWS);
+            let mut slices: Vec<SchedSliceRecord> = (next..end)
+                .map(|i| SchedSliceRecord {
+                    ts: 1_000_000 + i * 7,
+                    dur: 3,
+                    cpu: (i % 64) as i32,
+                    utid: 100 + i % 1_000,
+                    end_state: if i % 5 == 0 { Some(1) } else { None },
+                    priority: 120,
+                })
+                .collect();
+            let (mut t, mut irq, mut softirq, mut wake, mut mig, mut exits) = (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+            let failed = writer.add_sched_batch(SchedRecordBatch {
+                slices: &mut slices,
+                thread_states: &mut t,
+                irq_slices: &mut irq,
+                softirq_slices: &mut softirq,
+                wakeup_news: &mut wake,
+                sched_migrates: &mut mig,
+                process_exits: &mut exits,
+            });
+            assert_eq!(failed, 0);
+            next = end;
+        }
+        assert_eq!(writer.total_records(), ROWS as usize);
+        writer.finish().unwrap();
+
+        let file = File::open(dir.path().join("sched_slice.parquet")).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let metadata = builder.metadata().clone();
+        let groups: Vec<i64> = (0..metadata.num_row_groups())
+            .map(|i| metadata.row_group(i).num_rows())
+            .collect();
+        assert_eq!(groups, [1_000_000, 1], "row groups close at the bound");
+
+        let db_path = dir.path().join("t.duckdb");
+        parquet_to_duckdb(dir.path(), &db_path, "t").expect("the import succeeds");
+        let conn = Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM sched_slice", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, ROWS);
+        let (min_ts, max_ts, cpus): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT min(ts), max(ts), count(DISTINCT cpu) FROM sched_slice",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(min_ts, 1_000_000);
+        assert_eq!(max_ts, 1_000_000 + (ROWS - 1) * 7);
+        assert_eq!(cpus, 64);
+    }
 }
 
 /// The packet lane's file contract, through the production path: two
@@ -4643,5 +4891,123 @@ mod packet_lane_tests {
             .map(|b| b.unwrap().num_rows())
             .sum();
         assert_eq!(rows, 50);
+    }
+
+    /// A first batch smaller than the later ones — the consumer's first
+    /// `recv` plus whatever `try_iter` found — costs no regrow on the first
+    /// crossing append either: the headroom is the consumers' batch bound,
+    /// not the largest batch seen so far.
+    #[test]
+    fn a_small_first_batch_costs_no_regrow_on_the_first_crossing() {
+        let dir = TempDir::new().unwrap();
+        let sink = ParquetSink::directory(dir.path()).unwrap();
+        let mut writer = StreamingParquetWriter::with_sink(sink, 25);
+
+        let batch = |from: i64, n: i64| -> Vec<NetworkPacketRecord> {
+            (from..from + n).map(synth_record).collect()
+        };
+        writer.add_network_packet_batch(batch(0, 3)).unwrap();
+        let capacity = writer.network_packets.capacity();
+        assert_eq!(
+            capacity,
+            25 + PACKET_BATCH_HEADROOM,
+            "sized for the bound plus the consumers' batch bound"
+        );
+        writer.add_network_packet_batch(batch(3, 10)).unwrap();
+        writer.add_network_packet_batch(batch(13, 10)).unwrap();
+        assert_eq!(writer.network_packets.len(), 23);
+        assert_eq!(writer.network_packets.capacity(), capacity);
+        // The append that crosses the bound: 33 rows go to the lane.
+        writer.add_network_packet_batch(batch(23, 10)).unwrap();
+        assert_eq!(
+            writer.network_packets.len(),
+            0,
+            "the crossing append flushed"
+        );
+        assert_eq!(
+            writer.network_packets.capacity(),
+            capacity,
+            "no regrow on the first crossing; the fresh buffer is sized the same"
+        );
+        assert_eq!(writer.total_records(), 33);
+        writer.finish().unwrap();
+
+        let file = File::open(dir.path().join("network_packet.parquet")).unwrap();
+        let rows: usize = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(rows, 33);
+    }
+
+    /// Once the packet lane has died, every later append is refused at once
+    /// with the lane's own error — no batch is accepted and then dropped
+    /// whole by a later flush — so a caller that hands its ids back on an
+    /// error keeps them exact, and `total_records` counts none of the
+    /// refused rows.
+    #[test]
+    fn a_stopped_packet_lane_refuses_every_later_append() {
+        fn fail_build(_: &[NetworkPacketRecord], _: &Arc<Schema>) -> Result<RecordBatch> {
+            Err(anyhow::anyhow!("lane down"))
+        }
+        let dir = TempDir::new().unwrap();
+        let sink = ParquetSink::directory(dir.path()).unwrap();
+        let mut writer = StreamingParquetWriter::with_sink(sink, 25);
+        // The lane as `push_to_lane` starts it, over a build that fails: its
+        // first batch ends the lane thread.
+        let out = writer.sink.open("network_packet").unwrap();
+        writer.network_packet_lane = Some(
+            EncodeLane::start(
+                "network_packet",
+                out,
+                trace::network_packet_schema(),
+                writer.writer_props.clone(),
+                None,
+                fail_build,
+                2,
+                1_000_000,
+            )
+            .unwrap(),
+        );
+
+        let batch = |from: i64| -> Vec<NetworkPacketRecord> {
+            (from..from + 10).map(synth_record).collect()
+        };
+        writer.add_network_packet_batch(batch(0)).unwrap();
+        writer.add_network_packet_batch(batch(10)).unwrap();
+        // The crossing append hands 30 rows to the lane, which dies on them.
+        writer.add_network_packet_batch(batch(20)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !writer.network_packet_lane.as_ref().unwrap().stopped() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lane never stopped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let counted = writer.total_records();
+
+        for i in 0..5 {
+            let err = writer
+                .add_network_packet_batch(batch(100 + 10 * i))
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("lane down"), "{err:#}");
+        }
+        let err = writer.add_network_packet(synth_record(200)).unwrap_err();
+        assert!(format!("{err:#}").contains("lane down"), "{err:#}");
+        assert!(
+            writer.network_packets.is_empty(),
+            "no row is buffered for a dead lane"
+        );
+        assert_eq!(
+            writer.total_records(),
+            counted,
+            "refused rows are not counted"
+        );
+
+        let err = writer.finish().unwrap_err();
+        assert!(format!("{err:#}").contains("lane down"), "{err:#}");
     }
 }

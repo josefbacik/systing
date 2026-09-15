@@ -19,8 +19,12 @@
 //! every reader is unchanged.
 //!
 //! Errors surface on the next `push` after the lane thread stopped and on
-//! `finish`, which also returns the first error any encoder hit.
+//! `finish`, which also returns the first error any encoder hit. A writer
+//! asks `stopped` before it buffers more rows for a lane, so a lane that
+//! died refuses every later append at once instead of accepting rows that
+//! its next flush would drop whole.
 
+use std::any::Any;
 use std::io::Write;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
@@ -132,13 +136,30 @@ impl<R: Send + Sync + 'static> EncodeLane<R> {
             return Ok(());
         }
         // The receiver is gone: the lane thread exited. Its result says why.
+        Err(self.stop_error())
+    }
+
+    /// Has the lane stopped taking batches? True once a `push` found the
+    /// lane thread gone, and as soon as that thread has exited on its own —
+    /// an encoder or sink error ends it before any `push` notices — so a
+    /// writer that asks before buffering rows refuses them on the first
+    /// append after the lane died, not on the flush that would have found
+    /// out.
+    pub fn stopped(&self) -> bool {
+        self.tx.is_none() || self.thread.as_ref().is_none_or(|t| t.is_finished())
+    }
+
+    /// The error a stopped lane stopped on: the lane thread's own outcome,
+    /// or, when it exited clean before the writer finished, that fact. Ends
+    /// the lane (no batch is accepted after it) and joins the thread once.
+    pub fn stop_error(&mut self) -> anyhow::Error {
         self.tx = None;
         match self.join() {
-            Ok(()) => Err(anyhow!(
+            Ok(()) => anyhow!(
                 "encode lane for table {} stopped before the writer finished",
                 self.table
-            )),
-            Err(e) => Err(e),
+            ),
+            Err(e) => e,
         }
     }
 
@@ -155,7 +176,10 @@ impl<R: Send + Sync + 'static> EncodeLane<R> {
             let outcome = match thread.join() {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(format!("{e:#}")),
-                Err(_) => Err("the lane thread panicked".to_string()),
+                Err(payload) => Err(format!(
+                    "the lane thread panicked: {}",
+                    panic_text(payload.as_ref())
+                )),
             };
             self.outcome = Some(outcome);
         }
@@ -163,6 +187,18 @@ impl<R: Send + Sync + 'static> EncodeLane<R> {
             Some(Ok(())) | None => Ok(()),
             Some(Err(text)) => Err(anyhow!("encode lane for table {}: {text}", self.table)),
         }
+    }
+}
+
+/// The message a panic carried, when it was a string (`panic!("…")` and the
+/// formatted form both are); a payload of another type reads as such.
+fn panic_text(payload: &(dyn Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a non-string panic payload".to_string()
     }
 }
 
@@ -212,29 +248,39 @@ fn run_lane<R: Send + Sync + 'static>(
         }
         let batches = build_parallel(&rows, &schema, build, workers)?;
         drop(rows);
-        if group.is_none() {
-            group = Some(RowGroup::open(
-                table,
-                &parquet_schema,
-                &props,
-                &schema,
-                workers,
-            )?);
-        }
-        let current = group.as_mut().expect("row group opened above");
-        let write_error = batches
-            .iter()
-            .find_map(|batch| current.write(&schema, batch).err());
-        let rows = current.rows;
-        if let Some(e) = write_error {
-            // A closed encoder channel means an encoder failed: its own
-            // error is the one to report, not the send that found it.
-            let failed = group.take().expect("row group open");
-            return Err(failed.abort().unwrap_or(e));
-        }
-        if rows >= row_group_rows {
-            let closing = group.take().expect("row group open");
-            closing.close_into(&mut file)?;
+        // A row group closes at exactly `row_group_rows` rows, as
+        // `ArrowWriter::write` closed it: a batch that would carry the open
+        // group past the bound is written up to the bound, the group closed,
+        // and the rest goes to the next one.
+        for batch in &batches {
+            let mut offset = 0;
+            while offset < batch.num_rows() {
+                if group.is_none() {
+                    group = Some(RowGroup::open(
+                        table,
+                        &parquet_schema,
+                        &props,
+                        &schema,
+                        workers,
+                    )?);
+                }
+                let current = group.as_mut().expect("row group opened above");
+                let room = row_group_rows.saturating_sub(current.rows).max(1);
+                let take = room.min(batch.num_rows() - offset);
+                let part = batch.slice(offset, take);
+                if let Err(e) = current.write(&schema, &part) {
+                    // A closed encoder channel means an encoder failed: its
+                    // own error is the one to report, not the send that
+                    // found it.
+                    let failed = group.take().expect("row group open");
+                    return Err(failed.abort().unwrap_or(e));
+                }
+                offset += take;
+                if current.rows >= row_group_rows {
+                    let closing = group.take().expect("row group open");
+                    closing.close_into(&mut file)?;
+                }
+            }
         }
     }
     if let Some(closing) = group.take() {
@@ -261,10 +307,20 @@ fn build_parallel<R: Send + Sync>(
             .chunks(chunk)
             .map(|slice| scope.spawn(move || build(slice, schema)))
             .collect();
-        handles
+        // Every builder is joined before the first error is returned: a
+        // thread the scope would join on its own after a panic makes the
+        // scope panic in turn, and the builder's own message would be lost.
+        let built: Vec<Result<RecordBatch>> = handles
             .into_iter()
-            .map(|h| h.join().map_err(|_| anyhow!("a batch builder panicked"))?)
-            .collect()
+            .map(|h| match h.join() {
+                Ok(result) => result,
+                Err(payload) => Err(anyhow!(
+                    "a batch builder panicked: {}",
+                    panic_text(payload.as_ref())
+                )),
+            })
+            .collect();
+        built.into_iter().collect()
     })
 }
 
@@ -332,11 +388,12 @@ impl RowGroup {
         drop(self.senders);
         let mut chunks: Vec<IndexedChunk> = Vec::new();
         for handle in self.handles {
-            chunks.extend(
-                handle
-                    .join()
-                    .map_err(|_| anyhow!("a column encoder panicked"))??,
-            );
+            chunks.extend(handle.join().map_err(|payload| {
+                anyhow!(
+                    "a column encoder panicked: {}",
+                    panic_text(payload.as_ref())
+                )
+            })??);
         }
         chunks.sort_by_key(|(i, _)| *i);
         let mut row_group = file.next_row_group()?;
@@ -356,7 +413,10 @@ impl RowGroup {
             .filter_map(|handle| match handle.join() {
                 Ok(Ok(_)) => None,
                 Ok(Err(e)) => Some(e),
-                Err(_) => Some(anyhow!("a column encoder panicked")),
+                Err(payload) => Some(anyhow!(
+                    "a column encoder panicked: {}",
+                    panic_text(payload.as_ref())
+                )),
             })
             .next()
     }
@@ -418,9 +478,18 @@ mod tests {
     }
 
     fn read_back(path: &std::path::Path) -> (usize, Vec<i64>, usize) {
+        let (ids, groups) = read_back_groups(path);
+        (ids.len(), ids, groups.len())
+    }
+
+    /// The ids in file order and the row count of each row group.
+    fn read_back_groups(path: &std::path::Path) -> (Vec<i64>, Vec<usize>) {
         let file = File::open(path).unwrap();
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-        let groups = builder.metadata().num_row_groups();
+        let metadata = builder.metadata().clone();
+        let groups: Vec<usize> = (0..metadata.num_row_groups())
+            .map(|i| usize::try_from(metadata.row_group(i).num_rows()).unwrap())
+            .collect();
         let reader = builder.build().unwrap();
         let mut ids = Vec::new();
         for batch in reader {
@@ -432,12 +501,12 @@ mod tests {
                 .unwrap();
             ids.extend(col.iter().map(|v| v.unwrap()));
         }
-        (ids.len(), ids, groups)
+        (ids, groups)
     }
 
     /// Rows pushed in several batches come back whole, in order, with the
-    /// row groups closed at the configured bound and the arrow schema
-    /// carried in the file's metadata.
+    /// row groups closed at exactly the configured bound and the arrow
+    /// schema carried in the file's metadata.
     #[test]
     fn round_trip_in_order_with_row_groups() {
         let dir = TempDir::new().unwrap();
@@ -459,15 +528,40 @@ mod tests {
         lane.push(Vec::new()).unwrap();
         lane.finish().unwrap();
 
-        let (n, ids, groups) = read_back(&path);
-        assert_eq!(n, 700);
+        let (ids, groups) = read_back_groups(&path);
+        assert_eq!(ids.len(), 700);
         assert_eq!(ids, (0..700).collect::<Vec<i64>>());
-        // 700 rows in 100-row batches with a 250-row bound: groups close
-        // after the batch that reaches the bound — 300, 300, 100.
-        assert_eq!(groups, 3);
+        // 700 rows in 100-row batches with a 250-row bound: the batch that
+        // reaches the bound is split there, so the groups hold exactly the
+        // bound — 250, 250, 200 — as `ArrowWriter::write` would close them.
+        assert_eq!(groups, [250, 250, 200]);
         let file = File::open(&path).unwrap();
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
         assert_eq!(builder.schema().as_ref(), schema().as_ref());
+    }
+
+    /// One batch larger than the bound is split into full row groups and a
+    /// remainder, still in order — the shape a 200,000-row flush takes at a
+    /// small bound, and a 1,000,000-row bound takes at the crossing batch.
+    #[test]
+    fn a_batch_past_the_bound_is_split_into_exact_row_groups() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("s.parquet");
+        let out: Box<dyn Write + Send> = Box::new(File::create(&path).unwrap());
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(100)
+            .build();
+        let mut lane = EncodeLane::start("s", out, schema(), props, None, build, 4, 100).unwrap();
+        let rows: Vec<Row> = (0..350).map(|i| Row { id: i, name: "r" }).collect();
+        lane.push(rows).unwrap();
+        // A second batch continues the open 50-row group up to its bound.
+        let rows: Vec<Row> = (350..420).map(|i| Row { id: i, name: "r" }).collect();
+        lane.push(rows).unwrap();
+        lane.finish().unwrap();
+
+        let (ids, groups) = read_back_groups(&path);
+        assert_eq!(ids, (0..420).collect::<Vec<i64>>());
+        assert_eq!(groups, [100, 100, 100, 100, 20]);
     }
 
     /// An empty lane still produces a well-formed file with no rows.
@@ -523,6 +617,85 @@ mod tests {
         let _ = lane.push(rows);
         let err = lane.finish().unwrap_err();
         assert!(format!("{err:#}").contains("disk gone"), "{err:#}");
+    }
+
+    /// A lane whose thread died reads as stopped before any push finds out,
+    /// and `stop_error` names the error it died on; a live lane does not.
+    #[test]
+    fn a_dead_lane_reads_stopped_and_names_its_error() {
+        fn fail_build(_: &[Row], _: &SchemaRef) -> Result<RecordBatch> {
+            Err(anyhow!("lane down"))
+        }
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("d.parquet");
+        let out: Box<dyn Write + Send> = Box::new(File::create(&path).unwrap());
+        let mut lane = EncodeLane::start(
+            "d",
+            out,
+            schema(),
+            WriterProperties::default(),
+            None,
+            fail_build,
+            2,
+            10,
+        )
+        .unwrap();
+        assert!(!lane.stopped(), "a fresh lane is live");
+        let rows: Vec<Row> = (0..50).map(|i| Row { id: i, name: "x" }).collect();
+        // The batch is accepted (the build happens on the lane), fails
+        // there and ends the lane thread; the lane reads stopped once it
+        // has, before any push has found the receiver gone.
+        lane.push(rows).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !lane.stopped() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lane never stopped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let err = lane.stop_error();
+        assert!(format!("{err:#}").contains("lane down"), "{err:#}");
+        assert!(lane.stopped());
+        // Every later push is refused with the same error.
+        let rows: Vec<Row> = (50..60).map(|i| Row { id: i, name: "x" }).collect();
+        let err = lane.push(rows).unwrap_err();
+        assert!(format!("{err:#}").contains("lane down"), "{err:#}");
+        let err = lane.finish().unwrap_err();
+        assert!(format!("{err:#}").contains("lane down"), "{err:#}");
+    }
+
+    /// A panic on the lane carries its message into the outcome instead of
+    /// the fixed "panicked" text — whether the builder ran on the lane
+    /// thread itself (a batch at most one chunk long) or on a scoped
+    /// builder thread.
+    #[test]
+    fn a_builder_panic_carries_its_message() {
+        fn boom(rows: &[Row], _: &SchemaRef) -> Result<RecordBatch> {
+            panic!("builder boom on {} rows", rows.len())
+        }
+        for (workers, rows) in [(1usize, 20i64), (4, 200)] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("b.parquet");
+            let out: Box<dyn Write + Send> = Box::new(File::create(&path).unwrap());
+            let mut lane = EncodeLane::start(
+                "b",
+                out,
+                schema(),
+                WriterProperties::default(),
+                None,
+                boom,
+                workers,
+                1000,
+            )
+            .unwrap();
+            let batch: Vec<Row> = (0..rows).map(|i| Row { id: i, name: "x" }).collect();
+            let _ = lane.push(batch);
+            let err = lane.finish().unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains("builder boom on"), "{text}");
+            assert!(text.contains("panicked"), "{text}");
+        }
     }
 
     /// `prepare` runs on the lane thread over each batch before the build:

@@ -21,8 +21,10 @@ use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 /// consumers all sharing one underlying parquet writer (see
 /// `SharedCollector`), per-record adds would serialize the consumers on the
 /// writer lock, so every record type is buffered locally and handed over in
-/// batches.
-const STREAMING_SCHED_FLUSH_THRESHOLD: usize = 10_000;
+/// batches. The writer sizes its `sched_slice` and `thread_state` buffers
+/// for its own flush bound plus this, so the shard flush that carries a
+/// buffer past the bound never regrows it under the writer lock.
+pub(crate) const STREAMING_SCHED_FLUSH_THRESHOLD: usize = 10_000;
 
 /// Convert a kernel prev_state value to an Option<i32> for storage.
 ///

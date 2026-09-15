@@ -2074,7 +2074,11 @@ fn create_memory_ring<'a>(
     builder.build()
 }
 
-const CONSUME_BATCH: usize = 4096;
+/// The most events a ring consumer hands over in one batch: its first
+/// `recv` plus up to `CONSUME_BATCH - 1` more drained without blocking. The
+/// parquet writer sizes its packet buffer for its flush bound plus this, so
+/// the append that carries the buffer past the bound never regrows it.
+pub(crate) const CONSUME_BATCH: usize = 4096;
 
 /// Per-consumer tracker deciding which task_info sightings are worth
 /// forwarding to process discovery. Forwards the first sighting of a tgidpid
