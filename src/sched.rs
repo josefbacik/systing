@@ -542,6 +542,7 @@ mod tests {
             add_memory_iommu(crate::trace::MemoryIommuRecord),
             add_memory_thp(crate::trace::MemoryThpRecord),
             add_memory_vmstat(crate::trace::MemoryVmstatRecord),
+            add_task_stack_event(crate::trace::TaskStackEventRecord),
             set_sysinfo(crate::trace::SysInfoRecord),
             add_cpu_info(crate::trace::CpuInfoRecord),
             add_tpu_device(crate::trace::TpuDeviceRecord),

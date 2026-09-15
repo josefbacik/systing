@@ -140,11 +140,12 @@ This will display all available recorders and their default states:
 - `markers` - Userspace marker events (faccessat2 with mode=-975)
 - `tpu` - TPU profiling (gRPC to XLA runtime profiler service)
 - `tpu-metrics` - TPU runtime metrics polling (port 8431, always available)
+- `task-stacks` - Periodic stack snapshots of every targeted thread, blocked ones included (see [Task Stacks](#task-stacks))
 
 The three `network*` recorders are tiers of the same subsystem, ordered by event
 volume — see Network Traffic Recording below for when to use each.
 
-Python stack symbolization is not a recorder; enable it with `--collect-pystacks`, which resolves Python frames in whichever stacks the active recorders collect.
+Python stack symbolization is not a recorder; enable it with `--collect-pystacks`, which resolves Python frames in whichever stacks the active recorders collect. In a stack, the Python frames stand where the interpreter ran them among the native frames: each run of Python frames takes the place of the `_PyEval_EvalFrameDefault` frame it executed in, so C called from Python, and Python called back from C, read in order. When the two cannot be paired up (a native stack that lost an interpreter loop frame, because the frame-pointer unwinder skips the caller of a function built without frame pointers, or Python 3.11 re-entered from C, which leaves no marker of where) the Python frames come first as one block, followed by the native ones. That is decided stack by stack, so one Python function can appear under both shapes in a trace. The interpreter's own entry frames (3.12's `<interpreter trampoline>`) are not shown.
 
 `--collect-build-id` captures user stacks as (build-id, file offset) pairs
 instead of raw addresses, so frames of processes that exit before end-of-trace
@@ -253,6 +254,44 @@ The network recorder instruments multiple points in the Linux network stack:
 - `tcp_rcv_established`/`__udp4_lib_rcv` - Packet reception
 - `__dev_queue_xmit`/`net_dev_start_xmit` - Device queue and transmission
 - And additional points for tracking packet flow through queues and buffers
+
+### Task Stacks
+
+The `task-stacks` recorder snapshots the stack of every targeted thread
+(`--pid`, `--cgroup` or the traced command; every thread on the host without
+one) every `--task-stacks-interval-ms` (default 100), with a sleepable BPF
+task iterator. A trace then shows what each thread was doing, blocked ones
+included, not only what was on a CPU. It needs Linux 6.2 or newer.
+
+```bash
+sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 10
+```
+
+- `--task-stacks-frames` picks the frames: `native` (kernel frames, and native
+  user frames unwound by frame pointers), `python` (Python frames alone, and
+  only the threads that have any) or `all`. `python` and `all` turn
+  `--collect-pystacks` on; when the option is not given it is `all` with
+  `--collect-pystacks` and `native` without.
+- With `-d` the recorder takes ceil(duration / interval) snapshots, numbered
+  from 1 (10 s at 100 ms: iterations 1-100).
+- A thread that has not run since its last snapshot and is still in the same
+  non-runnable state cannot have changed its stack: it is not walked again and
+  its row is extended instead, so a thread blocked for a minute is one row.
+- The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
+  with the stack by `stack_id` into `stack` like every other recorder's.
+- In the Perfetto trace each thread gets a `Task Stacks: <thread>` track: the
+  stack over time the way py-spy's Chrome trace output draws it, each frame one
+  slice for as long as it stays on the stack, root at the top. A slice is named
+  after the function alone; `language`, `file` (the full path, for Python frames
+  and for native frames with debug info), `line`, `module` and `address` are
+  its arguments.
+
+What to keep in mind: a row's `ts` is the start of its iteration's walk, which
+reaches a given thread up to one walk later. A blocked thread's stack is exact;
+a running thread's is read while it runs and is a best effort. The
+unchanged-thread skip and the CPU-time deltas hold for up to 65,536 targeted
+threads. `--collect-build-id` does not apply to these stacks. The recorder keeps
+its events until the capture ends, so it cannot be used with `--continuous`.
 
 ### Debugging and Verbosity
 

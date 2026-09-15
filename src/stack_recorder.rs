@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 
 use crate::build_id_store::{build_id_hex, BuildIdStore};
 use crate::gvisor_guest::{GuestAddr, GuestProcess, SandboxIndex};
-use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
+use crate::pystacks::stack_walker::{PyAddr, PythonFrame, StackWalkerRun};
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::sandbox_maps::{FileId, ProcessMaps};
@@ -578,7 +578,7 @@ impl StackInterner {
 fn emit_stack_record(
     collector: &mut dyn RecordCollector,
     stack_id: i64,
-    frame_names: Vec<String>,
+    (frame_names, frame_files): (Vec<String>, Vec<Option<String>>),
 ) -> Result<()> {
     if frame_names.is_empty() {
         return Ok(());
@@ -592,6 +592,7 @@ fn emit_stack_record(
         frame_names,
         depth,
         leaf_name,
+        frame_files,
     })
 }
 
@@ -1224,6 +1225,14 @@ pub struct StackRecorder {
     /// `finish()`. Id ranges are disjoint per interner, so identical contents
     /// interned by two recorders simply emit one StackRecord per id.
     external_interners: Vec<StackInterner>,
+    /// Stacks with ids from here up get the full path of their native and
+    /// kernel frames' source files in `StackRecord::frame_files`, beside the
+    /// Python frames' that every stack gets: see [`Self::keep_native_paths_from`].
+    native_paths_from: Option<i64>,
+    /// While `native_paths_from` is set: the source file, by full path, of
+    /// each native or kernel frame symbolized with debug info, under the
+    /// frame's name (which has the file by name alone).
+    source_paths: std::cell::RefCell<HashMap<String, String>>,
     /// Directory for spill tempfiles. Retained so `finish()` can re-spill
     /// alive-process stacks into per-bucket files (see [`RESPILL_BUCKETS`]).
     spill_dir: Option<PathBuf>,
@@ -1304,6 +1313,8 @@ impl StackRecorder {
             interner: StackInterner::new(1)
                 .with_id_limit(crate::memory_recorder::MEMORY_STACK_ID_OFFSET),
             external_interners: Vec::new(),
+            native_paths_from: None,
+            source_paths: Default::default(),
             spill_dir: None,
             utid_generator,
             frame_labels: true,
@@ -1379,6 +1390,30 @@ impl StackRecorder {
     /// contents interned by both recorders emit one StackRecord per id.
     pub(crate) fn merge_external_interner(&mut self, interner: StackInterner) {
         self.external_interners.push(interner);
+    }
+
+    /// Give the stacks with ids from `first_id` up the full path of their
+    /// native and kernel frames' source files, where debug info has one: the
+    /// frame's name has the file by name alone, as it always had, and the path
+    /// goes beside it in `StackRecord::frame_files`. Stacks below `first_id`,
+    /// the recorders' that were here before, are written as they always were.
+    /// Interners have disjoint id ranges, so this picks a recorder's stacks.
+    pub(crate) fn keep_native_paths_from(&mut self, first_id: i64) {
+        self.native_paths_from = Some(first_id);
+    }
+
+    /// Remember the full path of `sym`'s source file under `frame_name`, when
+    /// paths are being kept and debug info names the directory.
+    fn note_source_path(&self, frame_name: &str, sym: &Sym) {
+        if self.native_paths_from.is_none() {
+            return;
+        }
+        if let Some(path) = source_path(sym.code_info.as_deref()) {
+            self.source_paths
+                .borrow_mut()
+                .entry(frame_name.to_string())
+                .or_insert(path);
+        }
     }
 
     /// Create a symbolizer with the configured process dispatcher.
@@ -1600,6 +1635,7 @@ impl StackRecorder {
                 let frame_names = self.symbolize_stack_frames(
                     &mut symbolizer,
                     &stack,
+                    self.native_paths_from.is_some_and(|from| stack_id >= from),
                     None,
                     &kernel_src,
                     &mut kernel_cache,
@@ -1788,6 +1824,7 @@ impl StackRecorder {
                     let frame_names = self.symbolize_stack_frames(
                         &mut symbolizer,
                         &stack,
+                        self.native_paths_from.is_some_and(|from| stack_id >= from),
                         Some((&ctx, &mut user_cache, &mut live_bid_cache)),
                         &kernel_src,
                         &mut kernel_cache,
@@ -1833,7 +1870,9 @@ impl StackRecorder {
                 .ok()
                 .and_then(|s| s.into_sym())
             {
-                return format_symbolized_frame(&sym, addr, "unknown", self.elide_generics);
+                let name = format_symbolized_frame(&sym, addr, "unknown", self.elide_generics);
+                self.note_source_path(&name, &sym);
+                return name;
             }
         }
 
@@ -1848,12 +1887,14 @@ impl StackRecorder {
             {
                 // sym.module would render the map_files link; report the
                 // original binary the island belongs to instead.
-                return format_symbolized_frame_forced_module(
+                let name = format_symbolized_frame_forced_module(
                     &sym,
                     addr,
                     &bridge.module_name,
                     self.elide_generics,
                 );
+                self.note_source_path(&name, &sym);
+                return name;
             }
         }
 
@@ -1926,12 +1967,14 @@ impl StackRecorder {
                 // The trailing <...> slot carries the file offset (the
                 // frame's identity within the module), not a virtual
                 // address — build-id frames don't have one.
-                return format_symbolized_frame_forced_module(
+                let name = format_symbolized_frame_forced_module(
                     &sym,
                     offset,
                     &bin.display_module,
                     self.elide_generics,
                 );
+                self.note_source_path(&name, &sym);
+                return name;
             }
             // Store hit, symbol unresolved: the module is still known.
             return render_unresolved_build_id(
@@ -1963,21 +2006,23 @@ impl StackRecorder {
         &self,
         symbolizer: &mut Symbolizer,
         stack: &Stack,
+        native_paths: bool,
         user: Option<LiveUserState<'_, '_>>,
         kernel_src: &Source<'_>,
         kernel_cache: &mut HashMap<u64, String>,
         bid_store: &mut BuildIdStore,
         bid_cache: &mut HashMap<BuildIdFrameKey, String>,
-    ) -> Vec<String> {
-        let mut frame_names = Vec::with_capacity(
-            stack.user_stack.len() + stack.kernel_stack.len() + stack.py_stack.len(),
-        );
+    ) -> (Vec<String>, Vec<Option<String>>) {
+        let python_frames = self.psr.get_python_frames(&stack.py_stack);
+        // A Python frame's name has its file by name alone; the full path
+        // goes beside the names (StackRecord::frame_files).
+        let python_files: HashMap<String, String> = python_frames
+            .iter()
+            .filter_map(|f| Some((f.name.clone(), f.file.clone()?)))
+            .collect();
 
-        // Symbolize Python stack first (if present)
-        let python_frames = self.psr.get_python_frame_names(&stack.py_stack);
-        frame_names.extend(python_frames);
-
-        // Symbolize user addresses (middle segment of the root-to-leaf array)
+        // Symbolize user addresses
+        let mut frame_names = Vec::with_capacity(stack.user_stack.len());
         match user {
             Some((ctx, user_cache, live_bid_cache)) => {
                 for frame in &stack.user_stack {
@@ -2035,7 +2080,10 @@ impl StackRecorder {
             }
         }
 
-        // Symbolize kernel addresses (leaf end).
+        // The Python frames go where the interpreter ran them, among the user
+        // frames; the kernel's come last (leaf end).
+        let mut frame_names = interleave_python_frames(python_frames, frame_names);
+        frame_names.reserve(stack.kernel_stack.len());
         for &addr in &stack.kernel_stack {
             let frame_name = kernel_cache
                 .entry(addr)
@@ -2044,14 +2092,33 @@ impl StackRecorder {
                         .symbolize_single(kernel_src, Input::AbsAddr(addr))
                         .ok()
                         .and_then(|s| s.into_sym())
-                        .map(|s| format_symbolized_frame(&s, addr, "[kernel]", self.elide_generics))
+                        .map(|s| {
+                            let name =
+                                format_symbolized_frame(&s, addr, "[kernel]", self.elide_generics);
+                            self.note_source_path(&name, &s);
+                            name
+                        })
                         .unwrap_or_else(|| format!("unknown ([kernel]) <{addr:#x}>"))
                 })
                 .clone();
             frame_names.push(frame_name);
         }
 
-        frame_names
+        // The Python frames' paths for every stack; the native and kernel
+        // frames' too for the stacks asked for (keep_native_paths_from).
+        let source_paths = self.source_paths.borrow();
+        let frame_files: Vec<Option<String>> = frame_names
+            .iter()
+            .map(|name| match python_files.get(name) {
+                Some(path) => Some(path.clone()),
+                None if native_paths => source_paths.get(name).cloned(),
+                None => None,
+            })
+            .collect();
+        if frame_files.iter().all(Option::is_none) {
+            return (frame_names, Vec::new());
+        }
+        (frame_names, frame_files)
     }
 
     pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &libbpf_rs::Object, debug: bool) {
@@ -2061,6 +2128,95 @@ impl StackRecorder {
         );
         psr.init_pystacks(pids, bpf_object, debug);
     }
+}
+
+/// Whether a symbolized user frame is CPython's bytecode loop (or a piece the
+/// compiler split off it: `.cold`, `.constprop.0`, ...).
+fn is_interpreter_loop(frame: &str) -> bool {
+    frame.starts_with("_PyEval_EvalFrameDefault")
+}
+
+/// One stack out of a thread's Python frames and its native user frames, both
+/// root first: the Python frames go where the interpreter ran them.
+///
+/// Python frames run inside the native bytecode loop, `_PyEval_EvalFrameDefault`.
+/// Since 3.11 a call from Python to Python stays in the loop it was made from,
+/// so there is one native loop frame per ENTRY from C into Python, and from
+/// 3.12 the interpreter marks each entry with a frame of its own in the Python
+/// chain ([`PythonFrame::entry`]). The markers cut the Python frames into
+/// runs, outermost first, and the k-th run replaces the k-th loop frame:
+///
+/// ```text
+///   native: main  run_mod  LOOP  builtin_sorted  list_sort  LOOP  time_sleep
+///   python: ENTRY <module> outer ENTRY inner
+///   result: main  run_mod  <module> outer  builtin_sorted  list_sort  inner  time_sleep
+/// ```
+///
+/// (3.10 and older have no markers but a loop frame for every Python frame,
+/// which pair up one to one; 3.11 has neither, and pairs up only when Python
+/// was entered once.)
+///
+/// When the runs and the loop frames do not pair up, the Python frames go in
+/// front of the native ones, as one block: a 3.11 stack that re-entered
+/// Python, a native stack that lost a loop frame (the frame-pointer unwinder
+/// reports a function built without one but skips its caller, so one such
+/// extension function called from the loop hides the loop; a leaf without
+/// one, the vDSO say, yields one frame), a Python walk that hit its depth
+/// limit. The choice is per stack: one Python function shows under native
+/// roots where its stacks pair up and at the root where they do not.
+///
+/// The markers themselves never appear in the result. Markers and nothing
+/// else is a thread between two Python calls: as the outermost frame of an
+/// entry returns, the interpreter is for a few instructions on the entry
+/// frame alone (a C thread calling into Python passes through it once per
+/// call). No Python function is running, and the native frames say the rest.
+fn interleave_python_frames(python: Vec<PythonFrame>, user: Vec<String>) -> Vec<String> {
+    if python.iter().all(|f| f.entry) {
+        return user;
+    }
+
+    // The runs between the markers. Frames ahead of the first marker are the
+    // outermost run of a walk that stopped short of its marker.
+    let mut runs: Vec<Vec<String>> = Vec::new();
+    for frame in python {
+        if frame.entry || runs.is_empty() {
+            runs.push(Vec::new());
+        }
+        if !frame.entry {
+            runs.last_mut().expect("a run to add to").push(frame.name);
+        }
+    }
+
+    let loops = user.iter().filter(|f| is_interpreter_loop(f)).count();
+    // 3.10 and older have no markers and a loop frame of its own for every
+    // Python frame: each frame is its own run.
+    if runs.len() == 1 && loops > 1 && runs[0].len() == loops {
+        runs = runs.remove(0).into_iter().map(|f| vec![f]).collect();
+    }
+    if runs.is_empty() || runs.len() != loops {
+        let mut frames: Vec<String> = runs.into_iter().flatten().collect();
+        frames.extend(user);
+        return frames;
+    }
+
+    let mut runs = runs.into_iter();
+    let mut frames = Vec::with_capacity(user.len());
+    for frame in user {
+        if is_interpreter_loop(&frame) {
+            frames.extend(runs.next().expect("a run per loop frame"));
+        } else {
+            frames.push(frame);
+        }
+    }
+    frames
+}
+
+/// The full path of the source file debug info names, when it names the
+/// directory too: [`format_location_info`] has the file alone.
+fn source_path(code_info: Option<&blazesym::symbolize::CodeInfo>) -> Option<String> {
+    let info = code_info?;
+    let path = info.dir.as_ref()?.join(&info.file);
+    Some(path.to_string_lossy().into_owned())
 }
 
 /// Formats code location information as a string suffix (e.g., "[file.rs:123]")
@@ -2917,13 +3073,17 @@ mod tests {
         emit_stack_record(
             &mut collector,
             7,
-            vec!["root".to_string(), "mid".to_string(), "leaf".to_string()],
+            (
+                vec!["root".to_string(), "mid".to_string(), "leaf".to_string()],
+                vec![None, Some("/app/mid.py".to_string()), None],
+            ),
         )
         .unwrap();
         let stacks = &collector.data().stacks;
         assert_eq!(stacks.len(), 1);
         assert_eq!(stacks[0].leaf_name, "leaf");
         assert_eq!(stacks[0].depth, 3);
+        assert_eq!(stacks[0].frame_files[1].as_deref(), Some("/app/mid.py"));
     }
 
     #[test]
@@ -3240,6 +3400,193 @@ mod tests {
              ratio={:.2}",
             full as f64 / ip_reserve as f64
         );
+    }
+
+    fn py(frames: &[&str]) -> Vec<PythonFrame> {
+        frames
+            .iter()
+            .map(|f| PythonFrame {
+                name: if *f == "ENTRY" {
+                    "[Frame Error] (python) [unknown]".to_string()
+                } else {
+                    format!("{f} (python) [app.py:1]")
+                },
+                file: None,
+                entry: *f == "ENTRY",
+            })
+            .collect()
+    }
+
+    fn native(frames: &[&str]) -> Vec<String> {
+        frames
+            .iter()
+            .map(|f| match *f {
+                "LOOP" => {
+                    "_PyEval_EvalFrameDefault (libpython3.13.so.1.0 [ceval.c:1]) <0x10>".to_string()
+                }
+                f => format!("{f} (libpython3.13.so.1.0) <0x20>"),
+            })
+            .collect()
+    }
+
+    /// The function names of a result, Python or native.
+    fn funcs(frames: &[String]) -> Vec<&str> {
+        frames
+            .iter()
+            .map(|f| f.split(' ').next().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn python_runs_replace_the_loop_frames_they_ran_in() {
+        let merged = interleave_python_frames(
+            py(&["ENTRY", "<module>", "outer", "ENTRY", "inner"]),
+            native(&[
+                "main",
+                "run_mod",
+                "LOOP",
+                "builtin_sorted",
+                "list_sort",
+                "LOOP",
+                "time_sleep",
+            ]),
+        );
+        assert_eq!(
+            funcs(&merged),
+            [
+                "main",
+                "run_mod",
+                "<module>",
+                "outer",
+                "builtin_sorted",
+                "list_sort",
+                "inner",
+                "time_sleep"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_split_off_piece_of_the_loop_is_the_loop() {
+        let user = vec![
+            "main (python3.13) <0x1>".to_string(),
+            "_PyEval_EvalFrameDefault.cold (libpython3.13.so.1.0) <0x2>".to_string(),
+        ];
+        let merged = interleave_python_frames(py(&["ENTRY", "f"]), user);
+        assert_eq!(funcs(&merged), ["main", "f"]);
+    }
+
+    #[test]
+    fn python_frames_lead_as_a_block_when_they_do_not_pair_up_with_the_loops() {
+        // The unwinder stopped at a leaf without a frame pointer: no loop frame.
+        let merged = interleave_python_frames(py(&["ENTRY", "<module>", "f"]), native(&["vdso"]));
+        assert_eq!(funcs(&merged), ["<module>", "f", "vdso"]);
+        // 3.11: no markers, and Python was entered twice.
+        let merged = interleave_python_frames(
+            py(&["<module>", "outer", "inner"]),
+            native(&["main", "LOOP", "list_sort", "LOOP"]),
+        );
+        assert_eq!(
+            funcs(&merged),
+            [
+                "<module>",
+                "outer",
+                "inner",
+                "main",
+                "_PyEval_EvalFrameDefault",
+                "list_sort",
+                "_PyEval_EvalFrameDefault"
+            ]
+        );
+        // Python only: nothing to pair with, and no markers left behind.
+        let merged = interleave_python_frames(py(&["ENTRY", "<module>", "ENTRY", "f"]), Vec::new());
+        assert_eq!(funcs(&merged), ["<module>", "f"]);
+        // Native only.
+        let merged = interleave_python_frames(Vec::new(), native(&["main", "LOOP"]));
+        assert_eq!(funcs(&merged), ["main", "_PyEval_EvalFrameDefault"]);
+    }
+
+    #[test]
+    fn pythons_without_markers_pair_up_when_the_counts_say_how() {
+        // 3.11, entered once: the whole stack ran in the one loop frame.
+        let merged = interleave_python_frames(
+            py(&["<module>", "outer", "inner"]),
+            native(&["main", "LOOP", "time_sleep"]),
+        );
+        assert_eq!(
+            funcs(&merged),
+            ["main", "<module>", "outer", "inner", "time_sleep"]
+        );
+        // 3.10 and older: a loop frame per Python frame.
+        let merged = interleave_python_frames(
+            py(&["<module>", "outer", "inner"]),
+            native(&[
+                "main",
+                "LOOP",
+                "call",
+                "LOOP",
+                "list_sort",
+                "LOOP",
+                "time_sleep",
+            ]),
+        );
+        assert_eq!(
+            funcs(&merged),
+            [
+                "main",
+                "<module>",
+                "call",
+                "outer",
+                "list_sort",
+                "inner",
+                "time_sleep"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_walk_that_stopped_short_of_its_outermost_marker_still_pairs_up() {
+        let merged = interleave_python_frames(
+            py(&["outer", "ENTRY", "inner"]),
+            native(&["LOOP", "list_sort", "LOOP"]),
+        );
+        assert_eq!(funcs(&merged), ["outer", "list_sort", "inner"]);
+    }
+
+    #[test]
+    fn markers_alone_are_no_python_frames() {
+        // The outermost Python frame of a callback has just returned.
+        let merged =
+            interleave_python_frames(py(&["ENTRY"]), native(&["worker", "LOOP", "dealloc"]));
+        assert_eq!(
+            funcs(&merged),
+            ["worker", "_PyEval_EvalFrameDefault", "dealloc"]
+        );
+    }
+
+    #[test]
+    fn source_path_is_the_directory_and_the_file_debug_info_names() {
+        use blazesym::symbolize::CodeInfo;
+        fn info<'a>(dir: Option<&'a str>, file: &'a str) -> CodeInfo<'a> {
+            CodeInfo {
+                dir: dir.map(|d| Path::new(d).into()),
+                file: std::ffi::OsStr::new(file).into(),
+                line: Some(408),
+                column: None,
+                _non_exhaustive: (),
+            }
+        }
+        assert_eq!(
+            source_path(Some(&info(
+                Some("/build/Python-3.13"),
+                "Modules/timemodule.c"
+            )))
+            .as_deref(),
+            Some("/build/Python-3.13/Modules/timemodule.c")
+        );
+        // The file alone is what the frame's name already has.
+        assert_eq!(source_path(Some(&info(None, "timemodule.c"))), None);
+        assert_eq!(source_path(None), None);
     }
 
     #[test]

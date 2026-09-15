@@ -167,6 +167,9 @@ impl ParquetToPerfettoConverter {
         // 9. Write perf samples
         self.write_perf_samples(input_dir, writer)?;
 
+        // 9b. Write the task-stacks recorder's events: a stack track per thread
+        self.write_task_stack_events(input_dir, writer)?;
+
         // 10. Write network data (sockets, packets, syscalls, polls)
         self.write_network_data(input_dir, writer)?;
 
@@ -1548,6 +1551,139 @@ impl ParquetToPerfettoConverter {
         Ok(())
     }
 
+    /// Write the task-stacks recorder's events (task_stack_event.parquet) as a
+    /// `Task Stacks: <thread>` track under each thread: the thread's stack over
+    /// time, each frame a slice (see [`merge_frames`]). What else an event
+    /// carries (its iterations, CPU-time deltas, state) stays in the table.
+    fn write_task_stack_events(
+        &mut self,
+        input_dir: &Path,
+        writer: &mut dyn TraceWriter,
+    ) -> Result<()> {
+        let path = input_dir.join("task_stack_event.parquet");
+        if !path.exists() {
+            return Ok(());
+        }
+        let stacks = read_stack_data(input_dir)?;
+        let thread_path = input_dir.join("thread.parquet");
+        let thread_info = if thread_path.exists() {
+            self.build_utid_to_thread_map(&thread_path)?
+        } else {
+            HashMap::new()
+        };
+
+        struct Event {
+            ts: i64,
+            dur: i64,
+            stack_id: Option<i64>,
+        }
+        // The threads in the order they first appear, each with its events.
+        let mut threads: Vec<(i64, Vec<Event>)> = Vec::new();
+        let mut thread_idx: HashMap<i64, usize> = HashMap::new();
+        for batch in &read_parquet_file(&path)? {
+            let int = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .with_context(|| format!("Missing {name} column in task_stack_event"))
+            };
+            let (ts, dur, utids, stack_ids) =
+                (int("ts")?, int("dur")?, int("utid")?, int("stack_id")?);
+            for i in 0..batch.num_rows() {
+                let utid = utids.value(i);
+                let idx = *thread_idx.entry(utid).or_insert_with(|| {
+                    threads.push((utid, Vec::new()));
+                    threads.len() - 1
+                });
+                threads[idx].1.push(Event {
+                    ts: ts.value(i),
+                    dur: dur.value(i),
+                    stack_id: get_optional_i64(Some(stack_ids), i),
+                });
+            }
+        }
+
+        // A frame's full source path, where the stack table has one: the name
+        // has the file by name alone.
+        let full_paths: HashMap<&str, &str> = stacks
+            .values()
+            .flat_map(|s| s.frame_names.iter().zip(&s.frame_files))
+            .filter_map(|(name, file)| Some((name.as_str(), file.as_deref()?)))
+            .collect();
+
+        let seq_id = self.alloc_seq_id();
+        for (utid, mut events) in threads {
+            events.sort_by_key(|e| e.ts);
+            let stack = merge_frames(events.iter().map(|e| {
+                let frames = e.stack_id.and_then(|id| stacks.get(&id));
+                (
+                    e.ts,
+                    e.ts + e.dur,
+                    frames.map_or(&[][..], |s| s.frame_names.as_slice()),
+                )
+            }));
+            if stack.is_empty() {
+                continue;
+            }
+
+            // The thread's own track is the parent. A main thread has none: its
+            // utid stands for the process track, where the stack would show as
+            // the process's and the thread stay nameless. Give it one.
+            let info = thread_info.get(&utid);
+            let parent = match info {
+                Some((tid, name, upid)) if self.resolve_tgid(*upid, *tid) == *tid => {
+                    let uuid = self.alloc_uuid();
+                    let mut thread = ThreadDescriptor::default();
+                    thread.set_tid(*tid);
+                    thread.set_pid(*tid);
+                    thread.set_thread_name(name.clone());
+                    let mut desc = TrackDescriptor::default();
+                    desc.set_uuid(uuid);
+                    desc.set_name(name.clone());
+                    desc.thread = Some(thread).into();
+                    let mut packet = TracePacket::default();
+                    packet.set_track_descriptor(desc);
+                    writer.write_packet(&packet)?;
+                    Some(uuid)
+                }
+                _ => self.utid_to_uuid.get(&utid).copied(),
+            };
+
+            let track = self.alloc_uuid();
+            let mut desc = TrackDescriptor::default();
+            desc.set_uuid(track);
+            desc.set_name(match info {
+                Some((_, name, _)) if !name.is_empty() => format!("Task Stacks: {name}"),
+                _ => format!("Task Stacks: utid {utid}"),
+            });
+            if let Some(parent) = parent {
+                desc.set_parent_uuid(parent);
+            }
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            writer.write_packet(&packet)?;
+
+            // In begin order, parents first: an end event closes whichever
+            // slice of the track began last. A slice is named after the
+            // function alone; where it is from goes in its arguments.
+            for frame in stack {
+                let mut parts = parse_frame(&frame.name);
+                if let Some(path) = full_paths.get(frame.name.as_str()) {
+                    parts.file = Some(path);
+                }
+                write_slice(
+                    writer,
+                    seq_id,
+                    track,
+                    parts.function,
+                    (frame.start, frame.end),
+                    parts.annotations(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Write perf sample packets
     ///
     /// Supports both new schema (stack_sample.parquet) and legacy schema (perf_sample.parquet).
@@ -2496,52 +2632,270 @@ fn get_optional_f64(arr: Option<&Float64Array>, i: usize) -> Option<f64> {
     arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
 }
 
-/// Get the minimum timestamp from parquet files in the directory.
-///
-/// Scans sched_slice.parquet and thread_state.parquet for the minimum timestamp,
-/// which represents the trace start time. Returns 0 if no timestamps are found.
+/// Write one slice of `track`: a begin event at `start`, carrying the
+/// annotations, and its end at `end`.
+fn write_slice(
+    writer: &mut dyn TraceWriter,
+    seq_id: u32,
+    track: u64,
+    name: &str,
+    (start, end): (i64, i64),
+    annotations: Vec<DebugAnnotation>,
+) -> Result<()> {
+    let mut begin = TrackEvent::default();
+    begin.set_type(Type::TYPE_SLICE_BEGIN);
+    begin.set_track_uuid(track);
+    begin.set_name(name.to_string());
+    begin.debug_annotations = annotations;
+    let mut finish = TrackEvent::default();
+    finish.set_type(Type::TYPE_SLICE_END);
+    finish.set_track_uuid(track);
+    for (at, event) in [(start, begin), (end, finish)] {
+        let mut packet = TracePacket::default();
+        packet.set_timestamp(at as u64);
+        packet.set_track_event(event);
+        packet.set_trusted_packet_sequence_id(seq_id);
+        writer.write_packet(&packet)?;
+    }
+    Ok(())
+}
+
+/// The parts of a symbolized frame name as `stack.frame_names` holds it:
+/// `function (module [file:line]) <0xaddress>` for a native or kernel frame
+/// (the location and the address as far as they are known; the kernel's module
+/// is `[kernel]`), `function (python) [file:line]` for a Python frame.
+#[derive(Debug, PartialEq, Eq)]
+struct FrameParts<'a> {
+    function: &'a str,
+    /// `python`, `kernel` or `native`.
+    language: &'static str,
+    module: Option<&'a str>,
+    file: Option<&'a str>,
+    line: Option<i64>,
+    address: Option<&'a str>,
+}
+
+impl FrameParts<'_> {
+    /// The parts other than the function, as a slice's arguments.
+    fn annotations(&self) -> Vec<DebugAnnotation> {
+        let text = |name: &str, value: &str| {
+            let mut ann = DebugAnnotation::default();
+            ann.set_name(name.to_string());
+            ann.set_string_value(value.to_string());
+            ann
+        };
+        let mut annotations = vec![text("language", self.language)];
+        if let Some(file) = self.file {
+            annotations.push(text("file", file));
+        }
+        if let Some(line) = self.line {
+            let mut ann = DebugAnnotation::default();
+            ann.set_name("line".to_string());
+            ann.set_int_value(line);
+            annotations.push(ann);
+        }
+        if let Some(module) = self.module {
+            annotations.push(text("module", module));
+        }
+        if let Some(address) = self.address {
+            annotations.push(text("address", address));
+        }
+        annotations
+    }
+}
+
+fn parse_frame(frame: &str) -> FrameParts<'_> {
+    // `file:line`, or a file alone.
+    fn location(location: &str) -> (Option<&str>, Option<i64>) {
+        match location.rsplit_once(':') {
+            Some((file, line)) => match line.parse() {
+                Ok(line) => (Some(file), Some(line)),
+                Err(_) => (Some(location), None),
+            },
+            None => (Some(location), None),
+        }
+    }
+    let (rest, address) = match frame.rfind(" <0x") {
+        Some(at) if frame.ends_with('>') => (&frame[..at], Some(&frame[at + 2..frame.len() - 1])),
+        _ => (frame, None),
+    };
+    if let Some((function, at)) = rest.split_once(" (python) [") {
+        if let Some(at) = at.strip_suffix(']') {
+            let (file, line) = location(at);
+            return FrameParts {
+                function,
+                language: "python",
+                module: None,
+                file,
+                line,
+                address,
+            };
+        }
+    }
+    // The module group is the last parenthesis: a C++ or Rust function name
+    // can hold some of its own.
+    if let (Some(open), true) = (rest.rfind(" ("), rest.ends_with(')')) {
+        let inner = &rest[open + 2..rest.len() - 1];
+        let (module, (file, line)) = match inner.split_once(" [") {
+            Some((module, at)) if at.ends_with(']') => (module, location(&at[..at.len() - 1])),
+            _ => (inner, (None, None)),
+        };
+        return FrameParts {
+            function: &rest[..open],
+            language: if module == "[kernel]" {
+                "kernel"
+            } else {
+                "native"
+            },
+            module: Some(module),
+            file,
+            line,
+            address,
+        };
+    }
+    // Not the grammar (a bare address, say): all of it is the name.
+    FrameParts {
+        function: frame,
+        language: "native",
+        module: None,
+        file: None,
+        line: None,
+        address: None,
+    }
+}
+
+/// The frame name as far as merging goes: two frames are the same frame when
+/// their keys and their depths are equal. The key is the symbolized name
+/// (`function (module [file:line]) <0xaddress>`) without the address, which
+/// moves within one function from sample to sample. The line stays, so a
+/// running thread's leaf starts a new slice as it moves from line to line
+/// while its callers stay merged. A frame with no symbol
+/// (`unknown (module) <0xaddress>`) has nothing but the address to tell it
+/// from its neighbours and keeps it. Python frames carry none. This is what
+/// py-spy merges on with line numbers on: function, file and line.
+fn merge_key(frame: &str) -> &str {
+    if frame.starts_with("unknown (") {
+        return frame;
+    }
+    match frame.rfind(" <0x") {
+        Some(at) if frame.ends_with('>') => &frame[..at],
+        _ => frame,
+    }
+}
+
+/// One frame of a thread's stack, for as long as it stayed on the stack.
+#[derive(Debug, PartialEq, Eq)]
+struct FrameSlice {
+    /// 0 is the root.
+    depth: i32,
+    /// The frame as the first event that had it named it.
+    name: String,
+    start: i64,
+    end: i64,
+}
+
+/// A thread's stack over time from its task-stacks events, as py-spy's Chrome
+/// trace output builds it: each event's frames are compared with the ones
+/// open before it, from the root; the ones they share stay open, the rest of
+/// the old ones end where the event starts and the rest of the new ones begin
+/// there. `events` are one thread's, in time order: start, end, and frames
+/// root first. An event that does not start where the one before it ended
+/// (the thread went unseen in between) shares nothing with it. The result is
+/// in begin order, parents before children.
+fn merge_frames<'a>(events: impl Iterator<Item = (i64, i64, &'a [String])>) -> Vec<FrameSlice> {
+    fn close(open: &mut Vec<(&str, i64)>, keep: usize, at: i64, out: &mut Vec<FrameSlice>) {
+        while open.len() > keep {
+            let (name, start) = open.pop().expect("open is longer than keep");
+            if at > start {
+                out.push(FrameSlice {
+                    depth: open.len() as i32,
+                    name: name.to_string(),
+                    start,
+                    end: at,
+                });
+            }
+        }
+    }
+
+    let mut open: Vec<(&str, i64)> = Vec::new();
+    let mut out = Vec::new();
+    let mut last_end: Option<i64> = None;
+    for (start, end, frames) in events {
+        // A gap: the frames end where the last event did. min(): the
+        // recorder's events never overlap, but a table that did not come from
+        // it may, and frames that outlast the next begin would pair each
+        // end with the wrong begin.
+        if let Some(last_end) = last_end.filter(|&e| e != start) {
+            close(&mut open, 0, last_end.min(start), &mut out);
+        }
+        let shared = open
+            .iter()
+            .zip(frames)
+            .take_while(|((name, _), frame)| merge_key(name) == merge_key(frame))
+            .count();
+        close(&mut open, shared, start, &mut out);
+        open.extend(frames[shared..].iter().map(|f| (f.as_str(), start)));
+        last_end = Some(end);
+    }
+    if let Some(last_end) = last_end {
+        close(&mut open, 0, last_end, &mut out);
+    }
+    out.sort_by_key(|f| (f.start, f.depth));
+    out
+}
+
+/// Event tables whose earliest `ts` is the trace start for a capture with no
+/// scheduler tables (e.g. only the task-stacks or marker recorders).
+const TRACE_START_FALLBACK_TABLES: &[&str] = &[
+    "task_stack_event",
+    "slice",
+    "instant",
+    "counter",
+    "stack_sample",
+    "irq_slice",
+    "softirq_slice",
+    "memory_rss",
+    "network_syscall",
+    "network_packet",
+];
+
+/// The minimum `ts` in `<table>.parquet` under `input_dir`, if it has rows.
+fn min_ts_in(input_dir: &Path, table: &str) -> Option<i64> {
+    let path = input_dir.join(format!("{table}.parquet"));
+    if !path.exists() {
+        return None;
+    }
+    let batches = read_parquet_file(&path).ok()?;
+    batches
+        .iter()
+        .filter_map(|batch| {
+            let ts = batch
+                .column_by_name("ts")?
+                .as_any()
+                .downcast_ref::<Int64Array>()?;
+            (0..ts.len())
+                .filter(|&i| !ts.is_null(i))
+                .map(|i| ts.value(i))
+                .min()
+        })
+        .min()
+}
+
+/// The trace start timestamp: the minimum `ts` of sched_slice.parquet, else
+/// of thread_state.parquet, else the earliest of the other event tables
+/// ([`TRACE_START_FALLBACK_TABLES`]). Returns 0 only if no table has a
+/// timestamp: metadata written at 0 would otherwise stretch the trace back to
+/// boot.
 fn get_trace_start_timestamp(input_dir: &Path) -> u64 {
-    let mut min_ts: Option<i64> = None;
-
-    // Try sched_slice.parquet first
-    let sched_path = input_dir.join("sched_slice.parquet");
-    if sched_path.exists() {
-        if let Ok(batches) = read_parquet_file(&sched_path) {
-            for batch in &batches {
-                if let Some(ts_col) = batch
-                    .column_by_name("ts")
-                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                {
-                    for i in 0..batch.num_rows() {
-                        let ts = ts_col.value(i);
-                        min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
-                    }
-                }
-            }
-        }
-    }
-
-    // Try thread_state.parquet as fallback
-    if min_ts.is_none() {
-        let thread_state_path = input_dir.join("thread_state.parquet");
-        if thread_state_path.exists() {
-            if let Ok(batches) = read_parquet_file(&thread_state_path) {
-                for batch in &batches {
-                    if let Some(ts_col) = batch
-                        .column_by_name("ts")
-                        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                    {
-                        for i in 0..batch.num_rows() {
-                            let ts = ts_col.value(i);
-                            min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    min_ts.unwrap_or(0) as u64
+    min_ts_in(input_dir, "sched_slice")
+        .or_else(|| min_ts_in(input_dir, "thread_state"))
+        .or_else(|| {
+            TRACE_START_FALLBACK_TABLES
+                .iter()
+                .filter_map(|table| min_ts_in(input_dir, table))
+                .min()
+        })
+        .unwrap_or(0) as u64
 }
 
 /// Helper struct for stack records from stack.parquet
@@ -2552,6 +2906,10 @@ struct StackData {
     /// Each name contains embedded module and location info in format:
     /// `function_name (module_name [file:line]) <0xaddr>`
     frame_names: Vec<String>,
+    /// Parallel to `frame_names`: the full path of a frame's source file where
+    /// known (Python frames); empty when none is, or in a trace from before
+    /// the column.
+    frame_files: Vec<Option<String>>,
 }
 
 /// Parse module name from a frame name string.
@@ -2597,6 +2955,9 @@ fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
             .column_by_name("frame_names")
             .and_then(|c| c.as_any().downcast_ref::<ListArray>())
             .context("Missing frame_names column in stack.parquet")?;
+        let frame_files_col = batch
+            .column_by_name("frame_files")
+            .and_then(|c| c.as_any().downcast_ref::<ListArray>());
 
         for i in 0..batch.num_rows() {
             let id = ids.value(i);
@@ -2621,7 +2982,27 @@ fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
                     .collect()
             };
 
-            stack_map.insert(id, StackData { frame_names });
+            let frame_files: Vec<Option<String>> = match frame_files_col {
+                Some(col) if !col.is_null(i) => {
+                    let inner = col.value(i);
+                    let files = inner
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .context("frame_files inner array is not StringArray")?;
+                    (0..files.len())
+                        .map(|j| (!files.is_null(j)).then(|| files.value(j).to_string()))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+
+            stack_map.insert(
+                id,
+                StackData {
+                    frame_names,
+                    frame_files,
+                },
+            );
         }
     }
 
@@ -3238,6 +3619,64 @@ mod tests {
         Ok(())
     }
 
+    /// A parquet table with only a `ts` column, enough for the trace-start scan.
+    fn create_test_ts_only_parquet(dir: &Path, table: &str, ts: &[i64]) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(ts.to_vec()))],
+        )?;
+        let file = File::create(dir.join(format!("{table}.parquet")))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn trace_start_prefers_sched_then_falls_back_to_other_event_tables() {
+        let dir = tempdir().unwrap();
+        assert_eq!(get_trace_start_timestamp(dir.path()), 0);
+
+        // No scheduler tables (e.g. a task-stacks-only capture): the earliest event.
+        create_test_ts_only_parquet(dir.path(), "slice", &[5_000, 3_000]).unwrap();
+        create_test_ts_only_parquet(dir.path(), "counter", &[4_000]).unwrap();
+        assert_eq!(get_trace_start_timestamp(dir.path()), 3_000);
+
+        // Scheduler data stays the anchor when present.
+        create_test_ts_only_parquet(dir.path(), "sched_slice", &[7_000]).unwrap();
+        assert_eq!(get_trace_start_timestamp(dir.path()), 7_000);
+    }
+
+    #[test]
+    fn network_interface_metadata_sits_at_the_first_event_without_sched_data() {
+        use crate::perfetto::VecTraceWriter;
+
+        const FIRST_EVENT_TS: i64 = 161_785_670_888_199;
+        let dir = tempdir().unwrap();
+        create_test_network_interface_parquet(dir.path(), "host", "lo", "127.0.0.1", "ipv4")
+            .unwrap();
+        create_test_ts_only_parquet(dir.path(), "slice", &[FIRST_EVENT_TS]).unwrap();
+
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+        converter
+            .write_network_interfaces(dir.path(), &mut writer)
+            .unwrap();
+
+        let timestamps: Vec<u64> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_track_event())
+            .map(|p| p.timestamp())
+            .collect();
+        assert!(!timestamps.is_empty(), "no interface events written");
+        assert!(
+            timestamps.iter().all(|&ts| ts == FIRST_EVENT_TS as u64),
+            "interface events not at the first event: {timestamps:?}"
+        );
+    }
+
     #[test]
     fn test_network_data_conversion_creates_socket_tracks() {
         use crate::perfetto::VecTraceWriter;
@@ -3660,6 +4099,440 @@ mod tests {
         assert!(
             has_new_state,
             "TCP state_change event should have new_state=TIME_WAIT annotation"
+        );
+    }
+
+    fn names(frames: &[&str]) -> Vec<String> {
+        frames.iter().map(|f| f.to_string()).collect()
+    }
+
+    #[test]
+    fn merge_key_drops_the_address_of_a_frame_that_has_a_symbol() {
+        assert_eq!(
+            merge_key("time_sleep (libpython3.13.so.1.0 [timemodule.c:408]) <0x7f1a59dec773>"),
+            "time_sleep (libpython3.13.so.1.0 [timemodule.c:408])"
+        );
+        assert_eq!(
+            merge_key("hrtimer_nanosleep ([kernel]) <0xffffffff9b1bd463>"),
+            "hrtimer_nanosleep ([kernel])"
+        );
+        // Nothing but the address tells two unsymbolized frames apart.
+        assert_eq!(
+            merge_key("unknown (libc.so.6) <0x7f1a595821ca>"),
+            "unknown (libc.so.6) <0x7f1a595821ca>"
+        );
+        // No address to drop.
+        assert_eq!(
+            merge_key("ts_sleeper (python) [ts_workload.py:4]"),
+            "ts_sleeper (python) [ts_workload.py:4]"
+        );
+        assert_eq!(merge_key("unknown ([guest])"), "unknown ([guest])");
+    }
+
+    #[test]
+    fn frames_that_stay_on_the_stack_are_one_slice_across_events() {
+        let main = names(&["main (app) <0x10>", "run (app) <0x20>"]);
+        let a = [main.clone(), names(&["read (libc.so.6) <0x30>"])].concat();
+        // The same function at another address: the same frame.
+        let a2 = [main.clone(), names(&["read (libc.so.6) <0x34>"])].concat();
+        let b = [
+            main.clone(),
+            names(&["write (libc.so.6) <0x40>", "ksys_write ([kernel]) <0x50>"]),
+        ]
+        .concat();
+        let events = [
+            (1_000, 2_000, &a[..]),
+            (2_000, 3_000, &a2[..]),
+            (3_000, 4_000, &b[..]),
+        ];
+        let frame = |depth, name: &str, start, end| FrameSlice {
+            depth,
+            name: name.to_string(),
+            start,
+            end,
+        };
+        assert_eq!(
+            merge_frames(events.into_iter()),
+            [
+                frame(0, "main (app) <0x10>", 1_000, 4_000),
+                frame(1, "run (app) <0x20>", 1_000, 4_000),
+                // Named as the first event named it.
+                frame(2, "read (libc.so.6) <0x30>", 1_000, 3_000),
+                frame(2, "write (libc.so.6) <0x40>", 3_000, 4_000),
+                frame(3, "ksys_write ([kernel]) <0x50>", 3_000, 4_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_changed_outer_frame_restarts_everything_under_it() {
+        let a = names(&["main (app) <0x10>", "f (app) <0x20>", "leaf (app) <0x30>"]);
+        let b = names(&["main (app) <0x10>", "g (app) <0x28>", "leaf (app) <0x30>"]);
+        let events = [(1_000, 2_000, &a[..]), (2_000, 3_000, &b[..])];
+        let got: Vec<(i32, String, i64, i64)> = merge_frames(events.into_iter())
+            .into_iter()
+            .map(|f| (f.depth, f.name, f.start, f.end))
+            .collect();
+        // `leaf` is under another caller: a new slice, though the name is the
+        // same. Begin order, parents first; all that ends at 2000 began
+        // before anything that begins there.
+        assert_eq!(
+            got,
+            [
+                (0, "main (app) <0x10>".to_string(), 1_000, 3_000),
+                (1, "f (app) <0x20>".to_string(), 1_000, 2_000),
+                (2, "leaf (app) <0x30>".to_string(), 1_000, 2_000),
+                (1, "g (app) <0x28>".to_string(), 2_000, 3_000),
+                (2, "leaf (app) <0x30>".to_string(), 2_000, 3_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn frames_do_not_carry_over_an_iteration_that_missed_the_thread() {
+        let a = names(&["main (app) <0x10>"]);
+        let none: [String; 0] = [];
+        let events = [
+            (1_000, 2_000, &a[..]),
+            // Seen again at 3000, not at 2000.
+            (3_000, 4_000, &a[..]),
+            // An event without a stack ends the frames too.
+            (4_000, 5_000, &none[..]),
+        ];
+        let got: Vec<(i64, i64)> = merge_frames(events.into_iter())
+            .iter()
+            .map(|f| (f.start, f.end))
+            .collect();
+        assert_eq!(got, [(1_000, 2_000), (3_000, 4_000)]);
+    }
+
+    #[test]
+    fn overlapping_events_still_nest() {
+        let a = names(&["main (app) <0x10>", "f (app) <0x20>"]);
+        let b = names(&["main (app) <0x10>", "g (app) <0x30>"]);
+        // The first runs on past the second's start: cut there.
+        let events = [(1_000, 3_000, &a[..]), (2_000, 4_000, &b[..])];
+        let got: Vec<(i32, i64, i64)> = merge_frames(events.into_iter())
+            .iter()
+            .map(|f| (f.depth, f.start, f.end))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, 1_000, 2_000),
+                (1, 1_000, 2_000),
+                (0, 2_000, 4_000),
+                (1, 2_000, 4_000)
+            ]
+        );
+    }
+
+    /// stack.parquet with the given stacks, root first, and their frames' full
+    /// paths (none: a null list, as for a stack without Python frames).
+    #[allow(clippy::type_complexity)]
+    fn create_test_stack_parquet(
+        dir: &Path,
+        stacks: &[(i64, &[&str], &[Option<&str>])],
+    ) -> Result<()> {
+        let mut frames = ListBuilder::new(arrow::array::StringBuilder::new());
+        let mut files = ListBuilder::new(arrow::array::StringBuilder::new());
+        for (_, stack, paths) in stacks {
+            for frame in *stack {
+                frames.values().append_value(frame);
+            }
+            frames.append(true);
+            for path in *paths {
+                files.values().append_option(*path);
+            }
+            files.append(!paths.is_empty());
+        }
+        let (frames, files) = (frames.finish(), files.finish());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("frame_names", frames.data_type().clone(), true),
+            Field::new("frame_files", files.data_type().clone(), true),
+        ]));
+        let ids = Int64Array::from(stacks.iter().map(|s| s.0).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(frames), Arc::new(files)],
+        )?;
+        let mut writer =
+            ArrowWriter::try_new(File::create(dir.join("stack.parquet"))?, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    /// task_stack_event.parquet: (ts, dur, utid, stack id).
+    fn create_test_task_stack_event_parquet(
+        dir: &Path,
+        events: &[(i64, i64, i64, Option<i64>)],
+    ) -> Result<()> {
+        let schema = crate::trace::task_stack_event_schema();
+        let column = |values: Vec<i64>| -> Arc<dyn arrow::array::Array> {
+            Arc::new(Int64Array::from(values))
+        };
+        let constant = |value: i64| column(vec![value; events.len()]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                column(events.iter().map(|e| e.0).collect()),
+                column(events.iter().map(|e| e.1).collect()),
+                column(events.iter().map(|e| e.2).collect()),
+                // The reserved thread name: not populated.
+                Arc::new(StringArray::from(vec![None::<&str>; events.len()])),
+                // The iterations, deltas and state: not drawn.
+                constant(1),
+                constant(1),
+                constant(0),
+                constant(0),
+                constant(0),
+                Arc::new(events.iter().map(|_| Some("S")).collect::<StringArray>()),
+                Arc::new(events.iter().map(|e| e.3).collect::<Int64Array>()),
+            ],
+        )?;
+        let file = File::create(dir.join("task_stack_event.parquet"))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn task_stack_events_become_a_merged_stack_track_under_the_thread() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+        create_test_process_parquet(dir.path(), 1, 1000).unwrap();
+        create_test_thread_parquet(dir.path(), 100, 2000, Some(1)).unwrap();
+        create_test_stack_parquet(
+            dir.path(),
+            &[
+                (5, &["main (app) <0x10>", "read (libc.so.6) <0x30>"], &[]),
+                (6, &["main (app) <0x10>", "write (libc.so.6) <0x40>"], &[]),
+            ],
+        )
+        .unwrap();
+        create_test_task_stack_event_parquet(
+            dir.path(),
+            &[
+                (1_000, 3_000, 100, Some(5)),
+                (4_000, 1_000, 100, Some(6)),
+                // A thread that never had a stack gets no track.
+                (1_000, 4_000, 101, None),
+            ],
+        )
+        .unwrap();
+        // A task-stacks-only capture starts at its first event.
+        assert_eq!(get_trace_start_timestamp(dir.path()), 1_000);
+
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+        converter
+            .write_process_and_thread_descriptors(dir.path(), &mut writer)
+            .unwrap();
+        let thread_uuid = converter.utid_to_uuid[&100];
+        writer.packets.clear();
+        converter
+            .write_task_stack_events(dir.path(), &mut writer)
+            .unwrap();
+
+        // One track, under the thread.
+        let tracks: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_track_descriptor())
+            .map(|p| p.track_descriptor())
+            .collect();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].name(), "Task Stacks: test_thread");
+        assert_eq!(tracks[0].parent_uuid(), thread_uuid);
+
+        // The slices' names and begin timestamps in packet order, and the end
+        // timestamps.
+        let (mut begins, mut ends) = (Vec::new(), Vec::new());
+        for packet in writer.packets.iter().filter(|p| p.has_track_event()) {
+            let event = packet.track_event();
+            assert_eq!(event.track_uuid(), tracks[0].uuid());
+            match event.type_() {
+                Type::TYPE_SLICE_BEGIN => begins.push((event.name(), packet.timestamp())),
+                Type::TYPE_SLICE_END => ends.push(packet.timestamp()),
+                other => panic!("unexpected track event type {other:?}"),
+            }
+        }
+        // `main` is on both stacks: one slice; parents begin first. A slice is
+        // named after the function alone.
+        assert_eq!(begins, [("main", 1_000), ("read", 1_000), ("write", 4_000)]);
+        assert_eq!(ends, [5_000, 4_000, 5_000]);
+
+        // Where a frame is from is in its arguments.
+        let read = writer
+            .packets
+            .iter()
+            .find(|p| p.has_track_event() && p.track_event().name() == "read")
+            .unwrap();
+        let args: Vec<(&str, &str)> = read
+            .track_event()
+            .debug_annotations
+            .iter()
+            .map(|a| (a.name(), a.string_value()))
+            .collect();
+        assert_eq!(
+            args,
+            [
+                ("language", "native"),
+                ("module", "libc.so.6"),
+                ("address", "0x30")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_main_threads_stack_track_hangs_off_a_thread_track_of_its_own() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+        create_test_process_parquet(dir.path(), 1, 1000).unwrap();
+        // tid == pid: the main thread, whose utid stands for the process track.
+        create_test_thread_parquet(dir.path(), 100, 1000, Some(1)).unwrap();
+        create_test_stack_parquet(
+            dir.path(),
+            &[(5, &["f (python) [app.py:3]"], &[Some("/srv/app/app.py")])],
+        )
+        .unwrap();
+        create_test_task_stack_event_parquet(dir.path(), &[(1_000, 1_000, 100, Some(5))]).unwrap();
+
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+        converter
+            .write_process_and_thread_descriptors(dir.path(), &mut writer)
+            .unwrap();
+        let process_uuid = converter.utid_to_uuid[&100];
+        writer.packets.clear();
+        converter
+            .write_task_stack_events(dir.path(), &mut writer)
+            .unwrap();
+
+        let tracks: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_track_descriptor())
+            .map(|p| p.track_descriptor())
+            .collect();
+        assert_eq!(tracks.len(), 2);
+        let (thread, stack) = (tracks[0], tracks[1]);
+        assert_eq!((thread.thread.tid(), thread.thread.pid()), (1000, 1000));
+        assert_eq!(thread.thread.thread_name(), "test_thread");
+        assert_eq!(stack.name(), "Task Stacks: test_thread");
+        assert_eq!(stack.parent_uuid(), thread.uuid());
+        assert_ne!(stack.parent_uuid(), process_uuid);
+
+        // The slice is the function; its file is the full path, which the
+        // frame's name does not have.
+        let f = writer
+            .packets
+            .iter()
+            .find(|p| p.has_track_event() && p.track_event().name() == "f")
+            .unwrap();
+        let args: Vec<(&str, String)> = f
+            .track_event()
+            .debug_annotations
+            .iter()
+            .map(|a| {
+                let value = if a.has_int_value() {
+                    a.int_value().to_string()
+                } else {
+                    a.string_value().to_string()
+                };
+                (a.name(), value)
+            })
+            .collect();
+        assert_eq!(
+            args,
+            [
+                ("language", "python".to_string()),
+                ("file", "/srv/app/app.py".to_string()),
+                ("line", "3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_names_come_apart_into_function_and_where_it_is_from() {
+        let parts = |function, language, module, file, line, address| FrameParts {
+            function,
+            language,
+            module,
+            file,
+            line,
+            address,
+        };
+        assert_eq!(
+            parse_frame("multiprocessing.process:BaseProcess._bootstrap (python) [process.py:313]"),
+            parts(
+                "multiprocessing.process:BaseProcess._bootstrap",
+                "python",
+                None,
+                Some("process.py"),
+                Some(313),
+                None
+            )
+        );
+        // A Python frame whose line is not known.
+        assert_eq!(
+            parse_frame("_init_module_attrs (python) [<frozen importlib._bootstrap>]"),
+            parts(
+                "_init_module_attrs",
+                "python",
+                None,
+                Some("<frozen importlib._bootstrap>"),
+                None,
+                None
+            )
+        );
+        assert_eq!(
+            parse_frame("time_sleep (libpython3.13.so.1.0 [timemodule.c:408]) <0x7f1a59dec773>"),
+            parts(
+                "time_sleep",
+                "native",
+                Some("libpython3.13.so.1.0"),
+                Some("timemodule.c"),
+                Some(408),
+                Some("0x7f1a59dec773")
+            )
+        );
+        assert_eq!(
+            parse_frame("hrtimer_nanosleep ([kernel]) <0xffffffff9b1bd463>"),
+            parts(
+                "hrtimer_nanosleep",
+                "kernel",
+                Some("[kernel]"),
+                None,
+                None,
+                Some("0xffffffff9b1bd463")
+            )
+        );
+        // The function's own parentheses are not the module's.
+        assert_eq!(
+            parse_frame("ns::Foo::bar(int) const (libfoo.so) <0x10>"),
+            parts(
+                "ns::Foo::bar(int) const",
+                "native",
+                Some("libfoo.so"),
+                None,
+                None,
+                Some("0x10")
+            )
+        );
+        assert_eq!(
+            parse_frame("unknown ([guest])"),
+            parts("unknown", "native", Some("[guest]"), None, None, None)
+        );
+        // Not the grammar: the whole string is the name.
+        assert_eq!(
+            parse_frame("0x7f5cdb6ffc1c"),
+            parts("0x7f5cdb6ffc1c", "native", None, None, None, None)
         );
     }
 }

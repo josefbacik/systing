@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -160,6 +160,7 @@ pub const DATA_TABLES: &[&str] = &[
     "stack_profile_callsite",
     "perf_sample",
     "frame",
+    "frame_file",
     "stack",
     "stack_sample",
     "network_interface",
@@ -177,6 +178,7 @@ pub const DATA_TABLES: &[&str] = &[
     "memory_iommu",
     "memory_thp",
     "memory_vmstat",
+    "task_stack_event",
     "clock_snapshot",
     "sysinfo",
     "cpu_info",
@@ -418,6 +420,17 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             leaf_name VARCHAR
         );
 
+        -- The full path of a frame's source file, for the frames that have one
+        -- (Python frames, and the native and kernel frames of task-stacks
+        -- stacks where debug info has the directory: the name has the file by
+        -- name alone). One path per frame name, the first seen. A side table
+        -- so frame keeps its shape: what a frame IS is still its name.
+        CREATE TABLE IF NOT EXISTS frame_file (
+            trace_id VARCHAR,
+            frame_id BIGINT,
+            file VARCHAR
+        );
+
         CREATE VIEW IF NOT EXISTS stack_frames AS
             SELECT s.trace_id, s.id,
                    list(f.name ORDER BY u.idx) AS frame_names,
@@ -653,6 +666,24 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             kind VARCHAR,
             addr BIGINT,
             result INTEGER,
+            stack_id BIGINT
+        );
+
+        -- The task-stacks recorder's events: one thread's state and stack
+        -- (stack.id) from ts for dur, over the snapshot iterations
+        -- start_iteration..=end_iteration that found it the same.
+        CREATE TABLE IF NOT EXISTS task_stack_event (
+            trace_id VARCHAR,
+            ts BIGINT,
+            dur BIGINT,
+            utid BIGINT,
+            thread_name VARCHAR, -- reserved: not populated yet, always NULL
+            start_iteration BIGINT,
+            end_iteration BIGINT,
+            utime_delta_ns BIGINT,
+            stime_delta_ns BIGINT,
+            runtime_delta_ns BIGINT,
+            state VARCHAR,
             stack_id BIGINT
         );
 
@@ -1074,7 +1105,32 @@ pub fn import_stack_from_parquet(conn: &Connection, path: &Path, trace_id: &str)
             "Failed to import stack/frame tables from '{}'",
             path.display()
         )
-    })
+    })?;
+
+    // frame_files (schema 23) is parallel to frame_names, null where a frame
+    // has no path and null altogether for a stack none of whose frames has:
+    // few rows, the Python frames' and the task-stacks stacks' native ones.
+    // Older stack.parquet files lack the column.
+    let has_frame_files: bool = conn.query_row(
+        &format!(
+            "SELECT count(*) > 0 FROM parquet_schema('{escaped_path}') WHERE name = 'frame_files'"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_frame_files {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "INSERT INTO frame_file \
+           SELECT '{escaped_trace_id}', fr.id, any_value(u.file) \
+           FROM (SELECT unnest(frame_names) AS fname, unnest(frame_files) AS file \
+                 FROM read_parquet('{escaped_path}') WHERE frame_files IS NOT NULL) u \
+           JOIN frame fr ON fr.trace_id = '{escaped_trace_id}' AND fr.name = u.fname \
+           WHERE u.file IS NOT NULL \
+           GROUP BY fr.id;"
+    ))
+    .with_context(|| format!("Failed to import frame_file from '{}'", path.display()))
 }
 
 /// Per-table sort keys applied at parquet→duckdb import time.
@@ -1088,7 +1144,7 @@ pub fn import_order_by(table_name: &str) -> Option<&'static str> {
     match table_name {
         "sched_slice" => Some("cpu, ts"),
         "thread_state" => Some("utid, ts"),
-        "stack_sample" => Some("utid, ts"),
+        "stack_sample" | "task_stack_event" => Some("utid, ts"),
         "softirq_slice" | "irq_slice" => Some("cpu, ts"),
         "counter" => Some("track_id, ts"),
         _ => None,
@@ -1297,16 +1353,16 @@ fn writer_phrase(recorder: Option<&ManifestRecord>) -> String {
 /// The columns the `stack.parquet` import reads by name
 /// ([`import_stack_from_parquet`]); any other column in the file is one this
 /// systing does not know.
-const STACK_PARQUET_COLUMNS: [&str; 4] = ["id", "depth", "leaf_name", "frame_names"];
+const STACK_PARQUET_COLUMNS: [&str; 5] = ["id", "depth", "leaf_name", "frame_names", "frame_files"];
 
 /// The guard's read of a `stack.parquet`, whose import selects its columns
 /// by name and so never fails on an extra one: an extra column is reported
 /// on `report` under table `stack` and warned once, or refused under
 /// [`ImportOptions::strict_schema`], exactly as [`import_column_list`] does
 /// for the tables imported `BY NAME`. A column the SELECT needs and the file
-/// lacks is left to the import's own error (an older file than this
-/// systing's `stack` shape, which has not changed since the `frame_names`
-/// form).
+/// lacks is left to the import's own error (a file from before the
+/// `frame_names` form); `frame_files`, which a file from before schema 23
+/// lacks, the import looks for itself.
 pub fn check_stack_parquet_columns(
     conn: &Connection,
     path: &Path,
@@ -1454,6 +1510,7 @@ fn import_tables(
     import_table("memory_iommu", &paths.memory_iommu)?;
     import_table("memory_thp", &paths.memory_thp)?;
     import_table("memory_vmstat", &paths.memory_vmstat)?;
+    import_table("task_stack_event", &paths.task_stack_event)?;
 
     // Clock snapshot
     import_table("clock_snapshot", &paths.clock_snapshot)?;
@@ -1939,9 +1996,31 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
             .unwrap_or(0);
         if stack_count > 0 {
             let escaped_path = paths.stack.to_string_lossy().replace('\'', "''");
+            // frame_files is rebuilt from frame_file, for the stacks that have
+            // a frame with a path (the Python ones, the task-stacks recorder's,
+            // and any that share a frame with those: the path is the frame's,
+            // not the stack's); the rest, and every stack of a trace without
+            // any, get a null list at no cost.
             conn.execute_batch(&format!(
-                "COPY (SELECT id, frame_names, depth, leaf_name \
-                       FROM stack_frames WHERE trace_id = '{escaped_trace_id}') \
+                "COPY (SELECT sf.id, sf.frame_names, sf.depth, sf.leaf_name, ff.frame_files \
+                       FROM stack_frames sf \
+                       LEFT JOIN (SELECT x.id, \
+                                         list_transform( \
+                                           list_sort(list(struct_pack(i := x.idx, f := f.file))), \
+                                           e -> e.f) AS frame_files \
+                                  FROM (SELECT id, unnest(frame_ids) AS fid, \
+                                               generate_subscripts(frame_ids, 1) AS idx \
+                                        FROM stack \
+                                        WHERE trace_id = '{escaped_trace_id}' \
+                                          AND list_has_any(frame_ids, \
+                                                (SELECT coalesce(list(frame_id), []) \
+                                                 FROM frame_file \
+                                                 WHERE trace_id = '{escaped_trace_id}'))) x \
+                                  LEFT JOIN frame_file f \
+                                         ON f.trace_id = '{escaped_trace_id}' \
+                                        AND f.frame_id = x.fid \
+                                  GROUP BY x.id) ff ON ff.id = sf.id \
+                       WHERE sf.trace_id = '{escaped_trace_id}') \
                  TO '{escaped_path}' (FORMAT PARQUET, COMPRESSION ZSTD)"
             ))
             .with_context(|| {
@@ -1977,6 +2056,7 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
     export_table("memory_iommu", &paths.memory_iommu)?;
     export_table("memory_thp", &paths.memory_thp)?;
     export_table("memory_vmstat", &paths.memory_vmstat)?;
+    export_table("task_stack_event", &paths.task_stack_event)?;
 
     // Clock snapshot
     export_table("clock_snapshot", &paths.clock_snapshot)?;
@@ -2166,6 +2246,74 @@ mod tests {
         assert!(tables.contains(&"stack".to_string()));
         assert!(tables.contains(&"frame".to_string()));
         assert!(tables.contains(&"stack_frames".to_string()));
+    }
+
+    #[test]
+    fn frame_files_land_in_frame_file_and_come_back_on_export() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.duckdb");
+        let pq = temp_dir.path().join("stack.parquet");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            create_schema(&conn).unwrap();
+            // Stack 1 has a Python frame with a path, stack 2 none at all.
+            conn.execute_batch(&format!(
+                "COPY (SELECT * FROM (VALUES \
+                    (1::BIGINT, ['main','f (python) [app.py:3]'], 2, 'f (python) [app.py:3]', \
+                     [NULL, '/srv/app/app.py']), \
+                    (2::BIGINT, ['main','read'], 2, 'read', NULL::VARCHAR[]) \
+                 ) t(id, frame_names, depth, leaf_name, frame_files)) \
+                 TO '{}' (FORMAT PARQUET)",
+                pq.to_string_lossy().replace('\'', "''")
+            ))
+            .unwrap();
+            import_stack_from_parquet(&conn, &pq, "t").unwrap();
+
+            // The frames are what they were: three names, interned once each.
+            let frames: i64 = conn
+                .query_row("SELECT COUNT(*) FROM frame", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(frames, 3);
+            // One of them has a path.
+            let files: Vec<(String, String)> = conn
+                .prepare(
+                    "SELECT f.name, ff.file FROM frame_file ff \
+                     JOIN frame f ON f.trace_id = ff.trace_id AND f.id = ff.frame_id",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                files,
+                [(
+                    "f (python) [app.py:3]".to_string(),
+                    "/srv/app/app.py".to_string()
+                )]
+            );
+        }
+
+        // And the column comes back on export: paths beside the names for the
+        // stack that has one, a null list for the other.
+        let out = temp_dir.path().join("out");
+        duckdb_to_parquet(&db_path, &out, "t").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        let rows: Vec<(i64, Option<String>)> = conn
+            .prepare(&format!(
+                "SELECT id, array_to_string(list_transform(frame_files, x -> coalesce(x, '-')), ',') \
+                 FROM read_parquet('{}') ORDER BY id",
+                out.join("stack.parquet").to_string_lossy()
+            ))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [(1, Some("-,/srv/app/app.py".to_string())), (2, None)]
+        );
     }
 
     #[test]
@@ -2625,6 +2773,62 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stacks_u, 1, "the lax import takes the known columns");
+    }
+
+    /// The `stack.parquet` this systing's writer produces passes the strict
+    /// import with nothing left out: the guard's column list is the writer's.
+    /// A column added to the one and not the other fails here.
+    #[test]
+    fn test_the_writers_own_stack_parquet_imports_strictly() {
+        use crate::parquet::StreamingParquetWriter;
+        use crate::record::RecordCollector;
+        use crate::trace::StackRecord;
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        let mut writer = StreamingParquetWriter::new(&dir).unwrap();
+        writer
+            .add_stack(StackRecord {
+                id: 1,
+                frame_names: vec!["main".to_string(), "f (python) [app.py:3]".to_string()],
+                depth: 2,
+                leaf_name: "f (python) [app.py:3]".to_string(),
+                frame_files: vec![None, Some("/srv/app/app.py".to_string())],
+            })
+            .unwrap();
+        writer
+            .add_stack(StackRecord {
+                id: 2,
+                frame_names: vec!["main".to_string(), "read".to_string()],
+                depth: 2,
+                leaf_name: "read".to_string(),
+                frame_files: Vec::new(),
+            })
+            .unwrap();
+        writer.finish().unwrap();
+
+        let db_path = temp_dir.path().join("strict.duckdb");
+        let report = parquet_to_duckdb_with_options(
+            &dir,
+            &db_path,
+            "t",
+            ImportOptions {
+                strict_schema: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.dropped_columns, Vec::new());
+        assert_eq!(report.unknown_files, Vec::<String>::new());
+        let conn = Connection::open(&db_path).unwrap();
+        let (stacks, files): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM stack), (SELECT COUNT(*) FROM frame_file)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((stacks, files), (2, 1));
     }
 
     /// A directory with a manifest records the recorder on `_traces`; one

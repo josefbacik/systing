@@ -232,7 +232,9 @@ tools can distinguish uniformly-ordered databases.
   the python segment is now stored root-to-leaf like the user and kernel
   segments, making the whole array one coherent root-to-leaf sequence
   (outermost caller first, innermost executing frame last). Segment layout is
-  unchanged: python (outermost), then user, then kernel. v11 and older
+  unchanged: python (outermost), then user, then kernel (through schema 22;
+  from 23 the Python frames stand among the user frames, see that entry).
+  v11 and older
   databases keep the mixed order they were written with — the python segment
   cannot be re-ordered after the fact without classifying frames by name
   (note for anyone attempting that: root-side markers — `<module>`, threading
@@ -443,6 +445,116 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 23 (unreleased) — 2026-09-14
+
+The task-stacks recorder (`--add-recorder task-stacks`): periodic snapshots
+of every targeted thread's stack, taken with a sleepable BPF task iterator,
+kernel and native user frames, Python frames, or both
+(`--task-stacks-frames native|python|all`). Its events are a table of their
+own, with the stack by id into `stack` as every other recorder's. With it come
+two changes to every recorder's stacks that have Python frames
+(`--collect-pystacks`): where those frames stand in the stack (Changed
+semantics, below), and their files' full paths beside them (`frame_files`).
+
+### New tables
+- `task_stack_event` — one thread as a snapshot found it, for as long as it
+  stayed that way (ts, dur, utid, thread_name, start_iteration,
+  end_iteration, utime_delta_ns, stime_delta_ns, runtime_delta_ns, state,
+  stack_id). `ts` is the start of the
+  iteration whose snapshot recorded the thread (iterations are numbered from
+  1, one every `--task-stacks-interval-ms`), `dur` runs to the start of the
+  iteration that found it changed or did not find it (the end of the capture
+  for the last). A thread that has not been on a CPU since its event began
+  and is still in the same non-runnable state cannot have changed its stack:
+  the iterations that find it so, through `end_iteration`, extend the event
+  instead of adding one, so a thread blocked for a minute is one row.
+  `utime_delta_ns` / `stime_delta_ns` / `runtime_delta_ns` are the thread's
+  user, system and on-CPU time since its last full record (0 on its first):
+  its previous event, or with `--task-stacks-frames python` a record that was
+  left out for having no Python frames. The first two advance by scheduler
+  ticks, so a 0 there is not "no CPU"; `runtime_delta_ns` is the scheduler's
+  own `se.sum_exec_runtime` and exact. `state` is the kernel's one-letter task
+  state (`R`, `S`, `D`, `T`, `t`, `X`, `Z`, `P`, `I`), as `/proc/<pid>/stat`
+  prints it: a letter, where `thread_state.state` and `sched_slice.end_state`
+  are the raw integer. `stack_id` is the thread's stack as the iteration's
+  walk found it, up to one walk after `ts` (`stack.id`, ids from
+  2,000,000,000 up), NULL when it had no frames. A blocked thread's stack is
+  exact; a running thread's is read while it runs, from its registers as of
+  its last kernel entry, and is a best effort.
+  `thread_name` is reserved for the thread's name as the snapshot read it (a
+  thread can rename itself during a capture); nothing fills it in yet and it
+  is always NULL, so join `thread` on `utid` for a name. With
+  `--task-stacks-frames python` a thread without Python frames has no rows.
+  The skip of unchanged threads and the deltas hold for up to 65,536 targeted
+  threads; past that every thread is walked every iteration and the deltas
+  read 0.
+
+  The stack a thread was in at a time `T`:
+  `SELECT sf.frame_names FROM task_stack_event e
+   JOIN stack_frames sf ON sf.trace_id = e.trace_id AND sf.id = e.stack_id
+   WHERE e.utid = ? AND e.ts <= T AND T < e.ts + e.dur`.
+
+### Changed semantics
+- `stack.frame_ids` (and `frame_names` in parquet / the `stack_frames` view),
+  in the stacks of every recorder that have Python frames (the CPU sampler's,
+  the sleep stacks', the memory recorder's, task-stacks'): the Python frames
+  stand where the interpreter ran them among the native user frames, no
+  longer as one block at the root end (the v12 layout: python, then user, then
+  kernel). Each run of Python frames takes the place of the
+  `_PyEval_EvalFrameDefault` frame it ran in, which is gone from the stack,
+  and so are the interpreter's own entry frames (3.12's `<interpreter
+  trampoline>`, 3.13+'s `[Frame Error]`), which named no function. The kernel
+  frames still come last. A stack whose runs and loop frames do not pair up
+  keeps the v12 block layout, less the entry frames: a native stack that lost
+  a loop frame (the frame-pointer unwinder skips the caller of a function
+  built without one, so one such extension function called from the loop
+  hides it), Python 3.11 re-entered from C, a Python walk cut at its 127
+  frames. The choice is per stack and nothing in the row marks it: within one
+  trace a Python function can stand under `main … run_mod` in one stack and
+  at the start of the array in another, and a flamegraph splits it between
+  the two roots. A reader that takes the leading run of `(python)` frames for
+  the Python segment finds none in an interleaved stack; one that classifies
+  each frame by its name is unaffected.
+
+### Added columns and tables
+- `stack` (Parquet): added `frame_files VARCHAR[]`, parallel to `frame_names`:
+  the full path of a frame's source file where one is known, NULL for the
+  frames that have none, and NULL altogether for a stack none of whose frames
+  has. That is the Python frames of every stack (with `--collect-pystacks`),
+  whose entry in `frame_names` has the file by name alone (`f (python)
+  [app.py:3]`): the path is as much of it as the BPF side keeps, its last 192
+  bytes. And it is the native and kernel frames of the task-stacks recorder's
+  stacks (ids from 2,000,000,000), where debug info names the directory: the
+  path on the machine that built the binary, not one on the traced host. The
+  other recorders' stacks carry no native paths, so a capture that does not
+  ask for task-stacks grows by nothing but the Python frames'. `frame_names`, the stack ids and everything keyed on them are as they
+  were: the column is beside them, not in them. Absent from traces recorded
+  before schema 23.
+- `frame_file` (DuckDB) — the same, for the interned form (trace_id, frame_id,
+  file): a row for each `frame` that has a path (a frame both a task-stacks
+  stack and another recorder's share has one). A side table so that `frame`
+  keeps its shape and a frame is still identified by its name; join it on
+  `(trace_id, frame_id = frame.id)`. The path is per frame NAME, the first
+  seen: a Python frame's name has its file's base name only, so two functions
+  of one name in files of one name share a path here (`stack.parquet` has the
+  path per stack, and is exact). And being the frame's, not the stack's, it
+  comes back on export to parquet in every stack that has the frame: that the
+  other recorders' stacks carry no native paths is what the recorder writes,
+  not something a round trip through a database keeps. Empty for a trace no
+  frame of which has a path and for one imported from an older
+  `stack.parquet`.
+
+### Behaviour change (no schema effect)
+- The Perfetto trace draws the table as a `Task Stacks: <thread>` track under
+  each thread: the stack over time the way py-spy's Chrome trace output draws
+  it, each frame one slice for as long as it stays on the stack (frames match
+  on function, module and source line, not on the address), root at the top.
+  A slice is named after the function alone; `language` (`python`, `native`,
+  `kernel`), `file` (the full path where `frame_files` has it), `line`,
+  `module` and `address` are its arguments. A main
+  thread gets a thread track of its own for it, under the thread's name.
+  The iterations, deltas and state are in the table only.
+
 ## Parquet import across schema versions (no schema version change)
 
 The parquet→DuckDB import (`parquet_to_duckdb`, `systing-util convert`) is
@@ -476,7 +588,7 @@ database into another) is outside the flag by design: it merges by column
 intersection, and a source table or column the target lacks is left out
 without a warning.
 
-## Schema Version 22 (unreleased) — 2026-09-12
+## Schema Version 22 (systing 1.19.0) — 2026-09-12
 
 The recorder now says who it is. A parquet directory carried no writer
 version — `_traces.systing_version` names the systing that CONVERTED it

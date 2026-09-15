@@ -49,6 +49,7 @@ Two representations exist:
 - `stack_sample(ts, utid, cpu, stack_id, stack_event_type)`. `stack_event_type`: `0` = uninterruptible sleep, `1` = CPU, `2` = interruptible sleep.
 - `stack(id, frame_ids BIGINT[], depth, leaf_name)`. **`frame_ids` is root-to-leaf** (outermost caller first, innermost executing frame last); `leaf_name` is the last frame's name.
 - `frame(id, name)` — interned strings, dense per-trace ids.
+- `frame_file(frame_id, file)` — the full source path of the frames that have one (from schema 23: Python frames, and the native and kernel frames of `task-stacks` stacks where debug info has the directory, which is the build machine's path): `frame.name` has only the file's name. `LEFT JOIN frame_file ff ON ff.trace_id = f.trace_id AND ff.frame_id = f.id`.
 - Join on **both** `trace_id` and the id: `JOIN stack s ON s.trace_id = ss.trace_id AND s.id = ss.stack_id`.
 - The `stack_frames` **view** reconstructs a `frame_names VARCHAR[]` column (root-to-leaf) for ad-hoc queries — convenient but slower than joining `frame` directly.
 
@@ -65,6 +66,27 @@ SELECT count(*)
 FROM stack_sample ss
 JOIN stack_frames sf ON sf.trace_id = ss.trace_id AND sf.id = ss.stack_id
 WHERE list_contains(sf.frame_names, 'do_futex_wait');
+```
+
+**Task-stacks snapshots** — `task_stack_event` → `stack` (the `task-stacks` recorder, from schema 23):
+- `task_stack_event(ts, dur, utid, thread_name, start_iteration, end_iteration, utime_delta_ns, stime_delta_ns, runtime_delta_ns, state, stack_id)`: a thread as a periodic snapshot found it, for as long as it stayed that way. Snapshots (iterations) are numbered from 1; a thread that had not run and was still in the same non-runnable state is not re-recorded, its row is extended through `end_iteration`, so a thread blocked for a minute is one row. `state` is the one-letter task state (`R`, `S`, `D`, ...); `utime_delta_ns` / `stime_delta_ns` are CPU time since the thread's previous row, which advance by scheduler ticks and so read 0 for a short run; `runtime_delta_ns` is the time on a CPU since then to the nanosecond, the one to use for "did it run"; `stack_id` is NULL when the thread had no frames. `thread_name` is reserved and always NULL for now: join `thread` for the name.
+- These are snapshots, not samples of CPU time: every targeted thread has a row whatever it was doing, so this is the table for "what was each thread blocked in" rather than for CPU flamegraphs.
+
+```sql
+-- What every thread of a process was doing at a time T
+SELECT t.name, e.state, s.leaf_name
+FROM task_stack_event e
+JOIN thread t ON t.trace_id = e.trace_id AND t.utid = e.utid
+JOIN stack s ON s.trace_id = e.trace_id AND s.id = e.stack_id
+WHERE e.ts <= 123456789 AND 123456789 < e.ts + e.dur;
+
+-- Time each thread spent blocked, by where
+SELECT t.name, s.leaf_name, sum(e.dur) / 1e9 AS seconds
+FROM task_stack_event e
+JOIN thread t ON t.trace_id = e.trace_id AND t.utid = e.utid
+JOIN stack s ON s.trace_id = e.trace_id AND s.id = e.stack_id
+WHERE e.state IN ('S', 'D')
+GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20;
 ```
 
 **Normalized (Perfetto-style)** — `perf_sample` → `stack_profile_callsite` (parent-child tree) → `stack_profile_frame` → `stack_profile_symbol` / `stack_profile_mapping`. Use when you need mapping/build-id info. Walk the `parent_id` chain to reconstruct stacks.

@@ -309,6 +309,14 @@ pub fn stack_schema() -> Arc<Schema> {
         ),
         Field::new("depth", DataType::Int32, false),
         Field::new("leaf_name", DataType::Utf8, false),
+        // Parallel to frame_names: a frame's full source path where known
+        // (Python frames; the native frames of task-stacks stacks), else
+        // null; the list is null when none is.
+        Field::new(
+            "frame_files",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
     ]))
 }
 
@@ -546,6 +554,23 @@ pub fn memory_thp_schema() -> Arc<Schema> {
         Field::new("kind", DataType::Utf8, false),
         Field::new("addr", DataType::Int64, true),
         Field::new("result", DataType::Int32, false),
+        Field::new("stack_id", DataType::Int64, true),
+    ]))
+}
+
+/// Schema for task_stack_event.parquet
+pub fn task_stack_event_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("thread_name", DataType::Utf8, true),
+        Field::new("start_iteration", DataType::Int64, false),
+        Field::new("end_iteration", DataType::Int64, false),
+        Field::new("utime_delta_ns", DataType::Int64, false),
+        Field::new("stime_delta_ns", DataType::Int64, false),
+        Field::new("runtime_delta_ns", DataType::Int64, false),
+        Field::new("state", DataType::Utf8, false),
         Field::new("stack_id", DataType::Int64, true),
     ]))
 }
