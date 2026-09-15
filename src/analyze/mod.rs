@@ -1817,6 +1817,9 @@ mod tests {
             "SELECT E'\\''; SET memory_limit='100GB'; SELECT E'\\''",
             "SELECT e'\\''; SET memory_limit='100GB'; SELECT e'\\''",
             "SELECT 1E'\\''; SET memory_limit='100GB'; SELECT 1E'\\''",
+            // A real with a digit separator in its exponent ahead of the
+            // prefix: `1e1_0` is one number to the lexer, `E'` the string.
+            "SELECT 1e1_0E'\\'') AS q LIMIT 1; SET memory_limit='100GB'; SELECT 1 FROM (SELECT 1 --'",
         ] {
             let err = db.query(sql).unwrap_err().to_string();
             assert!(err.contains("one statement"), "{sql:?}: {err}");
@@ -1930,6 +1933,40 @@ mod tests {
             .query("SELECT count(*) FROM duckdb_types() WHERE type_name LIKE '__pivot_enum%'")
             .unwrap();
         assert_eq!(enums.rows[0][0], serde_json::json!(0));
+    }
+
+    #[test]
+    fn test_query_strings_pins_the_lexer_facts_the_classifier_rests_on() {
+        // `query_strings` hands the text to DuckDB with no classifier in
+        // front, so these read the pinned library's own lexer: the facts the
+        // refusals in `statement_shape` exist for, which the refusals
+        // themselves never let reach `prepare`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+        let one = |sql: &str| -> String {
+            let (_, rows) = db.query_strings(sql).unwrap();
+            rows[0][0].clone()
+        };
+        // A `'` literal continues across a newline into the next `'` run,
+        // in the same lexer state: an escape string's backslash rule reaches
+        // into the second part, an ordinary string's does not.
+        assert_eq!(one("SELECT 'a'\n'b' AS s"), "ab");
+        assert_eq!(one("SELECT 'a'\r'b' AS s"), "ab");
+        assert_eq!(one("SELECT E'a'\n'\\'x' AS s"), "a'x");
+        assert_eq!(one("SELECT 'a'\n'\\' AS s"), "a\\");
+        // No newline between the quotes: two tokens, not a continuation.
+        assert!(db.query_strings("SELECT 'a' 'b' AS s").is_err());
+        // A number followed directly by an escape string is two tokens the
+        // grammar rejects — the property the escape-string prefix rule
+        // (`1E'`, `1e1_0E'`) relies on so that a walker reading the
+        // string one character late has nothing to hide behind.
+        assert_eq!(one("SELECT CAST(1e1_0 AS BIGINT) AS x"), "10000000000");
+        assert!(db.query_strings("SELECT 1 E'x' AS s").is_err());
+        assert!(db.query_strings("SELECT 1e1_0E'x' AS s").is_err());
+        assert!(db.query_strings("SELECT 1E'x' AS s").is_err());
+        // A `--` comment ends at `\r` as well as `\n`.
+        let (_, rows) = db.query_strings("SELECT 1 -- c\r, 2").unwrap();
+        assert_eq!(rows[0], vec!["1".to_string(), "2".to_string()]);
     }
 
     #[test]

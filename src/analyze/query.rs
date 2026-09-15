@@ -149,8 +149,9 @@ fn integer_literal_len(s: &[char]) -> usize {
 /// characters ending at the `E` is read the way the lexer reads it: leading
 /// digits are a number (digit separators included, `1_0E'` being `1_0`
 /// and an escape string; with an exponent when `[eE]` is followed by
-/// digits), and the `E` is the prefix only when nothing else stands between
-/// the number, or the run's start, and it.
+/// digits, separators allowed there too — `1e1_0E'` is the real `1e1_0`
+/// and an escape string), and the `E` is the prefix only when nothing else
+/// stands between the number, or the run's start, and it.
 fn opens_escape_string(chars: &[char], i: usize) -> bool {
     if i == 0 || !matches!(chars[i - 1], 'e' | 'E') {
         return false;
@@ -168,11 +169,11 @@ fn opens_escape_string(chars: &[char], i: usize) -> bool {
             break;
         }
         p += digits;
+        // An exponent's digits take separators like an integer's; a sign
+        // between the `e` and the digits is not an identifier character, so
+        // a run never contains one.
         let exponent = match run.get(p) {
-            Some('e' | 'E') => run[p + 1..]
-                .iter()
-                .take_while(|c| c.is_ascii_digit())
-                .count(),
+            Some('e' | 'E') => integer_literal_len(&run[p + 1..]),
             _ => 0,
         };
         if exponent == 0 {
@@ -703,6 +704,9 @@ mod tests {
             // the number 1 and an escape string (an exponent needs digits).
             "SELECT 1E'\\''; SET memory_limit = '100GB'; SELECT 1E'\\''",
             "SELECT 1e5E'\\''; SET memory_limit = '100GB'; SELECT 1e5E'\\''",
+            // A digit separator in the exponent: `1e1_0` is one real to the
+            // lexer, so the `E` after it is the prefix.
+            "SELECT 1e1_0E'\\'') AS q LIMIT 1; SET memory_limit = '100GB'; SELECT 1 FROM (SELECT 1 --'",
         ] {
             assert_eq!(statement_shape(sql), StatementShape::Multiple, "{sql:?}");
         }
@@ -757,6 +761,27 @@ mod tests {
             6
         ));
         assert!(!opens_escape_string(&['1', '_', '_', '0', 'E', '\''], 5));
+        // A digit separator in the EXPONENT: `1e1_0` is one real to the
+        // lexer (its exponent takes separators like an integer), so the `E`
+        // after it is the prefix; a doubled or trailing `_` there ends the
+        // number and the rest of the run is an identifier.
+        assert!(opens_escape_string(
+            &['1', 'e', '1', '_', '0', 'E', '\''],
+            6
+        ));
+        assert!(opens_escape_string(
+            &['1', '_', '0', 'e', '1', '_', '0', 'E', '\''],
+            8
+        ));
+        assert!(opens_escape_string(
+            &['5', '_', '0', 'e', '1', '_', '0', 'E', '\''],
+            8
+        ));
+        assert!(!opens_escape_string(
+            &['1', 'e', '1', '_', '_', '0', 'E', '\''],
+            7
+        ));
+        assert!(!opens_escape_string(&['1', 'e', '1', '_', 'E', '\''], 5));
         assert_eq!(integer_literal_len(&['1', '_', '0', '0', '0', 'x']), 5);
         assert_eq!(integer_literal_len(&['1', '_', '_', '0']), 1);
         assert_eq!(integer_literal_len(&['1', '_']), 1);
