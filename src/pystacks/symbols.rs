@@ -75,25 +75,34 @@ impl SymbolResolver {
 
         let mut sym = record.sym.clone();
 
-        // Handle page fault recovery for qualname
+        // Handle page fault recovery for qualname. BPF hands the qualname over
+        // as a NUL-terminated string in the first partition with the second
+        // partition cleared (see get_names() in pystacks.bpf.c); the recovery
+        // read pulls a whole window of the process's memory, so it is shaped
+        // the same way before it stands in for the BPF read.
         if sym.qualname.fault_addr != 0 && sym.fault_pid != 0 {
             let mut buf = [0u8; BPF_LIB_PYSTACKS_QUAL_NAME_LEN];
             if process::read_process_memory(sym.fault_pid, sym.qualname.fault_addr, &mut buf)
                 .is_ok()
             {
+                shape_recovered_qualname(&mut buf);
                 sym.qualname.value = buf;
             } else {
                 return false; // Can't recover qualname yet; retry on re-emit
             }
         }
 
-        // Handle page fault recovery for filename
+        // Handle page fault recovery for filename. BPF keeps the LAST
+        // BPF_LIB_PYSTACKS_FILE_NAME_LEN bytes of a long path (the module name
+        // lives at the end of it), so the recovery reads a longer window and
+        // keeps the same tail.
         if sym.filename.fault_addr != 0 && sym.fault_pid != 0 {
-            let mut buf = [0u8; BPF_LIB_PYSTACKS_FILE_NAME_LEN];
-            let _ = process::read_process_memory(sym.fault_pid, sym.filename.fault_addr, &mut buf)
-                .map(|_| {
-                    sym.filename.value = buf;
-                });
+            let mut window = [0u8; FILENAME_RECOVERY_WINDOW];
+            if let Ok(n) =
+                process::read_process_memory(sym.fault_pid, sym.filename.fault_addr, &mut window)
+            {
+                sym.filename.value = shape_recovered_filename(&window[..n]);
+            }
             // Continue even if filename recovery fails - qualname is more important
         }
 
@@ -181,6 +190,45 @@ impl SymbolResolver {
 fn cstring_from_bytes(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).to_string()
+}
+
+/// How much of the process's memory the filename recovery reads: a path can be
+/// longer than the record's filename field, and BPF keeps the tail of it.
+const FILENAME_RECOVERY_WINDOW: usize = 4096;
+
+/// Shape a qualname buffer recovered from process memory the way BPF hands
+/// one over.
+///
+/// The BPF side copies `co_qualname` as a NUL-terminated string into the first
+/// partition and then clears the second (`get_names()` writes
+/// `value[BPF_LIB_PYSTACKS_CLASS_NAME_LEN] = '\0'`), so `get_symbol_name`
+/// renders the first partition alone. The recovery read returns the whole
+/// window of the process's memory instead: after the string's NUL come the
+/// bytes of whatever object follows it, and handed over as they are they land
+/// in the second partition and render as `<qualname>.<those bytes>`. Keep the
+/// string, drop the rest, and truncate at the partition boundary as BPF does.
+fn shape_recovered_qualname(buf: &mut [u8]) {
+    let end = buf
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(buf.len())
+        .min(BPF_LIB_PYSTACKS_CLASS_NAME_LEN);
+    buf[end..].fill(0);
+}
+
+/// Shape a filename recovered from process memory the way BPF hands one over:
+/// the string up to its NUL, and of a path longer than the field its tail
+/// (`get_names()` keeps the last `BPF_LIB_PYSTACKS_FILE_NAME_LEN` bytes through
+/// a NUL-terminating copy, so the field holds one byte fewer of path than its
+/// size — the module name lives at the end either way). A window with no NUL
+/// is a path longer than the window; its tail is still the right tail.
+fn shape_recovered_filename(window: &[u8]) -> [u8; BPF_LIB_PYSTACKS_FILE_NAME_LEN] {
+    let len = window.iter().position(|&b| b == 0).unwrap_or(window.len());
+    let keep = BPF_LIB_PYSTACKS_FILE_NAME_LEN - 1;
+    let src = &window[len.saturating_sub(keep)..len];
+    let mut value = [0u8; BPF_LIB_PYSTACKS_FILE_NAME_LEN];
+    value[..src.len()].copy_from_slice(src);
+    value
 }
 
 /// Construct a full symbol name from a pystacks_symbol.
@@ -371,5 +419,68 @@ mod tests {
         let record = PystacksSymbolRecord::default();
         assert!(!resolver.ingest_record(&record));
         assert_eq!(resolver.symbol_count(), 0);
+    }
+
+    /// A qualname recovered from process memory carries whatever follows the
+    /// string in the heap; shaped, it renders like the BPF read would have.
+    #[test]
+    fn test_recovered_qualname_drops_the_heap_bytes_after_the_string() {
+        let mut buf = [0xa5u8; BPF_LIB_PYSTACKS_QUAL_NAME_LEN];
+        let name = b"bytes_print";
+        buf[..name.len()].copy_from_slice(name);
+        buf[name.len()] = 0;
+        // Unshaped, the second partition is non-empty and get_symbol_name
+        // joins it on.
+        let mut raw = PystacksSymbol::default();
+        raw.qualname.value = buf;
+        assert_ne!(get_symbol_name(&raw), "bytes_print");
+
+        shape_recovered_qualname(&mut buf);
+        let mut sym = PystacksSymbol::default();
+        sym.qualname.value = buf;
+        assert_eq!(get_symbol_name(&sym), "bytes_print");
+        assert!(buf[name.len()..].iter().all(|&b| b == 0));
+    }
+
+    /// A recovered qualname longer than the first partition is cut where the
+    /// BPF read cuts it.
+    #[test]
+    fn test_recovered_qualname_truncates_at_the_partition() {
+        let mut buf = [b'q'; BPF_LIB_PYSTACKS_QUAL_NAME_LEN];
+        shape_recovered_qualname(&mut buf);
+        let mut sym = PystacksSymbol::default();
+        sym.qualname.value = buf;
+        assert_eq!(
+            get_symbol_name(&sym),
+            "q".repeat(BPF_LIB_PYSTACKS_CLASS_NAME_LEN)
+        );
+        assert!(buf[BPF_LIB_PYSTACKS_CLASS_NAME_LEN..]
+            .iter()
+            .all(|&b| b == 0));
+    }
+
+    /// A recovered filename keeps the tail of a long path, as the BPF read
+    /// does, so the module name survives; a short one is kept whole.
+    #[test]
+    fn test_recovered_filename_keeps_the_tail_of_a_long_path() {
+        let tail = "/lib/python3.13/site-packages/pkg/mod.py";
+        let long = format!("/{}{}", "d".repeat(600), tail);
+        let mut window = [0xa5u8; FILENAME_RECOVERY_WINDOW];
+        window[..long.len()].copy_from_slice(long.as_bytes());
+        window[long.len()] = 0;
+        let value = shape_recovered_filename(&window);
+        let kept = cstring_from_bytes(&value);
+        assert_eq!(kept.len(), BPF_LIB_PYSTACKS_FILE_NAME_LEN - 1);
+        assert!(kept.ends_with(tail));
+        assert_eq!(get_module_name_from_filename(&kept), "pkg.mod");
+
+        let short = b"/app/main.py";
+        let mut window = [0xa5u8; 64];
+        window[..short.len()].copy_from_slice(short);
+        window[short.len()] = 0;
+        assert_eq!(
+            cstring_from_bytes(&shape_recovered_filename(&window)),
+            "/app/main.py"
+        );
     }
 }
