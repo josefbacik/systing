@@ -928,6 +928,16 @@ fn import_directory(
     let spill_dir = db_path.parent().unwrap_or(Path::new("."));
     configure_for_bulk_io(conn, spill_dir)?;
 
+    // The recorder's manifest is read first, so the guard's warnings can name
+    // the writer — and outside the transaction below. A manifest that is
+    // present but unreadable (a writer killed mid-`finish()`) is reported and
+    // read as `None` (see `read_manifest`); DuckDB aborts an explicit
+    // transaction on that read's error, so inside the transaction the warning
+    // would become a whole-import failure and the caller would remove the
+    // database.
+    let paths = ParquetPaths::new(parquet_dir);
+    let recorder = read_manifest(conn, &paths.manifest);
+
     // One transaction around the schema and every import. In autocommit each
     // statement below is its own DuckDB commit — a WAL write and an
     // fsync-class wait — and building a trace runs about forty to seventy of
@@ -964,13 +974,11 @@ fn import_directory(
         [SCHEMA_VERSION],
     )?;
 
-    // Import each table from Parquet files. The recorder's manifest is read
-    // first, so the guard's warnings can name the writer; the files this
-    // systing has no table for next, so a newer writer's whole table is
-    // reported (and refused under strict_schema) the way its columns are.
-    let paths = ParquetPaths::new(parquet_dir);
+    // Import each table from Parquet files: the files this systing has no
+    // table for first, so a newer writer's whole table is reported (and
+    // refused under strict_schema) the way its columns are.
     let mut report = ImportReport {
-        recorder: read_manifest(&tx, &paths.manifest),
+        recorder,
         unknown_files: unknown_parquet_files(parquet_dir, &paths),
         ..Default::default()
     };
@@ -2531,10 +2539,36 @@ mod tests {
             "the error names the table whose import failed: {err:#}"
         );
 
-        // Nothing was committed: the schema rolled back with the imports, and
-        // the caller removed the file it had created — a reopen finds an
-        // empty database either way.
-        let conn = Connection::open(&db_path).unwrap();
+        // The caller removed the file it had created, and the write-ahead log
+        // beside it.
+        assert!(
+            !db_path.exists(),
+            "a refused import leaves no database file"
+        );
+        assert!(
+            !temp_dir.path().join("test.duckdb.wal").exists(),
+            "a refused import leaves no write-ahead log"
+        );
+
+        // The rollback itself, read on the connection the import ran on: a
+        // reopen of a removed path finds an empty database whether or not
+        // anything was committed, so the transaction's own effect is read by
+        // calling the import against an open connection and counting its
+        // tables after the error.
+        let direct_db = temp_dir.path().join("direct.duckdb");
+        let mut conn = Connection::open(&direct_db).unwrap();
+        let err = import_directory(
+            &mut conn,
+            &parquet_dir,
+            &direct_db,
+            "test_trace",
+            ImportOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("sched_slice"),
+            "the error names the table whose import failed: {err:#}"
+        );
         let tables: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main'",
@@ -2542,7 +2576,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 0, "a failed import must leave no tables behind");
+        assert_eq!(
+            tables, 0,
+            "the transaction rolled back: no table survives on the import's own connection"
+        );
     }
 
     #[test]
@@ -2999,6 +3036,52 @@ mod tests {
         assert!(
             format!("{err:#}").contains("99.0.1"),
             "the refusal names the writer: {err:#}"
+        );
+    }
+
+    /// A manifest that is present but unreadable — what a writer killed
+    /// mid-`finish()` leaves behind — costs the manifest, never the tables:
+    /// the import succeeds with the warning, `recorder` reads `None` and the
+    /// `_traces` row carries no recorder fields. The read sits outside the
+    /// import transaction on purpose: DuckDB aborts an explicit transaction
+    /// on that read's error, and read inside it a damaged manifest turned
+    /// into a lost trace database.
+    #[test]
+    fn test_import_keeps_the_tables_when_the_manifest_is_damaged() {
+        let temp_dir = TempDir::new().unwrap();
+        let scratch = Connection::open_in_memory().unwrap();
+        let dir = temp_dir.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        scratch
+            .execute_batch(&format!(
+                "COPY (SELECT 1::INTEGER AS cpu, 2::BIGINT AS max_freq_khz) TO '{}' (FORMAT PARQUET)",
+                dir.join("cpu_info.parquet").to_string_lossy()
+            ))
+            .unwrap();
+        fs::write(dir.join("systing_manifest.parquet"), b"not a parquet file").unwrap();
+
+        let db_path = temp_dir.path().join("damaged_manifest.duckdb");
+        let report =
+            parquet_to_duckdb_with_options(&dir, &db_path, "damaged", ImportOptions::default())
+                .unwrap();
+        assert_eq!(report.recorder, None);
+        assert!(report.summary().is_none());
+        let info = get_trace_info(&db_path).unwrap();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].recorder_version, None);
+        assert_eq!(info[0].recorder_schema_version, None);
+        assert_eq!(info[0].recorded_at_unix_ns, None);
+        let conn = Connection::open(&db_path).unwrap();
+        let max_freq: i64 = conn
+            .query_row(
+                "SELECT max_freq_khz FROM cpu_info WHERE cpu = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            max_freq, 2,
+            "the table imported beside the damaged manifest"
         );
     }
 
