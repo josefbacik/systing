@@ -815,6 +815,10 @@ pub const MISSED_EVENT_CLASS_LABELS: &[(u32, &str)] = &[
     (6, "poll"),
     (7, "marker"),
     (8, "memory"),
+    // Not a loss: mmap/munmap/brk exits that dropped a scratch entry
+    // written by another leg instead of pairing with it (an enter that
+    // ran without its exit; see memory_syscall_leg in the BPF source).
+    (9, "memory-xleg"),
 ];
 
 /// One sample of one missed-event class: the cumulative (per-CPU-summed)

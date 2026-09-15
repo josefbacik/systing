@@ -239,13 +239,16 @@ const MEMORY_BPF_PROGRAMS: &[&str] = &[
 /// BTF (probed up front) and, at attach, a kernel that can build a
 /// trampoline (arm64 without DYNAMIC_FTRACE_WITH_DIRECT_CALLS cannot — the
 /// load succeeds, the attach does not, and the classic set takes over).
+///
+/// ORDER: within each leg the EXIT program is listed — and so attached —
+/// before its ENTER program (see [`MEMORY_SYSCALL_TP_PROGS`]).
 const MEMORY_SYSCALL_FENTRY_PROGS: &[&str] = &[
-    "systing_mmap_fentry",
     "systing_mmap_fexit",
-    "systing_munmap_fentry",
+    "systing_mmap_fentry",
     "systing_munmap_fexit",
-    "systing_brk_fentry",
+    "systing_munmap_fentry",
     "systing_brk_fexit",
+    "systing_brk_fentry",
 ];
 
 /// The same hooks in classic form: the six `syscalls/sys_{enter,exit}_*`
@@ -255,13 +258,31 @@ const MEMORY_SYSCALL_FENTRY_PROGS: &[&str] = &[
 /// form is opted in but cannot attach (or a kernel without the wrapper
 /// symbols). Always loaded; the trampoline set is loaded beside it only
 /// under `--kernel-hooks trampoline`.
+///
+/// ORDER: within each leg the EXIT program is listed — and so attached —
+/// before its ENTER program. The programs attach one at a time
+/// ([`attach_program_set`]), 100 µs to milliseconds apart on a busy host
+/// (each is a perf_event_open + ioctl round trip, and the first syscall
+/// tracepoint also walks every task to flag it), and the three legs share
+/// one per-thread scratch entry. Enter-before-exit left a window per leg in
+/// which a syscall that entered with the enter program live and returned
+/// before the exit program was live wrote a scratch entry nobody consumed;
+/// a later brk of the same thread whose own enter fell before its enter
+/// program was live then paired its exit with that stale munmap/mmap entry
+/// and recorded `new_brk − unmapped_address` — page-aligned negative brk
+/// deltas of 13–46 TB, a handful of rows a week across thousands of hosts.
+/// Exit first, a syscall spanning the gap can only exit without an enter,
+/// which the exit programs ignore; the BPF side additionally tags each entry
+/// with its leg and drops a cross-leg pairing (counted as the `memory-xleg`
+/// missed class); the detach order needs no care: the map dies with the
+/// capture.
 const MEMORY_SYSCALL_TP_PROGS: &[&str] = &[
-    "systing_mmap_enter",
     "systing_mmap_exit",
-    "systing_munmap_enter",
+    "systing_mmap_enter",
     "systing_munmap_exit",
-    "systing_brk_enter",
+    "systing_munmap_enter",
     "systing_brk_exit",
+    "systing_brk_enter",
 ];
 
 /// The same hooks in RAW-tracepoint form — the opt-in `--kernel-hooks
@@ -283,8 +304,11 @@ const MEMORY_SYSCALL_TP_PROGS: &[&str] = &[
 /// time after `skel.attach()`, the classic set taking over on an attach
 /// error. Unselected under the default classic form and under
 /// `--kernel-hooks trampoline`, where the trampoline set is the primary
-/// form and the classic set its fallback, as before.
-const MEMORY_SYSCALL_RAW_TP_PROGS: &[&str] = &["systing_sys_enter", "systing_sys_exit"];
+/// form and the classic set its fallback, as before. Exit before enter,
+/// like the other two sets (one enter program serves all three legs here,
+/// so a stale entry is overwritten by the next enter anyway — the order is
+/// kept uniform).
+const MEMORY_SYSCALL_RAW_TP_PROGS: &[&str] = &["systing_sys_exit", "systing_sys_enter"];
 
 /// The vmlinux BTF typedefs the raw-tracepoint pair attaches through.
 const MEMORY_SYSCALL_RAW_TP_TYPEDEFS: &[&str] = &["btf_trace_sys_enter", "btf_trace_sys_exit"];
@@ -5583,6 +5607,18 @@ fn run_tracing_loop(
             dump_missed_events(&skel.maps.missed_events, 8)
         );
     }
+    if opts.memory {
+        // Not lost events: mmap/munmap/brk exits that found the thread's
+        // scratch entry written by another leg and dropped it instead of
+        // pairing with it (see memory_syscall_leg in systing_system.bpf.c).
+        // Expected 0 now that each leg's exit program attaches before its
+        // enter; a count says an enter ran without its exit some other way.
+        // Printed unconditionally so a zero is a positive reading.
+        println!(
+            "Memory syscall scratch cross-leg drops: {}",
+            dump_missed_events(&skel.maps.missed_events, 9)
+        );
+    }
     if opts.memory && opts.memory_vfio {
         let dropped = sum_percpu_counter(&skel.maps.memory_iommu_overflow);
         if dropped > 0 {
@@ -5850,13 +5886,13 @@ pub fn systing(
                 })?;
         }
 
-        open_skel
-            .maps
-            .missed_events
-            .set_max_entries(num_cpus)
-            .with_context(|| {
-                format!("Failed to set missed_events map size to {num_cpus} entries")
-            })?;
+        // missed_events keeps its declared size (MISSED_EVENT_MAX slots, one
+        // per class; a per-CPU array already holds one value per CPU behind
+        // each slot). It used to be re-sized to the CPU count here, which
+        // on a host with fewer CPUs than classes left the high classes
+        // unallocated — their lookups returned NULL in the programs and 0
+        // in the summary, so a 4-CPU machine reported "Missed memory
+        // events: 0" whatever it lost.
 
         // Size the --cgroup filter maps for the mode resolved above (the maps of
         // the other mode stay at their 1-entry default, unused): kernel mode
@@ -6366,6 +6402,12 @@ pub fn systing(
             }
             if opts.memory || opts.memory_alloc {
                 classes.push(8);
+            }
+            if opts.memory {
+                // The cross-leg scratch drops (class 9): a counter track
+                // beside the memory loss track, so a non-zero reading is
+                // time-localized like a loss burst.
+                classes.push(9);
             }
             let shutdown_clone = shutdown_signal.clone();
             let missed_recorder = recorder.clone();
@@ -6943,8 +6985,8 @@ pub fn bpf_load_probe(
 
     // The map sizing systing() performs between configure and load, for the
     // shapes without perf counters or cgroup targets (both are attach-time
-    // inputs a load-only probe does not take): perf_counters at zero events
-    // and missed_events at one slot per CPU.
+    // inputs a load-only probe does not take): perf_counters at zero events;
+    // missed_events stays at its declared size, as in systing().
     open_skel
         .maps
         .rodata_data
@@ -6957,11 +6999,6 @@ pub fn bpf_load_probe(
         .perf_counters
         .set_max_entries(0)
         .with_context(|| "Failed to set perf_counters map size to 0 entries")?;
-    open_skel
-        .maps
-        .missed_events
-        .set_max_entries(num_cpus)
-        .with_context(|| format!("Failed to set missed_events map size to {num_cpus} entries"))?;
 
     let mut required = get_required_bpf_programs(
         opts,
@@ -7574,6 +7611,38 @@ mod tests {
             },
             MemoryKernelLegs::default()
         );
+    }
+
+    /// Every mmap/munmap/brk program set lists — and so attaches — each
+    /// leg's EXIT program before its ENTER program: a syscall spanning the
+    /// gap between the two attaches can then only exit without an enter
+    /// (ignored), never enter without an exit (a stale scratch entry the
+    /// next brk of the thread would pair with — see MEMORY_SYSCALL_TP_PROGS).
+    #[test]
+    fn test_memory_syscall_program_sets_attach_exit_before_enter() {
+        for (set, exit_suffix, enter_suffix) in [
+            (MEMORY_SYSCALL_TP_PROGS, "_exit", "_enter"),
+            (MEMORY_SYSCALL_FENTRY_PROGS, "_fexit", "_fentry"),
+            (MEMORY_SYSCALL_RAW_TP_PROGS, "_exit", "_enter"),
+        ] {
+            assert_eq!(set.len() % 2, 0, "{set:?}");
+            for pair in set.chunks(2) {
+                let (exit, enter) = (pair[0], pair[1]);
+                assert!(
+                    exit.ends_with(exit_suffix),
+                    "{exit} is not the exit of {pair:?}"
+                );
+                assert!(
+                    enter.ends_with(enter_suffix),
+                    "{enter} is not the enter of {pair:?}"
+                );
+                assert_eq!(
+                    exit.strip_suffix(exit_suffix),
+                    enter.strip_suffix(enter_suffix),
+                    "{pair:?} is not one leg's pair"
+                );
+            }
+        }
     }
 
     /// The mmap/munmap/brk hooks: the classic set always loads with the
