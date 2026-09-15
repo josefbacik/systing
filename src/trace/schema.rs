@@ -44,6 +44,7 @@ pub fn thread_schema() -> Arc<Schema> {
         Field::new("tid", DataType::Int32, false),
         Field::new("name", DataType::Utf8, true),
         Field::new("upid", DataType::Int64, true),
+        Field::new("py_name", DataType::Utf8, true),
     ]))
 }
 
@@ -564,7 +565,6 @@ pub fn task_stack_event_schema() -> Arc<Schema> {
         Field::new("ts", DataType::Int64, false),
         Field::new("dur", DataType::Int64, false),
         Field::new("utid", DataType::Int64, false),
-        Field::new("thread_name", DataType::Utf8, true),
         Field::new("start_iteration", DataType::Int64, false),
         Field::new("end_iteration", DataType::Int64, false),
         Field::new("utime_delta_ns", DataType::Int64, false),

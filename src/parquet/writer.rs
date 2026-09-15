@@ -2024,12 +2024,14 @@ fn build_thread_batch(records: &[ThreadRecord], schema: &Arc<Schema>) -> Result<
     let mut tid_builder = Int32Builder::with_capacity(records.len());
     let mut name_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
     let mut upid_builder = Int64Builder::with_capacity(records.len());
+    let mut py_name_builder = StringBuilder::with_capacity(records.len(), 0);
 
     for record in records {
         utid_builder.append_value(record.utid);
         tid_builder.append_value(record.tid);
         name_builder.append_option(record.name.as_deref());
         upid_builder.append_option(record.upid);
+        py_name_builder.append_option(record.py_name.as_deref());
     }
 
     Ok(RecordBatch::try_new(
@@ -2039,6 +2041,7 @@ fn build_thread_batch(records: &[ThreadRecord], schema: &Arc<Schema>) -> Result<
             Arc::new(tid_builder.finish()),
             Arc::new(name_builder.finish()),
             Arc::new(upid_builder.finish()),
+            Arc::new(py_name_builder.finish()),
         ],
     )?)
 }
@@ -3216,7 +3219,6 @@ fn build_task_stack_event_batch(
     let mut ts = Int64Builder::with_capacity(n);
     let mut dur = Int64Builder::with_capacity(n);
     let mut utid = Int64Builder::with_capacity(n);
-    let mut thread_name = StringBuilder::with_capacity(n, 0);
     let mut start_iteration = Int64Builder::with_capacity(n);
     let mut end_iteration = Int64Builder::with_capacity(n);
     let mut utime_delta_ns = Int64Builder::with_capacity(n);
@@ -3228,7 +3230,6 @@ fn build_task_stack_event_batch(
         ts.append_value(r.ts);
         dur.append_value(r.dur);
         utid.append_value(r.utid);
-        thread_name.append_option(r.thread_name.as_deref());
         start_iteration.append_value(r.start_iteration);
         end_iteration.append_value(r.end_iteration);
         utime_delta_ns.append_value(r.utime_delta_ns);
@@ -3243,7 +3244,6 @@ fn build_task_stack_event_batch(
             Arc::new(ts.finish()),
             Arc::new(dur.finish()),
             Arc::new(utid.finish()),
-            Arc::new(thread_name.finish()),
             Arc::new(start_iteration.finish()),
             Arc::new(end_iteration.finish()),
             Arc::new(utime_delta_ns.finish()),

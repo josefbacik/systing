@@ -5512,12 +5512,15 @@ with open({expected:?}, "w") as f:
 
 /// The task-stacks recorder with pystacks: `--collect-pystacks` merges each
 /// thread's Python frames with its native and kernel frames, and
-/// `--task-stacks-frames python` records the Python frames alone.
+/// `--task-stacks-frames python` records the Python frames alone. Either way
+/// the thread table has the name the process gave the thread.
 #[test]
 #[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
 fn test_e2e_task_stacks_python_frames() {
     let python_bin = pyenv_python(PYTHON_313_VERSION);
     let defs = r#"
+import threading
+threading.current_thread().name = "renamed-main"
 def task_stacks_marker():
     time.sleep(0.2)
 "#;
@@ -5574,6 +5577,16 @@ def task_stacks_marker():
             parquet_list_column_contains(&stack_path, "frame_files", |file| file.starts_with('/')
                 && file.ends_with("task_stacks.py")),
             "[frames={frames:?}] no full path to the workload's script in stack.frame_files"
+        );
+        // The name the process gave its thread, beside the kernel's
+        // `python3.13`, on the thread table.
+        assert!(
+            parquet_column_contains_prefix(
+                &dir.path().join("thread.parquet"),
+                "py_name",
+                "renamed-main"
+            ),
+            "[frames={frames:?}] the thread's Python name is on no row of the thread table"
         );
         let (_, has_kernel_frames) = find_python_symbols_in_parquet(&stack_path, "([kernel])");
         assert_eq!(

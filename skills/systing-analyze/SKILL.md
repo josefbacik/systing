@@ -40,7 +40,7 @@ All `ts` columns are **nanoseconds** from an arbitrary epoch. Convert durations:
 
 ### Thread / process identity
 - `utid` / `upid` are **internal** IDs (dense, unique within DB).
-- Join to `thread` (utid → tid, name, upid) and `process` (upid → pid, name) for the Linux IDs.
+- Join to `thread` (utid → tid, name, upid, py_name) and `process` (upid → pid, name) for the Linux IDs. `thread.name` is the kernel's name for the thread (`comm`); `thread.py_name` (from schema 24) is the name its Python process gave it (`threading.Thread(name=...)`, e.g. `Thread-1 (worker)`), filled by the `task-stacks` recorder for Python 3.13+ processes with `--task-stacks-frames python|all` and NULL for every other thread.
 
 ### Stack traces
 Two representations exist:
@@ -69,7 +69,7 @@ WHERE list_contains(sf.frame_names, 'do_futex_wait');
 ```
 
 **Task-stacks snapshots** — `task_stack_event` → `stack` (the `task-stacks` recorder, from schema 23):
-- `task_stack_event(ts, dur, utid, thread_name, start_iteration, end_iteration, utime_delta_ns, stime_delta_ns, runtime_delta_ns, state, stack_id)`: a thread as a periodic snapshot found it, for as long as it stayed that way. Snapshots (iterations) are numbered from 1; a thread that had not run and was still in the same non-runnable state is not re-recorded, its row is extended through `end_iteration`, so a thread blocked for a minute is one row. `state` is the one-letter task state (`R`, `S`, `D`, ...); `utime_delta_ns` / `stime_delta_ns` are CPU time since the thread's previous row, which advance by scheduler ticks and so read 0 for a short run; `runtime_delta_ns` is the time on a CPU since then to the nanosecond, the one to use for "did it run"; `stack_id` is NULL when the thread had no frames. `thread_name` is reserved and always NULL for now: join `thread` for the name.
+- `task_stack_event(ts, dur, utid, start_iteration, end_iteration, utime_delta_ns, stime_delta_ns, runtime_delta_ns, state, stack_id)`: a thread as a periodic snapshot found it, for as long as it stayed that way. Snapshots (iterations) are numbered from 1; a thread that had not run and was still in the same non-runnable state is not re-recorded, its row is extended through `end_iteration`, so a thread blocked for a minute is one row. `state` is the one-letter task state (`R`, `S`, `D`, ...); `utime_delta_ns` / `stime_delta_ns` are CPU time since the thread's previous row, which advance by scheduler ticks and so read 0 for a short run; `runtime_delta_ns` is the time on a CPU since then to the nanosecond, the one to use for "did it run"; `stack_id` is NULL when the thread had no frames. The thread's names are on `thread`: `name` (the kernel's) and `py_name` (its Python process's).
 - These are snapshots, not samples of CPU time: every targeted thread has a row whatever it was doing, so this is the table for "what was each thread blocked in" rather than for CPU flamegraphs.
 
 ```sql

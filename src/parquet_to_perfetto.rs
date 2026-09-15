@@ -1553,8 +1553,9 @@ impl ParquetToPerfettoConverter {
 
     /// Write the task-stacks recorder's events (task_stack_event.parquet) as a
     /// `Task Stacks: <thread>` track under each thread: the thread's stack over
-    /// time, each frame a slice (see [`merge_frames`]). What else an event
-    /// carries (its iterations, CPU-time deltas, state) stays in the table.
+    /// time, each frame a slice (see [`merge_frames`]), titled with the
+    /// thread's names (see [`task_stacks_title`]). What else an event carries
+    /// (its iterations, CPU-time deltas, state) stays in the table.
     fn write_task_stack_events(
         &mut self,
         input_dir: &Path,
@@ -1566,10 +1567,13 @@ impl ParquetToPerfettoConverter {
         }
         let stacks = read_stack_data(input_dir)?;
         let thread_path = input_dir.join("thread.parquet");
-        let thread_info = if thread_path.exists() {
-            self.build_utid_to_thread_map(&thread_path)?
+        let (thread_info, py_names) = if thread_path.exists() {
+            (
+                self.build_utid_to_thread_map(&thread_path)?,
+                read_thread_py_names(&thread_path)?,
+            )
         } else {
-            HashMap::new()
+            (HashMap::new(), HashMap::new())
         };
 
         struct Event {
@@ -1652,10 +1656,14 @@ impl ParquetToPerfettoConverter {
             let track = self.alloc_uuid();
             let mut desc = TrackDescriptor::default();
             desc.set_uuid(track);
-            desc.set_name(match info {
-                Some((_, name, _)) if !name.is_empty() => format!("Task Stacks: {name}"),
-                _ => format!("Task Stacks: utid {utid}"),
-            });
+            desc.set_name(task_stacks_title(
+                info.map(|(_, name, _)| name.as_str()),
+                py_names.get(&utid).map(String::as_str),
+                stack
+                    .iter()
+                    .any(|f| parse_frame(&f.name).language != "python"),
+                utid,
+            ));
             if let Some(parent) = parent {
                 desc.set_parent_uuid(parent);
             }
@@ -2660,6 +2668,56 @@ fn write_slice(
     Ok(())
 }
 
+/// `thread.py_name` by utid, for the threads that have one: the name a Python
+/// process gave the thread (schema 24; an older `thread.parquet` has none).
+fn read_thread_py_names(path: &Path) -> Result<HashMap<i64, String>> {
+    let mut names = HashMap::new();
+    for batch in &read_parquet_file(path)? {
+        let utids = batch
+            .column_by_name("utid")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .context("Missing utid column")?;
+        let py_names = batch
+            .column_by_name("py_name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        for i in 0..batch.num_rows() {
+            if let Some(name) = get_optional_string(py_names, i) {
+                names.insert(utids.value(i), name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The title of a thread's Task Stacks track. It names the thread the way its
+/// frames were chosen (`--task-stacks-frames`): by the kernel's name (`comm`)
+/// where the track has native or kernel frames, by the name its Python
+/// process gave it where it has one, and by both, the Python one first, where
+/// it has both. So `native` titles with `comm`, `python` with the Python name,
+/// and `all` with `MainThread [python3]` (brackets, because Python's own
+/// default names have parentheses: `Thread-1 (worker)`). This is py-spy's
+/// `thread (<os id>): <name>`, turned around. One name serves when the two are
+/// the same (3.14 sets `comm` from the Python name, cut at 15 characters), and
+/// `comm` alone when there is no Python name to show: another language's
+/// thread, or a Python older than 3.13.
+fn task_stacks_title(
+    comm: Option<&str>,
+    py_name: Option<&str>,
+    native_frames: bool,
+    utid: i64,
+) -> String {
+    let comm = comm.filter(|c| !c.is_empty());
+    let py_name = py_name.filter(|n| !n.is_empty());
+    match (py_name, comm) {
+        (Some(py), Some(comm)) if native_frames && !py.starts_with(comm) => {
+            format!("Task Stacks: {py} [{comm}]")
+        }
+        (Some(py), _) => format!("Task Stacks: {py}"),
+        (None, Some(comm)) => format!("Task Stacks: {comm}"),
+        (None, None) => format!("Task Stacks: utid {utid}"),
+    }
+}
+
 /// The parts of a symbolized frame name as `stack.frame_names` holds it:
 /// `function (module [file:line]) <0xaddress>` for a native or kernel frame
 /// (the location and the address as far as they are known; the kernel's module
@@ -3098,6 +3156,34 @@ mod tests {
         )?;
 
         let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    /// thread.parquet as schema 24 writes it: `test_thread` with the name its
+    /// Python process gave it. ([`create_test_thread_parquet`] writes the
+    /// older form, without the column.)
+    fn create_test_python_thread_parquet(
+        dir: &Path,
+        utid: i64,
+        tid: i32,
+        upid: Option<i64>,
+        py_name: Option<&str>,
+    ) -> Result<()> {
+        let schema = crate::trace::thread_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![utid])),
+                Arc::new(Int32Array::from(vec![tid])),
+                Arc::new(StringArray::from(vec![Some("test_thread")])),
+                Arc::new(Int64Array::from(vec![upid])),
+                Arc::new(StringArray::from(vec![py_name])),
+            ],
+        )?;
+        let file = File::create(dir.join("thread.parquet"))?;
         let mut writer = ArrowWriter::try_new(file, schema, None)?;
         writer.write(&batch)?;
         writer.close()?;
@@ -4280,8 +4366,6 @@ mod tests {
                 column(events.iter().map(|e| e.0).collect()),
                 column(events.iter().map(|e| e.1).collect()),
                 column(events.iter().map(|e| e.2).collect()),
-                // The reserved thread name: not populated.
-                Arc::new(StringArray::from(vec![None::<&str>; events.len()])),
                 // The iterations, deltas and state: not drawn.
                 constant(1),
                 constant(1),
@@ -4386,6 +4470,98 @@ mod tests {
                 ("address", "0x30")
             ]
         );
+    }
+
+    #[test]
+    fn a_stack_track_is_titled_with_the_names_its_frames_call_for() {
+        // native: the kernel's name. python: the Python one. all: both.
+        assert_eq!(
+            task_stacks_title(Some("python3"), None, true, 7),
+            "Task Stacks: python3"
+        );
+        assert_eq!(
+            task_stacks_title(Some("python3"), Some("MainThread"), false, 7),
+            "Task Stacks: MainThread"
+        );
+        assert_eq!(
+            task_stacks_title(Some("python3"), Some("MainThread"), true, 7),
+            "Task Stacks: MainThread [python3]"
+        );
+        // 3.14 names the kernel's thread after the Python one, cut at 15
+        // characters: once is enough.
+        assert_eq!(
+            task_stacks_title(Some("Thread-1 (worke"), Some("Thread-1 (worker)"), true, 7),
+            "Task Stacks: Thread-1 (worker)"
+        );
+        // Python frames and no Python name (before 3.13): the kernel's.
+        assert_eq!(
+            task_stacks_title(Some("python3"), None, false, 7),
+            "Task Stacks: python3"
+        );
+        assert_eq!(
+            task_stacks_title(Some(""), Some(""), true, 7),
+            "Task Stacks: utid 7"
+        );
+    }
+
+    #[test]
+    fn a_stack_tracks_python_name_is_the_thread_tables() {
+        use crate::perfetto::VecTraceWriter;
+
+        struct Case {
+            /// The frames of the thread's one stack.
+            frames: &'static [&'static str],
+            /// `thread.py_name`.
+            py_name: Option<&'static str>,
+            title: &'static str,
+        }
+        let cases = [
+            Case {
+                frames: &["main (python3) <0x10>", "f (python) [app.py:3]"],
+                py_name: Some("Thread-1 (worker)"),
+                title: "Task Stacks: Thread-1 (worker) [test_thread]",
+            },
+            Case {
+                frames: &["f (python) [app.py:3]"],
+                py_name: Some("Thread-1 (worker)"),
+                title: "Task Stacks: Thread-1 (worker)",
+            },
+            Case {
+                frames: &["main (python3) <0x10>"],
+                py_name: None,
+                title: "Task Stacks: test_thread",
+            },
+        ];
+        for Case {
+            frames,
+            py_name,
+            title,
+        } in cases
+        {
+            let dir = tempdir().unwrap();
+            create_test_process_parquet(dir.path(), 1, 1000).unwrap();
+            create_test_python_thread_parquet(dir.path(), 100, 2000, Some(1), py_name).unwrap();
+            create_test_stack_parquet(dir.path(), &[(5, frames, &[])]).unwrap();
+            create_test_task_stack_event_parquet(dir.path(), &[(1_000, 1_000, 100, Some(5))])
+                .unwrap();
+
+            let mut converter = ParquetToPerfettoConverter::new();
+            let mut writer = VecTraceWriter::default();
+            converter
+                .write_process_and_thread_descriptors(dir.path(), &mut writer)
+                .unwrap();
+            writer.packets.clear();
+            converter
+                .write_task_stack_events(dir.path(), &mut writer)
+                .unwrap();
+            let titles: Vec<_> = writer
+                .packets
+                .iter()
+                .filter(|p| p.has_track_descriptor())
+                .map(|p| p.track_descriptor().name().to_string())
+                .collect();
+            assert_eq!(titles, [title]);
+        }
     }
 
     #[test]

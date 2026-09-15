@@ -22,7 +22,7 @@
 //! by id into the `stack` table like every other recorder's. Drawing them is
 //! the Perfetto converter's business (`parquet_to_perfetto.rs`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::mem::MaybeUninit;
 use std::os::fd::BorrowedFd;
@@ -36,6 +36,7 @@ use anyhow::{bail, Context, Result};
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
+use crate::pystacks::thread_names::ThreadNames;
 use crate::record::RecordCollector;
 use crate::session_recorder::{get_clock_value, SessionRecorder};
 use crate::stack_recorder::{Stack, StackInterner};
@@ -422,6 +423,70 @@ pub fn iteration_count(duration: Duration, interval: Duration) -> Option<u64> {
     Some(duration.as_nanos().div_ceil(interval.as_nanos().max(1)) as u64)
 }
 
+/// The names Python processes gave their threads, for the snapshot thread: a
+/// reader per process, opened the first time one of its threads is recorded
+/// and kept, with its open /proc/pid/mem, for as long as the snapshots see the
+/// process.
+struct PythonThreadNames {
+    psr: Arc<StackWalkerRun>,
+    /// By tgid. A process that has no reader (not Python, a Python whose
+    /// objects cannot be read, or one pystacks has yet to find) has no entry
+    /// and is asked about again: that is a map lookup.
+    readers: HashMap<u32, ThreadNames>,
+    /// The processes whose reader lost them (an exec: the pid lives on in a
+    /// new address space), and when to open another: not on every snapshot,
+    /// which is what it would take for one that became something other than
+    /// a Python.
+    reopen_at: HashMap<u32, Instant>,
+}
+
+/// How long to leave a process alone after its reader lost it.
+const REOPEN_AFTER: Duration = Duration::from_secs(2);
+
+impl PythonThreadNames {
+    /// The names of process `tgid`'s threads there are to take note of, when
+    /// `changed` of them have a full record in this snapshot and `seen` are
+    /// all of them it saw (see [`ThreadNames::read`]). A name's tid is the
+    /// process's word (`Thread._native_id`): one that is not a thread of its
+    /// own is not its to name, and is not answered for.
+    fn read(
+        &mut self,
+        tgid: u32,
+        changed: &HashSet<i32>,
+        seen: &HashSet<i32>,
+    ) -> HashMap<i32, String> {
+        if !self.readers.contains_key(&tgid) {
+            if self
+                .reopen_at
+                .get(&tgid)
+                .is_some_and(|at| Instant::now() < *at)
+            {
+                return HashMap::new();
+            }
+            match self.psr.thread_names(tgid as i32) {
+                Some(reader) => self.readers.insert(tgid, reader),
+                None => return HashMap::new(),
+            };
+        }
+        let Some(reader) = self.readers.get_mut(&tgid) else {
+            return HashMap::new();
+        };
+        let names = reader.read(changed, seen);
+        if reader.is_gone() {
+            self.readers.remove(&tgid);
+            self.reopen_at.insert(tgid, Instant::now() + REOPEN_AFTER);
+        }
+        names
+    }
+
+    /// Let go of the readers of the processes a snapshot did not see: they
+    /// have exited, and their tgid may be another process's next time.
+    fn forget_all_but(&mut self, seen: &HashMap<u32, HashSet<i32>>) {
+        self.readers.retain(|tgid, _| seen.contains_key(tgid));
+        self.reopen_at.retain(|tgid, _| seen.contains_key(tgid));
+    }
+}
+
 /// The snapshot thread: takes a snapshot every `interval`, numbered from 1,
 /// until stopped or until `max_iterations` have been taken.
 pub struct TaskStacksThread {
@@ -444,16 +509,34 @@ impl TaskStacksThread {
             .name("task_stacks".to_string())
             .spawn(move || {
                 let mut seen_tasks = TaskSightings::new();
+                let mut thread_names = PythonThreadNames {
+                    psr: Arc::clone(&psr),
+                    readers: HashMap::new(),
+                    reopen_at: HashMap::new(),
+                };
                 let mut next = Instant::now();
                 let mut failed = 0u64;
                 for iteration in 1u64.. {
                     // The iteration starts when its walk does (the trace clock).
                     let start = get_clock_value(libc::CLOCK_BOOTTIME);
+                    // With Python frames collected: every process's threads
+                    // as this snapshot sees them, and of those the ones with
+                    // a full record, which are the reason to ask for their
+                    // process's names: no thread is renamed without one of
+                    // them running. (Asked for is not read: the reader
+                    // remembers, see ThreadNames::read.)
+                    let mut seen: HashMap<u32, HashSet<i32>> = HashMap::new();
+                    let mut renamers: HashMap<u32, HashSet<i32>> = HashMap::new();
                     let entries: Option<Vec<_>> = match iter.snapshot() {
                         Ok(samples) => Some(
                             samples
                                 .iter()
                                 .filter_map(|sample| {
+                                    if mode.python() {
+                                        seen.entry(tgid(&sample.task))
+                                            .or_default()
+                                            .insert(tid(&sample.task) as i32);
+                                    }
                                     if sample.unchanged {
                                         return Some(SnapshotEntry::Unchanged {
                                             tid: tid(&sample.task) as i32,
@@ -465,6 +548,12 @@ impl TaskStacksThread {
                                     }
                                     if seen_tasks.observe(&sample.task) {
                                         let _ = task_info_tx.send(sample.task);
+                                    }
+                                    if mode.python() {
+                                        renamers
+                                            .entry(tgid(&sample.task))
+                                            .or_default()
+                                            .insert(tid(&sample.task) as i32);
                                     }
                                     Some(SnapshotEntry::Changed(TaskEntry {
                                         task: sample.task,
@@ -495,6 +584,15 @@ impl TaskStacksThread {
                     // iteration comes back as unchanged too, and its event
                     // runs on over the stack that was lost, until the thread
                     // next changes.
+                    for (tgid, changed) in renamers {
+                        let names = thread_names.read(tgid, &changed, &seen[&tgid]);
+                        if !names.is_empty() {
+                            recorder.note_py_thread_names(tgid as i32, names);
+                        }
+                    }
+                    if entries.is_some() {
+                        thread_names.forget_all_but(&seen);
+                    }
                     if let Some(entries) = entries {
                         recorder
                             .task_stacks_recorder
@@ -669,8 +767,6 @@ impl TaskStacksRecorder {
                 ts: event.start as i64,
                 dur: (end - event.start) as i64,
                 utid: self.utid_generator.get_or_create_utid(event.tid),
-                // Reserved: not populated yet.
-                thread_name: None,
                 start_iteration: event.start_iteration as i64,
                 end_iteration: event.end_iteration as i64,
                 utime_delta_ns: event.utime_delta as i64,
@@ -983,7 +1079,6 @@ mod tests {
                 ts: 1_000,
                 dur: 1_000,
                 utid: utid(10),
-                thread_name: None,
                 start_iteration: 1,
                 end_iteration: 1,
                 utime_delta_ns: 300,
