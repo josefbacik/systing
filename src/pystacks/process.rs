@@ -71,6 +71,32 @@ pub fn read_process_memory(pid: i32, addr: usize, buf: &mut [u8]) -> std::io::Re
     file.read(buf)
 }
 
+/// Reads of a process's memory, for a parser that makes many of them.
+pub trait ReadMemory {
+    /// Fill `buf` from `addr`; false when any of it cannot be read.
+    fn read_exact_at(&self, addr: usize, buf: &mut [u8]) -> bool;
+}
+
+/// A process's memory through /proc/pid/mem, opened once.
+pub struct ProcessMemory {
+    file: fs::File,
+}
+
+impl ProcessMemory {
+    pub fn open(pid: i32) -> std::io::Result<Self> {
+        Ok(Self {
+            file: fs::File::open(format!("/proc/{pid}/mem"))?,
+        })
+    }
+}
+
+impl ReadMemory for ProcessMemory {
+    fn read_exact_at(&self, addr: usize, buf: &mut [u8]) -> bool {
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(buf, addr as u64).is_ok()
+    }
+}
+
 /// Read the exe link for a process.
 pub fn read_exe_path(pid: i32) -> Option<PathBuf> {
     fs::read_link(format!("/proc/{pid}/exe")).ok()

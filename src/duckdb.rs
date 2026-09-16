@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 24;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -231,8 +231,9 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             trace_id VARCHAR,
             utid BIGINT,
             tid INTEGER,
-            name VARCHAR,
-            upid BIGINT
+            name VARCHAR, -- the kernel's name for the thread (comm)
+            upid BIGINT,
+            py_name VARCHAR -- the name its Python process gave it; NULL for any other thread
         );
 
         CREATE TABLE IF NOT EXISTS sched_slice (
@@ -677,7 +678,6 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             ts BIGINT,
             dur BIGINT,
             utid BIGINT,
-            thread_name VARCHAR, -- reserved: not populated yet, always NULL
             start_iteration BIGINT,
             end_iteration BIGINT,
             utime_delta_ns BIGINT,
@@ -1272,6 +1272,19 @@ impl ImportReport {
 /// [`ImportOptions::strict_schema`] the unknown columns are an error naming
 /// them; otherwise they are recorded on `report`, warned once per table and
 /// left out.
+/// Columns an older schema had and this one does not, which never held a
+/// value: a source that still has one is read without it, and without the
+/// warning an unknown column gets. `task_stack_event.thread_name` was
+/// schema 23's reserved, always-NULL column; schema 24 has a thread's names
+/// on `thread` (`name`, `py_name`).
+const RETIRED_COLUMNS: [(&str, &str); 1] = [("task_stack_event", "thread_name")];
+
+fn is_retired_column(table_name: &str, column: &str) -> bool {
+    RETIRED_COLUMNS
+        .iter()
+        .any(|(t, c)| *t == table_name && c.eq_ignore_ascii_case(column))
+}
+
 pub fn import_column_list(
     conn: &Connection,
     table_name: &str,
@@ -1301,13 +1314,18 @@ pub fn import_column_list(
     }
     let source = column_names(&format!("DESCRIBE SELECT * FROM {source_sql}"))
         .with_context(|| format!("Failed to read the parquet columns for table '{table_name}'"))?;
-    let (known, unknown): (Vec<&String>, Vec<&String>) = source
+    let (known, mut unknown): (Vec<&String>, Vec<&String>) = source
         .iter()
         .partition(|c| target.contains(&c.to_ascii_lowercase()));
     if unknown.is_empty() {
         return Ok(Some("*".to_string()));
     }
-    note_unknown_columns(table_name, source_sql, &unknown, options, report)?;
+    // A retired column is left out like an unknown one, but is nothing to
+    // report: it is older than this systing, not newer.
+    unknown.retain(|c| !is_retired_column(table_name, c));
+    if !unknown.is_empty() {
+        note_unknown_columns(table_name, source_sql, &unknown, options, report)?;
+    }
     if known.is_empty() {
         return Ok(None);
     }
@@ -2819,6 +2837,81 @@ mod tests {
         assert_eq!(
             report.dropped_columns,
             vec![("cpu_info".to_string(), vec!["not_a_column".to_string()])]
+        );
+    }
+
+    /// A schema-23 `task_stack_event.parquet` still has the `thread_name`
+    /// column that schema 24 retired (the names are on `thread`). It never
+    /// held a value, so it is left out without a word, even under
+    /// strict_schema; a column that is really unknown beside it is still
+    /// reported.
+    #[test]
+    fn test_a_retired_column_is_left_out_without_a_report() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        let parquet = |name: &str, select: &str| -> String {
+            let path = temp_dir.path().join(name).to_string_lossy().into_owned();
+            conn.execute_batch(&format!("COPY ({select}) TO '{path}' (FORMAT PARQUET)"))
+                .unwrap();
+            format!("read_parquet('{path}')")
+        };
+        let strict = ImportOptions {
+            strict_schema: true,
+        };
+
+        let v23 = parquet(
+            "v23.parquet",
+            "SELECT 10::BIGINT AS ts, 5::BIGINT AS dur, 1::BIGINT AS utid, \
+                    NULL::VARCHAR AS thread_name, 'S' AS state",
+        );
+        let mut report = ImportReport::default();
+        let columns = import_column_list(&conn, "task_stack_event", &v23, strict, &mut report)
+            .unwrap()
+            .unwrap();
+        assert_eq!(columns, "\"ts\", \"dur\", \"utid\", \"state\"");
+        assert_eq!(report, ImportReport::default());
+        conn.execute_batch(&format!(
+            "INSERT INTO task_stack_event BY NAME SELECT 't' AS trace_id, {columns} FROM {v23}"
+        ))
+        .unwrap();
+        let row: (i64, String) = conn
+            .query_row("SELECT ts, state FROM task_stack_event", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, (10, "S".to_string()));
+
+        // The same name in another table is an unknown column like any other.
+        let elsewhere = parquet(
+            "cpu.parquet",
+            "SELECT 1::INTEGER AS cpu, 'x' AS thread_name",
+        );
+        let mut report = ImportReport::default();
+        import_column_list(
+            &conn,
+            "cpu_info",
+            &elsewhere,
+            ImportOptions::default(),
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(
+            report.dropped_columns,
+            vec![("cpu_info".to_string(), vec!["thread_name".to_string()])]
+        );
+
+        // And a really unknown column beside the retired one is still named.
+        let newer = parquet(
+            "newer.parquet",
+            "SELECT 10::BIGINT AS ts, NULL::VARCHAR AS thread_name, 7 AS wchan",
+        );
+        let err =
+            import_column_list(&conn, "task_stack_event", &newer, strict, &mut report).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("wchan") && !err.contains("thread_name"),
+            "{err}"
         );
     }
 

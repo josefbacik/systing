@@ -257,6 +257,9 @@ pub struct SessionRecorder {
     pub memory_recorder: Mutex<MemoryRecorder>,
     pub marker_recorder: Mutex<MarkerRecorder>,
     pub task_stacks_recorder: Mutex<TaskStacksRecorder>,
+    /// The names Python processes gave their threads, by (tgid, tid): the
+    /// `thread` table's `py_name`. See [`Self::note_py_thread_names`].
+    py_thread_names: Mutex<HashMap<(i32, i32), String>>,
     pub tpu_metrics_recorder: Option<Mutex<TpuMetricsRecorder>>,
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
@@ -1001,6 +1004,7 @@ impl SessionRecorder {
                     .with_duration_threshold(marker_duration_threshold),
             ),
             task_stacks_recorder: Mutex::new(TaskStacksRecorder::new(Arc::clone(&utid_generator))),
+            py_thread_names: Mutex::new(HashMap::new()),
             tpu_metrics_recorder: if tpu_metrics_enabled {
                 Some(Mutex::new(TpuMetricsRecorder::new()))
             } else {
@@ -1263,6 +1267,22 @@ impl SessionRecorder {
             return false;
         }
         true
+    }
+
+    /// Take note of the names Python process `tgid` gave its threads
+    /// (`threading.Thread(name=...)`), by tid. The caller vouches that each
+    /// tid is a thread of that process: the tids are the process's word. The
+    /// latest a thread was seen with stands, as with its `comm`. They are
+    /// kept by process as well as thread, so that a tid handed to another
+    /// process's thread later in the capture does not come with the old
+    /// one's name, and apart from the threads themselves: a name can get
+    /// here before its thread's first sighting does, and a tid that never
+    /// turns into a recorded thread is left out when the table is written.
+    pub fn note_py_thread_names(&self, tgid: i32, names: HashMap<i32, String>) {
+        self.py_thread_names
+            .lock()
+            .unwrap()
+            .extend(names.into_iter().map(|(tid, name)| ((tgid, tid), name)));
     }
 
     pub fn maybe_record_task(&self, info: &task_info) {
@@ -1751,6 +1771,7 @@ impl SessionRecorder {
 
         // Write thread records using the shared utid generator
         // Threads seen during streaming already have utids assigned; new threads get new utids
+        let py_thread_names = self.py_thread_names.lock().unwrap();
         for thread in self.threads.read().unwrap().values() {
             let tid = thread.tid();
             // Use existing utid from streaming, or create new one if not seen during streaming
@@ -1774,8 +1795,13 @@ impl SessionRecorder {
                 tid,
                 name,
                 upid,
+                py_name: thread
+                    .has_pid()
+                    .then(|| py_thread_names.get(&(thread.pid(), tid)).cloned())
+                    .flatten(),
             })?;
         }
+        drop(py_thread_names);
 
         // Step 4: Generate network interface metadata
         eprintln!("Writing network interface metadata...");
@@ -2179,6 +2205,7 @@ mod tests {
                 Arc::clone(&track_event_ids),
             )),
             task_stacks_recorder: Mutex::new(TaskStacksRecorder::new(Arc::clone(&utid_generator))),
+            py_thread_names: Mutex::new(HashMap::new()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),

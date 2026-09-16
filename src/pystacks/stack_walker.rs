@@ -4,8 +4,9 @@ use std::hash::{Hash, Hasher};
 
 use {
     crate::pystacks::bpf_maps::PystacksMaps, crate::pystacks::discovery,
-    crate::pystacks::symbols::SymbolResolver, crate::pystacks::types::PystacksSymbolRecord,
-    crate::pystacks::types::StackWalkerFrame, std::fmt,
+    crate::pystacks::symbols::SymbolResolver, crate::pystacks::thread_names::ThreadNames,
+    crate::pystacks::types::PystacksSymbolRecord, crate::pystacks::types::StackWalkerFrame,
+    std::fmt,
 };
 
 /// A symbolized Python frame.
@@ -110,6 +111,9 @@ pub struct StackWalkerRun {
     /// Failed inserts into the BPF gate map (warned once, see
     /// `ingest_symbol_record`).
     gate_insert_failures: std::sync::atomic::AtomicU64,
+    /// The Python processes found so far, for reading their memory from user
+    /// space: (major, minor, the address of `_PyRuntime`) by pid.
+    python_processes: std::sync::RwLock<std::collections::HashMap<i32, (i32, i32, usize)>>,
 }
 
 impl StackWalkerRun {
@@ -127,7 +131,27 @@ impl StackWalkerRun {
             frames_symbolized: AtomicU64::new(0),
             frames_unknown: AtomicU64::new(0),
             gate_insert_failures: AtomicU64::new(0),
+            python_processes: Default::default(),
         }
+    }
+
+    fn note_python_process(&self, pid: i32, info: &discovery::PyProcessInfo) {
+        self.python_processes.write().unwrap().insert(
+            pid,
+            (
+                info.version_major,
+                info.version_minor,
+                info.pid_data.py_runtime_addr,
+            ),
+        );
+    }
+
+    /// A reader of the names process `pid` gave its threads; `None` when it is
+    /// not a Python process pystacks found, is one whose objects cannot be
+    /// read yet (before 3.13), or is gone.
+    pub fn thread_names(&self, pid: i32) -> Option<ThreadNames> {
+        let (major, minor, runtime_addr) = *self.python_processes.read().unwrap().get(&pid)?;
+        ThreadNames::open(pid, runtime_addr, major, minor)
     }
 
     fn init(&mut self, bpf_object: &Object, pid_opts: &[i32], debug: bool) {
@@ -177,6 +201,7 @@ impl StackWalkerRun {
                 attached_count += 1;
             }
             maps.update_pid_config(*pid, &info.pid_data);
+            self.note_python_process(*pid, info);
         }
 
         if debug {
@@ -307,6 +332,7 @@ impl StackWalkerRun {
             if let Some(resolver) = &self.resolver {
                 resolver.add_pid_version(pid, info.version_major, info.version_minor);
             }
+            self.note_python_process(pid, &info);
             if let Some(maps) = &self.maps {
                 maps.add_targeted_pid(pid);
                 maps.update_pid_config(pid, &info.pid_data);

@@ -2059,7 +2059,7 @@ mod tests {
         }
         for (utid, tid, name) in threads {
             conn.execute(
-                "INSERT INTO thread VALUES ('t', ?, ?, ?, NULL)",
+                "INSERT INTO thread (trace_id, utid, tid, name, upid) VALUES ('t', ?, ?, ?, NULL)",
                 duckdb::params![utid, tid, name],
             )
             .unwrap();

@@ -278,9 +278,17 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   non-runnable state cannot have changed its stack: it is not walked again and
   its row is extended instead, so a thread blocked for a minute is one row.
 - The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
-  with the stack by `stack_id` into `stack` like every other recorder's.
-- In the Perfetto trace each thread gets a `Task Stacks: <thread>` track: the
-  stack over time the way py-spy's Chrome trace output draws it, each frame one
+  with the stack by `stack_id` into `stack` like every other recorder's. With
+  Python frames collected, the `thread` table also gets the name the process
+  gave each thread (`thread.py_name`: `threading.Thread(name=...)`), read out
+  of the interpreter: Python 3.13 and 3.14 for now.
+- In the Perfetto trace each thread gets a `Task Stacks: <thread>` track,
+  titled with the names that go with the frames asked for: the kernel's name
+  for the thread (`comm`) with `native`, the Python name with `python`, both
+  with `all` (`Task Stacks: MainThread [python3]`). A thread that has no
+  Python name, another language's or an older Python's, goes by the kernel's.
+  The track is the stack over time the way py-spy's Chrome trace output draws
+  it, each frame one
   slice for as long as it stays on the stack, root at the top. A slice is named
   after the function alone; `language`, `file` (the full path, for Python frames
   and for native frames with debug info), `line`, `module` and `address` are

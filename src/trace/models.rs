@@ -43,14 +43,19 @@ pub struct ProcessRecord {
 /// # Fields
 /// - `utid`: Unique thread ID (internal, not the OS tid)
 /// - `tid`: OS thread ID
-/// - `name`: Thread name
+/// - `name`: Thread name: the kernel's (`comm`), the latest the thread was seen with
 /// - `upid`: Parent process's upid (references `ProcessRecord.upid`)
+/// - `py_name`: The name the thread's Python process gave it
+///   (`threading.Thread(name=...)`), the latest it was seen with; `None` for a
+///   thread that is not a Python one whose name could be read, and for a name
+///   over 1,024 characters or with control characters in it
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ThreadRecord {
     pub utid: i64,
     pub tid: i32,
     pub name: Option<String>,
     pub upid: Option<i64>,
+    pub py_name: Option<String>,
 }
 
 /// Scheduler slice record - represents time a thread ran on a CPU.
@@ -851,15 +856,13 @@ pub struct MemoryThpRecord {
 /// `state` is the kernel's one-letter task state (`thread_state.state` is the
 /// raw integer); `stack_id` is the thread's stack as the iteration's walk found it
 /// (kernel, native user and Python frames as the capture's mode collects them),
-/// `None` when it had no frames. `thread_name` is reserved for the thread's
-/// name as the snapshot read it (a thread can rename itself mid-capture); it is
-/// not filled in yet and is always `None`: join `thread` on `utid` for a name.
+/// `None` when it had no frames. The thread's names, the kernel's and its
+/// Python process's, are on `thread`: join it on `utid`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TaskStackEventRecord {
     pub ts: i64,
     pub dur: i64,
     pub utid: i64,
-    pub thread_name: Option<String>,
     pub start_iteration: i64,
     pub end_iteration: i64,
     pub utime_delta_ns: i64,

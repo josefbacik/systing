@@ -7,15 +7,55 @@
 
 // PyObject
 pub const PY_OBJECT_OB_TYPE: usize = 8;
+pub const PY_OBJECT_MANAGED_DICT_BEFORE: usize = 24;
 
 // PyTypeObject
 pub const PY_TYPE_OBJECT_TP_NAME: usize = 24;
+pub const PY_TYPE_OBJECT_TP_BASICSIZE: usize = 32;
+pub const PY_TYPE_OBJECT_TP_FLAGS: usize = 168;
+pub const PY_TYPE_OBJECT_TP_DICTOFFSET: usize = 288;
 
 // PyVarObject
 pub const PY_VAR_OBJECT_OB_SIZE: usize = 16;
 
 // PyASCIIObject
 pub const PY_ASCII_OBJECT_SIZE: usize = 40;
+pub const PY_ASCII_OBJECT_LENGTH: usize = 16;
+pub const PY_ASCII_OBJECT_STATE: usize = 32;
+
+// PyCompactUnicodeObject
+pub const PY_COMPACT_UNICODE_OBJECT_SIZE: usize = 56;
+
+// PyHeapTypeObject
+pub const PY_HEAP_TYPE_OBJECT_HT_CACHED_KEYS: usize = 880;
+
+// PyLongObject
+pub const PY_LONG_OBJECT_LV_TAG: usize = 16;
+pub const PY_LONG_OBJECT_OB_DIGIT: usize = 24;
+
+// PyModuleObject
+pub const PY_MODULE_OBJECT_MD_DICT: usize = 16;
+
+// PyDictObject, PyDictKeysObject, its entries, PyDictValues
+pub const PY_DICT_OBJECT_MA_USED: usize = 16;
+pub const PY_DICT_OBJECT_MA_KEYS: usize = 32;
+pub const PY_DICT_OBJECT_MA_VALUES: usize = 40;
+pub const PY_DICT_KEYS_DK_LOG2_INDEX_BYTES: usize = 9;
+pub const PY_DICT_KEYS_DK_KIND: usize = 10;
+pub const PY_DICT_KEYS_DK_NENTRIES: usize = 24;
+pub const PY_DICT_KEYS_DK_INDICES: usize = 32;
+pub const PY_DICT_KEY_ENTRY_SIZE: usize = 24;
+pub const PY_DICT_KEY_ENTRY_ME_KEY: usize = 8;
+pub const PY_DICT_KEY_ENTRY_ME_VALUE: usize = 16;
+pub const PY_DICT_UNICODE_ENTRY_SIZE: usize = 16;
+pub const PY_DICT_UNICODE_ENTRY_ME_KEY: usize = 0;
+pub const PY_DICT_UNICODE_ENTRY_ME_VALUE: usize = 8;
+pub const PY_DICT_VALUES_VALID: usize = 3;
+pub const PY_DICT_VALUES_VALUES: usize = 8;
+
+// _Py_DebugOffsets
+pub const PY_DEBUG_OFFSETS_RUNTIME_INTERPRETERS_HEAD: usize = 40;
+pub const PY_DEBUG_OFFSETS_INTERP_IMPORTS_MODULES: usize = 96;
 
 // PyTupleObject
 pub const PY_TUPLE_OBJECT_OB_ITEM: usize = 32;
@@ -49,8 +89,10 @@ pub const PY_CORO_OBJECT_CR_ORIGIN_OR_FINALIZER: usize = 56;
 pub const PY_GEN_OBJECT_GI_IFRAME: usize = 72;
 
 // _PyRuntimeState / PyInterpreterState compound offsets
+pub const PYRUNTIME_DEBUG_OFFSETS_OFFSET: usize = 0;
 pub const PYRUNTIME_TLS_KEY_OFFSET: usize = 2340;
 pub const PYRUNTIME_INTERPRETERS_HEAD_OFFSET: usize = 808;
+pub const PYRUNTIME_INTERPRETERS_MAIN_OFFSET: usize = 816;
 pub const PYINTERP_MODULES_OFFSET: usize = 7664;
 pub const PYINTERP_GIL_LOCKED_OFFSET: usize = 7776;
 pub const PYINTERP_GIL_LAST_HOLDER_OFFSET: usize = 7768;

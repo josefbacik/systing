@@ -445,7 +445,51 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
-## Schema Version 23 (unreleased) — 2026-09-14
+## Schema Version 24 (unreleased) — 2026-09-15
+
+The task-stacks recorder names Python threads, and the name goes where a
+thread's name belongs: on `thread`. Schema 23 reserved a `thread_name` column
+on `task_stack_event` for "the thread's name as the snapshot read it" and never
+filled it. A name is the thread's, not an event's: the kernel's is
+`thread.name` (which already follows a rename), and the Python one now stands
+beside it, where every table that has a `utid` can join it.
+
+### Added columns
+- `thread.py_name` (VARCHAR): the name the thread's Python process gave it
+  (`threading.Thread(name=...)`, e.g. `MainThread`, `Thread-1 (worker)`), read
+  out of the interpreter's `threading._active`. Filled by the task-stacks
+  recorder, for the threads of a Python 3.13 or 3.14 process that has imported
+  `threading`, when Python frames are collected (`--task-stacks-frames
+  python|all`); NULL for every other thread: another language's, an older
+  Python's, `--task-stacks-frames native`, a capture without the recorder. A
+  process's names are read again as soon as a thread of it that has a new
+  event is one not seen before, and otherwise at most once a second while its
+  threads have new events, each time for all of its threads, the blocked ones
+  too: a rename shows up to a second late. The latest a
+  thread was seen with stands, as with `name` (`comm`, 15 characters, which
+  Python sets from the thread's name only from 3.14 on). A name of more than
+  1,024 characters, or one with a control character in it, is left NULL: it
+  is never cut short or cleaned up. The names are those of the process's main
+  interpreter; a subinterpreter's own `threading` is not read.
+  NULL in traces recorded before schema 24.
+
+### Removed columns
+- `task_stack_event.thread_name`: reserved in schema 23 and NULL in every row
+  of every trace, so nothing is lost. A schema-23 `task_stack_event.parquet`
+  imports with the column left out, without the warning an unknown column gets
+  (`--strict-schema` included).
+
+### Behaviour change (no schema effect)
+- The Perfetto `Task Stacks: <thread>` track is titled with the names that go
+  with the frames on it, which is to say with `--task-stacks-frames`: the
+  kernel's name (`thread.name`) where the track has native or kernel frames,
+  `thread.py_name` where the thread has one, and both where it has both, the
+  Python one first: `Task Stacks: MainThread [python3]`. One name serves when
+  the two are the same (3.14), and the kernel's alone when there is no Python
+  name. The converter reads this off the tables, not off the option, which no
+  table records.
+
+## Schema Version 23 (systing 1.20.0) — 2026-09-14
 
 The task-stacks recorder (`--add-recorder task-stacks`): periodic snapshots
 of every targeted thread's stack, taken with a sleepable BPF task iterator,

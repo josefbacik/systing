@@ -80,6 +80,8 @@ def get_offset_program(cpython_path, version):
         "pycore_interp.h",
         "pycore_frame.h",
         "pycore_dict.h",
+        "pycore_object.h",
+        "pycore_moduleobject.h",
     ]:
         if os.path.isfile(os.path.join(internal, hdr)):
             includes.append(f'#include "Include/internal/{hdr}"')
@@ -203,6 +205,69 @@ def get_offset_program(cpython_path, version):
         )
         emit("PY_GEN_OBJECT_GI_IFRAME", "offsetof(PyGenObject, gi_iframe)")
 
+    # --- Reading objects out of a process: dicts, instances, modules, ints,
+    # strings (the thread-name lookup). 3.13+ for now; an older version needs
+    # its own block here, as its dict and managed-dict layouts differ.
+    if minor >= 13:
+        # PyDictObject and what ma_keys / ma_values point to
+        emit("PY_DICT_OBJECT_MA_USED", "offsetof(PyDictObject, ma_used)")
+        emit("PY_DICT_OBJECT_MA_KEYS", "offsetof(PyDictObject, ma_keys)")
+        emit("PY_DICT_OBJECT_MA_VALUES", "offsetof(PyDictObject, ma_values)")
+        emit(
+            "PY_DICT_KEYS_DK_LOG2_INDEX_BYTES",
+            "offsetof(PyDictKeysObject, dk_log2_index_bytes)",
+        )
+        emit("PY_DICT_KEYS_DK_KIND", "offsetof(PyDictKeysObject, dk_kind)")
+        emit("PY_DICT_KEYS_DK_NENTRIES", "offsetof(PyDictKeysObject, dk_nentries)")
+        emit("PY_DICT_KEYS_DK_INDICES", "offsetof(PyDictKeysObject, dk_indices)")
+        emit("PY_DICT_KEY_ENTRY_SIZE", "sizeof(PyDictKeyEntry)")
+        emit("PY_DICT_KEY_ENTRY_ME_KEY", "offsetof(PyDictKeyEntry, me_key)")
+        emit("PY_DICT_KEY_ENTRY_ME_VALUE", "offsetof(PyDictKeyEntry, me_value)")
+        emit("PY_DICT_UNICODE_ENTRY_SIZE", "sizeof(PyDictUnicodeEntry)")
+        emit("PY_DICT_UNICODE_ENTRY_ME_KEY", "offsetof(PyDictUnicodeEntry, me_key)")
+        emit(
+            "PY_DICT_UNICODE_ENTRY_ME_VALUE",
+            "offsetof(PyDictUnicodeEntry, me_value)",
+        )
+        emit("PY_DICT_VALUES_VALID", "offsetof(PyDictValues, valid)")
+        emit("PY_DICT_VALUES_VALUES", "offsetof(PyDictValues, values)")
+
+        # An instance's attributes: the type says where they are
+        emit("PY_TYPE_OBJECT_TP_BASICSIZE", "offsetof(PyTypeObject, tp_basicsize)")
+        emit("PY_TYPE_OBJECT_TP_FLAGS", "offsetof(PyTypeObject, tp_flags)")
+        emit("PY_TYPE_OBJECT_TP_DICTOFFSET", "offsetof(PyTypeObject, tp_dictoffset)")
+        emit(
+            "PY_HEAP_TYPE_OBJECT_HT_CACHED_KEYS",
+            "offsetof(PyHeapTypeObject, ht_cached_keys)",
+        )
+        # Bytes ahead of the object at which its managed dict pointer sits
+        emit("PY_OBJECT_MANAGED_DICT_BEFORE", "(size_t)(-(MANAGED_DICT_OFFSET))")
+
+        emit("PY_MODULE_OBJECT_MD_DICT", "offsetof(PyModuleObject, md_dict)")
+
+        emit("PY_LONG_OBJECT_LV_TAG", "offsetof(PyLongObject, long_value.lv_tag)")
+        emit("PY_LONG_OBJECT_OB_DIGIT", "offsetof(PyLongObject, long_value.ob_digit)")
+
+        emit("PY_ASCII_OBJECT_LENGTH", "offsetof(PyASCIIObject, length)")
+        emit("PY_ASCII_OBJECT_STATE", "offsetof(PyASCIIObject, state)")
+        emit("PY_COMPACT_UNICODE_OBJECT_SIZE", "sizeof(PyCompactUnicodeObject)")
+
+        # _Py_DebugOffsets, the table at the start of _PyRuntime that a process
+        # publishes for readers like this one (3.13+). PyInterpreterState grows
+        # in patch releases (imports.modules is 24 bytes further in 3.14.6 than
+        # in 3.14.0), so the two offsets that lead to sys.modules are read from
+        # the process's own table, whose layout a minor version keeps: what is
+        # generated is where they are in it.
+        emit("PYRUNTIME_DEBUG_OFFSETS_OFFSET", "offsetof(_PyRuntimeState, debug_offsets)")
+        emit(
+            "PY_DEBUG_OFFSETS_RUNTIME_INTERPRETERS_HEAD",
+            "offsetof(_Py_DebugOffsets, runtime_state.interpreters_head)",
+        )
+        emit(
+            "PY_DEBUG_OFFSETS_INTERP_IMPORTS_MODULES",
+            "offsetof(_Py_DebugOffsets, interpreter_state.imports_modules)",
+        )
+
     # --- _PyRuntimeState / PyInterpreterState compound offsets ---
 
     # _PyRuntimeState TLS key
@@ -236,6 +301,12 @@ def get_offset_program(cpython_path, version):
         emit(
             "PYRUNTIME_INTERPRETERS_HEAD_OFFSET",
             "offsetof(_PyRuntimeState, interpreters.head)",
+        )
+        # The list that starts at head is newest first: with a subinterpreter
+        # alive, head is not the interpreter the program started in. main is.
+        emit(
+            "PYRUNTIME_INTERPRETERS_MAIN_OFFSET",
+            "offsetof(_PyRuntimeState, interpreters.main)",
         )
 
     # PyInterpreterState modules
@@ -312,6 +383,15 @@ def group_constants(lines):
         ("// PyTypeObject", ["PY_TYPE_OBJECT_"]),
         ("// PyVarObject", ["PY_VAR_OBJECT_"]),
         ("// PyASCIIObject", ["PY_ASCII_OBJECT_"]),
+        ("// PyCompactUnicodeObject", ["PY_COMPACT_UNICODE_OBJECT_"]),
+        ("// PyHeapTypeObject", ["PY_HEAP_TYPE_OBJECT_"]),
+        ("// PyLongObject", ["PY_LONG_OBJECT_"]),
+        ("// PyModuleObject", ["PY_MODULE_OBJECT_"]),
+        (
+            "// PyDictObject, PyDictKeysObject, its entries, PyDictValues",
+            ["PY_DICT_"],
+        ),
+        ("// _Py_DebugOffsets", ["PY_DEBUG_OFFSETS_"]),
         ("// PyTupleObject", ["PY_TUPLE_OBJECT_"]),
         ("// PyBytesObject", ["PY_BYTES_OBJECT_"]),
         ("// PyThreadState", ["PY_THREAD_STATE_"]),

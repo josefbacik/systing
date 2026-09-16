@@ -5340,14 +5340,187 @@ fn test_e2e_task_stacks_recording() {
     );
 }
 
+/// The names a process gave its threads, read out of live interpreters: the
+/// `threading` module found through sys.modules, its `_active` dict, and each
+/// Thread's `_name` and `_native_id` wherever this instance keeps its
+/// attributes. Once as it is, and once in a pid namespace of its own, as a
+/// container's process is: there `_native_id` is the tid the process sees,
+/// and the names have to come back under the host's.
+#[test]
+#[ignore] // Reads another process's memory; unshare(1) wants root
+fn test_pystacks_thread_names() {
+    use std::collections::{HashMap, HashSet};
+    use systing::pystacks::{discovery, thread_names::ThreadNames};
+
+    // The tids of `pid`'s threads as it sees them, to the host's: the last
+    // and the first id of each task's NSpid line.
+    fn host_tids_by_inner(pid: i32) -> HashMap<i32, i32> {
+        std::fs::read_dir(format!("/proc/{pid}/task"))
+            .expect("the workload's tasks")
+            .flatten()
+            .filter_map(|task| {
+                let status = std::fs::read_to_string(task.path().join("status")).ok()?;
+                let ids: Vec<i32> = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("NSpid:"))?
+                    .split_whitespace()
+                    .filter_map(|id| id.parse().ok())
+                    .collect();
+                Some((*ids.last()?, *ids.first()?))
+            })
+            .collect()
+    }
+
+    for (version, in_pid_namespace) in [
+        (PYTHON_313_VERSION, false),
+        (PYTHON_314_VERSION, false),
+        (PYTHON_313_VERSION, true),
+    ] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let expected_path = dir.path().join("expected");
+        // Threads of every kind an instance's attributes come in, one of them
+        // running a subinterpreter that has a `threading` of its own (where
+        // that thread is "MainThread": not the name to find), then a file of
+        // "tid name" lines for what the reader should find.
+        let defs = format!(
+            r#"import threading, _interpreters
+stop = threading.Event()
+in_sub = threading.Event()
+def run_subinterpreter():
+    interp = _interpreters.create()
+    _interpreters.run_string(interp, "import threading")
+    in_sub.set()
+    _interpreters.run_string(interp, "import time\ntime.sleep(3600)")
+class Worker(threading.Thread):          # its own class, its own shared keys
+    def __init__(self, name):
+        super().__init__(name=name, target=stop.wait)
+        self.extra = 1
+threads = [
+    threading.Thread(target=stop.wait, name="plain"),
+    threading.Thread(target=stop.wait, name="wörker-ü"),      # Latin-1
+    threading.Thread(target=stop.wait, name="工作线程-🧵"),      # wider characters
+    threading.Thread(target=stop.wait),                        # Thread-N (wait)
+    Worker("subclass"),
+    threading.Thread(target=stop.wait, name="before"),
+    threading.Thread(target=stop.wait, name="has-a-dict"),
+    threading.Thread(target=stop.wait, name="crowded"),
+    threading.Thread(target=run_subinterpreter, name="runs-a-subinterpreter", daemon=True),
+]
+for t in threads:
+    t.start()
+in_sub.wait()
+threads[5].name = "renamed"
+vars(threads[6])                          # its __dict__ now exists as a dict
+for i in range(40):                       # more attributes than keys are shared
+    setattr(threads[7], f"attr{{i}}", i)
+never_started = threading.Thread(target=stop.wait, name="never-started")
+with open({expected:?}, "w") as f:
+    for t in threading.enumerate():
+        f.write(f"{{t.native_id}} {{t.name}}\n")
+"#,
+            expected = expected_path.to_str().unwrap()
+        );
+        // In a pid namespace: what is spawned is unshare(1), and the
+        // interpreter is its child, pid 1 in there.
+        let python = pyenv_python(version);
+        let launcher = dir.path().join("python-in-a-pid-namespace");
+        if in_pid_namespace {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &launcher,
+                format!(
+                    "#!/bin/sh\nexec unshare --pid --fork --kill-child {} \"$@\"\n",
+                    std::path::Path::new(&python).display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let workload = if in_pid_namespace {
+            spawn_python_workload(
+                &launcher,
+                dir.path(),
+                "thread_names.py",
+                &defs,
+                "time.sleep(0.05)",
+            )
+        } else {
+            spawn_python_workload(
+                &python,
+                dir.path(),
+                "thread_names.py",
+                &defs,
+                "time.sleep(0.05)",
+            )
+        };
+        let pid = if in_pid_namespace {
+            let children = format!("/proc/{0}/task/{0}/children", workload.pid);
+            std::fs::read_to_string(&children)
+                .ok()
+                .and_then(|c| c.split_whitespace().next()?.parse().ok())
+                .unwrap_or_else(|| panic!("[{version}] unshare(1) has no child in {children}"))
+        } else {
+            workload.pid as i32
+        };
+
+        // By the tid the workload sees; by the host's, which is what the
+        // reader answers in, a line further down.
+        let expected: HashMap<i32, String> = std::fs::read_to_string(&expected_path)
+            .expect("the workload's own list of its threads")
+            .lines()
+            .map(|line| {
+                let (tid, name) = line.split_once(' ').unwrap();
+                (tid.parse().unwrap(), name.to_string())
+            })
+            .collect();
+        assert_eq!(expected.len(), 10, "[{version}] main and nine threads");
+        let expected: HashMap<i32, String> = if in_pid_namespace {
+            assert!(
+                expected.contains_key(&1),
+                "[{version}] not in a pid namespace"
+            );
+            let host = host_tids_by_inner(pid);
+            expected
+                .into_iter()
+                .map(|(inner, name)| (host[&inner], name))
+                .collect()
+        } else {
+            expected
+        };
+
+        let info = discovery::check_python_process(pid)
+            .unwrap_or_else(|| panic!("[{version}] not found to be a Python process"));
+        let mut names = ThreadNames::open(
+            pid,
+            info.pid_data.py_runtime_addr,
+            info.version_major,
+            info.version_minor,
+        )
+        .unwrap_or_else(|| panic!("[{version}] no thread name reader"));
+        // Its own threads, and one that is not: no name for that one.
+        let mut tids: HashSet<i32> = expected.keys().copied().collect();
+        tids.insert(1);
+        let got = names.read(&tids, &tids);
+        assert_eq!(got, expected, "[{version}] thread names by tid");
+        // And again at once: nothing has been read again, so nothing is new.
+        assert!(
+            names.read(&tids, &tids).is_empty(),
+            "[{version}] second read"
+        );
+    }
+}
+
 /// The task-stacks recorder with pystacks: `--collect-pystacks` merges each
 /// thread's Python frames with its native and kernel frames, and
-/// `--task-stacks-frames python` records the Python frames alone.
+/// `--task-stacks-frames python` records the Python frames alone. Either way
+/// the thread table has the name the process gave the thread.
 #[test]
 #[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
 fn test_e2e_task_stacks_python_frames() {
     let python_bin = pyenv_python(PYTHON_313_VERSION);
     let defs = r#"
+import threading
+threading.current_thread().name = "renamed-main"
 def task_stacks_marker():
     time.sleep(0.2)
 "#;
@@ -5404,6 +5577,16 @@ def task_stacks_marker():
             parquet_list_column_contains(&stack_path, "frame_files", |file| file.starts_with('/')
                 && file.ends_with("task_stacks.py")),
             "[frames={frames:?}] no full path to the workload's script in stack.frame_files"
+        );
+        // The name the process gave its thread, beside the kernel's
+        // `python3.13`, on the thread table.
+        assert!(
+            parquet_column_contains_prefix(
+                &dir.path().join("thread.parquet"),
+                "py_name",
+                "renamed-main"
+            ),
+            "[frames={frames:?}] the thread's Python name is on no row of the thread table"
         );
         let (_, has_kernel_frames) = find_python_symbols_in_parquet(&stack_path, "([kernel])");
         assert_eq!(
