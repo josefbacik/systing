@@ -218,6 +218,11 @@ impl ProcessMaps {
             }
             pm.entries.push(entry);
         }
+        // The kernel writes `/proc/<pid>/maps` in address order and the
+        // lookups below binary-search on it; keep that order even for
+        // hand-written maps text. Mappings never overlap, so the order by
+        // start is total.
+        pm.entries.sort_by_key(|e| e.start);
         pm
     }
 
@@ -245,10 +250,15 @@ impl ProcessMaps {
     /// Only the pools count. The sandbox binary that runsc re-execs from a
     /// memfd (`/memfd:runsc (deleted)`) is a real ELF and keeps the ordinary
     /// path — the test is the memfd's name, never `memfd:` as a class.
+    ///
+    /// Asked once per distinct sampled address of every process, so a
+    /// process with no pool mapping at all — every process outside a
+    /// sandbox — answers without touching its entries.
     pub fn is_pool_backed(&self, addr: u64) -> bool {
-        self.entry_for(addr).is_some_and(|e| {
-            matches!(&e.backing, Backing::Memfd(name) if GVISOR_MEMFDS.contains(&name.as_str()))
-        })
+        self.gvisor_memfd
+            && self.entry_for(addr).is_some_and(|e| {
+                matches!(&e.backing, Backing::Memfd(name) if GVISOR_MEMFDS.contains(&name.as_str()))
+            })
     }
 
     /// Executable file-backed ranges of this process — for a systrap stub,
@@ -347,11 +357,19 @@ impl ProcessMaps {
             .collect()
     }
 
+    /// Index of the mapping holding `addr`, by binary search over the
+    /// address-ordered, non-overlapping entries: the last entry starting at
+    /// or below `addr`, if `addr` is below its end.
+    fn index_for(&self, addr: u64) -> Option<usize> {
+        let idx = self
+            .entries
+            .partition_point(|e| e.start <= addr)
+            .checked_sub(1)?;
+        (addr < self.entries[idx].end).then_some(idx)
+    }
+
     fn entry_for(&self, addr: u64) -> Option<&MapEntry> {
-        // Entries are in address order as read from /proc.
-        self.entries
-            .iter()
-            .find(|e| e.start <= addr && addr < e.end)
+        self.index_for(addr).map(|i| &self.entries[i])
     }
 
     /// The tgid these maps were read from — needed to read the process's own
@@ -388,10 +406,7 @@ impl ProcessMaps {
     /// offsets (`R.offset - L.offset == R.start - L.start`), so a pool page
     /// that merely happens to sit between two unrelated files never bridges.
     pub fn bridge_for(&self, addr: u64) -> Option<BridgedAddr> {
-        let idx = self
-            .entries
-            .iter()
-            .position(|e| e.start <= addr && addr < e.end)?;
+        let idx = self.index_for(addr)?;
         let island = &self.entries[idx];
         if !matches!(island.backing, Backing::Memfd(_)) || !island.exec {
             return None;
@@ -710,6 +725,50 @@ mod tests {
         );
         assert!(!jit.is_gvisor());
         assert!(!jit.is_pool_backed(0x7f0000000800));
+    }
+
+    /// The address lookup behind `is_pool_backed`, `bridge_for`,
+    /// `pool_image_base` and `label_for` is a binary search over the
+    /// entries, which `parse` keeps in address order whatever order the
+    /// text came in; every boundary answers as the linear scan did.
+    #[test]
+    fn test_entry_lookup_is_a_binary_search_over_ordered_entries() {
+        // Three mappings written out of order, with gaps between them.
+        let maps = "\
+4c2000-4c3000 r-xs 3ff1f000 00:01 4                        /memfd:runsc-memory (deleted)
+400000-4c2000 r-xs 00000000 00:13 426                      /root/bin/guestbox
+7fa398efc000-7fa398eff000 r-xp 00000000 00:00 0";
+        let pm = ProcessMaps::parse(510, maps, "");
+        let starts: Vec<u64> = pm.entries.iter().map(|e| e.start).collect();
+        assert_eq!(starts, vec![0x400000, 0x4c2000, 0x7fa398efc000]);
+
+        let hit = |addr: u64| pm.entry_for(addr).map(|e| e.start);
+        assert_eq!(hit(0x400000), Some(0x400000), "an entry's first byte");
+        assert_eq!(hit(0x4c1fff), Some(0x400000), "an entry's last byte");
+        assert_eq!(hit(0x4c2000), Some(0x4c2000), "the next entry's first byte");
+        assert_eq!(hit(0x4c2fff), Some(0x4c2000));
+        assert_eq!(hit(0x4c3000), None, "the gap after the last low entry");
+        assert_eq!(hit(0x3fffff), None, "below every entry");
+        assert_eq!(hit(0x7fa398efe000), Some(0x7fa398efc000), "the last entry");
+        assert_eq!(hit(0x7fa398eff000), None, "past the last entry's end");
+        assert_eq!(hit(u64::MAX), None);
+
+        let empty = ProcessMaps::parse(1, "", "");
+        assert_eq!(empty.entry_for(0x400000).map(|e| e.start), None);
+
+        // A process with no pool mapping answers `is_pool_backed` without
+        // an entry lookup, and the answer is the same as before: false for
+        // every address, its own re-exec'd binary's memfd included.
+        let sentry = ProcessMaps::parse(
+            3,
+            "5600000-8a00000 r-xp 00000000 00:01 9 /memfd:runsc (deleted)\n\
+             7ffd1c000000-7ffd1c021000 rw-p 00000000 00:00 0 [stack]",
+            "exe",
+        );
+        assert!(!sentry.gvisor_memfd);
+        assert!(!sentry.is_pool_backed(0x5600100));
+        assert!(!sentry.is_pool_backed(0x7ffd1c000100));
+        assert!(!sentry.is_pool_backed(0x1000));
     }
 
     #[test]
