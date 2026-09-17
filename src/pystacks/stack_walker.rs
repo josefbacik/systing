@@ -33,16 +33,26 @@ pub struct PythonFrame {
 /// outward. `frames` is root-first, as `Stack` keeps it, so a frame's entry
 /// frames stand in front of it. An entry frame beyond the innermost emitted
 /// frame is not counted (the interpreter between two Python calls), and a
-/// walk that met only entry frames emits nothing.
+/// walk that met only entry frames emits nothing. A count is clamped to what
+/// one walk can visit ([`MAX_ENTRY_FRAMES_PER_SYMBOL`]): a frame read back
+/// from a spill can carry any word, and a word past the walk's bound is not
+/// the walk's.
 fn with_entry_markers(frames: impl IntoIterator<Item = (PythonFrame, i32)>) -> Vec<PythonFrame> {
     let mut out = Vec::new();
     for (frame, entry_frames) in frames {
-        let entry_frames = usize::try_from(entry_frames).unwrap_or(0);
+        let entry_frames = usize::try_from(entry_frames)
+            .unwrap_or(0)
+            .min(MAX_ENTRY_FRAMES_PER_SYMBOL);
         out.extend(std::iter::repeat_with(entry_marker).take(entry_frames));
         out.push(frame);
     }
     out
 }
+
+/// The most entry frames one symbol can count: the walk visits at most twice
+/// the symbol budget (the bound in `pystacks.bpf.c`), and every visited frame
+/// but the counting symbol itself could be an entry frame.
+const MAX_ENTRY_FRAMES_PER_SYMBOL: usize = 2 * crate::pystacks::types::BPF_LIB_MAX_STACK_DEPTH - 1;
 
 /// The stand-in for an entry frame: named so a reader of the raw list can
 /// tell it, never shown (the interleave consumes the markers).
@@ -533,6 +543,20 @@ mod tests {
         let merged = with_entry_markers(vec![(frame("f"), -1)]);
         assert_eq!(shape(&merged), ["f"]);
         assert!(with_entry_markers(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn a_count_past_the_walks_bound_is_clamped_to_it() {
+        // A spilled record can carry any word; the walk never counts past its
+        // own visit budget, so the expansion stops there.
+        let merged = with_entry_markers(vec![(frame("f"), i32::MAX)]);
+        assert_eq!(merged.len(), MAX_ENTRY_FRAMES_PER_SYMBOL + 1);
+        assert!(merged[..MAX_ENTRY_FRAMES_PER_SYMBOL]
+            .iter()
+            .all(|frame| frame.entry));
+        assert_eq!(merged.last().map(|frame| frame.name.as_str()), Some("f"));
+        let exact = with_entry_markers(vec![(frame("f"), MAX_ENTRY_FRAMES_PER_SYMBOL as i32)]);
+        assert_eq!(exact.len(), MAX_ENTRY_FRAMES_PER_SYMBOL + 1);
     }
 
     #[test]
