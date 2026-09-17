@@ -445,7 +445,7 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
-## Schema Version 24 (unreleased) — 2026-09-15
+## Schema Version 24 (systing 1.21.0) — 2026-09-15
 
 The task-stacks recorder names Python threads, and the name goes where a
 thread's name belongs: on `thread`. Schema 23 reserved a `thread_name` column
@@ -794,13 +794,17 @@ The tables keep their columns; the new columns are nullable.
   which always attached the classic tracepoints. `memory_fault_leg` keeps
   reading `tracepoint` on x86 for the raw-attached tracepoint — the same
   event, the same rows.
-  New VALUES from the next release (unreleased at the time of writing; no
+  New VALUES from systing 1.20.0 (no
   schema version change — the column and the rows are the same):
   `raw_tracepoint` — a third form, `--kernel-hooks raw-tracepoint`, opt-in:
   one `tp_btf/sys_enter` and one `tp_btf/sys_exit` program dispatching on
   the syscall number in place of the six perf-attached tracepoints, whose
   detach takes `tracepoint_probe_unregister`'s asynchronous `call_rcu` path
-  instead of six synchronous SRCU + RCU grace-period pairs (the `detach bpf
+  instead of six synchronous SRCU + RCU grace-period pairs — no tasks-trace
+  wait; the one wait the path keeps is `tracepoint_remove_func`'s
+  conditional classic-RCU + SRCU sync on its 2→1 branch, paid only when
+  another probe stays registered on the tracepoint (kernel/tracepoint.c,
+  `tp_rcu_cond_sync`) — (the `detach bpf
   programs` stop phase: 81 / 70 / 79 / 62 / 66 ms against the classic set's
   146 / 161 / 141 / 125 / 135 / 137 ms, one capture per boot on a 4-vCPU
   6.12.0 guest under TCG — the direction; the magnitude is a busy host's);
@@ -822,7 +826,14 @@ The tables keep their columns; the new columns are nullable.
   (−49 to −52 %) — a tax on every syscall of every traced-host task for the
   capture's duration, in exchange for a stop-path saving on the tracer
   alone. The rows a form produces are byte-identical: both feed the same
-  row-building code.
+  row-building code, and both skip a 32-bit compat task's syscalls — the
+  classic events in the kernel (`ARCH_TRACE_IGNORE_COMPAT_SYSCALLS`), the
+  pair by its own test at the syscall number (`systing_in_compat_syscall`;
+  the raw `sys_enter` / `sys_exit` tracepoints fire for a compat task with
+  the compat table's number, so from 1.20.0 until the release carrying
+  this test (unreleased at the time of writing) an ia32 `link` / `execve`
+  / `chdir` read as an mmap / munmap / brk row under the pair — a defect of
+  the opt-in form that no shipped configuration reached).
 - `sysinfo`: added `network_tw_leg VARCHAR` — how the network recorder's
   TIME_WAIT leg (the `tcp_time_wait` / `inet_twsk_hashdance_schedule` /
   `inet_twsk_deschedule_put` hooks that turn `tcp_time_wait()`'s CLOSE into
