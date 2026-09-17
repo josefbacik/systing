@@ -464,6 +464,35 @@ pub struct SchedAggregateMeta {
     pub running_at_end: u64,
     /// Cumulative scheduler events the BPF side reported dropped (None = no counter track in the trace).
     pub missed_sched_events: Option<u64>,
+    /// Dropped scheduler events INSIDE the folded window: the counter
+    /// track's value at its last sample at or before `window_end_ns` minus
+    /// its value at its last sample at or before `window_start_ns` (None =
+    /// no counter track). The track is the recorder's once-a-second poll of
+    /// the BPF drop counter, so this is a lower bound on the window's loss,
+    /// like `missed_sched_events` on the run's.
+    pub missed_in_window: Option<u64>,
+    /// Samples of the track inside the window whose delta from the previous
+    /// sample is positive: how many distinct seconds carried drops.
+    pub missed_seconds: Option<u32>,
+    /// The largest one-sample delta inside the window. Most of
+    /// `missed_in_window` in one sample is a burst or a stall; spread over
+    /// `missed_seconds` samples it is a sustained shortfall.
+    pub missed_burst_max: Option<u64>,
+    /// Time from the first to the last sample with a positive delta inside
+    /// the window (0 when there is one such sample): where the loss sat.
+    pub missed_span_ns: Option<u64>,
+    /// The longest runnable wait the pass closed for one of the recorder's
+    /// own ring pollers (the `events_<N>` threads), and how many of their
+    /// waits it closed. A poller that waited longer than its ring takes to
+    /// fill lost that ring's events for the wait: drops in the seconds such
+    /// a wait covers are the recorder starved of CPU, not its consumers'
+    /// throughput.
+    pub self_poller_max_wait_ns: u64,
+    pub self_poller_waits: u64,
+    /// The same for the recorder's own sched consumers (`sched_rec_<N>`),
+    /// which drain the pollers' channels.
+    pub self_consumer_max_wait_ns: u64,
+    pub self_consumer_waits: u64,
     /// True when the trace carries the `sched_migrate` table: woken threads
     /// are then queued on a known CPU from their marker on (their previous
     /// CPU, moved by migrate events), so per-CPU runqueue lengths, the
@@ -639,6 +668,54 @@ struct Pass {
     attribute_tails: bool,
     wakeup_by_comm: HashMap<String, LogHist>,
     preempt_by_comm: HashMap<String, LogHist>,
+    // Which of the recorder's own threads each utid is (see `self_threads`),
+    // so their runnable waits can be told from the workload's: one indexed
+    // byte per closed wait on the fold's hot path, no hashing.
+    self_kind: Vec<SelfThread>,
+    self_poller_max_wait_ns: u64,
+    self_poller_waits: u64,
+    self_consumer_max_wait_ns: u64,
+    self_consumer_waits: u64,
+}
+
+/// What a utid is to the recorder itself: nothing (the workload), one of its
+/// ring pollers, or one of its sched consumers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SelfThread {
+    None,
+    Poller,
+    Consumer,
+}
+
+/// The recorder's own threads by their names, indexed by utid: the ring
+/// pollers are `events_<N>` and the sched consumers `sched_rec_<N>` (one of
+/// each per ring; the kernel keeps 15 bytes of a name, both forms fit). A
+/// kernel workqueue thread is `events/<N>`, with a slash, and matches
+/// neither. utids are dense small integers, so the table is as long as the
+/// largest recorder utid and every utid past it is the workload's.
+fn self_threads(names: &HashMap<i64, String>) -> Vec<SelfThread> {
+    fn tagged(name: &str, prefix: &str) -> bool {
+        name.strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    }
+    let mut kinds = Vec::new();
+    for (utid, name) in names {
+        let kind = if tagged(name, "events_") {
+            SelfThread::Poller
+        } else if tagged(name, "sched_rec_") {
+            SelfThread::Consumer
+        } else {
+            continue;
+        };
+        let Ok(i) = usize::try_from(*utid) else {
+            continue;
+        };
+        if kinds.len() <= i {
+            kinds.resize(i + 1, SelfThread::None);
+        }
+        kinds[i] = kind;
+    }
+    kinds
 }
 
 impl Pass {
@@ -649,6 +726,7 @@ impl Pass {
         attribute_tails: bool,
         placement_exact: bool,
     ) -> Self {
+        let self_kind = self_threads(&names);
         Self {
             threads: HashMap::new(),
             cpus: Vec::new(),
@@ -689,6 +767,11 @@ impl Pass {
             attribute_tails,
             wakeup_by_comm: HashMap::new(),
             preempt_by_comm: HashMap::new(),
+            self_kind,
+            self_poller_max_wait_ns: 0,
+            self_poller_waits: 0,
+            self_consumer_max_wait_ns: 0,
+            self_consumer_waits: 0,
         }
     }
 
@@ -812,6 +895,21 @@ impl Pass {
                 }
             }
             WaitKind::Preempt => self.preempt_wait.record(wait_ns),
+        }
+        let self_kind = usize::try_from(utid)
+            .ok()
+            .and_then(|i| self.self_kind.get(i).copied())
+            .unwrap_or(SelfThread::None);
+        match self_kind {
+            SelfThread::Poller => {
+                self.self_poller_waits += 1;
+                self.self_poller_max_wait_ns = self.self_poller_max_wait_ns.max(wait_ns);
+            }
+            SelfThread::Consumer => {
+                self.self_consumer_waits += 1;
+                self.self_consumer_max_wait_ns = self.self_consumer_max_wait_ns.max(wait_ns);
+            }
+            SelfThread::None => {}
         }
         if self.attribute_tails {
             let comm = self.names.get(&utid).cloned().unwrap_or_default();
@@ -1668,6 +1766,7 @@ impl AnalyzeDb {
         };
 
         let missed_sched_events = self.missed_sched_events(trace_id)?;
+        let missed = self.missed_in_window(trace_id, window_start, window_end)?;
 
         // Assemble.
         let window_ns = (window_end - window_start) as u64;
@@ -1815,6 +1914,14 @@ impl AnalyzeDb {
                 first_runs: pass.first_runs,
                 running_at_end: pass.running_at_end,
                 missed_sched_events,
+                missed_in_window: missed.as_ref().map(|m| m.in_window),
+                missed_seconds: missed.as_ref().map(|m| m.seconds),
+                missed_burst_max: missed.as_ref().map(|m| m.burst_max),
+                missed_span_ns: missed.as_ref().map(|m| m.span_ns),
+                self_poller_max_wait_ns: pass.self_poller_max_wait_ns,
+                self_poller_waits: pass.self_poller_waits,
+                self_consumer_max_wait_ns: pass.self_consumer_max_wait_ns,
+                self_consumer_waits: pass.self_consumer_waits,
                 placement_exact,
                 migrate_mismatch: pass.migrate_mismatch,
                 slice_rows_capture,
@@ -2022,6 +2129,101 @@ impl AnalyzeDb {
             None => Ok(None),
         }
     }
+
+    /// The shape of the loss inside the window, from the same counter
+    /// track's samples (see [`SchedAggregateMeta::missed_in_window`] and its
+    /// siblings): None when the trace carries no such track or no sample of
+    /// it inside the window.
+    fn missed_in_window(
+        &self,
+        trace_id: Option<&str>,
+        start: i64,
+        end: i64,
+    ) -> Result<Option<MissedShape>> {
+        if !self.table_exists("counter_track")? || !self.table_exists("counter")? {
+            return Ok(None);
+        }
+        let f_ct = trace_id_filter(trace_id, "ct.");
+        // Every sample of the track in time order; the shape is folded in
+        // Rust so one ordered fetch (a few hundred rows for a continuous
+        // capture) serves every field.
+        let sql = format!(
+            "SELECT CAST(c.ts AS BIGINT), c.value FROM counter c \
+             JOIN counter_track ct ON c.track_id = ct.id AND c.trace_id = ct.trace_id \
+             WHERE ct.name = 'Missed sched/IRQ events'{f_ct} \
+             ORDER BY c.ts"
+        );
+        let mut stmt = match self.conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        let mut rows = match stmt.query([]) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        let mut samples: Vec<(i64, u64)> = Vec::new();
+        while let Some(r) = rows.next()? {
+            let ts: i64 = r.get(0)?;
+            let value: Option<f64> = r.get(1)?;
+            samples.push((ts, value.unwrap_or(0.0).max(0.0) as u64));
+        }
+        Ok(missed_shape(&samples, start, end))
+    }
+}
+
+/// The loss inside one window as read from the drop counter's samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MissedShape {
+    in_window: u64,
+    seconds: u32,
+    burst_max: u64,
+    span_ns: u64,
+}
+
+/// Fold the counter track's cumulative samples (time-ordered) into the
+/// window's loss shape. A sample's delta is charged to the sample's own
+/// timestamp; the baseline is the last sample at or before `start` (the
+/// first sample in the window when none precedes it), so a window that
+/// starts mid-run does not count the run's earlier drops.
+fn missed_shape(samples: &[(i64, u64)], start: i64, end: i64) -> Option<MissedShape> {
+    let mut prev: Option<u64> = None;
+    let mut in_window = 0u64;
+    let mut seconds = 0u32;
+    let mut burst_max = 0u64;
+    let mut first_drop: Option<i64> = None;
+    let mut last_drop: Option<i64> = None;
+    let mut any_in_window = false;
+    for &(ts, value) in samples {
+        if ts < start {
+            prev = Some(value);
+            continue;
+        }
+        if ts > end {
+            break;
+        }
+        any_in_window = true;
+        // The counter is cumulative; a value below its predecessor is a
+        // counter reset (a restarted run in one database) and counts as no
+        // drop at this sample.
+        let delta = prev.map_or(0, |p| value.saturating_sub(p));
+        prev = Some(value);
+        if delta > 0 {
+            in_window += delta;
+            seconds += 1;
+            burst_max = burst_max.max(delta);
+            first_drop.get_or_insert(ts);
+            last_drop = Some(ts);
+        }
+    }
+    any_in_window.then_some(MissedShape {
+        in_window,
+        seconds,
+        burst_max,
+        span_ns: match (first_drop, last_drop) {
+            (Some(a), Some(b)) => (b - a).max(0) as u64,
+            _ => 0,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -3081,5 +3283,148 @@ mod tests {
         // [1600,2000); no other observed CPU is idle, so no violation.
         assert_eq!(r.runqueue.max, 2);
         assert_eq!(r.imbalance.work_conservation_violation_ns, 0);
+    }
+
+    #[test]
+    fn missed_shape_folds_cumulative_samples_inside_the_window() {
+        // A once-a-second cumulative counter: flat, one stall of 3 samples
+        // (10 + 40 + 5), flat, one burst sample of 100, flat.
+        let s: Vec<(i64, u64)> = vec![
+            (0, 0),
+            (1_000, 0),
+            (2_000, 10),
+            (3_000, 50),
+            (4_000, 55),
+            (5_000, 55),
+            (6_000, 155),
+            (7_000, 155),
+        ];
+        let m = missed_shape(&s, 0, 7_000).unwrap();
+        assert_eq!(m.in_window, 155);
+        assert_eq!(m.seconds, 4);
+        assert_eq!(m.burst_max, 100);
+        assert_eq!(m.span_ns, 4_000);
+        // A window starting mid-run charges nothing before its start: the
+        // last sample at or before the start is the baseline.
+        let m = missed_shape(&s, 2_500, 7_000).unwrap();
+        assert_eq!(m.in_window, 145);
+        assert_eq!(m.seconds, 3);
+        assert_eq!(m.burst_max, 100);
+        assert_eq!(m.span_ns, 3_000);
+        // A window with no sample inside it reads None; a window whose
+        // samples carry no drop reads zeros.
+        assert!(missed_shape(&s, 7_500, 9_000).is_none());
+        let m = missed_shape(&s, 0, 1_000).unwrap();
+        assert_eq!(
+            (m.in_window, m.seconds, m.burst_max, m.span_ns),
+            (0, 0, 0, 0)
+        );
+        // A counter reset (a value below its predecessor) is no drop.
+        let reset: Vec<(i64, u64)> = vec![(0, 90), (1_000, 100), (2_000, 5), (3_000, 12)];
+        let m = missed_shape(&reset, 0, 3_000).unwrap();
+        assert_eq!(m.in_window, 17);
+        assert_eq!(m.seconds, 2);
+        assert_eq!(m.burst_max, 10);
+    }
+
+    #[test]
+    fn self_threads_match_the_recorder_pollers_and_consumers_only() {
+        let names: HashMap<i64, String> = [
+            (1, "events_0"),
+            (2, "events_63"),
+            (3, "sched_rec_7"),
+            (4, "events/3"),
+            (5, "events_"),
+            (6, "events_1x"),
+            (7, "kworker/0:1"),
+            (8, "sched_recorder"),
+        ]
+        .into_iter()
+        .map(|(u, n)| (u, n.to_string()))
+        .collect();
+        let kinds = self_threads(&names);
+        // As long as the largest recorder utid, and nothing else in it.
+        assert_eq!(kinds.len(), 4);
+        let want = [
+            SelfThread::None,
+            SelfThread::Poller,
+            SelfThread::Poller,
+            SelfThread::Consumer,
+        ];
+        assert_eq!(kinds, want);
+        // A workload utid past the table, or a negative one, is nobody's.
+        assert_eq!(kinds.get(7).copied(), None);
+        assert!(usize::try_from(-1i64).is_err());
+    }
+
+    #[test]
+    fn recorder_thread_waits_and_window_loss_reach_the_meta() {
+        // A ring poller (utid A, `events_3`) wakes at 1000 and runs at 3000
+        // on cpu 0 (a 2000 ns runnable wait); a consumer (utid B,
+        // `sched_rec_3`) wakes at 500 and runs at 800 (300 ns). The drop
+        // counter steps 0 -> 7 at 2000 ns and 7 -> 12 at 3000 ns.
+        let db = db_with(
+            &[
+                (0, 800, 0, IDLE, None),
+                (800, 200, 0, B, Some(1)),
+                (1000, 2000, 0, IDLE, None),
+                (3000, 500, 0, A, Some(1)),
+                (3500, 500, 0, IDLE, None),
+            ],
+            &[(1000, A, 0), (500, B, 0)],
+            &[
+                (IDLE, 0, "swapper/0"),
+                (A, 201, "events_3"),
+                (B, 202, "sched_rec_3"),
+            ],
+        );
+        db.conn
+            .execute_batch(
+                "CREATE TABLE counter_track (trace_id VARCHAR, id BIGINT, name VARCHAR); \
+                 CREATE TABLE counter (trace_id VARCHAR, ts BIGINT, track_id BIGINT, value DOUBLE); \
+                 INSERT INTO counter_track VALUES ('t', 9, 'Missed sched/IRQ events'); \
+                 INSERT INTO counter VALUES ('t', 0, 9, 0), ('t', 1000, 9, 0), ('t', 2000, 9, 7), ('t', 3000, 9, 12), ('t', 4000, 9, 12);",
+            )
+            .unwrap();
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert_eq!(r.meta.missed_sched_events, Some(12));
+        assert_eq!(r.meta.missed_in_window, Some(12));
+        assert_eq!(r.meta.missed_seconds, Some(2));
+        assert_eq!(r.meta.missed_burst_max, Some(7));
+        assert_eq!(r.meta.missed_span_ns, Some(1000));
+        assert_eq!(r.meta.self_poller_waits, 1);
+        assert_eq!(r.meta.self_poller_max_wait_ns, 2000);
+        assert_eq!(r.meta.self_consumer_waits, 1);
+        assert_eq!(r.meta.self_consumer_max_wait_ns, 300);
+        // The workload's own statistics are untouched by the split.
+        assert_eq!(r.wakeup_latency.count, 2);
+        assert_eq!(r.wakeup_latency.sum_ns, 2300);
+    }
+
+    #[test]
+    fn no_counter_track_leaves_the_loss_fields_none_and_the_self_fields_zero() {
+        let db = db_with(
+            &[
+                (0, 1500, 0, IDLE, None),
+                (1500, 500, 0, A, Some(1)),
+                (2000, 1000, 0, IDLE, None),
+            ],
+            &[(1000, A, 0)],
+            &threads(),
+        );
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert_eq!(r.meta.missed_sched_events, None);
+        assert_eq!(r.meta.missed_in_window, None);
+        assert_eq!(r.meta.missed_seconds, None);
+        assert_eq!(r.meta.missed_burst_max, None);
+        assert_eq!(r.meta.missed_span_ns, None);
+        assert_eq!(r.meta.self_poller_waits, 0);
+        assert_eq!(r.meta.self_poller_max_wait_ns, 0);
+        assert_eq!(r.meta.self_consumer_waits, 0);
+        assert_eq!(r.meta.self_consumer_max_wait_ns, 0);
     }
 }
