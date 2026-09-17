@@ -136,9 +136,41 @@ pub struct StackWalkerRun {
     /// Failed inserts into the BPF gate map (warned once, see
     /// `ingest_symbol_record`).
     gate_insert_failures: std::sync::atomic::AtomicU64,
+    /// Per process, how BPF's pthread-id witness read on its samples, indexed
+    /// by the `PYSTACKS_PTHREAD_ID_*` value (see [`PTHREAD_ID_KIND_NAMES`]):
+    /// MISMATCH against MATCH says whether the thread states found through
+    /// the TLS slot were bound by the threads sampled. Debug mode only.
+    pthread_id_by_pid: std::sync::Mutex<std::collections::HashMap<u64, [u64; PTHREAD_ID_KINDS]>>,
     /// The Python processes found so far, for reading their memory from user
     /// space: (major, minor, the address of `_PyRuntime`) by pid.
     python_processes: std::sync::RwLock<std::collections::HashMap<i32, (i32, i32, usize)>>,
+}
+
+/// The values of `pystacks_message.pthread_id_match`, in the BPF enum's
+/// order (`PYSTACKS_PTHREAD_ID_UNKNOWN` = 0 … `PYSTACKS_PTHREAD_ID_NO_DESCRIPTOR`
+/// = 7).
+const PTHREAD_ID_KIND_NAMES: [&str; PTHREAD_ID_KINDS] = [
+    "unknown",
+    "match",
+    "mismatch",
+    "thread_state_null",
+    "null",
+    "not_using_tls",
+    "error",
+    "no_descriptor",
+];
+const PTHREAD_ID_KINDS: usize = 8;
+
+/// One line per process of the witness counts, `kind=count` for every kind
+/// that was seen, in a fixed order.
+fn describe_pthread_id_counts(counts: &[u64; PTHREAD_ID_KINDS]) -> String {
+    PTHREAD_ID_KIND_NAMES
+        .iter()
+        .zip(counts)
+        .filter(|(_, count)| **count > 0)
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl StackWalkerRun {
@@ -156,8 +188,18 @@ impl StackWalkerRun {
             frames_symbolized: AtomicU64::new(0),
             frames_unknown: AtomicU64::new(0),
             gate_insert_failures: AtomicU64::new(0),
+            pthread_id_by_pid: Default::default(),
             python_processes: Default::default(),
         }
+    }
+
+    /// Tallies one sample's witness value for `pid` (debug mode only; an
+    /// out-of-range value counts as `unknown`).
+    fn note_pthread_id_match(&self, pid: u64, kind: u8) {
+        let kind = usize::from(kind);
+        let kind = if kind < PTHREAD_ID_KINDS { kind } else { 0 };
+        let mut by_pid = self.pthread_id_by_pid.lock().unwrap();
+        by_pid.entry(pid).or_insert([0; PTHREAD_ID_KINDS])[kind] += 1;
     }
 
     fn note_python_process(&self, pid: i32, info: &discovery::PyProcessInfo) {
@@ -273,6 +315,15 @@ impl StackWalkerRun {
             if gate_failures > 0 {
                 eprintln!("[pystacks debug] gate map insert failures: {gate_failures}");
             }
+            let by_pid = self.pthread_id_by_pid.lock().unwrap();
+            let mut pids: Vec<&u64> = by_pid.keys().collect();
+            pids.sort_unstable();
+            for pid in pids {
+                eprintln!(
+                    "[pystacks debug] pthread-id witness pid={pid}: {}",
+                    describe_pthread_id_counts(&by_pid[pid])
+                );
+            }
         }
     }
 
@@ -378,6 +429,12 @@ impl StackWalkerRun {
         let stack_len = (buf.stack_len as usize).min(buf.buffer.len());
 
         if self.is_debug() {
+            // The witness byte is reset to "unknown" (0) by the sampler for a
+            // process the walker did not run on; every other value is the
+            // walker's own reading for this sample.
+            if buf.pthread_id_match != 0 {
+                self.note_pthread_id_match(pid, buf.pthread_id_match);
+            }
             if stack_len > 0 {
                 let count = self.events_with_pystack.fetch_add(1, Ordering::Relaxed) + 1;
                 if count <= DEBUG_SAMPLE_LOG_LIMIT {
@@ -578,5 +635,41 @@ mod tests {
         };
         assert_ne!(with, without);
         assert_eq!(with, with.clone());
+    }
+
+    #[test]
+    fn the_witness_counts_read_as_named_kinds_in_a_fixed_order() {
+        let mut counts = [0u64; PTHREAD_ID_KINDS];
+        counts[1] = 40;
+        counts[2] = 2;
+        counts[6] = 1;
+        counts[7] = 3;
+        assert_eq!(
+            describe_pthread_id_counts(&counts),
+            "match=40 mismatch=2 error=1 no_descriptor=3"
+        );
+        assert_eq!(describe_pthread_id_counts(&[0; PTHREAD_ID_KINDS]), "");
+    }
+
+    #[test]
+    fn the_witness_is_tallied_per_process_and_an_unknown_value_counts_as_unknown() {
+        let run = StackWalkerRun::new();
+        run.note_pthread_id_match(7, 1);
+        run.note_pthread_id_match(7, 1);
+        run.note_pthread_id_match(7, 2);
+        run.note_pthread_id_match(9, 3);
+        run.note_pthread_id_match(9, 7);
+        // A value past the enum is not a kind: it counts as "unknown".
+        run.note_pthread_id_match(9, 42);
+        let by_pid = run.pthread_id_by_pid.lock().unwrap();
+        assert_eq!(
+            describe_pthread_id_counts(&by_pid[&7]),
+            "match=2 mismatch=1"
+        );
+        assert_eq!(
+            describe_pthread_id_counts(&by_pid[&9]),
+            "unknown=1 thread_state_null=1 no_descriptor=1"
+        );
+        assert!(!by_pid.contains_key(&8));
     }
 }

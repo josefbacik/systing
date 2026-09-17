@@ -37,6 +37,9 @@ enum {
   PYSTACKS_PTHREAD_ID_NULL = 4,
   PYSTACKS_PTHREAD_ID_NOT_USING_TLS = 5,
   PYSTACKS_PTHREAD_ID_ERROR = 6,
+  // The thread's pointers registered with the kernel do not witness glibc's
+  // descriptor layout (pthread_helpers.bpf.c), so no TLS slot was read.
+  PYSTACKS_PTHREAD_ID_NO_DESCRIPTOR = 7,
 };
 
 enum {
