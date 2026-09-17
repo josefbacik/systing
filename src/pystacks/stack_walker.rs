@@ -17,32 +17,51 @@ pub struct PythonFrame {
     /// The file's full path, as far as BPF kept it (the last 192 bytes).
     pub file: Option<String>,
     /// One of the interpreter's own entry frames rather than a function's: see
-    /// [`is_entry_frame`].
+    /// [`with_entry_markers`].
     pub entry: bool,
 }
 
-/// Whether a frame is an interpreter entry frame. From 3.12 CPython pushes a
-/// frame of its own each time C enters the bytecode loop (one per native
-/// `_PyEval_EvalFrameDefault`), and links it into the chain the BPF walk
-/// follows: they mark where, among the native frames, each run of Python
-/// frames belongs, and name no Python function. In 3.12 its code object is a
-/// real one named `<interpreter trampoline>`. In 3.13 it is `None`, which
-/// reads well enough as memory but has no qualname, so BPF reports
-/// `[Frame Error]` with an instruction index it computed from that garbage; a
-/// frame whose code object could not be READ, a real failure worth showing,
-/// never gets as far as an index and keeps -1.
+/// Puts the entry frames BPF stepped over back beside the frames it emitted.
 ///
-/// The 3.13 rule leans on the build: "no qualname" is the word that follows
-/// `_Py_NoneStruct` at the qualname's offset not being a pointer, which it is
-/// not (it is 0) on the 3.13 and 3.14 builds looked at, and which nothing in
-/// CPython promises. Where it is one, the entry frame comes out as a Python
-/// frame with a name read from wherever it points, the runs come out one
-/// short per entry, and the process's stacks keep the block layout
-/// (`interleave_python_frames` in the stack recorder) with that frame in them.
-/// The interpreter's own mark is `_PyInterpreterFrame.owner`, which only BPF
-/// can read.
-fn is_entry_frame(func_name: &str, inst_idx: i32) -> bool {
-    func_name == "<interpreter trampoline>" || (func_name == "[Frame Error]" && inst_idx != -1)
+/// From 3.12 CPython pushes a frame of its own each time C enters the bytecode
+/// loop (one per native `_PyEval_EvalFrameDefault`), and links it into the
+/// chain the BPF walk follows: they mark where, among the native frames, each
+/// run of Python frames belongs, and name no Python function. BPF tells them
+/// by the interpreter's own mark, `_PyInterpreterFrame.owner`, emits no
+/// symbol for them and counts each on the symbol just inward of it: a frame's
+/// `pad_` is the number of entry frames between it and the next frame
+/// outward. `frames` is root-first, as `Stack` keeps it, so a frame's entry
+/// frames stand in front of it. An entry frame beyond the innermost emitted
+/// frame is not counted (the interpreter between two Python calls), and a
+/// walk that met only entry frames emits nothing. A count is clamped to what
+/// one walk can visit ([`MAX_ENTRY_FRAMES_PER_SYMBOL`]): a frame read back
+/// from a spill can carry any word, and a word past the walk's bound is not
+/// the walk's.
+fn with_entry_markers(frames: impl IntoIterator<Item = (PythonFrame, i32)>) -> Vec<PythonFrame> {
+    let mut out = Vec::new();
+    for (frame, entry_frames) in frames {
+        let entry_frames = usize::try_from(entry_frames)
+            .unwrap_or(0)
+            .min(MAX_ENTRY_FRAMES_PER_SYMBOL);
+        out.extend(std::iter::repeat_with(entry_marker).take(entry_frames));
+        out.push(frame);
+    }
+    out
+}
+
+/// The most entry frames one symbol can count: the walk visits at most twice
+/// the symbol budget (the bound in `pystacks.bpf.c`), and every visited frame
+/// but the counting symbol itself could be an entry frame.
+const MAX_ENTRY_FRAMES_PER_SYMBOL: usize = 2 * crate::pystacks::types::BPF_LIB_MAX_STACK_DEPTH - 1;
+
+/// The stand-in for an entry frame: named so a reader of the raw list can
+/// tell it, never shown (the interleave consumes the markers).
+fn entry_marker() -> PythonFrame {
+    PythonFrame {
+        name: "<interpreter entry> (python) [unknown]".to_string(),
+        file: None,
+        entry: true,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,9 +69,14 @@ pub struct PyAddr {
     pub addr: StackWalkerFrame,
 }
 
+// The entry-frame count is part of a frame's identity: the same Python frames
+// reached through different C re-entries interleave differently with the
+// native frames, so they are different stacks.
 impl PartialEq for PyAddr {
     fn eq(&self, other: &Self) -> bool {
-        self.addr.symbol_id == other.addr.symbol_id && self.addr.inst_idx == other.addr.inst_idx
+        self.addr.symbol_id == other.addr.symbol_id
+            && self.addr.inst_idx == other.addr.inst_idx
+            && self.addr.pad_ == other.addr.pad_
     }
 }
 impl Eq for PyAddr {}
@@ -61,6 +85,7 @@ impl Hash for PyAddr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.addr.symbol_id.hash(state);
         self.addr.inst_idx.hash(state);
+        self.addr.pad_.hash(state);
     }
 }
 
@@ -69,7 +94,7 @@ impl From<&crate::systing_core::types::stack_walker_frame> for StackWalkerFrame 
         StackWalkerFrame {
             symbol_id: frame.symbol_id,
             inst_idx: frame.inst_idx,
-            pad_: 0,
+            pad_: frame.pad_,
         }
     }
 }
@@ -78,8 +103,8 @@ impl fmt::Display for crate::systing_core::types::stack_walker_frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "StackWalkerFrame {{ symbol_id: {} inst_idx: {} }}",
-            self.symbol_id, self.inst_idx
+            "StackWalkerFrame {{ symbol_id: {} inst_idx: {} entry_frames: {} }}",
+            self.symbol_id, self.inst_idx, self.pad_
         )
     }
 }
@@ -407,46 +432,45 @@ impl StackWalkerRun {
 
         let debug = self.is_debug();
 
-        py_stack
-            .iter()
-            .map(|frame| {
-                let func_name = self.symbolize_function(frame);
-                let (filename, line_number) = self.symbolize_filename_line(frame);
+        let frames = py_stack.iter().map(|frame| {
+            let func_name = self.symbolize_function(frame);
+            let (filename, line_number) = self.symbolize_filename_line(frame);
 
-                if debug {
-                    if func_name == "<unknown python>" {
-                        self.frames_unknown.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        let count = self.frames_symbolized.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count <= DEBUG_SAMPLE_LOG_LIMIT {
-                            let base_filename = std::path::Path::new(&filename)
-                                .file_name()
-                                .and_then(|f| f.to_str())
-                                .unwrap_or(&filename);
-                            eprintln!(
-                                "[pystacks debug] Symbolized frame #{}: symbol_id={} -> {} [{}]",
-                                count, frame.addr.symbol_id, func_name, base_filename
-                            );
-                        }
+            if debug {
+                if func_name == "<unknown python>" {
+                    self.frames_unknown.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    let count = self.frames_symbolized.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count <= DEBUG_SAMPLE_LOG_LIMIT {
+                        let base_filename = std::path::Path::new(&filename)
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .unwrap_or(&filename);
+                        eprintln!(
+                            "[pystacks debug] Symbolized frame #{}: symbol_id={} -> {} [{}]",
+                            count, frame.addr.symbol_id, func_name, base_filename
+                        );
                     }
                 }
+            }
 
-                let base_filename = std::path::Path::new(&filename)
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or(&filename);
+            let base_filename = std::path::Path::new(&filename)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(&filename);
 
-                let name = match line_number {
-                    Some(line) => format!("{func_name} (python) [{base_filename}:{line}]"),
-                    None => format!("{func_name} (python) [{base_filename}]"),
-                };
-                PythonFrame {
-                    name,
-                    file: (!filename.is_empty() && filename != "unknown").then_some(filename),
-                    entry: is_entry_frame(&func_name, frame.addr.inst_idx),
-                }
-            })
-            .collect()
+            let name = match line_number {
+                Some(line) => format!("{func_name} (python) [{base_filename}:{line}]"),
+                None => format!("{func_name} (python) [{base_filename}]"),
+            };
+            let frame_out = PythonFrame {
+                name,
+                file: (!filename.is_empty() && filename != "unknown").then_some(filename),
+                entry: false,
+            };
+            (frame_out, frame.addr.pad_)
+        });
+        with_entry_markers(frames)
     }
 }
 
@@ -469,15 +493,90 @@ unsafe impl Sync for StackWalkerRun {}
 mod tests {
     use super::*;
 
+    fn frame(name: &str) -> PythonFrame {
+        PythonFrame {
+            name: format!("{name} (python) [app.py:1]"),
+            file: None,
+            entry: false,
+        }
+    }
+
+    /// The names of a list, an entry frame as `ENTRY`.
+    fn shape(frames: &[PythonFrame]) -> Vec<&str> {
+        frames
+            .iter()
+            .map(|f| {
+                if f.entry {
+                    "ENTRY"
+                } else {
+                    f.name.split(' ').next().unwrap()
+                }
+            })
+            .collect()
+    }
+
     #[test]
-    fn entry_frames_are_the_trampoline_and_the_readable_frame_error() {
-        // 3.12: a real code object of that name.
-        assert!(is_entry_frame("<interpreter trampoline>", 0));
-        // 3.13: `None` for a code object, read fine, index computed from it.
-        assert!(is_entry_frame("[Frame Error]", -685857));
-        // A code object that could not be read: a failure to show.
-        assert!(!is_entry_frame("[Frame Error]", -1));
-        assert!(!is_entry_frame("main", 12));
-        assert!(!is_entry_frame("main", -1));
+    fn entry_frames_stand_in_front_of_the_frame_that_counted_them() {
+        // Root-first: `<module>` ran in the outermost loop frame, called
+        // `sorted`, whose key function `inner` ran in a second one.
+        let merged = with_entry_markers(vec![(frame("<module>"), 1), (frame("inner"), 1)]);
+        assert_eq!(shape(&merged), ["ENTRY", "<module>", "ENTRY", "inner"]);
+    }
+
+    #[test]
+    fn a_count_of_zero_adds_nothing_and_a_count_of_two_adds_two() {
+        // 3.11 and older: no entry frames at all.
+        let merged = with_entry_markers(vec![(frame("outer"), 0), (frame("inner"), 0)]);
+        assert_eq!(shape(&merged), ["outer", "inner"]);
+        // A finalizer re-entered the interpreter while a frame was being
+        // popped: two entry frames back to back.
+        let merged = with_entry_markers(vec![(frame("outer"), 2), (frame("inner"), 0)]);
+        assert_eq!(shape(&merged), ["ENTRY", "ENTRY", "outer", "inner"]);
+        // A walk that stopped short of its outermost entry frame.
+        let merged = with_entry_markers(vec![(frame("outer"), 0), (frame("inner"), 1)]);
+        assert_eq!(shape(&merged), ["outer", "ENTRY", "inner"]);
+    }
+
+    #[test]
+    fn a_frame_from_before_the_count_reads_as_no_entry_frames() {
+        // A negative word is not a count.
+        let merged = with_entry_markers(vec![(frame("f"), -1)]);
+        assert_eq!(shape(&merged), ["f"]);
+        assert!(with_entry_markers(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn a_count_past_the_walks_bound_is_clamped_to_it() {
+        // A spilled record can carry any word; the walk never counts past its
+        // own visit budget, so the expansion stops there.
+        let merged = with_entry_markers(vec![(frame("f"), i32::MAX)]);
+        let merged = shape(&merged);
+        assert_eq!(merged.len(), MAX_ENTRY_FRAMES_PER_SYMBOL + 1);
+        assert!(merged[..MAX_ENTRY_FRAMES_PER_SYMBOL]
+            .iter()
+            .all(|name| *name == "ENTRY"));
+        assert_eq!(merged.last(), Some(&"f"));
+        let exact = with_entry_markers(vec![(frame("f"), MAX_ENTRY_FRAMES_PER_SYMBOL as i32)]);
+        assert_eq!(exact.len(), MAX_ENTRY_FRAMES_PER_SYMBOL + 1);
+    }
+
+    #[test]
+    fn the_count_is_part_of_the_frame_identity() {
+        let with = PyAddr {
+            addr: StackWalkerFrame {
+                symbol_id: 7,
+                inst_idx: 3,
+                pad_: 1,
+            },
+        };
+        let without = PyAddr {
+            addr: StackWalkerFrame {
+                symbol_id: 7,
+                inst_idx: 3,
+                pad_: 0,
+            },
+        };
+        assert_ne!(with, without);
+        assert_eq!(with, with.clone());
     }
 }

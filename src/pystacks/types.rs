@@ -18,7 +18,10 @@ pub const BPF_LIB_DEFAULT_MAP_SIZE: usize = 1024;
 pub type SymbolIdT = u64;
 
 /// Matches `struct stack_walker_frame` from stack_walker.h.
-/// 16 bytes: symbol_id (u64) + inst_idx (i32) + explicit padding.
+/// 16 bytes: symbol_id (u64) + inst_idx (i32) + the count of CPython 3.12+
+/// entry frames BPF stepped over outward of this frame (`pad_`, the struct's
+/// former explicit padding; see `PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER` in
+/// pystacks.bpf.c).
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub struct StackWalkerFrame {

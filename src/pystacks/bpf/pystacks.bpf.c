@@ -164,11 +164,33 @@ struct sample_state_t {
   uint64_t cur_cpu;
   void* frame_ptr;
   bool sync_use_shadow_frame;
+  /* The frame just visited by pystacks_get_frame_data was a CPython 3.12+
+   * entry frame (see PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER): nothing was read
+   * from it and no symbol is to be emitted for it. */
+  bool frame_skipped;
   char long_file_name[BPF_LIB_FILE_NAME_TRYGET];
   struct pystacks_symbol sym;
   struct pystacks_line_table linetable;
   int32_t lasti;
 };
+
+/*
+ * _PyInterpreterFrame.owner values whose frame is the interpreter's own, not
+ * a Python function's. CPython 3.12+ pushes an entry frame onto the frame
+ * chain for every entry into _PyEval_EvalFrameDefault, i.e. at every
+ * C -> Python re-entry (PyObject_Call from C, a bound method's __call__,
+ * functools.partial, ...): owner = FRAME_OWNED_BY_CSTACK (3) and
+ * f_executable = None. 3.14 renames that value FRAME_OWNED_BY_INTERPRETER (3)
+ * and adds FRAME_OWNED_BY_CSTACK (4); both are non-Python frames. The values
+ * below it (THREAD 0, GENERATOR 1, FRAME_OBJECT 2) are real frames. Reading
+ * the (None) code object of an entry frame yields a "[Frame Error]"
+ * placeholder and spends a slot of the stack budget, so such frames are
+ * stepped over instead and only counted: each emitted symbol carries, in its
+ * spare word, how many entry frames sit between it and the next emitted
+ * symbol outward (stack_walker_frame.pad_), which is what user space needs
+ * to put each run of Python frames back where the interpreter ran it.
+ */
+#define PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER 3
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -660,6 +682,35 @@ static __always_inline bool is_ending_frame(struct pystacks_symbol* sym) {
 }
 
 /*
+ * An entry frame was stepped over: count it on the symbol emitted last, the
+ * frame just inward of it, whose pad_ then says how many entry frames sit
+ * between it and the next symbol outward. An entry frame ahead of the first
+ * emitted symbol (the interpreter between two Python calls: as the outermost
+ * frame of an entry returns it is, for a few instructions, on the entry
+ * frame alone) has no symbol to count on and is dropped, as a walk that finds
+ * only entry frames yields no Python frames at all.
+ *
+ * The index is bounded on the register that indexes: `last` is made opaque
+ * before the check, so the compiler cannot compute the buffer offset from
+ * stack_len instead (a bound proved on `stack_len - 1` and an offset formed
+ * from `stack_len` is pointer arithmetic with an unbounded register, which
+ * the verifier rejects). A stack_len of zero wraps to the largest value and
+ * fails the same check.
+ */
+static __always_inline void note_entry_frame(void) {
+  struct pystacks_message* py_msg = pystacks_get_msg();
+  if (!py_msg) {
+    return; /* should never happen */
+  }
+  uint64_t last = py_msg->stack_len - 1;
+  barrier_var(last);
+  if (last >= BPF_LIB_MAX_STACK_DEPTH) {
+    return;
+  }
+  py_msg->buffer[last].pad_ += 1;
+}
+
+/*
  * Read current PyFrameObject filename/name and update
  * stack_info->frame_ptr with pointer to next PyFrameObject
  */
@@ -678,10 +729,37 @@ __noinline bool pystacks_get_frame_data(int pid) {
     return false;
   }
 
-  void* code_ptr =
-      get_code_ptr(state->frame_ptr, offsets, use_shadow_frame, task);
+  /*
+   * CPython 3.12+ interleaves entry frames with the real ones on the
+   * `previous` chain; they carry no code object (see
+   * PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER). Read the frame's owner first and
+   * step over such a frame without reading names for it, counting it on the
+   * last symbol emitted. The owner byte is a `char` in CPython (signed on
+   * x86, unsigned on aarch64) whose values 0-4 are non-negative, so reading
+   * it unsigned is safe on both.
+   */
+  state->frame_skipped = false;
+  if (!use_shadow_frame && offsets->PyVersion_major >= 3 &&
+      offsets->PyVersion_minor >= 12 &&
+      offsets->PyFrameObject_owner != BPF_LIB_DEFAULT_FIELD_OFFSET) {
+    uint8_t owner = 0;
+    if (bpf_probe_read_user_task(
+            &owner,
+            sizeof(owner),
+            state->frame_ptr + offsets->PyFrameObject_owner,
+            task) == 0 &&
+        owner >= PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER) {
+      state->frame_skipped = true;
+      note_entry_frame();
+    }
+  }
 
-  get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+  if (!state->frame_skipped) {
+    void* code_ptr =
+        get_code_ptr(state->frame_ptr, offsets, use_shadow_frame, task);
+
+    get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+  }
 
   int ret_code = 0;
 
@@ -866,17 +944,31 @@ __hidden int walk_and_load_py_stack(
   bool last_frame_read = false;
   int pid = task ? BPF_CORE_READ(task, pid) : 0;
 
-  for (; i < stack_max_len && i < BPF_LIB_MAX_STACK_DEPTH &&
+  /*
+   * Bound the walk on emitted symbols rather than on visited frames, so a
+   * stack of N Python frames interleaved with entry frames still yields up
+   * to stack_max_len symbols. A visited-frame bound stays for the verifier:
+   * an entry frame hosts at least one real frame above it, so on the usual
+   * chain at most every other visited frame is stepped over and twice the
+   * symbol budget covers the walk; entry frames do follow one another when a
+   * finalizer re-enters the interpreter while a frame is being popped, and
+   * such a chain, rare and shallow, may end short of its symbol budget. An
+   * entry frame is counted where it is stepped over, in
+   * pystacks_get_frame_data, and spends nothing here.
+   */
+  for (; i < 2 * BPF_LIB_MAX_STACK_DEPTH && py_msg->stack_len < stack_max_len &&
        (last_frame_read = pystacks_get_frame_data(pid));
        ++i) {
-    add_symbol_to_buffer(py_msg);
+    if (!state->frame_skipped) {
+      add_symbol_to_buffer(py_msg);
+    }
   }
 
   set_py_stack_status(
       &py_msg->stack_status,
       (long)state->frame_ptr,
       last_frame_read,
-      (i == stack_max_len - 1) /* is_final_iteration */);
+      (py_msg->stack_len == stack_max_len - 1) /* is_final_iteration */);
 
   return py_msg->header.len;
 }

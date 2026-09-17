@@ -49,6 +49,9 @@ typedef uint64_t symbol_id_t;
 struct stack_walker_frame {
   symbol_id_t symbol_id;
   int32_t inst_idx;
+  /* The number of CPython 3.12+ entry frames the walk stepped over between
+   * this frame and the next one emitted outward (root-ward); 0 before 3.12.
+   * See PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER in pystacks.bpf.c. */
   int32_t pad_;
 };
 

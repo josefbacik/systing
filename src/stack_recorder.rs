@@ -290,6 +290,7 @@ impl StackSpill {
         for py in &stack.py_stack {
             self.buf.extend_from_slice(&py.addr.symbol_id.to_le_bytes());
             self.buf.extend_from_slice(&py.addr.inst_idx.to_le_bytes());
+            self.buf.extend_from_slice(&py.addr.pad_.to_le_bytes());
         }
 
         let writer = self.writer.as_mut().expect("writer checked above");
@@ -658,8 +659,9 @@ fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32,
         }
     }
 
-    // Python frames serialize as 12 bytes: u64 symbol_id + i32 inst_idx.
-    const PY_FRAME_BYTES: usize = 12;
+    // Python frames serialize as 16 bytes: u64 symbol_id + i32 inst_idx + the
+    // i32 count of entry frames outward of the frame (StackWalkerFrame::pad_).
+    const PY_FRAME_BYTES: usize = 16;
     let mut py_bytes = vec![0u8; pylen * PY_FRAME_BYTES];
     reader
         .read_exact(&mut py_bytes)
@@ -672,7 +674,7 @@ fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32,
             addr: crate::pystacks::types::StackWalkerFrame {
                 symbol_id: u64::from_le_bytes(c[0..8].try_into().unwrap()),
                 inst_idx: i32::from_le_bytes(c[8..12].try_into().unwrap()),
-                pad_: 0,
+                pad_: i32::from_le_bytes(c[12..16].try_into().unwrap()),
             },
         })
         .collect();
@@ -3093,13 +3095,25 @@ mod tests {
         spill.set_dir(dir.path());
         assert!(spill.writer.is_some(), "spill file should be created");
 
-        let py = vec![PyAddr {
-            addr: crate::pystacks::types::StackWalkerFrame {
-                symbol_id: 0xdeadbeef_cafef00d,
-                inst_idx: -1,
-                pad_: 0,
+        // Two Python frames, the outer one with an entry frame counted on it:
+        // the count must round-trip beside the symbol and the index (PyAddr
+        // compares it).
+        let py = vec![
+            PyAddr {
+                addr: crate::pystacks::types::StackWalkerFrame {
+                    symbol_id: 0xdeadbeef_cafef00d,
+                    inst_idx: -1,
+                    pad_: 1,
+                },
             },
-        }];
+            PyAddr {
+                addr: crate::pystacks::types::StackWalkerFrame {
+                    symbol_id: 0x0123_4567_89ab_cdef,
+                    inst_idx: 42,
+                    pad_: 0,
+                },
+            },
+        ];
         let stacks = [
             (
                 Stack {
