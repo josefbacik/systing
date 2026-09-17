@@ -682,6 +682,29 @@ static __always_inline bool is_ending_frame(struct pystacks_symbol* sym) {
 }
 
 /*
+ * An entry frame was stepped over: count it on the symbol emitted last, the
+ * frame just inward of it, whose pad_ then says how many entry frames sit
+ * between it and the next symbol outward. An entry frame ahead of the first
+ * emitted symbol (the interpreter between two Python calls: as the outermost
+ * frame of an entry returns it is, for a few instructions, on the entry
+ * frame alone) has no symbol to count on and is dropped, as a walk that finds
+ * only entry frames yields no Python frames at all.
+ */
+static __always_inline void note_entry_frame(void) {
+  struct pystacks_message* py_msg = pystacks_get_msg();
+  if (!py_msg) {
+    return; /* should never happen */
+  }
+  uint64_t st_len = py_msg->stack_len;
+  if (st_len > 0) {
+    uint64_t last = st_len - 1;
+    if (last < BPF_LIB_MAX_STACK_DEPTH) {
+      py_msg->buffer[last].pad_ += 1;
+    }
+  }
+}
+
+/*
  * Read current PyFrameObject filename/name and update
  * stack_info->frame_ptr with pointer to next PyFrameObject
  */
@@ -704,9 +727,10 @@ __noinline bool pystacks_get_frame_data(int pid) {
    * CPython 3.12+ interleaves entry frames with the real ones on the
    * `previous` chain; they carry no code object (see
    * PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER). Read the frame's owner first and
-   * step over such a frame without reading names for it. The owner byte is
-   * a `char` in CPython (signed on x86, unsigned on aarch64) whose values
-   * 0-4 are non-negative, so reading it unsigned is safe on both.
+   * step over such a frame without reading names for it, counting it on the
+   * last symbol emitted. The owner byte is a `char` in CPython (signed on
+   * x86, unsigned on aarch64) whose values 0-4 are non-negative, so reading
+   * it unsigned is safe on both.
    */
   state->frame_skipped = false;
   if (!use_shadow_frame && offsets->PyVersion_major >= 3 &&
@@ -720,6 +744,7 @@ __noinline bool pystacks_get_frame_data(int pid) {
             task) == 0 &&
         owner >= PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER) {
       state->frame_skipped = true;
+      note_entry_frame();
     }
   }
 
@@ -781,26 +806,6 @@ add_symbol_to_buffer(struct pystacks_message* const py_msg) {
    * (see the locking rule above the map definitions). */
   py_msg->stack_len = st_len;
   return st_len;
-}
-
-/*
- * An entry frame was stepped over: count it on the symbol emitted last, the
- * frame just inward of it, whose pad_ then says how many entry frames sit
- * between it and the next symbol outward. An entry frame ahead of the first
- * emitted symbol (the interpreter between two Python calls: as the outermost
- * frame of an entry returns it is, for a few instructions, on the entry
- * frame alone) has no symbol to count on and is dropped, as a walk that finds
- * only entry frames yields no Python frames at all.
- */
-static __always_inline void
-note_entry_frame(struct pystacks_message* const py_msg) {
-  uint64_t st_len = py_msg->stack_len;
-  if (st_len > 0) {
-    uint64_t last = st_len - 1;
-    if (last < BPF_LIB_MAX_STACK_DEPTH) {
-      py_msg->buffer[last].pad_ += 1;
-    }
-  }
 }
 
 #ifdef STROBELIGHT_READ_LEAF_FRAME
@@ -941,14 +946,14 @@ __hidden int walk_and_load_py_stack(
    * chain at most every other visited frame is stepped over and twice the
    * symbol budget covers the walk; entry frames do follow one another when a
    * finalizer re-enters the interpreter while a frame is being popped, and
-   * such a chain, rare and shallow, may end short of its symbol budget.
+   * such a chain, rare and shallow, may end short of its symbol budget. An
+   * entry frame is counted where it is stepped over, in
+   * pystacks_get_frame_data, and spends nothing here.
    */
   for (; i < 2 * BPF_LIB_MAX_STACK_DEPTH && py_msg->stack_len < stack_max_len &&
        (last_frame_read = pystacks_get_frame_data(pid));
        ++i) {
-    if (state->frame_skipped) {
-      note_entry_frame(py_msg);
-    } else {
+    if (!state->frame_skipped) {
       add_symbol_to_buffer(py_msg);
     }
   }
