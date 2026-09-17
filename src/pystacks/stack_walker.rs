@@ -550,11 +550,12 @@ mod tests {
         // A spilled record can carry any word; the walk never counts past its
         // own visit budget, so the expansion stops there.
         let merged = with_entry_markers(vec![(frame("f"), i32::MAX)]);
+        let merged = shape(&merged);
         assert_eq!(merged.len(), MAX_ENTRY_FRAMES_PER_SYMBOL + 1);
         assert!(merged[..MAX_ENTRY_FRAMES_PER_SYMBOL]
             .iter()
-            .all(|frame| frame.entry));
-        assert_eq!(merged.last().map(|frame| frame.name.as_str()), Some("f"));
+            .all(|name| *name == "ENTRY"));
+        assert_eq!(merged.last(), Some(&"f"));
         let exact = with_entry_markers(vec![(frame("f"), MAX_ENTRY_FRAMES_PER_SYMBOL as i32)]);
         assert_eq!(exact.len(), MAX_ENTRY_FRAMES_PER_SYMBOL + 1);
     }
