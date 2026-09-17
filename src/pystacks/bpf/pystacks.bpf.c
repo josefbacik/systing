@@ -689,19 +689,25 @@ static __always_inline bool is_ending_frame(struct pystacks_symbol* sym) {
  * frame of an entry returns it is, for a few instructions, on the entry
  * frame alone) has no symbol to count on and is dropped, as a walk that finds
  * only entry frames yields no Python frames at all.
+ *
+ * The index is bounded on the register that indexes: `last` is made opaque
+ * before the check, so the compiler cannot compute the buffer offset from
+ * stack_len instead (a bound proved on `stack_len - 1` and an offset formed
+ * from `stack_len` is pointer arithmetic with an unbounded register, which
+ * the verifier rejects). A stack_len of zero wraps to the largest value and
+ * fails the same check.
  */
 static __always_inline void note_entry_frame(void) {
   struct pystacks_message* py_msg = pystacks_get_msg();
   if (!py_msg) {
     return; /* should never happen */
   }
-  uint64_t st_len = py_msg->stack_len;
-  if (st_len > 0) {
-    uint64_t last = st_len - 1;
-    if (last < BPF_LIB_MAX_STACK_DEPTH) {
-      py_msg->buffer[last].pad_ += 1;
-    }
+  uint64_t last = py_msg->stack_len - 1;
+  barrier_var(last);
+  if (last >= BPF_LIB_MAX_STACK_DEPTH) {
+    return;
   }
+  py_msg->buffer[last].pad_ += 1;
 }
 
 /*
