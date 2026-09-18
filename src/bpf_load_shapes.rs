@@ -310,6 +310,18 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.memory = true;
         c.kernel_hooks = KernelHooks::RawTracepoint;
     });
+    // The pair's exit program inlines the `_common` helpers' sampled branch
+    // (`memory_map_sample_rate > 1`), dead rodata on the row above at the
+    // default rate; this twin loads it live, as `memory-sample-rates-97`
+    // does for the classic exit programs. A tp_btf program that fails the
+    // verifier fails the whole object at load with no attach-time fallback,
+    // so every branch the pair can take is loaded here, not first on a host.
+    add("memory-raw-tracepoint-97", &|c| {
+        c.memory = true;
+        c.memory_fault_sample_rate = 97;
+        c.memory_map_sample_rate = 97;
+        c.kernel_hooks = KernelHooks::RawTracepoint;
+    });
 
     // The opt-in trampoline form (`--kernel-hooks trampoline`): the
     // fentry/fexit syscall hooks and the fentry TIME_WAIT trio load beside
@@ -630,6 +642,12 @@ R0 unbounded memory access\n\
             .any(|s| s.name == "network" && s.config.kernel_hooks == KernelHooks::Classic));
         assert!(shapes.iter().any(|s| s.config.memory
             && s.config.kernel_hooks == KernelHooks::RawTracepoint
+            && s.legs == LegSelection::Host));
+        // The pair at the sampled knob: the exit program's `> 1` branch is
+        // loaded live on this row and on no other.
+        assert!(shapes.iter().any(|s| s.config.memory
+            && s.config.kernel_hooks == KernelHooks::RawTracepoint
+            && s.config.memory_map_sample_rate > 1
             && s.legs == LegSelection::Host));
         assert!(shapes.iter().any(|s| s.config.memory
             && s.config.kernel_hooks == KernelHooks::Trampoline

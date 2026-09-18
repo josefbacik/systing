@@ -291,8 +291,11 @@ const MEMORY_SYSCALL_TP_PROGS: &[&str] = &[
 /// perf-attached classic programs, which stay loaded beside them as the
 /// fallback. Their detach takes `tracepoint_probe_unregister`'s
 /// asynchronous `call_rcu` path instead of the classic set's six
-/// synchronous SRCU + RCU grace-period pairs (see the block comment above
-/// `systing_sys_enter` in `systing_system.bpf.c`); their cost is two
+/// synchronous SRCU + RCU grace-period pairs (no tasks-trace wait; the one
+/// wait left is `tracepoint_remove_func`'s conditional classic-RCU + SRCU
+/// sync on the 2→1 branch, paid only when another probe stays on the
+/// tracepoint — see the block comment above `systing_sys_enter` in
+/// `systing_system.bpf.c`); their cost is two
 /// program entries on every syscall of every task while attached, returned
 /// at the syscall-number test — measured at ≈50 % of the uncaptured rate of
 /// a four-thread getpid() storm against the classic set's 84–88 % on a
@@ -302,7 +305,9 @@ const MEMORY_SYSCALL_TP_PROGS: &[&str] = &[
 /// `btf_trace_sys_enter` / `btf_trace_sys_exit` typedefs
 /// (`MemoryKernelLegs::syscall_raw_off`), and attached one program at a
 /// time after `skel.attach()`, the classic set taking over on an attach
-/// error. Unselected under the default classic form and under
+/// error. Both programs skip a 32-bit compat task's syscalls, as the classic
+/// events do in the kernel (`systing_in_compat_syscall`). Unselected under
+/// the default classic form and under
 /// `--kernel-hooks trampoline`, where the trampoline set is the primary
 /// form and the classic set its fallback, as before. Exit before enter,
 /// like the other two sets (one enter program serves all three legs here,
@@ -1447,7 +1452,9 @@ fn vmlinux_btf_has_typedefs(names: &[&str]) -> bool {
 /// vmlinux BTF lacks the pair's typedefs or the pair fails to attach; the
 /// network hooks stay the kprobes). The pair detaches asynchronously
 /// (`tracepoint_probe_unregister`'s `call_rcu` path in place of the six
-/// perf events' synchronous SRCU + RCU grace periods, measured on the
+/// perf events' synchronous SRCU + RCU grace periods — no tasks-trace wait,
+/// and at most one conditional RCU + SRCU sync when another probe stays on
+/// the tracepoint; measured on the
 /// rig's 6.12 guest at ≈0.5× the classic set's `detach bpf programs`
 /// phase), but it runs two BPF programs on EVERY syscall of every task
 /// while attached — returned at their first instruction, the syscall-number
