@@ -333,6 +333,13 @@ struct SchedAggregateArgs {
     /// says so (meta.window_truncated); 0 disables the budget
     #[arg(long, default_value_t = analyze::DEFAULT_MAX_ROWS)]
     max_rows: u64,
+
+    /// Wall-clock budget for the whole command, in seconds: when the first
+    /// chunk's fold rate says the rest would run past it, the window is
+    /// shortened to what fits and the row says so (meta.truncation_reason =
+    /// "time"); 0 disables the budget
+    #[arg(long, default_value_t = 0.0)]
+    time_budget: f64,
 }
 
 /// Run the query command
@@ -747,6 +754,8 @@ fn run_sched_aggregate(args: SchedAggregateArgs) -> Result<()> {
         top_k: args.top_k,
         chunk_rows: args.chunk_rows,
         max_rows: args.max_rows,
+        time_budget: (args.time_budget > 0.0)
+            .then(|| std::time::Duration::from_secs_f64(args.time_budget)),
     };
 
     let r = db.sched_aggregate(&params)?;
@@ -779,13 +788,20 @@ fn run_sched_aggregate(args: SchedAggregateArgs) -> Result<()> {
         r.meta.runnable_markers,
         r.meta.threads_seen
     );
-    if r.meta.window_truncated {
-        eprintln!(
+    match r.meta.truncation_reason {
+        Some(analyze::TruncationReason::Rows) => eprintln!(
             "# Window TRUNCATED to the event budget (--max-rows {}): the requested window holds {} sched_slice rows (idle included); every figure below is exact over the first {:.3}s of it.",
             args.max_rows,
             r.meta.slice_rows_capture,
             r.meta.window_ns as f64 / 1e9
-        );
+        ),
+        Some(analyze::TruncationReason::Time) => eprintln!(
+            "# Window TRUNCATED to the time budget (--time-budget {}s): at this host's fold rate the requested window ({} sched_slice rows, idle included) would not fit; every figure below is exact over the first {:.3}s of it.",
+            args.time_budget,
+            r.meta.slice_rows_capture,
+            r.meta.window_ns as f64 / 1e9
+        ),
+        None => {}
     }
     if r.meta.stream_chunks > 1 {
         eprintln!(

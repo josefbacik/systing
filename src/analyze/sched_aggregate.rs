@@ -88,8 +88,8 @@
 //! materializes that stream to sort it, and the sort does not spill: on a
 //! host that records tens of millions of context switches per second a
 //! 10-second capture holds hundreds of millions of stream rows, more than a
-//! bounded process can hold. Two guards keep the fold inside a budget, both
-//! set from [`SchedAggregateParams`] and both reported in the metadata:
+//! bounded process can hold. Three guards keep the fold inside a budget,
+//! each set from [`SchedAggregateParams`] and each reported in the metadata:
 //!
 //! - **Chunking** (`chunk_rows`): the stream is fetched in consecutive time
 //!   chunks of the window, each sorted by the engine on its own and consumed
@@ -121,9 +121,22 @@
 //!   window actually folded, and `meta.slice_rows_capture` is the number of
 //!   slices the requested window held. A shorter window on the hosts where a
 //!   full one cannot be folded beats no row at all.
+//! - **The time budget** (`time_budget`): the event budget is a row count,
+//!   but the fold's cost per row differs by host — twice over between two
+//!   machines of one class is ordinary — so a caller with a wall-clock
+//!   deadline cannot set one row budget that fits everywhere. With a time
+//!   budget the first chunk of a multi-chunk fold doubles as a probe of this
+//!   host's rate: when the time it took, times the chunks still to fold,
+//!   would run past the budget, the rows that fit in what is left of it
+//!   (less a fifth for the rate's own error) become an event budget, the
+//!   window is cut to them exactly as above, and the fold restarts over the
+//!   shorter window. The restart costs the first chunk's fold twice; a
+//!   deadline missed costs the whole row. The row says which budget cut it:
+//!   `meta.truncation_reason` is `rows` or `time`. A single-chunk fold has
+//!   nothing to probe and is never cut by time.
 //!
 //! The stream rows of a window are counted before the fold (one aggregate
-//! query per source table) to size both guards, and counted again after a
+//! query per source table) to size the guards, and counted again after a
 //! budget cut so the chunk count and the metadata describe the window
 //! actually folded.
 
@@ -133,6 +146,7 @@ use duckdb::arrow::datatypes::{Int32Type, Int64Type};
 use duckdb::arrow::record_batch::RecordBatch;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use super::{trace_id_filter, AnalyzeDb};
 
@@ -160,6 +174,11 @@ pub const DEFAULT_CHUNK_ROWS: u64 = 16_000_000;
 /// stream row. A stream row is a slice start, a slice end, a runnable
 /// marker, a new-task wakeup or a migrate event.
 pub const DEFAULT_MAX_ROWS: u64 = 80_000_000;
+/// The share of the time left in a time budget that a re-cut window is
+/// sized to fill (see the module docs, "Bounded folding"): the fold rate of
+/// one chunk is the estimate, and the fifth held back covers its error and
+/// the restart's own sizing queries.
+const TIME_CUT_FILL: f64 = 0.8;
 /// Time buckets of the event histogram both guards are sized from (see the
 /// module docs, "Bounded folding"): the budget cut and the chunk edges land
 /// on bucket boundaries, so a chunk can be unbalanced only by a burst
@@ -191,6 +210,12 @@ pub struct SchedAggregateParams {
     /// Event budget for the fold (stream rows); 0 disables the budget. See
     /// the module docs, "Bounded folding".
     pub max_rows: u64,
+    /// Wall-clock budget for the whole call; None (or zero) disables it.
+    /// When the first chunk's fold rate says the remaining chunks would run
+    /// past it, the window is shortened from its end to what fits and the
+    /// fold restarts over the shorter window. See the module docs, "Bounded
+    /// folding".
+    pub time_budget: Option<Duration>,
 }
 
 impl Default for SchedAggregateParams {
@@ -202,6 +227,7 @@ impl Default for SchedAggregateParams {
             top_k: 10,
             chunk_rows: DEFAULT_CHUNK_ROWS,
             max_rows: DEFAULT_MAX_ROWS,
+            time_budget: None,
         }
     }
 }
@@ -510,15 +536,32 @@ pub struct SchedAggregateMeta {
     /// truncated to the event budget this is the size the fold could not
     /// take whole; `slices` counts what the pass folded (non-idle only).
     pub slice_rows_capture: u64,
-    /// True when the window was shortened from its end to fit the event
-    /// budget (see the module docs, "Bounded folding"): `window_ns` and
-    /// `window_end_ns` are the window actually folded, and every count and
-    /// rate is exact over that shorter window.
+    /// True when the window was shortened from its end — to fit the event
+    /// budget, or to fit the time budget once the first chunk's fold rate
+    /// said the rest would not (see the module docs, "Bounded folding";
+    /// `truncation_reason` says which): `window_ns` and `window_end_ns` are
+    /// the window actually folded, and every count and rate is exact over
+    /// that shorter window.
     pub window_truncated: bool,
+    /// Why the window was shortened, when it was: `rows` (the event budget)
+    /// or `time` (the time budget); None when it was folded whole.
+    pub truncation_reason: Option<TruncationReason>,
     /// Time chunks the stream was fetched in (1 = one query over the whole
     /// window). Chunking never changes a result; the count is diagnostic.
+    /// After a time-budget restart it counts the restarted fold's chunks.
     pub stream_chunks: u32,
     pub aggregate_ms: u64,
+}
+
+/// Which budget shortened the window (see [`SchedAggregateMeta::window_truncated`]).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TruncationReason {
+    /// The requested window held more stream rows than `max_rows`.
+    Rows,
+    /// The first chunk's fold rate said the remaining chunks would run past
+    /// `time_budget`; the window was re-cut to the rows that fit.
+    Time,
 }
 
 /// The per-capture scheduler summary.
@@ -1723,28 +1766,36 @@ impl AnalyzeDb {
                 );
             }
         }
-        let stream_chunk_count: u32 = if params.chunk_rows > 0 {
-            folded
-                .stream_rows()
-                .div_ceil(params.chunk_rows)
-                .clamp(1, u32::MAX as u64) as u32
-        } else {
-            1
+        let mut truncation_reason = window_truncated.then_some(TruncationReason::Rows);
+        let plan_chunks = |window_end: i64, folded: &StreamCounts| -> Result<Vec<StreamChunk>> {
+            let n: u32 = if params.chunk_rows > 0 {
+                folded
+                    .stream_rows()
+                    .div_ceil(params.chunk_rows)
+                    .clamp(1, u32::MAX as u64) as u32
+            } else {
+                1
+            };
+            self.chunk_plan(trace_id, window_start, window_end, placement_exact, n)
         };
-        let chunks = self.chunk_plan(
-            trace_id,
-            window_start,
-            window_end,
-            placement_exact,
-            stream_chunk_count,
-        )?;
-        let stream_chunk_count = chunks.len() as u32;
+        let mut chunks = plan_chunks(window_end, &folded)?;
 
+        // The time budget (module docs, "Bounded folding"): the first chunk
+        // of a multi-chunk fold doubles as the probe of this host's fold
+        // rate; when the rest would run past the budget the window is re-cut
+        // to the rows that fit and the fold restarts over it. The pass keeps
+        // the thread tables by value, so a restart needs its own copies.
+        let time_budget = params.time_budget.filter(|b| !b.is_zero());
+        let restart_seed = time_budget.map(|_| (idle.clone(), names.clone()));
         let mut pass = Pass::new(window_end, idle, names, params.top_k > 0, placement_exact);
-        for chunk in chunks {
+        let sizing = started.elapsed();
+        let fold_started = Instant::now();
+        let mut restarted = false;
+        let mut i = 0;
+        while i < chunks.len() {
             // A single chunk is the whole window: no chunk predicate, the
             // query as it always was.
-            let chunk = (stream_chunk_count > 1).then_some(chunk);
+            let chunk = (chunks.len() > 1).then_some(chunks[i]);
             let sql = build_event_stream_query(
                 trace_id,
                 window_start,
@@ -1753,7 +1804,48 @@ impl AnalyzeDb {
                 chunk,
             );
             self.fold_stream(&sql, &mut pass)?;
+            i += 1;
+            let (Some(budget), Some((idle, names))) = (time_budget, restart_seed.as_ref()) else {
+                continue;
+            };
+            if restarted || i != 1 || chunks.len() < 2 {
+                continue;
+            }
+            let elapsed = started.elapsed();
+            let first_chunk = fold_started.elapsed();
+            let remaining = (chunks.len() - 1) as u32;
+            if elapsed + first_chunk * remaining <= budget {
+                continue;
+            }
+            // Re-sizing the shorter window costs about what sizing this one
+            // did; the rest of the budget goes to the restarted fold.
+            let left = budget.saturating_sub(elapsed).saturating_sub(sizing);
+            let end = self.time_cut(
+                trace_id,
+                window_start,
+                window_end,
+                placement_exact,
+                &folded,
+                chunks.len() as u64,
+                first_chunk,
+                left,
+            )?;
+            window_end = end;
+            window_truncated = true;
+            truncation_reason = Some(TruncationReason::Time);
+            folded = self.stream_counts(trace_id, window_start, window_end, placement_exact)?;
+            chunks = plan_chunks(window_end, &folded)?;
+            pass = Pass::new(
+                window_end,
+                idle.clone(),
+                names.clone(),
+                params.top_k > 0,
+                placement_exact,
+            );
+            restarted = true;
+            i = 0;
         }
+        let stream_chunk_count = chunks.len() as u32;
         let (wakeup_censored, preempt_censored) = pass.finish();
 
         let (wakeup_tail_top, preempt_tail_top) = if params.top_k > 0 {
@@ -1926,6 +2018,7 @@ impl AnalyzeDb {
                 migrate_mismatch: pass.migrate_mismatch,
                 slice_rows_capture,
                 window_truncated,
+                truncation_reason,
                 stream_chunks: stream_chunk_count,
                 aggregate_ms: started.elapsed().as_millis() as u64,
             },
@@ -2004,6 +2097,50 @@ impl AnalyzeDb {
         let span = (end - start) as u128;
         let keep = span * max_rows as u128 / stream_rows.max(1) as u128;
         Ok(start.saturating_add(keep as i64))
+    }
+
+    /// The end of the prefix of the window whose fold fits in `left` at the
+    /// rate the first chunk showed (see the module docs, "Bounded
+    /// folding"): the rows that rate folds in [`TIME_CUT_FILL`] of `left`
+    /// become an event budget for [`Self::budget_cut`]. The first chunk held
+    /// about `stream_rows / chunk_count` rows (the chunk plan cuts by row
+    /// count). An end at `start` — nothing fits, or no time is left — is an
+    /// error: a row with no window is no row.
+    #[allow(clippy::too_many_arguments)]
+    fn time_cut(
+        &self,
+        trace_id: Option<&str>,
+        start: i64,
+        end: i64,
+        with_migrate: bool,
+        folded: &StreamCounts,
+        chunk_count: u64,
+        first_chunk: Duration,
+        left: Duration,
+    ) -> Result<i64> {
+        let rows_per_chunk = (folded.stream_rows() / chunk_count.max(1)).max(1);
+        let per_row = first_chunk.as_secs_f64() / rows_per_chunk as f64;
+        let fits = if per_row > 0.0 {
+            (left.as_secs_f64() * TIME_CUT_FILL / per_row).floor() as u64
+        } else {
+            0
+        };
+        let cut = self.budget_cut(
+            trace_id,
+            start,
+            end,
+            with_migrate,
+            folded.stream_rows(),
+            fits.max(1),
+        )?;
+        if cut <= start {
+            bail!(
+                "The first chunk's fold rate leaves no part of the window inside the time budget \
+                 (about {} stream rows fit); raise --time-budget or narrow the window.",
+                fits
+            );
+        }
+        Ok(cut)
     }
 
     /// Cut the window into chunks of about equal row count (see the module
@@ -2878,7 +3015,9 @@ mod tests {
         assert_eq!(explicit.meta.window_end_ns, 500_000_000);
         assert_eq!(explicit.meta.slice_rows_capture, 800);
         let mut t = comparable(truncated);
+        assert_eq!(t.meta.truncation_reason, Some(TruncationReason::Rows));
         t.meta.window_truncated = false;
+        t.meta.truncation_reason = None;
         t.meta.slice_rows_capture = 800;
         assert_eq!(t, comparable(explicit));
         // A budget the window fits leaves it whole.
@@ -2920,6 +3059,88 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("max-rows"), "{err}");
+    }
+
+    #[test]
+    fn time_budget_recuts_the_window_from_the_first_chunks_rate() {
+        let (slices, markers, threads) = busy_workload();
+        let db = db_with(&slices, &markers, &threads);
+        let whole = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert_eq!(whole.meta.truncation_reason, None);
+        // A budget any fold overruns: after the first of nine chunks the
+        // projection fails, nothing of the budget is left, one row fits, and
+        // the fold restarts over the same sliver the event budget of one
+        // row keeps — stamped `time`, exact over that sliver (nothing lies
+        // inside 227 µs), one chunk.
+        let cut = db
+            .sched_aggregate(&SchedAggregateParams {
+                chunk_rows: 500,
+                time_budget: Some(Duration::from_nanos(1)),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(cut.meta.window_truncated);
+        assert_eq!(cut.meta.truncation_reason, Some(TruncationReason::Time));
+        assert_eq!(cut.meta.window_start_ns, 0);
+        assert_eq!(cut.meta.window_end_ns, 1_000_000_000 / 4400);
+        assert_eq!(cut.meta.window_ns, 1_000_000_000 / 4400);
+        assert_eq!(cut.meta.slices, 0);
+        assert_eq!(cut.meta.slice_rows_capture, 1600);
+        assert_eq!(cut.meta.stream_chunks, 1);
+        // A budget every fold fits leaves the window whole and the result
+        // exactly the unbudgeted one.
+        let roomy = db
+            .sched_aggregate(&SchedAggregateParams {
+                chunk_rows: 500,
+                time_budget: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!roomy.meta.window_truncated);
+        assert_eq!(roomy.meta.truncation_reason, None);
+        assert_eq!(roomy.meta.stream_chunks, 9);
+        assert_eq!(comparable(roomy), comparable(whole.clone()));
+        // A single-chunk fold has nothing to probe: never cut by time.
+        let single = db
+            .sched_aggregate(&SchedAggregateParams {
+                chunk_rows: 0,
+                time_budget: Some(Duration::from_nanos(1)),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!single.meta.window_truncated);
+        assert_eq!(single.meta.truncation_reason, None);
+        assert_eq!(single.meta.stream_chunks, 1);
+        assert_eq!(comparable(single), comparable(whole.clone()));
+        // A zero budget is no budget.
+        let none = db
+            .sched_aggregate(&SchedAggregateParams {
+                chunk_rows: 500,
+                time_budget: Some(Duration::ZERO),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!none.meta.window_truncated);
+        assert_eq!(none.meta.stream_chunks, 9);
+        // The event budget's own cut keeps its name.
+        let rows = db
+            .sched_aggregate(&SchedAggregateParams {
+                max_rows: 2200,
+                chunk_rows: 700,
+                time_budget: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(rows.meta.window_truncated);
+        assert_eq!(rows.meta.truncation_reason, Some(TruncationReason::Rows));
+        assert_eq!(rows.meta.window_end_ns, 500_000_000);
+        // The stamp serializes as a lowercase word, or null when whole.
+        let json = serde_json::to_value(&cut.meta).unwrap();
+        assert_eq!(json["truncation_reason"], serde_json::json!("time"));
+        let json = serde_json::to_value(&whole.meta).unwrap();
+        assert_eq!(json["truncation_reason"], serde_json::Value::Null);
     }
 
     /// A one-second workload whose first fifth is five times as dense as
