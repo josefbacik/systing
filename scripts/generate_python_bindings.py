@@ -6,11 +6,14 @@ values, then outputs minimal Rust files containing only `pub const` declarations
 
 Requires:
   - gcc
-  - A CPython git repo (cloned or worktree)
+  - A CPython git repo (cloned or worktree), or an installed CPython with its
+    headers (<prefix>/include/python3.X[t]/, internal/ included)
 
 Usage:
   python3 scripts/generate_python_bindings.py --cpython ~/src/cpython --all
   python3 scripts/generate_python_bindings.py --cpython ~/src/cpython v3.13.0
+  python3 scripts/generate_python_bindings.py --cpython ~/src/cpython --free-threaded v3.14.0
+  python3 scripts/generate_python_bindings.py --installed /usr --free-threaded v3.14.0
 """
 import argparse
 import os
@@ -37,19 +40,45 @@ def run(cmd, **kwargs):
     return result
 
 
-def checkout_and_configure(cpython_path, version):
+def checkout_and_configure(cpython_path, version, free_threaded):
     """Check out the CPython tag and run ./configure to generate pyconfig.h."""
     run(f"cd {cpython_path} && git checkout {version}", capture_output=True)
     # Clean up any stale pyconfig.h, then configure
     run(f"cd {cpython_path} && rm -f pyconfig.h", capture_output=True)
     install_prefix = os.path.abspath(os.path.join(cpython_path, f"build_{version}"))
+    # --disable-gil defines Py_GIL_DISABLED in pyconfig.h
+    flavour = " --disable-gil" if free_threaded else ""
     run(
-        f"cd {cpython_path} && ./configure --prefix={install_prefix} 2>&1 | tail -3",
+        f"cd {cpython_path} && ./configure --prefix={install_prefix}{flavour} 2>&1 | tail -3",
     )
 
 
-def get_offset_program(cpython_path, version):
+def installed_headers(prefix, version, free_threaded):
+    """Return (root, include) for an installed CPython: its headers are in
+    <prefix>/include/python3.X (python3.Xt for a free-threaded build), with
+    pyconfig.h beside Python.h. The counterpart of (cpython_path, "Include")."""
+    major, minor, micro = version_tuple(version)
+    root = os.path.join(prefix, "include")
+    include = f"python{major}.{minor}{'t' if free_threaded else ''}"
+    patchlevel = os.path.join(root, include, "patchlevel.h")
+    if not os.path.isfile(patchlevel):
+        raise RuntimeError(f"No CPython headers in {os.path.join(root, include)}")
+    with open(patchlevel) as f:
+        found = [
+            l.split()[2].strip('"') for l in f if l.startswith("#define PY_VERSION ")
+        ]
+    if found != [f"{major}.{minor}.{micro}"]:
+        found = " ".join(found) or "of no known version"
+        raise RuntimeError(f"{patchlevel} is CPython {found}, not {version}")
+    return root, include
+
+
+def get_offset_program(root, include, version, free_threaded=None):
     """Return a C program that prints all offset and sizeof constants.
+
+    The headers are in <root>/<include>: "Include" in a CPython checkout.
+    With free_threaded given, the program only compiles against headers of
+    that build (True) or of the default one (False).
 
     Uses GCC nested-member offsetof extension: offsetof(type, a.b.c).
     All offsets needed by offsets.rs are computed here.
@@ -57,7 +86,7 @@ def get_offset_program(cpython_path, version):
     _, minor, _ = version_tuple(version)
 
     # Determine which internal headers exist for this version
-    include_dir = os.path.join(cpython_path, "Include")
+    include_dir = os.path.join(root, include)
     internal = os.path.join(include_dir, "internal")
     internal_cpython = os.path.join(include_dir, "cpython")
 
@@ -65,12 +94,12 @@ def get_offset_program(cpython_path, version):
         "#include <stddef.h>",
         "#include <stdio.h>",
         "#define Py_BUILD_CORE 1",
-        '#include "Include/Python.h"',
+        f'#include "{include}/Python.h"',
     ]
 
     # frameobject.h exposes the internal frame struct
     if os.path.isfile(os.path.join(include_dir, "frameobject.h")):
-        includes.append('#include "Include/frameobject.h"')
+        includes.append(f'#include "{include}/frameobject.h"')
 
     # Internal headers for nested struct access
     for hdr in [
@@ -84,13 +113,27 @@ def get_offset_program(cpython_path, version):
         "pycore_moduleobject.h",
     ]:
         if os.path.isfile(os.path.join(internal, hdr)):
-            includes.append(f'#include "Include/internal/{hdr}"')
+            includes.append(f'#include "{include}/internal/{hdr}"')
 
     # genobject.h for PyGenObject / PyCoroObject
     if os.path.isfile(os.path.join(internal_cpython, "genobject.h")):
-        includes.append('#include "Include/cpython/genobject.h"')
+        includes.append(f'#include "{include}/cpython/genobject.h"')
     elif os.path.isfile(os.path.join(include_dir, "genobject.h")):
-        includes.append('#include "Include/genobject.h"')
+        includes.append(f'#include "{include}/genobject.h"')
+
+    # The other build's headers would give a module that is not what it says
+    if free_threaded:
+        includes += [
+            "#ifndef Py_GIL_DISABLED",
+            '#error "these are not the headers of a free-threaded build"',
+            "#endif",
+        ]
+    elif free_threaded is not None:
+        includes += [
+            "#ifdef Py_GIL_DISABLED",
+            '#error "these are the headers of a free-threaded build: use --free-threaded"',
+            "#endif",
+        ]
 
     body_lines = []
     emitted = set()
@@ -259,6 +302,14 @@ def get_offset_program(cpython_path, version):
         # the process's own table, whose layout a minor version keeps: what is
         # generated is where they are in it.
         emit("PYRUNTIME_DEBUG_OFFSETS_OFFSET", "offsetof(_PyRuntimeState, debug_offsets)")
+        # How a reader knows the table, its Python, and which build it is of:
+        # free_threaded is non-zero in a free-threaded one
+        emit("PY_DEBUG_OFFSETS_COOKIE", "offsetof(_Py_DebugOffsets, cookie)")
+        emit("PY_DEBUG_OFFSETS_VERSION", "offsetof(_Py_DebugOffsets, version)")
+        emit(
+            "PY_DEBUG_OFFSETS_FREE_THREADED",
+            "offsetof(_Py_DebugOffsets, free_threaded)",
+        )
         emit(
             "PY_DEBUG_OFFSETS_RUNTIME_INTERPRETERS_HEAD",
             "offsetof(_Py_DebugOffsets, runtime_state.interpreters_head)",
@@ -342,9 +393,9 @@ int main(int argc, const char *argv[]) {{
     return program
 
 
-def compile_and_run_offset_program(cpython_path, version):
+def compile_and_run_offset_program(root, include, version, free_threaded=None):
     """Compile and run the offset C program, return output lines."""
-    program = get_offset_program(cpython_path, version)
+    program = get_offset_program(root, include, version, free_threaded)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         src = os.path.join(tmpdir, "offsets.c")
@@ -354,15 +405,15 @@ def compile_and_run_offset_program(cpython_path, version):
 
         try:
             run(
-                f"gcc {src} -I {cpython_path} -I {cpython_path}/Include "
-                f"-I {cpython_path}/Include/internal -o {exe}",
+                f"gcc {src} -I {root} -I {root}/{include} "
+                f"-I {root}/{include}/internal -o {exe}",
                 capture_output=True,
             )
         except RuntimeError:
             # Some versions need different include structure; try with -w to suppress warnings
             run(
-                f"gcc -w {src} -I {cpython_path} -I {cpython_path}/Include "
-                f"-I {cpython_path}/Include/internal -o {exe}",
+                f"gcc -w {src} -I {root} -I {root}/{include} "
+                f"-I {root}/{include}/internal -o {exe}",
             )
 
         result = subprocess.run(exe, capture_output=True, text=True)
@@ -424,33 +475,46 @@ def group_constants(lines):
     return sections
 
 
-def write_binding_file(cpython_path, version, output_dir):
+def write_binding_file(cpython_path, installed, free_threaded, version, output_dir):
     """Generate and write the offset constants file for a Python version."""
     major, minor, micro = version_tuple(version)
-    mod_name = f"v{major}_{minor}_{micro}"
+    if free_threaded and minor < 13:
+        raise RuntimeError(f"CPython {version} has no free-threaded build")
+    # The "t" of the free-threaded ABI tag (python3.14t, cpython-314t)
+    mod_name = f"v{major}_{minor}_{micro}{'t' if free_threaded else ''}"
     output_path = os.path.join(output_dir, f"{mod_name}.rs")
+    flavour = " --free-threaded" if free_threaded else ""
+    build = " (free-threaded)" if free_threaded else ""
 
     print(f"\n{'='*60}")
-    print(f"Generating offset constants for Python {version}")
+    print(f"Generating offset constants for Python {version}{build}")
     print(f"{'='*60}")
 
-    # Step 1: Checkout and configure
-    checkout_and_configure(cpython_path, version)
+    # Step 1: Checkout and configure, or find the installed headers
+    if installed is not None:
+        root, include = installed_headers(installed, version, free_threaded)
+        source = "--installed <prefix>"
+    else:
+        checkout_and_configure(cpython_path, version, free_threaded)
+        root, include = cpython_path, "Include"
+        source = "--cpython <path>"
 
-    # Step 2: Compile and run offset program
-    offset_lines = compile_and_run_offset_program(cpython_path, version)
+    # Step 2: Compile and run offset program. A default build from a checkout
+    # is configured here, so its headers need no check.
+    check_build = free_threaded if installed is not None or free_threaded else None
+    offset_lines = compile_and_run_offset_program(root, include, version, check_build)
 
     # Step 3: Write output file with grouped sections
     sections = group_constants(offset_lines)
 
     with open(output_path, "w") as f:
-        f.write(f"// Auto-generated offset constants for CPython {version}\n")
+        f.write(f"// Auto-generated offset constants for CPython {version}{build}\n")
         f.write(f"// Generated by scripts/generate_python_bindings.py\n")
         f.write(f"// Target: x86_64-unknown-linux-gnu\n")
         f.write(f"//\n")
         f.write(f"// DO NOT EDIT - regenerate with:\n")
         f.write(
-            f"//   python3 scripts/generate_python_bindings.py --cpython <path> {version}\n"
+            f"//   python3 scripts/generate_python_bindings.py {source}{flavour} {version}\n"
         )
 
         for comment, lines in sections:
@@ -466,11 +530,23 @@ def main():
         description="Generate Python offset constants from CPython headers for systing pystacks",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--cpython",
         type=str,
-        required=True,
         help="Path to CPython git repo",
+    )
+    source.add_argument(
+        "--installed",
+        type=str,
+        help="Prefix of an installed CPython of the given version, to use its "
+        "headers (<prefix>/include/python3.X[t]/) instead of a checkout",
+    )
+    parser.add_argument(
+        "--free-threaded",
+        action="store_true",
+        help="Generate for the free-threaded build (--disable-gil, 3.13+): "
+        "a separate ABI, written to a module with a 't' suffix",
     )
     parser.add_argument(
         "--output",
@@ -496,15 +572,17 @@ def main():
 
     args = parser.parse_args()
 
-    if not os.path.isdir(args.cpython):
+    if args.cpython is not None and not os.path.isdir(args.cpython):
         print(f"Error: CPython directory '{args.cpython}' does not exist")
         sys.exit(1)
 
-    if not os.path.isdir(os.path.join(args.cpython, ".git")):
+    if args.cpython is not None and not os.path.isdir(os.path.join(args.cpython, ".git")):
         print(f"Error: '{args.cpython}' is not a git repository")
         sys.exit(1)
 
     versions = VERSIONS if args.all else args.versions
+    if args.all and args.free_threaded:
+        versions = [v for v in versions if version_tuple(v)[1] >= 13]
     if not versions:
         print("Error: specify versions or --all")
         parser.print_help()
@@ -515,7 +593,9 @@ def main():
     for version in versions:
         if version not in VERSIONS:
             print(f"Warning: {version} is not in the known list {VERSIONS}")
-        write_binding_file(args.cpython, version, args.output)
+        write_binding_file(
+            args.cpython, args.installed, args.free_threaded, version, args.output
+        )
 
     print(f"\nDone! Generated {len(versions)} offset constant files in {args.output}")
 

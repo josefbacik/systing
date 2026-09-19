@@ -4,7 +4,7 @@
 /// binaries for version info and _PyRuntime symbol, computes runtime addresses.
 use super::offsets;
 use super::process::{self, MemoryMapping};
-use super::types::{BpfLibBinaryId, PyPidData, BPF_LIB_DEFAULT_FIELD_OFFSET};
+use super::types::{BpfLibBinaryId, OffsetConfig, PyPidData, BPF_LIB_DEFAULT_FIELD_OFFSET};
 use object::read::{ReadCache, ReadRef};
 use object::{Object, ObjectSymbol};
 use std::collections::HashMap;
@@ -24,6 +24,9 @@ struct ElfPyInfo {
     py_runtime_addr: usize,
     version: (i32, i32, i32),
     is_dynamic: bool,
+    /// Whether this is a free-threaded build, which the runtime says of itself
+    /// from 3.13 on (see `read_free_threaded`). `None`: it does not say.
+    free_threaded: Option<bool>,
 }
 
 /// Per-binary ELF parse results keyed by (st_dev, st_ino, st_size). `None`
@@ -109,11 +112,19 @@ fn parse_elf_py_info(file_path: &str, file: &fs::File) -> Option<Arc<ElfPyInfo>>
             py_runtime_addr,
             version,
             is_dynamic: elf.kind() == object::ObjectKind::Dynamic,
+            free_threaded: read_free_threaded(&elf, &reader, py_runtime_addr, version),
         }))
     });
     let elapsed = start.elapsed().as_secs_f64();
-    if result.is_some() {
+    if let Some(info) = &result {
         eprintln!("[pystacks] Parsed Python runtime ELF {file_path} in {elapsed:.2}s");
+        let (major, minor, _) = info.version;
+        if let Err(Some(why)) = offsets_for(major, minor, info.free_threaded) {
+            eprintln!(
+                "[pystacks] {file_path}: {why}; Python frames will not be collected \
+                 for processes running it"
+            );
+        }
     } else if elapsed >= SLOW_REJECT_SECS {
         eprintln!("[pystacks] Rejected non-Python ELF {file_path} in {elapsed:.2}s");
     }
@@ -242,8 +253,8 @@ fn try_python_module(
     let py_runtime_addr = elf_info.py_runtime_addr;
     let (major, minor, micro) = elf_info.version;
 
-    // Get offset config for this version
-    let offsets = offsets::for_version(major, minor)?;
+    // Get offset config for this version and build
+    let offsets = offsets_for(major, minor, elf_info.free_threaded).ok()?;
 
     // Find base load address from maps
     let base_addr = find_module_base_address(maps, module_path).unwrap_or(0);
@@ -324,9 +335,13 @@ fn try_python_module(
         }
     }
 
+    let build = match elf_info.free_threaded {
+        Some(true) => " (free-threaded)",
+        _ => "",
+    };
     eprintln!(
-        "[pystacks] Process {} uses Python {}.{}.{} - runtime at {:#x}",
-        pid, major, minor, micro, effective_runtime_addr
+        "[pystacks] Process {} uses Python {}.{}.{}{} - runtime at {:#x}",
+        pid, major, minor, micro, build, effective_runtime_addr
     );
 
     Some(PyProcessInfo {
@@ -388,6 +403,117 @@ fn detect_python_version<'data, R: ReadRef<'data>>(
     parse_version_from_path(module_path)
 }
 
+/// Up to `len` bytes at virtual address `va`, read from the file range of the
+/// allocated section that holds it. Only allocated sections with an address
+/// are candidates (non-allocated ones carry no virtual address, and
+/// `.bss`-style sections have no file bytes), so the lookup does not depend on
+/// section order. The range arithmetic is checked: a malformed header whose
+/// address plus size wraps is skipped rather than matched, in the release
+/// build as in the test profile.
+fn bytes_at<'data, R: ReadRef<'data>>(
+    elf: &object::File<'data, R>,
+    reader: R,
+    va: u64,
+    len: u64,
+) -> Option<&'data [u8]> {
+    use object::{ObjectSection, SectionFlags};
+
+    let alloc_flag = u64::from(object::elf::SHF_ALLOC);
+    elf.sections().find_map(|section| {
+        let allocated = match section.flags() {
+            SectionFlags::Elf { sh_flags } => sh_flags & alloc_flag != 0,
+            _ => false,
+        };
+        let (s_addr, s_size) = (section.address(), section.size());
+        let s_end = s_addr.checked_add(s_size)?;
+        if !allocated || s_addr == 0 || va < s_addr || va >= s_end {
+            return None;
+        }
+        let (file_off, file_size) = section.file_range()?;
+        let within = va - s_addr;
+        if within >= file_size {
+            return None;
+        }
+        let len = len.min(file_size - within);
+        let at = file_off.checked_add(within)?;
+        reader.read_bytes_at(at, len).ok()
+    })
+}
+
+/// What `_PyRuntime` starts with in a Python that publishes its offsets.
+const DEBUG_OFFSETS_COOKIE_BYTES: &[u8; 8] = b"xdebugpy";
+
+/// Whether the runtime in `elf` is a free-threaded build: from 3.13 on
+/// `_PyRuntime` starts with a `_Py_DebugOffsets` that says so, and as the
+/// table is initialized data it is in the file. `None` when it is not there,
+/// or is not the table of this `version`.
+fn read_free_threaded<'data, R: ReadRef<'data>>(
+    elf: &object::File<'data, R>,
+    reader: R,
+    py_runtime_addr: usize,
+    version: (i32, i32, i32),
+) -> Option<bool> {
+    let (major, minor, _) = version;
+    let in_runtime = offsets::object_offsets_for_version(major, minor)?.runtime_debug_offsets;
+    let table_addr = py_runtime_addr.checked_add(in_runtime)?;
+    // free_threaded is the last of the three words that are read
+    let len = offsets::DEBUG_OFFSETS_FREE_THREADED + 8;
+    parse_free_threaded(
+        bytes_at(elf, reader, table_addr as u64, len as u64)?,
+        major,
+        minor,
+    )
+}
+
+/// The `free_threaded` word of the `_Py_DebugOffsets` that `table` starts
+/// with. It is only believed behind the table's cookie and a version word
+/// (PY_VERSION_HEX) of Python `major`.`minor`, and when it is 0 or 1.
+fn parse_free_threaded(table: &[u8], major: i32, minor: i32) -> Option<bool> {
+    let word = |at: usize| {
+        let bytes = table.get(at..)?.get(..8)?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    };
+    if word(offsets::DEBUG_OFFSETS_COOKIE)? != u64::from_le_bytes(*DEBUG_OFFSETS_COOKIE_BYTES) {
+        return None;
+    }
+    let version = word(offsets::DEBUG_OFFSETS_VERSION)?;
+    if (version >> 24, (version >> 16) & 0xff) != (major as u64, minor as u64) {
+        return None;
+    }
+    match word(offsets::DEBUG_OFFSETS_FREE_THREADED)? {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// The offsets to walk a Python `major`.`minor` with, when its binary says
+/// `free_threaded` of which build it is (`None`: it does not say). `Err` when
+/// it is not to be walked, with why where that is worth saying.
+fn offsets_for(
+    major: i32,
+    minor: i32,
+    free_threaded: Option<bool>,
+) -> Result<OffsetConfig, Option<String>> {
+    let free_threaded = match free_threaded {
+        Some(free_threaded) => free_threaded,
+        // Up to 3.13 a frame holds plain pointers: the default build's offsets
+        // read as they always have.
+        None if minor < 14 => false,
+        // From 3.14 on it holds tagged ones, and the wrong build's offsets can
+        // read wrong names out of them.
+        None => {
+            return Err(Some(format!(
+                "Python {major}.{minor}, but its runtime table does not say whether this is \
+                 the default or the free-threaded build"
+            )))
+        }
+    };
+    offsets::for_build(major, minor, free_threaded).ok_or_else(|| {
+        free_threaded.then(|| format!("free-threaded Python {major}.{minor} is not supported"))
+    })
+}
+
 /// Try to read the _PySys_ImplCacheTag string from ELF.
 ///
 /// Reads only the bytes it needs, straight from the file through `reader`:
@@ -401,8 +527,6 @@ fn read_impl_cache_tag<'data, R: ReadRef<'data>>(
     elf: &object::File<'data, R>,
     reader: R,
 ) -> Option<String> {
-    use object::{ObjectSection, SectionFlags};
-
     /// "cpython-313" is 11 bytes; the tag never approaches this.
     const TAG_MAX_LEN: u64 = 32;
 
@@ -417,35 +541,7 @@ fn read_impl_cache_tag<'data, R: ReadRef<'data>>(
         return None;
     }
 
-    // Up to `TAG_MAX_LEN` bytes at a virtual address, read from the file
-    // range of the allocated section that holds it. Only allocated sections
-    // with an address are candidates (non-allocated ones carry no virtual
-    // address, and `.bss`-style sections have no file bytes), so the lookup
-    // does not depend on section order. The range arithmetic is checked: a
-    // malformed header whose address plus size wraps is skipped rather than
-    // matched, in the release build as in the test profile.
-    let alloc_flag = u64::from(object::elf::SHF_ALLOC);
-    let bytes_at = |va: u64| -> Option<&'data [u8]> {
-        elf.sections().find_map(|section| {
-            let allocated = match section.flags() {
-                SectionFlags::Elf { sh_flags } => sh_flags & alloc_flag != 0,
-                _ => false,
-            };
-            let (s_addr, s_size) = (section.address(), section.size());
-            let s_end = s_addr.checked_add(s_size)?;
-            if !allocated || s_addr == 0 || va < s_addr || va >= s_end {
-                return None;
-            }
-            let (file_off, file_size) = section.file_range()?;
-            let within = va - s_addr;
-            if within >= file_size {
-                return None;
-            }
-            let len = TAG_MAX_LEN.min(file_size - within);
-            let at = file_off.checked_add(within)?;
-            reader.read_bytes_at(at, len).ok()
-        })
-    };
+    let bytes_at = |va: u64| bytes_at(elf, reader, va, TAG_MAX_LEN);
 
     let at_symbol = bytes_at(addr)?;
 
@@ -578,6 +674,72 @@ mod tests {
     #[test]
     fn test_kmkdev() {
         assert_eq!(kmkdev(8, 1), (8 << 20) | 1);
+    }
+
+    /// PY_VERSION_HEX of the final releases 3.14.7 and 3.13.15.
+    const HEX_3_14_7: u64 = 0x030e_07f0;
+    const HEX_3_13_15: u64 = 0x030d_0ff0;
+
+    /// The start of a `_Py_DebugOffsets`: cookie, version, free_threaded.
+    fn debug_offsets(cookie: &[u8; 8], version: u64, free_threaded: u64) -> Vec<u8> {
+        let mut table = cookie.to_vec();
+        table.extend(version.to_le_bytes());
+        table.extend(free_threaded.to_le_bytes());
+        table
+    }
+
+    #[test]
+    fn test_parse_free_threaded() {
+        let parse = |cookie, version, word| {
+            parse_free_threaded(&debug_offsets(cookie, version, word), 3, 14)
+        };
+        assert_eq!(parse(b"xdebugpy", HEX_3_14_7, 0), Some(false));
+        assert_eq!(parse(b"xdebugpy", HEX_3_14_7, 1), Some(true));
+        // Not the table, not this Python's (an older one's, a newer one's,
+        // another major's), not a flag, or not all of it.
+        assert_eq!(parse(b"xdebugpz", HEX_3_14_7, 1), None);
+        assert_eq!(parse(b"xdebugpy", HEX_3_13_15, 1), None);
+        assert_eq!(parse(b"xdebugpy", 0x030f_00a1, 1), None);
+        assert_eq!(parse(b"xdebugpy", 0x040e_07f0, 1), None);
+        assert_eq!(parse(b"xdebugpy", HEX_3_14_7, 2), None);
+        let cut_short = &debug_offsets(b"xdebugpy", HEX_3_14_7, 1)[..23];
+        assert_eq!(parse_free_threaded(cut_short, 3, 14), None);
+        assert_eq!(parse_free_threaded(&[], 3, 14), None);
+        // A 3.13's own table is believed for a 3.13.
+        let of_3_13 = debug_offsets(b"xdebugpy", HEX_3_13_15, 1);
+        assert_eq!(parse_free_threaded(&of_3_13, 3, 13), Some(true));
+    }
+
+    #[test]
+    fn test_offsets_for() {
+        let object_type = |minor, free_threaded| {
+            offsets_for(3, minor, free_threaded)
+                .map(|c| (c.py_object_type, c.py_frame_object_owner))
+        };
+        // The binary says which build: that build's offsets, or none.
+        assert_eq!(object_type(14, Some(false)), Ok((8, 74)));
+        assert_eq!(object_type(14, Some(true)), Ok((24, 78)));
+        assert_eq!(object_type(13, Some(false)), Ok((8, 70)));
+        assert_eq!(object_type(15, Some(false)), Ok((8, 74))); // falls back to 3.14
+        for minor in [13, 15] {
+            let why = object_type(minor, Some(true)).unwrap_err().unwrap();
+            assert_eq!(
+                why,
+                format!("free-threaded Python 3.{minor} is not supported")
+            );
+        }
+        // It does not say: as ever up to 3.13, and not walked from 3.14 on,
+        // never the default build's offsets on a guess.
+        assert_eq!(object_type(11, None), Ok((8, 9999)));
+        assert_eq!(object_type(12, None), Ok((8, 70)));
+        assert_eq!(object_type(13, None), Ok((8, 70)));
+        for minor in [14, 15] {
+            let why = object_type(minor, None).unwrap_err().unwrap();
+            assert!(why.starts_with(&format!("Python 3.{minor}, but")), "{why}");
+        }
+        // No offsets for the version at all: nothing is said, as before.
+        assert_eq!(object_type(7, None), Err(None));
+        assert_eq!(offsets_for(2, 7, None).map(|_| ()), Err(None));
     }
 
     #[test]
@@ -841,6 +1003,10 @@ mod tests {
                 );
             }
             assert_ne!(info.py_runtime_addr, 0);
+            // These are all default builds, and from 3.13 on the file says so.
+            if rt.minor >= 13 {
+                assert_eq!(info.free_threaded, Some(false), "{}", rt.path.display());
+            }
 
             let file = fs::File::open(&rt.path).unwrap();
             let reader = ReadCache::new(&file);
@@ -878,6 +1044,55 @@ mod tests {
         );
     }
 
+    /// The C compiler that builds a fixture: its name, and a call of it with
+    /// `flags`, an output and a source. `None` on a host without one, which in
+    /// CI fails the `what` check instead (see `skip_or_fail_without_runtime`).
+    struct FixtureCc {
+        cc: String,
+        compile: Compile,
+    }
+    type Compile = Box<dyn Fn(&[&str], &Path, &Path) -> bool>;
+
+    fn fixture_cc(what: &str) -> Option<FixtureCc> {
+        use std::process::Command;
+
+        // `CC` may carry a driver prefix ("sccache clang", "ccache cc"), as
+        // the cc crate accepts it: the first word is the program.
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let mut cc_words = cc.split_whitespace();
+        let cc_prog = cc_words.next().unwrap_or("cc").to_string();
+        let cc_args: Vec<String> = cc_words.map(String::from).collect();
+        if Command::new(&cc_prog)
+            .args(&cc_args)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no C compiler ({cc}) on this host: the built-fixture {what} check must not \
+                 pass vacuously in CI"
+            );
+            eprintln!("no C compiler ({cc}) on this host: skipping the built-fixture {what} check");
+            return None;
+        }
+        let compile = move |flags: &[&str], out: &Path, src: &Path| -> bool {
+            Command::new(&cc_prog)
+                .args(&cc_args)
+                .args(flags)
+                .arg("-o")
+                .arg(out)
+                .arg(src)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        Some(FixtureCc {
+            cc,
+            compile: Box::new(compile),
+        })
+    }
+
     /// A stand-in CPython runtime built on the spot: the two symbols
     /// discovery keys on and nothing else, with a cache tag no real build
     /// has and a filename that carries no version, so the version the lazy
@@ -894,40 +1109,10 @@ mod tests {
     /// skipping it, for the same reason as `skip_or_fail_without_runtime`.
     #[test]
     fn test_read_impl_cache_tag_on_a_built_fixture() {
-        use std::process::Command;
-
         const TAG: &str = "cpython-399";
-        // `CC` may carry a driver prefix ("sccache clang", "ccache cc"), as
-        // the cc crate accepts it: the first word is the program.
-        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-        let mut cc_words = cc.split_whitespace();
-        let cc_prog = cc_words.next().unwrap_or("cc").to_string();
-        let cc_args: Vec<String> = cc_words.map(String::from).collect();
-        let compile = |flags: &[&str], out: &Path, src: &Path| -> bool {
-            Command::new(&cc_prog)
-                .args(&cc_args)
-                .args(flags)
-                .arg("-o")
-                .arg(out)
-                .arg(src)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        };
-        if Command::new(&cc_prog)
-            .args(&cc_args)
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "no C compiler ({cc}) on this host: the built-fixture tag check must not \
-                 pass vacuously in CI"
-            );
-            eprintln!("no C compiler ({cc}) on this host: skipping the built-fixture tag check");
+        let Some(FixtureCc { cc, compile }) = fixture_cc("tag") else {
             return;
-        }
+        };
         let dir = tempfile::tempdir().unwrap();
         let src_string = dir.path().join("string.c");
         let src_pointer = dir.path().join("pointer.c");
@@ -991,10 +1176,58 @@ mod tests {
             );
             assert_eq!(info.is_dynamic, expect_dynamic, "{}", path.display());
             assert_ne!(info.py_runtime_addr, 0, "{}", path.display());
+            // A zeroed `_PyRuntime` has no bytes in the file, so no table.
+            assert_eq!(info.free_threaded, None, "{}", path.display());
             checked += 1;
         }
         assert!(checked >= 1);
         eprintln!("built-fixture check: {checked} fixture(s) read their cache tag");
+    }
+
+    /// The stand-in runtime again, starting `_PyRuntime` as 3.13+ does: the
+    /// free-threaded word is read out of the file's initialized data, and
+    /// only believed behind the cookie and this Python's version.
+    #[test]
+    fn test_read_free_threaded_on_a_built_fixture() {
+        let Some(FixtureCc { cc, compile }) = fixture_cc("free-threaded word") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("free-threaded", b"xdebugpy", HEX_3_14_7, 1, Some(true)),
+            ("default", b"xdebugpy", HEX_3_14_7, 0, Some(false)),
+            ("other-cookie", b"xdebugpz", HEX_3_14_7, 1, None),
+            ("other-version", b"xdebugpy", HEX_3_13_15, 1, None),
+        ];
+        for (name, cookie, version, word, expected) in cases {
+            let src = dir.path().join(format!("{name}.c"));
+            let so = dir.path().join(format!("fixture-{name}.so"));
+            let cookie = cookie.map(|b| b.to_string()).join(", ");
+            fs::write(
+                &src,
+                format!(
+                    "const char _PySys_ImplCacheTag[] = \"cpython-314\";\n\
+                     struct {{ char cookie[8]; unsigned long long version, free_threaded; \
+                     char rest[40]; }}\n\
+                     _PyRuntime = {{ {{ {cookie} }}, {version:#x}ULL, {word}ULL, {{ 0 }} }};\n\
+                     int systing_fixture_keep(void) {{ return _PyRuntime.cookie[0]; }}\n"
+                ),
+            )
+            .unwrap();
+            let built = compile(&["-shared", "-fPIC"], &so, &src);
+            assert!(built, "{cc} could not build the {name} fixture");
+            let info = elf_py_info(&so.to_string_lossy())
+                .unwrap_or_else(|| panic!("the {name} fixture was not recognized as a runtime"));
+            assert_eq!((info.version.0, info.version.1), (3, 14), "{name}");
+            assert_eq!(info.free_threaded, expected, "{name}");
+            // And what discovery makes of it for a process (ours, which maps
+            // none of this): that build's offsets, or no walk at all.
+            let pid = std::process::id() as i32;
+            let ob_type = try_python_module(pid, &so.to_string_lossy(), &[], false)
+                .map(|process| process.pid_data.offsets.py_object_type);
+            let expected_ob_type = expected.map(|free_threaded| if free_threaded { 24 } else { 8 });
+            assert_eq!(ob_type, expected_ob_type, "{name}");
+        }
     }
 
     /// Bytes this THREAD has requested through read(2) so far (`rchar` in
