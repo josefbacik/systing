@@ -51,8 +51,9 @@ fn current_cgroup_v2_path() -> Option<String> {
 /// Python versions used by pystacks integration tests.
 /// Install these via: ./scripts/setup-pystacks.sh
 ///
-/// Per-version tests (test_pystacks_python38 .. test_pystacks_python314)
-/// exercise each version individually so failures can be narrowed down.
+/// Per-version tests (test_pystacks_python38 .. test_pystacks_python314, and
+/// test_pystacks_python314t for the free-threaded build) exercise each
+/// version individually so failures can be narrowed down.
 const PYTHON_38_VERSION: &str = "3.8.20";
 const PYTHON_39_VERSION: &str = "3.9.25";
 const PYTHON_310_VERSION: &str = "3.10.19";
@@ -60,19 +61,28 @@ const PYTHON_311_VERSION: &str = "3.11.14";
 const PYTHON_312_VERSION: &str = "3.12.12";
 const PYTHON_313_VERSION: &str = "3.13.11";
 const PYTHON_314_VERSION: &str = "3.14.6";
+/// The free-threaded build of the same release (pyenv's `t` suffix, a
+/// `--disable-gil` build): a different ABI, walked with its own offsets.
+const PYTHON_314T_VERSION: &str = "3.14.6t";
 
 /// Get the path to a pyenv-installed Python binary.
 ///
 /// Checks `$PYENV_ROOT/versions/<version>/bin/python<major.minor>` first
 /// (works under sudo -E where HOME is reset but PYENV_ROOT is preserved),
 /// then falls back to `$HOME/.pyenv/versions/<version>/bin/python<major.minor>`.
+/// A free-threaded release (`3.14.6t`) carries its ABI flag on the binary's
+/// name too (`python3.14t`), so the flag travels from the version to the name.
 /// Returns `None` if the binary is not found (caller decides whether to skip or panic).
 fn try_pyenv_python(version: &str) -> Option<PathBuf> {
-    let parts: Vec<&str> = version.split('.').collect();
+    let (numeric, abiflags) = match version.strip_suffix('t') {
+        Some(numeric) => (numeric, "t"),
+        None => (version, ""),
+    };
+    let parts: Vec<&str> = numeric.split('.').collect();
     if parts.len() != 3 {
         return None;
     }
-    let short = format!("{}.{}", parts[0], parts[1]);
+    let short = format!("{}.{}{abiflags}", parts[0], parts[1]);
 
     // Prefer PYENV_ROOT (preserved by sudo -E even when HOME is reset to /root)
     let pyenv_root = std::env::var("PYENV_ROOT")
@@ -3082,6 +3092,15 @@ fn test_pystacks_python313() {
 #[ignore]
 fn test_pystacks_python314() {
     run_pystacks_version_test(PYTHON_314_VERSION);
+}
+
+/// The free-threaded build reads its own offsets table, chosen by the
+/// `free_threaded` word of the binary's `_Py_DebugOffsets`; walked with the
+/// default 3.14 table it would yield no names.
+#[test]
+#[ignore]
+fn test_pystacks_python314t() {
+    run_pystacks_version_test(PYTHON_314T_VERSION);
 }
 
 // =============================================================================

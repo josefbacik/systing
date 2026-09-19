@@ -36,7 +36,8 @@ if [[ -f "$SETUP_PYSTACKS" ]]; then
         echo "WARNING: pyenv is not installed. Pystacks integration tests will fail."
         echo "Install pyenv and run: ./scripts/setup-pystacks.sh"
     else
-        mapfile -t REQUIRED_PYVERSIONS < <(grep -o '"[0-9]*\.[0-9]*\.[0-9]*"' "$SETUP_PYSTACKS" | tr -d '"')
+        # A free-threaded release carries pyenv's "t" suffix ("3.14.6t").
+        mapfile -t REQUIRED_PYVERSIONS < <(grep -o '"[0-9]*\.[0-9]*\.[0-9]*t\?"' "$SETUP_PYSTACKS" | tr -d '"')
         NEEDS_PYSETUP=false
         for ver in "${REQUIRED_PYVERSIONS[@]}"; do
             if ! pyenv versions --bare 2>/dev/null | sed 's/^[[:space:]]*//' | grep -qx "$ver"; then
