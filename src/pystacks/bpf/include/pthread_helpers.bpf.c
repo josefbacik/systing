@@ -5,44 +5,80 @@
 #include "bpf_read_helpers.bpf.h"
 #include "task_helpers.bpf.h"
 
-#if __aarch64__ || __riscv64__
 /*
- * On TLS-variant-1 architectures (aarch64, riscv64) the thread pointer
- * addresses the 16-byte TCB, not struct pthread: the descriptor sits at
- * tp - sizeof(struct pthread), and that distance is tail-anchored — it
- * changes when glibc grows or shrinks struct pthread (e.g. 1856 bytes in
- * glibc 2.36 vs 1824 in 2.41 on aarch64). Head-anchored offsets are
- * stable across those same versions, so instead of the thread pointer we
- * derive the descriptor from pointers glibc registers with the kernel,
- * which point into the descriptor head.
+ * glibc's struct pthread, head-anchored: the three offsets the walker relies
+ * on, per architecture. On x86-64 the thread pointer (fsbase) IS the
+ * descriptor and its head is the full tcbhead_t (0x2c0 bytes); on the
+ * TLS-variant-1 architectures (aarch64, riscv64) the thread pointer
+ * addresses the 16-byte TCB, the descriptor sits at tp - sizeof(struct
+ * pthread) — a tail-anchored distance that changes when glibc grows or
+ * shrinks struct pthread (1856 bytes in glibc 2.36 vs 1824 in 2.41 on
+ * aarch64) — and the head is the 24-pointer padding (192 bytes). After the
+ * head, the same generic-nptl layout on all three: list_head (16), tid (4),
+ * pid_ununsed (4), robust_prev (8), robust_head (24), cleanup (8),
+ * cleanup_jmp_buf (8), cancelhandling (4), flags (4), specific_1stblock.
+ */
+#if __x86_64__
+#define GLIBC_PTHREAD_TID_OFFSET 0x2d0
+#define GLIBC_PTHREAD_ROBUST_HEAD_OFFSET 0x2e0
+#define GLIBC_PTHREAD_SPECIFIC_1STBLOCK_OFFSET 0x310
+#elif __aarch64__ || __riscv64__
+#define GLIBC_PTHREAD_TID_OFFSET 0xd0
+#define GLIBC_PTHREAD_ROBUST_HEAD_OFFSET 0xe0
+#define GLIBC_PTHREAD_SPECIFIC_1STBLOCK_OFFSET 0x110
+#else
+#error "Unsupported platform"
+#endif
+
+/*
+ * The descriptor of the current thread, or NULL when it is not laid out the
+ * way the offsets above say.
  *
- * glibc registers &pthread->tid as the kernel clear-child-tid pointer
- * (set_tid_address is called for the main thread too). 0xd0 is
- * offsetof(struct pthread, tid) for the generic-nptl layout both
- * architectures share: 24-pointer header padding (192) + list_head (16).
+ * glibc registers two pointers INTO the descriptor with the kernel:
+ * &pthread->tid as the clear-child-tid pointer (set_tid_address for the
+ * main thread, CLONE_CHILD_CLEARTID for the others) and &pthread->robust_head
+ * as the robust-list pointer (set_robust_list). Both sit at fixed
+ * head-anchored offsets, so on x86-64 the thread pointer is the candidate
+ * and on the TLS-variant-1 architectures the candidate is derived from the
+ * clear-child-tid pointer; either way the candidate is trusted only when
+ * both registered pointers sit where glibc puts them. A C library with
+ * another layout registers the same two pointers from its own descriptor
+ * (musl keeps them 0x58 apart — tid at 0x30 and the robust list at 0x88 on
+ * x86-64, 0x20 and 0x78 on aarch64 — where glibc keeps them 0x10 apart), so
+ * the check refuses it without reading a byte of user memory, and the
+ * walker then reports no thread state instead of reading through the wrong
+ * offsets.
  */
 static __always_inline void* get_glibc_pthread_descriptor(
     const struct task_struct* cur_task) {
-  const uint32_t offsetof_tid = 0xd0;
   void* clear_child_tid = (void*)BPF_PROBE_READ(cur_task, clear_child_tid);
-  if (!IS_VALID_USER_SPACE_ADDRESS(clear_child_tid))
-      return NULL;
-  return (char*)clear_child_tid - offsetof_tid;
+  void* robust_list = (void*)BPF_PROBE_READ(cur_task, robust_list);
+  if (!IS_VALID_USER_SPACE_ADDRESS(clear_child_tid) ||
+      !IS_VALID_USER_SPACE_ADDRESS(robust_list)) {
+    return NULL;
+  }
+#if __x86_64__
+  void* descriptor = (void*)BPF_PROBE_READ(cur_task, thread.fsbase);
+  if (!IS_VALID_USER_SPACE_ADDRESS(descriptor)) {
+    return NULL;
+  }
+#else
+  void* descriptor = (char*)clear_child_tid - GLIBC_PTHREAD_TID_OFFSET;
+#endif
+  if ((char*)clear_child_tid != (char*)descriptor + GLIBC_PTHREAD_TID_OFFSET ||
+      (char*)robust_list != (char*)descriptor + GLIBC_PTHREAD_ROBUST_HEAD_OFFSET) {
+    return NULL;
+  }
+  return descriptor;
 }
 
-/*
- * glibc registers &pthread->robust_head as the kernel robust-list pointer.
- * specific_1stblock is 0x30 bytes after robust_head in both of glibc's
- * robust-mutex layouts.
- */
 static __always_inline void* get_glibc_specific1stblock(
     const struct task_struct* cur_task) {
-  void* robust_list = (void*)BPF_PROBE_READ(cur_task, robust_list);
-  return IS_VALID_USER_SPACE_ADDRESS(robust_list)
-      ? (char*)robust_list + 0x30
+  void* descriptor = get_glibc_pthread_descriptor(cur_task);
+  return descriptor
+      ? (char*)descriptor + GLIBC_PTHREAD_SPECIFIC_1STBLOCK_OFFSET
       : NULL;
 }
-#endif
 
 // Read the current value of the pthread tls slot, mirroring the logic
 // in pthread_getspecific().
@@ -55,18 +91,11 @@ __hidden int probe_read_pthread_tls_slot(
     void** value,
     struct task_struct* task) {
   struct task_struct* cur_task = get_current_task(task);
-#if __x86_64__
-  void* tls_base = (void*)BPF_PROBE_READ(cur_task, thread.fsbase);
-  void* specific1stblock = (char*)tls_base + 0x310;
-#elif __aarch64__ || __riscv64__
   void* specific1stblock = get_glibc_specific1stblock(cur_task);
   if (!specific1stblock) {
     *value = 0;
     return -1;
   }
-#else
-#error "Unsupported platform"
-#endif
 
   // Assuming implementation of pthread_getspecific() described here:
   //   https://fburl.com/2rgefzmn

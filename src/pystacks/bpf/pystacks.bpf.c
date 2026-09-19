@@ -1063,18 +1063,33 @@ static __always_inline bool use_shadow_frame(
       offsets->PyShadowFrame_PYSF_PYFRAME != BPF_LIB_DEFAULT_FIELD_OFFSET;
 }
 
-static __always_inline int
-get_pthread_id_match(void* thread_state, void* tls_base, PyPidData* pid_data) {
+/*
+ * Whether the thread state found through the TLS slot was bound by the
+ * thread whose descriptor we derived: CPython stores pthread_self() of the
+ * binding thread in PyThreadState.thread, and on glibc pthread_self() is
+ * the descriptor's own address, so a MATCH is the witness that both the
+ * descriptor derivation and the TLS-slot read landed on this thread's
+ * glibc structures. A MISMATCH means a thread state bound by another
+ * thread (an embedder creating a thread state in one thread and swapping it
+ * in from another, on 3.11 and older) or a descriptor laid out otherwise
+ * than assumed. Every word compared here lives in user memory.
+ */
+static __always_inline int get_pthread_id_match(
+    void* thread_state,
+    void* tls_base,
+    PyPidData* pid_data,
+    struct task_struct* task) {
   if (thread_state == 0) {
     return PYSTACKS_PTHREAD_ID_THREAD_STATE_NULL;
   }
 
   uint64_t pthread_self, pthread_created;
   long result;
-  result = bpf_probe_read_kernel(
+  result = bpf_probe_read_user_task(
       &pthread_created,
       sizeof(pthread_created),
-      thread_state + pid_data->offsets.PyThreadState_thread);
+      thread_state + pid_data->offsets.PyThreadState_thread,
+      task);
   if (result != 0) {
     return PYSTACKS_PTHREAD_ID_ERROR;
   }
@@ -1091,9 +1106,10 @@ get_pthread_id_match(void* thread_state, void* tls_base, PyPidData* pid_data) {
    */
   pthread_self = (uint64_t)tls_base;
 #else
-  // 0x10 = offsetof(struct pthread, header.self)
-  result = bpf_probe_read_kernel(
-      &pthread_self, sizeof(pthread_self), tls_base + 0x10);
+  // 0x10 = offsetof(struct pthread, header.self), the descriptor's own
+  // address as glibc keeps it in the TCB.
+  result = bpf_probe_read_user_task(
+      &pthread_self, sizeof(pthread_self), tls_base + 0x10, task);
   if (result != 0) {
     return PYSTACKS_PTHREAD_ID_ERROR;
   }
@@ -1206,21 +1222,22 @@ __hidden int pystacks_read_stacks_task(
   state->offsets = pid_data->offsets;
   state->cur_cpu = bpf_get_smp_processor_id();
 
-  // Get pointer of global PyThreadState, which should belong to the Thread
-  // currently holds the GIL
+  // The global PyThreadState of the thread holding the GIL, where the
+  // interpreter keeps one (_PyThreadState_Current, 3.11 and older; the
+  // address is left unset from 3.12 on, where it is thread-local). It lives
+  // in the traced process, so it is a user read.
   void* global_current_thread = (void*)0;
-  bpf_probe_read_kernel(
-      &global_current_thread,
-      sizeof(global_current_thread),
-      (void*)pid_data->current_state_addr);
+  if (pid_data->current_state_addr != 0) {
+    bpf_probe_read_user_task(
+        &global_current_thread,
+        sizeof(global_current_thread),
+        (void*)pid_data->current_state_addr,
+        task);
+  }
 
-#if __x86_64__
-  void* tls_base = (void*)BPF_PROBE_READ(cur_task, thread.fsbase);
-#elif __aarch64__ || __riscv64__
+  // The thread's glibc descriptor, NULL when the thread's registered
+  // pointers do not witness glibc's layout (pthread_helpers.bpf.c).
   void* tls_base = get_glibc_pthread_descriptor(cur_task);
-#else
-#error "Unsupported platform"
-#endif
 
   struct pystacks_message* py_msg = pystacks_get_msg();
   if (!py_msg) {
@@ -1247,9 +1264,11 @@ __hidden int pystacks_read_stacks_task(
         get_gil_state(thread_state, global_current_thread, pid_data, task);
 
     // Check for matching between pthread ID created current PyThreadState and
-    // pthread of actual current pthread
-    py_msg->pthread_id_match =
-        get_pthread_id_match(thread_state, tls_base, pid_data);
+    // pthread of actual current pthread; without a witnessed descriptor no
+    // slot was read and the thread state above is NULL.
+    py_msg->pthread_id_match = tls_base
+        ? get_pthread_id_match(thread_state, tls_base, pid_data, task)
+        : PYSTACKS_PTHREAD_ID_NO_DESCRIPTOR;
   } else {
     // Use the global PyThreadState if native TLS not available
     thread_state = global_current_thread;
@@ -1261,9 +1280,15 @@ __hidden int pystacks_read_stacks_task(
   py_msg->stack_status = PYSTACKS_STATUS_UNKNOWN;
   py_msg->async_stack_status = PYSTACKS_STATUS_UNKNOWN;
 
+  /*
+   * No frames to walk: the message is its header alone, and its length says
+   * so to pystacks_read_stacks(), which hands the header over — the
+   * diagnostic bytes (the pthread-id witness above all) are what tells a
+   * thread without a thread state from a descriptor that was not glibc's.
+   */
   if (!thread_state) {
     py_msg->probe_time_ns = bpf_ktime_get_ns() - sample_ts;
-    return 0; // PYSTACKS_SUCCESS;
+    return py_msg->header.len;
   }
 
   // Shadow frame usage is determined by availability off shadow frame
@@ -1276,7 +1301,7 @@ __hidden int pystacks_read_stacks_task(
       thread_state, &pid_data->offsets, state->sync_use_shadow_frame, task);
   if (!state->frame_ptr) {
     py_msg->probe_time_ns = bpf_ktime_get_ns() - sample_ts;
-    return 0; // PYSTACKS_SUCCESS; // Finalize sample.
+    return py_msg->header.len;
   }
 
   int py_stack_size = walk_and_load_py_stack(ctx, task);
@@ -1326,6 +1351,17 @@ __hidden int pystacks_read_stacks(
   }
 
   int py_stack_size = pystacks_read_stacks_global(ctx, pid);
+
+  if (py_stack_size == (int)offsetof(struct pystacks_message, buffer)) {
+    /* The walker ran and emitted no frame (no thread state behind the TLS
+     * slot, or an empty frame chain): hand over the header alone, whose
+     * diagnostic bytes — the pthread-id witness above all — say which. A
+     * process that is not Python returns a negative code and leaves the
+     * buffer as the sampler initialised it. */
+    bpf_probe_read_kernel(
+        py_msg_buffer, offsetof(struct pystacks_message, buffer), py_msg);
+    return py_stack_size;
+  }
 
   if (py_stack_size > 0 && (uint32_t)py_stack_size <= sizeof(*py_msg_buffer)) {
     /* Use bpf_probe_read_kernel with the fixed struct size to satisfy the

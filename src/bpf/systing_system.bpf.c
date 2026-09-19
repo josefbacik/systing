@@ -1579,6 +1579,7 @@ static struct memory_event *reserve_memory_event(long *flags)
 		memory_header_init(&event->hdr);
 #ifdef SYSTING_PYSTACKS
 		event->py_msg_buffer.stack_len = 0;
+		event->py_msg_buffer.pthread_id_match = 0;
 #endif
 	}
 	return event;
@@ -1938,6 +1939,12 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 
 #ifdef SYSTING_PYSTACKS
 	event->py_msg_buffer.stack_len = 0;
+	/*
+	 * The walker fills the message only for a Python process; a sample of
+	 * any other process leaves the rest of the buffer as the ring had it,
+	 * so the witness byte user space tallies is reset here to "unknown".
+	 */
+	event->py_msg_buffer.pthread_id_match = 0;
 	if (tool_config.collect_pystacks) {
 		struct pt_regs *pt_regs = (struct pt_regs *)bpf_task_pt_regs(task);
 		pystacks_read_stacks(pt_regs, NULL, &event->py_msg_buffer);
