@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * task-stacks recorder: a sleepable BPF task iterator. Userspace reads one
- * seq file from the iterator link per iteration; the program runs once per
- * thread on the host, in the process context of that read(2), and writes one
+ * task-stacks recorder: a sleepable BPF task iterator. Userspace reads a seq
+ * file from an iterator link; the program runs once per thread the link
+ * covers, in the process context of that read(2) -- every thread on the host
+ * for the plain link, one process's threads for a link scoped to it (see
+ * TaskStacksIter in task_stacks_recorder.rs) -- and writes one
  * variable-length record per targeted thread: struct task_stacks_event, then
  * kernel_stack_len kernel frames, user_stack_len user frames (u64 each, leaf
  * first) and py_len bytes of struct pystacks_message. A thread that has not run
@@ -107,6 +109,39 @@ struct {
 	__type(key, u32);
 	__type(value, struct task_stacks_scratch);
 } task_stacks_scratch SEC(".maps");
+
+/*
+ * What the walks cost: every task the capture's links handed the program, and
+ * of those the ones in the target set. A walk scoped to the targets visits
+ * little more than it records; the walk over the whole host visits every
+ * thread there is to record a few. Userspace reads the pair for its closing
+ * note, and the tests to tell which walk ran. One slot, and one reader of the
+ * capture's links at a time, so the adds never contend.
+ *
+ * group_threads is how userspace tells a walk of one process that the kernel
+ * cut short. A walk scoped to a process has no cursor in its thread list: to
+ * advance, the iterator looks the thread it last handed over up again by pid,
+ * and if that thread has exited meanwhile -- it may, while this program is
+ * unwinding it -- the walk ends there and the threads behind it are not
+ * visited. (The walk over every thread steps to the next pid that exists and
+ * has no such window.) So the program notes how many threads the group it has
+ * just entered has, userspace sets that against the threads its read visited
+ * -- the runs less the ones whose record did not fit the seq buffer, which the
+ * kernel hands over again -- and reads a process that came up short once more.
+ */
+struct task_stacks_walk_stats {
+	u64 visited;
+	u64 targeted;
+	u64 unsent;
+	u64 group_threads;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct task_stacks_walk_stats);
+} task_stacks_walk_stats SEC(".maps");
 
 static __always_inline void read_status(struct task_struct *task,
 					struct task_status *now)
@@ -289,6 +324,7 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 {
 	struct seq_file *seq = ctx->meta->seq;
 	struct task_struct *task = ctx->task;
+	struct task_stacks_walk_stats *stats;
 	struct task_stacks_scratch *s;
 	struct pystacks_message *py;
 	struct task_stacks_event *e;
@@ -301,11 +337,26 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	/* NULL once, after the last task. */
 	if (!task)
 		return 0;
+	/* Runs of the program, so a task whose record did not fit the seq
+	 * buffer and is handed over again counts again: it cost again. */
+	stats = bpf_map_lookup_elem(&task_stacks_walk_stats, &zero);
+	if (stats) {
+		__sync_fetch_and_add(&stats->visited, 1);
+		/* A group leader: the first task a walk scoped to a process is
+		 * handed, so what this holds when that read ends is that
+		 * process's thread count. */
+		if (task->pid == task->tgid)
+			stats->group_threads = task->signal->nr_threads;
+	}
 	/* The iterator runs in the reader's context: skip systing itself. */
 	if (task->tgid == bpf_get_current_pid_tgid() >> 32)
 		return 0;
+	/* Whatever the link covers: a walk scoped to the targets narrows what
+	 * is visited, never what is recorded. */
 	if (!task_in_target_set(task))
 		return 0;
+	if (stats)
+		__sync_fetch_and_add(&stats->targeted, 1);
 	s = get_scratch();
 	if (!s)
 		return 0;
@@ -331,7 +382,9 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 		e->kernel_stack_len = 0;
 		e->user_stack_len = 0;
 		e->py_len = 0;
-		bpf_seq_write(seq, e, sizeof(*e));
+		err = bpf_seq_write(seq, e, sizeof(*e));
+		if (err && stats)
+			__sync_fetch_and_add(&stats->unsent, 1);
 		return 0;
 	}
 
@@ -370,6 +423,52 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	 */
 	if (!err)
 		bpf_map_update_elem(&task_status, &tid, &now, BPF_ANY);
+	else if (stats)
+		__sync_fetch_and_add(&stats->unsent, 1);
+	return 0;
+}
+
+/*
+ * The processes of a cgroup, for the walk scoped to --cgroup targets: a cgroup
+ * iterator that userspace attaches to a target's directory, the cgroups below
+ * it included, and reads once per snapshot. For each cgroup it visits it
+ * writes the tgid of each process in it (u32 each), which the kernel hands
+ * over with the css_task open-coded iterator (Linux 6.7). Userspace then walks
+ * each of those processes with a link of the task iterator above scoped to it.
+ *
+ * It lists and does no more, for two reasons of the kernel's. A cgroup
+ * iterator's program runs with cgroup_mutex held: every cgroup operation on
+ * the host waits for it, so it must not unwind stacks there. And a cgroup
+ * iterator has one read session: all it writes, for the target and every
+ * cgroup below it, has to fit the iterator's seq buffer, eight pages and never
+ * grown. One cgroup's output over that fails the read with E2BIG, several
+ * cgroups' with EOPNOTSUPP once the first buffer has been read. On 4K pages
+ * the tgids of 8192 processes under one target fit it; the records of a dozen
+ * threads with deep stacks fill it. A read that fails is a snapshot that walks
+ * every thread instead.
+ *
+ * "?": loaded only where userspace asks for it, which it does where the
+ * kernel has the css_task iterator and the capture is one it is for. Elsewhere
+ * the object loads without it and the capture walks every thread, as before.
+ * The kfuncs are weak in vmlinux.h, so their absence is no relocation error.
+ */
+SEC("?iter/cgroup")
+int systing_task_stacks_members(struct bpf_iter__cgroup *ctx)
+{
+	struct seq_file *seq = ctx->meta->seq;
+	struct cgroup *cgrp = ctx->cgroup;
+	struct cgroup_subsys_state *css;
+	struct task_struct *task;
+
+	/* NULL once, after the last cgroup. */
+	if (!cgrp)
+		return 0;
+	css = &cgrp->self;
+	bpf_for_each(css_task, task, css, CSS_TASK_ITER_PROCS) {
+		u32 tgid = task->tgid;
+
+		bpf_seq_write(seq, &tgid, sizeof(tgid));
+	}
 	return 0;
 }
 

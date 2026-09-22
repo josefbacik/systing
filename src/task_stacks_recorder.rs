@@ -1,11 +1,15 @@
 //! The task-stacks recorder: periodic snapshots of every targeted thread's
 //! stack, taken with a sleepable BPF task iterator (`src/bpf/task_stacks.bpf.c`).
 //!
-//! Each iteration creates a fresh seq file from the iterator link and reads it
-//! to the end; the kernel runs the BPF program once per thread on the host,
+//! Each iteration opens a fresh seq file on an iterator link and reads it to
+//! the end; the kernel runs the BPF program once per thread the link covers,
 //! and the program writes one record per targeted thread: its identity, its
 //! user/system CPU time since its last record, its state, and its kernel,
-//! native user and Python frames (per [`TaskStackFrames`]). A thread that has
+//! native user and Python frames (per [`TaskStackFrames`]). A capture without
+//! targets walks every thread on the host; one with `--pid` or `--cgroup`
+//! targets walks their threads alone where the host allows it, a link per
+//! target process ([`TaskWalk`]), and every thread on the host where it does
+//! not, recording the same threads either way. A thread that has
 //! used no CPU time and sits in the same non-runnable state as at its last
 //! record cannot have changed its stack: for it the program skips the walk and
 //! writes a bare header flagged unchanged. The stacks are symbolized with the
@@ -23,16 +27,20 @@
 //! the Perfetto converter's business (`parquet_to_perfetto.rs`).
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::io::Read;
 use std::mem::MaybeUninit;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use libbpf_rs::libbpf_sys;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
@@ -331,23 +339,304 @@ fn parse_records(buf: &[u8]) -> Result<Vec<TaskSample>> {
     Ok(samples)
 }
 
+/// Forces the walk over every thread on the host, whatever the capture
+/// targets and whatever the kernel offers: the scoped walks' fallback,
+/// which this makes exercisable (and testable) on any kernel.
+const FULL_WALK_ENV: &str = "SYSTING_TASK_STACKS_FULL_WALK";
+
+/// The most target processes a snapshot walks one at a time. Each of those
+/// walks costs a link, a seq file and a handful of system calls on top of its
+/// threads' records: nothing beside a walk over every thread of a host, until
+/// the targets are a good part of the host themselves. Past this many the
+/// snapshot takes the one walk over everything.
+const SCOPED_WALK_MAX_PROCESSES: usize = 1024;
+
+/// The inode of the root pid namespace (the kernel's `PROC_PID_INIT_INO`).
+const ROOT_PID_NS_INO: u64 = 0xEFFF_FFFC;
+
+/// The kfunc that starts a walk over a cgroup's tasks (Linux 6.7).
+const CSS_TASK_ITER_KFUNC: &str = "bpf_iter_css_task_new";
+
+/// How a snapshot reaches the threads it records. Whichever it is, the BPF
+/// program tests every task it is handed against the capture's targets: a
+/// scoped walk narrows what is visited, never what is recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskWalk {
+    /// One walk over every thread on the host. What a capture without
+    /// targets asks for, what every capture did before the scoped walks, and
+    /// what one they do not cover still does.
+    Full,
+    /// `--pid` (the traced command's included): a walk per target process
+    /// over its threads alone, with the task iterator's `pid` parameter
+    /// (Linux 6.1, older than anything the iterator itself loads on). The
+    /// processes are the `pids` map's keys at each snapshot, so the children
+    /// the targets have during the capture are walked as soon as the fork
+    /// hook has added them.
+    ByPid,
+    /// `--cgroup` alone: the kernel lists the processes of each target cgroup
+    /// and of the cgroups below it (the css_task iterator, Linux 6.7) at each
+    /// snapshot, and each is walked as with `--pid`.
+    ByCgroup,
+}
+
+impl TaskWalk {
+    fn describe(self) -> &'static str {
+        match self {
+            TaskWalk::Full => "every thread on the host",
+            TaskWalk::ByPid => "the --pid targets' threads alone",
+            TaskWalk::ByCgroup => "the --cgroup targets' processes alone",
+        }
+    }
+}
+
+/// What the choice of walk rests on besides the capture's targeting, spelled
+/// out so a test can ask about hosts it does not run on.
+#[derive(Clone, Copy, Debug)]
+struct WalkFacts {
+    /// [`FULL_WALK_ENV`] is set.
+    force_full: bool,
+    /// systing runs in the root pid namespace. A scoped link looks its pid up
+    /// in the namespace of the process that reads it, while the targets are
+    /// kept, and matched by the BPF program, by their pid in the root one.
+    root_pid_ns: bool,
+    /// The kernel's BTF exports [`CSS_TASK_ITER_KFUNC`].
+    css_task_iter: bool,
+}
+
+impl WalkFacts {
+    fn of_this_host(filter: &TargetFilter) -> Self {
+        WalkFacts {
+            force_full: std::env::var_os(FULL_WALK_ENV).is_some_and(|v| !v.is_empty()),
+            root_pid_ns: std::fs::metadata("/proc/self/ns/pid")
+                .map(|ns| ns.ino() == ROOT_PID_NS_INO)
+                .unwrap_or(false),
+            // Asked of the BTF only by the capture that would use it.
+            css_task_iter: filter.filter_cgroup
+                && filter.cgroup_match_kernel
+                && !filter.filter_pid
+                && crate::systing_core::kernel_has_kfunc(CSS_TASK_ITER_KFUNC),
+        }
+    }
+}
+
+/// The walk a capture targeted as `filter` gets on a host like `facts`, and,
+/// when a capture with targets gets the full walk, why.
+fn choose_walk(filter: &TargetFilter, facts: &WalkFacts) -> (TaskWalk, Option<&'static str>) {
+    if !filter.filter_pid && !filter.filter_cgroup {
+        // No targets: every thread on the host is what was asked for.
+        return (TaskWalk::Full, None);
+    }
+    if facts.force_full {
+        return (TaskWalk::Full, Some("SYSTING_TASK_STACKS_FULL_WALK is set"));
+    }
+    if !facts.root_pid_ns {
+        return (
+            TaskWalk::Full,
+            Some(
+                "systing is not in the root pid namespace, which the targets' pids are counted in",
+            ),
+        );
+    }
+    if filter.filter_pid {
+        // With --cgroup as well the targets are the --pid processes that are
+        // in the cgroups: the pids are the shorter list, the program's test
+        // does the rest.
+        return (TaskWalk::ByPid, None);
+    }
+    if !filter.cgroup_match_kernel {
+        return (
+            TaskWalk::Full,
+            Some("--cgroup is matched against a start-time snapshot of cgroup ids here"),
+        );
+    }
+    if !facts.css_task_iter {
+        return (
+            TaskWalk::Full,
+            Some("this kernel's BTF does not export bpf_iter_css_task_new"),
+        );
+    }
+    (TaskWalk::ByCgroup, None)
+}
+
+/// Whether `dir`, a `--cgroup` target's directory, is a member of a threaded
+/// subtree (cgroup v2's threaded mode). There a thread and its process can sit
+/// in different cgroups, and the kernel lists a cgroup by process: a thread
+/// placed in the target whose process sits beside it would never be walked,
+/// where the walk over every thread matches it by its own cgroup. A type that
+/// cannot be read is taken for a domain's, in which every thread of a process
+/// is where its process is.
+fn in_threaded_subtree(dir: BorrowedFd<'_>) -> bool {
+    std::fs::read_to_string(format!("/proc/self/fd/{}/cgroup.type", dir.as_raw_fd()))
+        .is_ok_and(|kind| kind.trim() == "threaded")
+}
+
+/// Create an iterator link of `prog` with `link_info`'s parameters: what
+/// libbpf's own attach does, by file descriptor, so the link needs nothing of
+/// the skeleton the program came from. libbpf-rs's `attach_iter` only knows
+/// map iterators.
+fn create_iter_link(
+    prog: BorrowedFd<'_>,
+    link_info: &mut libbpf_sys::bpf_iter_link_info,
+) -> std::io::Result<OwnedFd> {
+    let opts = libbpf_sys::bpf_link_create_opts {
+        sz: std::mem::size_of::<libbpf_sys::bpf_link_create_opts>() as _,
+        iter_info: link_info as *mut libbpf_sys::bpf_iter_link_info,
+        iter_info_len: std::mem::size_of::<libbpf_sys::bpf_iter_link_info>() as _,
+        ..Default::default()
+    };
+    // SAFETY: `prog` is an open program, and `opts` and the `link_info` it
+    // points at outlive the call, which copies what it keeps.
+    let fd = unsafe {
+        libbpf_sys::bpf_link_create(
+            prog.as_raw_fd(),
+            0,
+            libbpf_sys::BPF_TRACE_ITER,
+            &opts as *const libbpf_sys::bpf_link_create_opts,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::from_raw_os_error(-fd));
+    }
+    // SAFETY: a non-negative return is a descriptor created for us to own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open a seq file on iterator link `link` and append all it has to `buf`:
+/// the read is what runs the link's program, in this thread.
+fn read_iter_link(link: BorrowedFd<'_>, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    // SAFETY: `link` is an open iterator link.
+    let fd = unsafe { libbpf_sys::bpf_iter_create(link.as_raw_fd()) };
+    if fd < 0 {
+        return Err(std::io::Error::from_raw_os_error(-fd));
+    }
+    // SAFETY: a non-negative return is a descriptor created for us to own.
+    let mut seq = unsafe { std::fs::File::from_raw_fd(fd) };
+    seq.read_to_end(buf)?;
+    Ok(())
+}
+
+/// The tgids the cgroup-members program wrote (`u32` each), appended to
+/// `tgids` in the order written, each once: a process is in one cgroup, but
+/// one target may lie below another.
+fn append_member_tgids(bytes: &[u8], seen: &mut HashSet<u32>, tgids: &mut Vec<u32>) {
+    for tgid in bytes.as_chunks::<4>().0 {
+        let tgid = u32::from_ne_bytes(*tgid);
+        if seen.insert(tgid) {
+            tgids.push(tgid);
+        }
+    }
+}
+
+/// What [`TaskStacksIter::load_object`] keeps of the object it loaded.
+struct LoadedObject {
+    link: libbpf_rs::Link,
+    prog: OwnedFd,
+    walk_stats: OwnedFd,
+    member_links: Vec<OwnedFd>,
+}
+
 /// The loaded and attached task iterator.
 ///
-/// Only the link is kept: it holds the kernel's references to the program
-/// (and the program to its maps), so the skeleton it came from can go.
+/// Only links and file descriptors are kept: they hold the kernel's
+/// references to the programs (and the programs to their maps), so the
+/// skeleton they came from can go.
 pub struct TaskStacksIter {
+    /// The link over every thread on the host: every snapshot's walk when
+    /// `walk` is [`TaskWalk::Full`], and that of any snapshot the scoped
+    /// walks cannot cover.
     link: libbpf_rs::Link,
+    walk: TaskWalk,
+    /// The iterator program, to scope a link of it to each target process.
+    prog: OwnedFd,
+    /// The capture's `--pid` targets as they stand: the main object's `pids`
+    /// map, which the fork hook grows.
+    pids: OwnedFd,
+    /// A link of the cgroup-members program per `--cgroup` target
+    /// ([`TaskWalk::ByCgroup`]).
+    member_links: Vec<OwnedFd>,
+    /// The program's count of the tasks it was handed and of those it found
+    /// targeted (`task_stacks_walk_stats`).
+    walk_stats: OwnedFd,
+    /// The snapshots of a scoped capture that took the full walk instead.
+    full_walk_snapshots: AtomicU64,
+    /// The scoped walks of one process that came up short and were read again.
+    reread_processes: AtomicU64,
+    /// Of those, the ones whose second walk came up short too.
+    still_short_processes: AtomicU64,
 }
 
 impl TaskStacksIter {
     /// Load the iterator with the capture's targeting, reading the main
     /// object's target and pystacks maps, collecting the stacks `mode` names.
+    /// `cgroup_dirs` are the `--cgroup` targets' directories (none when the
+    /// kernel does not decide `--cgroup` membership).
     pub fn load(
         filter: &TargetFilter,
         maps: &TargetFilterMaps<'_>,
         pystacks_maps: &SharedPystacksMaps<'_>,
         mode: TaskStackFrames,
+        cgroup_dirs: &[BorrowedFd<'_>],
     ) -> Result<Self> {
+        let (mut walk, mut why_full) = choose_walk(filter, &WalkFacts::of_this_host(filter));
+        if walk == TaskWalk::ByCgroup && cgroup_dirs.is_empty() {
+            (walk, why_full) = (
+                TaskWalk::Full,
+                Some("there is no --cgroup directory to list"),
+            );
+        }
+        if walk == TaskWalk::ByCgroup && cgroup_dirs.iter().any(|dir| in_threaded_subtree(*dir)) {
+            (walk, why_full) = (
+                TaskWalk::Full,
+                Some("a --cgroup target is in a threaded subtree, where a thread need not be in its process's cgroup"),
+            );
+        }
+        let loaded = if walk == TaskWalk::ByCgroup {
+            // The members program is one more thing a kernel can refuse, and
+            // nothing a capture should fail for: without it, the full walk.
+            match Self::load_object(filter, maps, pystacks_maps, mode, cgroup_dirs) {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    eprintln!("task-stacks: could not load the cgroup-members iterator: {e:#}");
+                    (walk, why_full) = (TaskWalk::Full, Some("the kernel refused the iterator"));
+                    Self::load_object(filter, maps, pystacks_maps, mode, &[])?
+                }
+            }
+        } else {
+            Self::load_object(filter, maps, pystacks_maps, mode, &[])?
+        };
+        // One line on which walk a capture with targets runs with: the first
+        // thing to read when its snapshots cost more, or see less, than hoped.
+        match why_full {
+            Some(why) => eprintln!("task-stacks: walking {}: {why}", walk.describe()),
+            None if walk != TaskWalk::Full => eprintln!("task-stacks: walking {}", walk.describe()),
+            None => {}
+        }
+        Ok(Self {
+            link: loaded.link,
+            walk,
+            prog: loaded.prog,
+            pids: maps
+                .pids
+                .try_clone_to_owned()
+                .context("Failed to keep the pids map for the task-stacks iterator")?,
+            member_links: loaded.member_links,
+            walk_stats: loaded.walk_stats,
+            full_walk_snapshots: AtomicU64::new(0),
+            reread_processes: AtomicU64::new(0),
+            still_short_processes: AtomicU64::new(0),
+        })
+    }
+
+    /// Open, configure, load and attach the object; with `member_dirs`, the
+    /// cgroup-members program too, a link of it on each directory and the
+    /// cgroups below it.
+    fn load_object(
+        filter: &TargetFilter,
+        maps: &TargetFilterMaps<'_>,
+        pystacks_maps: &SharedPystacksMaps<'_>,
+        mode: TaskStackFrames,
+        member_dirs: &[BorrowedFd<'_>],
+    ) -> Result<LoadedObject> {
         let mut storage = MaybeUninit::uninit();
         let mut open_skel = skel::TaskStacksSkelBuilder::default()
             .open(&mut storage)
@@ -378,6 +667,14 @@ impl TaskStacksIter {
             bss.pystacks_prog_cfg.stack_max_len = MAX_FRAMES as u32;
         }
 
+        // Off in the object ("?iter/cgroup"): on for the capture that reads it.
+        if !member_dirs.is_empty() {
+            open_skel
+                .progs
+                .systing_task_stacks_members
+                .set_autoload(true);
+        }
+
         let m = &mut open_skel.maps;
         maps.reuse_in(
             &mut m.cgroup_targets,
@@ -399,18 +696,281 @@ impl TaskStacksIter {
             .systing_task_stacks
             .attach()
             .context("Failed to attach the task-stacks BPF iterator")?;
-        Ok(Self { link })
+        let prog = skel
+            .progs
+            .systing_task_stacks
+            .as_fd()
+            .try_clone_to_owned()
+            .context("Failed to keep the task-stacks iterator program")?;
+        let walk_stats = skel
+            .maps
+            .task_stacks_walk_stats
+            .as_fd()
+            .try_clone_to_owned()
+            .context("Failed to keep the task-stacks walk counters")?;
+        let mut member_links = Vec::with_capacity(member_dirs.len());
+        for dir in member_dirs {
+            let mut link_info = libbpf_sys::bpf_iter_link_info::default();
+            link_info.cgroup.order = libbpf_sys::BPF_CGROUP_ITER_DESCENDANTS_PRE;
+            link_info.cgroup.cgroup_fd = dir.as_raw_fd() as u32;
+            member_links.push(
+                create_iter_link(
+                    skel.progs.systing_task_stacks_members.as_fd(),
+                    &mut link_info,
+                )
+                .context("Failed to attach the cgroup-members iterator to a --cgroup target")?,
+            );
+        }
+        Ok(LoadedObject {
+            link,
+            prog,
+            walk_stats,
+            member_links,
+        })
     }
 
-    /// Walk every thread once and return the targeted ones.
-    pub fn snapshot(&self) -> Result<Vec<TaskSample>> {
-        let mut iter =
-            libbpf_rs::Iter::new(&self.link).context("Failed to create a task-stacks iterator")?;
-        let mut buf = Vec::new();
-        iter.read_to_end(&mut buf)
-            .context("Failed to read the task-stacks iterator")?;
-        parse_records(&buf)
+    /// The walk this capture's snapshots take.
+    pub fn walk(&self) -> TaskWalk {
+        self.walk
     }
+
+    /// The `--pid` targets now: the keys of the `pids` map, the processes the
+    /// targets have forked since the capture began among them.
+    fn target_pids(&self) -> Result<Vec<u32>> {
+        let mut tgids = Vec::new();
+        let mut seen = HashSet::new();
+        let mut key = 0u32;
+        let mut have_key = false;
+        loop {
+            let mut next = 0u32;
+            // SAFETY: the map's keys are u32, `key` and `next` are one each,
+            // and a null key asks for the first.
+            let ret = unsafe {
+                libbpf_sys::bpf_map_get_next_key(
+                    self.pids.as_raw_fd(),
+                    if have_key {
+                        &key as *const u32 as *const c_void
+                    } else {
+                        std::ptr::null()
+                    },
+                    &mut next as *mut u32 as *mut c_void,
+                )
+            };
+            if ret == -libc::ENOENT {
+                return Ok(tgids);
+            }
+            if ret < 0 {
+                return Err(std::io::Error::from_raw_os_error(-ret))
+                    .context("Failed to read the --pid targets");
+            }
+            // The map grows under the walk; a key met twice is walked once.
+            if seen.insert(next) {
+                tgids.push(next);
+            }
+            if tgids.len() > SCOPED_WALK_MAX_PROCESSES {
+                return Ok(tgids);
+            }
+            key = next;
+            have_key = true;
+        }
+    }
+
+    /// The processes in the `--cgroup` targets now, the cgroups below them
+    /// included, as the kernel lists them.
+    fn cgroup_members(&self) -> Result<Vec<u32>> {
+        let mut tgids = Vec::new();
+        let mut seen = HashSet::new();
+        let mut bytes = Vec::new();
+        for link in &self.member_links {
+            bytes.clear();
+            read_iter_link(link.as_fd(), &mut bytes)
+                .context("Failed to list a --cgroup target's processes")?;
+            append_member_tgids(&bytes, &mut seen, &mut tgids);
+        }
+        Ok(tgids)
+    }
+
+    /// The processes this snapshot walks one at a time, or `None` for the one
+    /// walk over every thread on the host.
+    fn scoped_targets(&self) -> Option<Vec<u32>> {
+        let tgids = match self.walk {
+            TaskWalk::Full => return None,
+            TaskWalk::ByPid => self.target_pids(),
+            TaskWalk::ByCgroup => self.cgroup_members(),
+        };
+        let why = match tgids {
+            Ok(tgids) if tgids.len() <= SCOPED_WALK_MAX_PROCESSES => return Some(tgids),
+            Ok(_) => format!("more than {SCOPED_WALK_MAX_PROCESSES} target processes"),
+            Err(e) => format!("{e:#}"),
+        };
+        if self.full_walk_snapshots.fetch_add(1, Ordering::Relaxed) == 0 {
+            eprintln!("task-stacks: a snapshot walked every thread on the host instead: {why}");
+        }
+        None
+    }
+
+    /// Walk the targeted threads once and return them: every thread on the
+    /// host for the program to pick them from, or each target process's own.
+    pub fn snapshot(&self) -> Result<Vec<TaskSample>> {
+        let mut buf = Vec::new();
+        let scoped = match self.scoped_targets() {
+            Some(tgids) => {
+                // The counters as they stand: one process's read leaves them
+                // as the next one's finds them, since a snapshot is the only
+                // thing that runs the program while it is being taken.
+                let mut stats = self.walk_stats();
+                for tgid in tgids {
+                    if self.read_process(tgid, &mut buf, &mut stats)? {
+                        // Cut short by a thread that exited under the walk:
+                        // once more, for the threads behind it. The second
+                        // walk can be cut too; one re-read is the bound, and
+                        // the ones that were have a count of their own.
+                        self.reread_processes.fetch_add(1, Ordering::Relaxed);
+                        if self.read_process(tgid, &mut buf, &mut stats)? {
+                            self.still_short_processes.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                true
+            }
+            None => {
+                let mut iter = libbpf_rs::Iter::new(&self.link)
+                    .context("Failed to create a task-stacks iterator")?;
+                iter.read_to_end(&mut buf)
+                    .context("Failed to read the task-stacks iterator")?;
+                false
+            }
+        };
+        let samples = parse_records(&buf)?;
+        // The walk over every thread steps through the pids in order and
+        // meets each once; the scoped walks can hand a thread over again.
+        Ok(if scoped {
+            one_entry_per_thread(samples)
+        } else {
+            samples
+        })
+    }
+
+    /// Walk process `tgid`'s threads through a link of the iterator program
+    /// scoped to it, appending their records to `buf`. `true` when the walk
+    /// visited fewer threads than the process had as the walk entered it: the
+    /// kernel ends such a walk early when the thread it has just handed over
+    /// exits before it advances (it finds its place again by that thread's
+    /// pid), and the threads behind it go unvisited. A count that races the
+    /// process's own thread starts and exits, so a reason to read once more,
+    /// never an error. A link to a process that has gone reads as empty.
+    ///
+    /// `stats` is the program's counters as the caller last saw them, and as
+    /// this read leaves them on return.
+    fn read_process(
+        &self,
+        tgid: u32,
+        buf: &mut Vec<u8>,
+        stats: &mut Option<WalkStats>,
+    ) -> Result<bool> {
+        let before = *stats;
+        let mut link_info = libbpf_sys::bpf_iter_link_info::default();
+        link_info.task.pid = tgid;
+        let link = create_iter_link(self.prog.as_fd(), &mut link_info)
+            .context("Failed to scope a task-stacks iterator to a process")?;
+        read_iter_link(link.as_fd(), buf).context("Failed to read a task-stacks iterator")?;
+        *stats = self.walk_stats();
+        let (Some(before), Some(after)) = (before, *stats) else {
+            return Ok(false);
+        };
+        let runs = after.visited.wrapping_sub(before.visited);
+        let resent = after.unsent.wrapping_sub(before.unsent);
+        Ok(runs > 0 && runs.saturating_sub(resent) < after.group_threads)
+    }
+
+    /// The program's counters so far; `None` if they cannot be read.
+    pub fn walk_stats(&self) -> Option<WalkStats> {
+        let key = 0u32;
+        let mut stats = WalkStats::default();
+        // SAFETY: the map's one value is a `struct task_stacks_walk_stats`,
+        // which `WalkStats` mirrors field for field (its size is checked
+        // against the skeleton's at compile time).
+        let ret = unsafe {
+            libbpf_sys::bpf_map_lookup_elem(
+                self.walk_stats.as_raw_fd(),
+                &key as *const u32 as *const c_void,
+                &mut stats as *mut WalkStats as *mut c_void,
+            )
+        };
+        (ret == 0).then_some(stats)
+    }
+
+    /// The snapshots of a scoped capture that took the full walk instead.
+    pub fn full_walk_snapshots(&self) -> u64 {
+        self.full_walk_snapshots.load(Ordering::Relaxed)
+    }
+
+    /// The scoped walks of one process that came up short and were read again.
+    pub fn reread_processes(&self) -> u64 {
+        self.reread_processes.load(Ordering::Relaxed)
+    }
+
+    /// Of those, the ones whose second walk came up short too: what says
+    /// whether one re-read is enough.
+    pub fn still_short_processes(&self) -> u64 {
+        self.still_short_processes.load(Ordering::Relaxed)
+    }
+}
+
+/// Userspace mirror of the BPF side's `struct task_stacks_walk_stats`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkStats {
+    /// Runs of the iterator program: a task whose record did not fit the seq
+    /// buffer is handed over again and counts again.
+    pub visited: u64,
+    /// The runs that found their task in the capture's target set.
+    pub targeted: u64,
+    /// The runs whose record did not fit the seq buffer.
+    pub unsent: u64,
+    /// The thread count of the thread group the walk last entered.
+    pub group_threads: u64,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<WalkStats>() == std::mem::size_of::<skel::types::task_stacks_walk_stats>()
+);
+
+/// One entry per thread out of a snapshot of scoped walks, which can hand a
+/// thread over more than once: the second walk of a process read twice meets
+/// again the threads the first reached, and a kernel older than 6.8 can return
+/// a thread group's leader twice to a walk that races an exec by another of
+/// its threads. The recorder takes one statement about a thread per snapshot.
+///
+/// The program moves a thread's baseline every time a full record of it goes
+/// out, so the baseline it holds when the snapshot ends is the LAST full
+/// record's: that is the one to keep, or the thread's next "unchanged" would
+/// extend a stack the program has since replaced. Its CPU-time deltas run from
+/// the record before it, so the full records' deltas are summed. A header
+/// after a record says no more than the record did, and a thread with headers
+/// alone keeps one.
+fn one_entry_per_thread(samples: Vec<TaskSample>) -> Vec<TaskSample> {
+    let mut merged: Vec<TaskSample> = Vec::with_capacity(samples.len());
+    let mut at: HashMap<u32, usize> = HashMap::with_capacity(samples.len());
+    for mut sample in samples {
+        match at.get(&tid(&sample.task)).copied() {
+            None => {
+                at.insert(tid(&sample.task), merged.len());
+                merged.push(sample);
+            }
+            Some(_) if sample.unchanged => {}
+            Some(i) => {
+                let earlier = &merged[i];
+                if !earlier.unchanged {
+                    sample.utime_delta += earlier.utime_delta;
+                    sample.stime_delta += earlier.stime_delta;
+                    sample.runtime_delta += earlier.runtime_delta;
+                }
+                merged[i] = sample;
+            }
+        }
+    }
+    merged
 }
 
 /// How many snapshots a capture of `duration` holds, one every `interval`
@@ -614,6 +1174,31 @@ impl TaskStacksThread {
                 }
                 if failed > 1 {
                     eprintln!("task-stacks: {failed} iterations failed in all");
+                }
+                // What the walks cost: the tasks the program was handed
+                // against those it had records to write for.
+                if let Some(stats) = iter.walk_stats() {
+                    let mut asides = String::new();
+                    match iter.full_walk_snapshots() {
+                        0 => {}
+                        n => asides.push_str(&format!(
+                            "; {n} snapshots walked every thread on the host instead"
+                        )),
+                    }
+                    match iter.reread_processes() {
+                        0 => {}
+                        n => asides.push_str(&format!(
+                            "; {n} walks of a process came up short and were read again, \
+                             {} of them short the second time too",
+                            iter.still_short_processes()
+                        )),
+                    }
+                    eprintln!(
+                        "task-stacks: walked {} and visited {} tasks for {} targeted{asides}",
+                        iter.walk().describe(),
+                        stats.visited,
+                        stats.targeted
+                    );
                 }
             })?;
         Ok(Self { stop_tx, handle })
@@ -873,6 +1458,194 @@ mod tests {
         );
         assert_eq!(iteration_count(secs(1), secs(2)), Some(1));
         assert_eq!(iteration_count(Duration::ZERO, secs(1)), None);
+    }
+
+    /// A host every scoped walk runs on: nothing forced, the root pid
+    /// namespace, a kernel with the css_task iterator.
+    const ABLE_HOST: WalkFacts = WalkFacts {
+        force_full: false,
+        root_pid_ns: true,
+        css_task_iter: true,
+    };
+
+    fn targeting(pid: bool, cgroup: bool, kernel: bool) -> TargetFilter {
+        TargetFilter {
+            filter_pid: pid,
+            filter_cgroup: cgroup,
+            cgroup_match_kernel: cgroup && kernel,
+            num_cgroup_targets: cgroup as u32,
+        }
+    }
+
+    #[test]
+    fn a_capture_without_targets_walks_every_thread_and_says_nothing() {
+        // Whatever the host: every thread is what it asked for, not a
+        // fallback to explain.
+        for facts in [
+            ABLE_HOST,
+            WalkFacts {
+                force_full: true,
+                ..ABLE_HOST
+            },
+            WalkFacts {
+                root_pid_ns: false,
+                css_task_iter: false,
+                ..ABLE_HOST
+            },
+        ] {
+            assert_eq!(
+                choose_walk(&targeting(false, false, false), &facts),
+                (TaskWalk::Full, None)
+            );
+        }
+    }
+
+    #[test]
+    fn pid_targets_are_walked_one_process_at_a_time() {
+        let (walk, why) = choose_walk(&targeting(true, false, false), &ABLE_HOST);
+        assert_eq!((walk, why), (TaskWalk::ByPid, None));
+        // No kernel the iterator loads on is without the pid parameter, so
+        // the css_task iterator's absence is none of its business.
+        let old = WalkFacts {
+            css_task_iter: false,
+            ..ABLE_HOST
+        };
+        assert_eq!(
+            choose_walk(&targeting(true, false, false), &old).0,
+            TaskWalk::ByPid
+        );
+    }
+
+    #[test]
+    fn pid_and_cgroup_targets_are_walked_by_pid() {
+        // The pids are the shorter list; the program intersects.
+        for kernel in [true, false] {
+            assert_eq!(
+                choose_walk(&targeting(true, true, kernel), &ABLE_HOST),
+                (TaskWalk::ByPid, None)
+            );
+        }
+    }
+
+    #[test]
+    fn cgroup_targets_are_listed_by_the_kernel_where_it_can() {
+        assert_eq!(
+            choose_walk(&targeting(false, true, true), &ABLE_HOST),
+            (TaskWalk::ByCgroup, None)
+        );
+    }
+
+    #[test]
+    fn cgroup_targets_fall_back_to_the_full_walk_and_say_why() {
+        // A kernel without the css_task iterator.
+        let (walk, why) = choose_walk(
+            &targeting(false, true, true),
+            &WalkFacts {
+                css_task_iter: false,
+                ..ABLE_HOST
+            },
+        );
+        assert_eq!(walk, TaskWalk::Full);
+        assert!(why.unwrap().contains("bpf_iter_css_task_new"));
+        // The start-time snapshot of cgroup ids, by the kernel's age or by
+        // the knob: there are no target directories to list then, whatever
+        // else the kernel has.
+        let (walk, why) = choose_walk(&targeting(false, true, false), &ABLE_HOST);
+        assert_eq!(walk, TaskWalk::Full);
+        assert!(why.unwrap().contains("start-time snapshot"));
+    }
+
+    #[test]
+    fn the_knob_and_a_pid_namespace_of_its_own_force_the_full_walk() {
+        for filter in [
+            targeting(true, false, false),
+            targeting(false, true, true),
+            targeting(true, true, true),
+        ] {
+            let (walk, why) = choose_walk(
+                &filter,
+                &WalkFacts {
+                    force_full: true,
+                    ..ABLE_HOST
+                },
+            );
+            assert_eq!(walk, TaskWalk::Full);
+            assert!(why.unwrap().contains(FULL_WALK_ENV));
+
+            let (walk, why) = choose_walk(
+                &filter,
+                &WalkFacts {
+                    root_pid_ns: false,
+                    ..ABLE_HOST
+                },
+            );
+            assert_eq!(walk, TaskWalk::Full);
+            assert!(why.unwrap().contains("pid namespace"));
+        }
+    }
+
+    #[test]
+    fn member_tgids_come_out_once_each_in_the_order_written() {
+        let mut bytes = Vec::new();
+        for tgid in [30u32, 10, 30, 20] {
+            bytes.extend_from_slice(&tgid.to_ne_bytes());
+        }
+        // A read never ends inside a tgid; were it to, the tail is no tgid.
+        bytes.extend_from_slice(&[0xff, 0xff]);
+        let mut seen = HashSet::new();
+        let mut tgids = Vec::new();
+        append_member_tgids(&bytes, &mut seen, &mut tgids);
+        assert_eq!(tgids, [30, 10, 20]);
+        // A second target's list, one process of it met under the first.
+        append_member_tgids(&10u32.to_ne_bytes(), &mut seen, &mut tgids);
+        append_member_tgids(&40u32.to_ne_bytes(), &mut seen, &mut tgids);
+        assert_eq!(tgids, [30, 10, 20, 40]);
+    }
+
+    #[test]
+    fn a_process_read_twice_keeps_each_threads_last_full_record() {
+        // The first walk of the process wrote thread 11's record and was cut
+        // short there. The second hands 11 over again: a header if it has not
+        // run since, a full record if it has -- and then that record is the
+        // program's baseline, so it is the one to keep, with the CPU time of
+        // both. Thread 12 the first walk never met; 13 has headers alone; 14
+        // had not run when the first walk passed it and had when the second
+        // did, and a header gives way to the record that follows it.
+        let (ran, behind, idle, woke) = (
+            task(10, 11, "worker"),
+            task(10, 12, "worker"),
+            task(10, 13, "worker"),
+            task(10, 14, "worker"),
+        );
+        let mut buf = record_bytes(&ran, 0, (1, 2), &[0xa], &[], &[]);
+        buf.extend(record_bytes(&idle, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
+        buf.extend(record_bytes(&woke, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
+        buf.extend(record_bytes(&ran, 0, (5, 6), &[0xb], &[], &[]));
+        buf.extend(record_bytes(&ran, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
+        buf.extend(record_bytes(&behind, 0, (3, 4), &[0xc], &[], &[]));
+        buf.extend(record_bytes(&idle, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
+        buf.extend(record_bytes(&woke, 0, (7, 1), &[0xd], &[], &[]));
+        let samples = one_entry_per_thread(parse_records(&buf).unwrap());
+        let kept: Vec<_> = samples
+            .iter()
+            .map(|sample| {
+                (
+                    tid(&sample.task),
+                    sample.unchanged,
+                    sample.kernel_stack.clone(),
+                    (sample.utime_delta, sample.stime_delta, sample.runtime_delta),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (11, false, vec![0xb], (6, 8, 14)),
+                (13, true, vec![], (0, 0, 0)),
+                (14, false, vec![0xd], (7, 1, 8)),
+                (12, false, vec![0xc], (3, 4, 7)),
+            ]
+        );
     }
 
     #[test]

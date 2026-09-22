@@ -5340,6 +5340,574 @@ fn test_e2e_task_stacks_recording() {
     );
 }
 
+/// One task-stacks capture by the binary, so that each has its own
+/// environment: what it printed, and where it wrote.
+fn task_stacks_capture(
+    target: &[&str],
+    interval_ms: u32,
+    duration_s: u32,
+    full_walk: bool,
+) -> (String, TempDir) {
+    let out_dir = TempDir::new().expect("Failed to create temp dir");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_systing"));
+    cmd.args([
+        "--only-recorder",
+        "task-stacks",
+        "--task-stacks-frames",
+        "native",
+        "--task-stacks-interval-ms",
+    ])
+    .arg(interval_ms.to_string())
+    .arg("--duration")
+    .arg(duration_s.to_string())
+    .args(["--parquet-only", "--output-dir"])
+    .arg(out_dir.path())
+    .args(target)
+    .env_remove("SYSTING_CGROUP_FILTER_LEGACY");
+    if full_walk {
+        cmd.env("SYSTING_TASK_STACKS_FULL_WALK", "1");
+    } else {
+        cmd.env_remove("SYSTING_TASK_STACKS_FULL_WALK");
+    }
+    let output = cmd.output().expect("Failed to run systing");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "systing {target:?} (full walk forced: {full_walk}) failed:\n{stderr}"
+    );
+    (stderr, out_dir)
+}
+
+/// The task-stacks recorder's closing line out of what a capture printed.
+fn task_stacks_closing_line(stderr: &str) -> &str {
+    stderr
+        .lines()
+        .find(|line| line.starts_with("task-stacks: walked "))
+        .unwrap_or_else(|| panic!("the recorder printed no closing line:\n{stderr}"))
+}
+
+/// Why a task-stacks capture with targets may walk every thread on the host
+/// and nothing be wrong: what the recorder prints at start for each reason it
+/// knows before it loads anything. A kernel that refuses a program the capture
+/// asked it to load ends up on that walk too, with none of these, and a test
+/// that took any reason for a fallback would pass on that refusal.
+const TASK_STACKS_NOT_ROOT_PID_NS: &str =
+    "systing is not in the root pid namespace, which the targets' pids are counted in";
+const TASK_STACKS_START_TIME_CGROUPS: &str =
+    "--cgroup is matched against a start-time snapshot of cgroup ids here";
+const TASK_STACKS_NO_CSS_TASK_KFUNC: &str =
+    "this kernel's BTF does not export bpf_iter_css_task_new";
+const TASK_STACKS_THREADED_SUBTREE: &str =
+    "a --cgroup target is in a threaded subtree, where a thread need not be in its process's cgroup";
+
+/// The reason a capture gave at start for walking every thread on the host, if
+/// it gave one.
+fn task_stacks_full_walk_reason(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("task-stacks: walking every thread on the host: "))
+}
+
+/// The tasks a capture's walks visited, and those of them it found targeted,
+/// from the recorder's closing line.
+fn task_stacks_walk_counts(stderr: &str) -> (u64, u64) {
+    let line = task_stacks_closing_line(stderr);
+    let number_after = |marker: &str| -> u64 {
+        let at = line
+            .find(marker)
+            .unwrap_or_else(|| panic!("no {marker:?} in {line:?}"))
+            + marker.len();
+        line[at..]
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no number after {marker:?} in {line:?}"))
+    };
+    (number_after("visited "), number_after(" tasks for "))
+}
+
+/// The walks of a process that came up short and were read again, and those
+/// of them that came up short the second time too, from the same line: it
+/// says nothing of either when there were none.
+fn task_stacks_reread_counts(stderr: &str) -> (u64, u64) {
+    let line = task_stacks_closing_line(stderr);
+    let number_before = |marker: &str| -> u64 {
+        let Some(at) = line.find(marker) else {
+            return 0;
+        };
+        let head = &line[..at];
+        let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        head[head.len() - digits..]
+            .parse()
+            .unwrap_or_else(|_| panic!("no number before {marker:?} in {line:?}"))
+    };
+    (
+        number_before(" walks of a process came up short"),
+        number_before(" of them short the second time too"),
+    )
+}
+
+/// What a recording says of its own coverage, over every thread in it. Counted
+/// per iteration and not from each thread's totals, where a snapshot a thread
+/// is missing from and a snapshot that states it twice would cancel.
+struct TaskStacksCoverage {
+    /// The threads that have any event.
+    threads: i64,
+    /// The thread-snapshots their events state, each counted once.
+    covered: i64,
+    /// The iterations between a thread's first and last that none of its
+    /// events covers: each a snapshot the thread is missing from though it was
+    /// there before and after.
+    misses: i64,
+    /// The statements beyond the first of a thread in one iteration: a thread
+    /// stated twice in one snapshot.
+    twice: i64,
+}
+
+fn task_stacks_coverage(out_dir: &TempDir) -> TaskStacksCoverage {
+    let events = out_dir.path().join("task_stack_event.parquet");
+    assert!(
+        events.exists(),
+        "no task_stack_event.parquet in {}",
+        out_dir.path().display()
+    );
+    let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+    conn.query_row(
+        &format!(
+            "SELECT CAST(COUNT(*) AS BIGINT), \
+                    CAST(COALESCE(SUM(stated), 0) AS BIGINT), \
+                    CAST(COALESCE(SUM(span - stated), 0) AS BIGINT), \
+                    CAST(COALESCE(SUM(statements - stated), 0) AS BIGINT) \
+             FROM (SELECT CAST(MAX(it) - MIN(it) + 1 AS BIGINT) AS span, \
+                          CAST(COUNT(DISTINCT it) AS BIGINT) AS stated, \
+                          CAST(COUNT(*) AS BIGINT) AS statements \
+                   FROM (SELECT utid, \
+                                UNNEST(range(start_iteration, end_iteration + 1)) AS it \
+                         FROM read_parquet('{}')) \
+                   GROUP BY utid)",
+            events.display()
+        ),
+        [],
+        |row| {
+            Ok(TaskStacksCoverage {
+                threads: row.get(0)?,
+                covered: row.get(1)?,
+                misses: row.get(2)?,
+                twice: row.get(3)?,
+            })
+        },
+    )
+    .expect("Failed to read the recording's coverage")
+}
+
+/// The task-stacks walks scoped to the capture's targets, beside the walk over
+/// every thread on the host that they stand in for. The same capture run both
+/// ways (`SYSTING_TASK_STACKS_FULL_WALK` forces the second) has to record the
+/// same threads, the processes the target forks during the capture among them,
+/// and the scoped run has to have visited a fraction of the tasks the full one
+/// did. Once with `--pid` and once with `--cgroup`. On a kernel without the
+/// css_task iterator the `--cgroup` run is the fallback's own test: it has to
+/// say which walk it took and why, and record the same.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_task_stacks_scoped_walks_record_what_the_full_walk_does() {
+    use std::process::{Command, Stdio};
+
+    // A shell that forks a short sleep a second, for good: whenever the
+    // capture starts, its children are forked during it. Killed and reaped
+    // when the guard drops, on the test's panic path too, so that the cgroup
+    // it was put in can go.
+    struct ForkingShell(std::process::Child);
+
+    impl ForkingShell {
+        fn spawn() -> ForkingShell {
+            ForkingShell(
+                Command::new("sh")
+                    .arg("-c")
+                    .arg("while :; do sleep 1; done")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("Failed to spawn the forking shell"),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for ForkingShell {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Each capture: six seconds of a snapshot every 250 ms.
+    fn capture(target: &[&str], full_walk: bool) -> (String, TempDir) {
+        task_stacks_capture(target, 250, 6, full_walk)
+    }
+
+    // What a capture recorded of the shell and of anything else: the
+    // shell's events, and the other threads that have any.
+    fn recorded(out_dir: &TempDir, shell: u32) -> (i64, i64) {
+        let events = out_dir.path().join("task_stack_event.parquet");
+        let threads = out_dir.path().join("thread.parquet");
+        assert!(
+            events.exists() && threads.exists(),
+            "no task_stack_event.parquet / thread.parquet in {}",
+            out_dir.path().display()
+        );
+        let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+        let count = |select: &str, relation: &str| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT {select} FROM read_parquet('{}') e JOIN read_parquet('{}') t \
+                     ON t.utid = e.utid WHERE t.tid {relation} {shell}",
+                    events.display(),
+                    threads.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("Failed to count the recorded threads")
+        };
+        (count("COUNT(*)", "="), count("COUNT(DISTINCT t.tid)", "<>"))
+    }
+
+    // Both walks of one targeting, read the same way. `scoped_line` is what
+    // the capture prints at start when it takes the scoped walk, and
+    // `healthy_fallbacks` the reasons for which it may take the other one
+    // with nothing wrong.
+    fn check(
+        label: &str,
+        target: &[&str],
+        shell: u32,
+        scoped_line: &str,
+        healthy_fallbacks: &[&str],
+    ) {
+        let (stderr, out_dir) = capture(target, false);
+        let (visited, targeted) = task_stacks_walk_counts(&stderr);
+        let (shell_events, others) = recorded(&out_dir, shell);
+        eprintln!(
+            "[{label}] as it comes: visited {visited} for {targeted} targeted; \
+             {shell_events} events of the shell's, {others} other threads"
+        );
+        let (full_stderr, full_dir) = capture(target, true);
+        let (full_visited, full_targeted) = task_stacks_walk_counts(&full_stderr);
+        let (full_shell_events, full_others) = recorded(&full_dir, shell);
+        eprintln!(
+            "[{label}] full walk forced: visited {full_visited} for {full_targeted} targeted; \
+             {full_shell_events} events of the shell's, {full_others} other threads"
+        );
+
+        assert!(
+            full_stderr
+                .contains("walking every thread on the host: SYSTING_TASK_STACKS_FULL_WALK is set"),
+            "[{label}] the forced run must say which walk it took and why:\n{full_stderr}"
+        );
+        // The same threads either way: the shell, and the sleeps it forked
+        // while each capture ran (six seconds of one a second, less the edges).
+        for (run, shell_events, others) in [
+            ("as it comes", shell_events, others),
+            ("full walk forced", full_shell_events, full_others),
+        ] {
+            assert!(
+                shell_events > 0,
+                "[{label}, {run}] the shell (tid {shell}) was not recorded"
+            );
+            assert!(
+                others >= 3,
+                "[{label}, {run}] {others} threads other than the shell recorded: \
+                 the processes it forked during the capture are missing"
+            );
+        }
+        if stderr.contains(scoped_line) {
+            // Visits are per snapshot: what the scoped walks were handed is
+            // about what was targeted, what the full walk was handed is
+            // every thread on the host, two dozen times over.
+            assert!(
+                visited <= targeted + 4 * 24,
+                "[{label}] the scoped walks visited {visited} tasks for {targeted} targeted"
+            );
+            assert!(
+                visited * 4 < full_visited,
+                "[{label}] the scoped walks visited {visited} tasks, the full walk {full_visited}: \
+                 no fraction of it"
+            );
+            eprintln!("[{label}] scoped: {visited} visits against the full walk's {full_visited}");
+        } else {
+            // The fallback's own leg: a host the scoped walk does not run on
+            // has to say so, and has recorded the same above. Only a reason
+            // known before anything is loaded counts. A kernel that refuses
+            // the iterator falls back as well, and that is a failure: on a
+            // kernel that has the iterator it is the only sign of one.
+            let why = task_stacks_full_walk_reason(&stderr).unwrap_or_else(|| {
+                panic!(
+                    "[{label}] a capture with targets that walks every thread must say why:\n{stderr}"
+                )
+            });
+            assert!(
+                healthy_fallbacks.contains(&why),
+                "[{label}] the capture walked every thread on the host for a reason no healthy \
+                 host gives ({why:?}):\n{stderr}"
+            );
+            eprintln!("[{label}] this host took the full walk ({why}); recorded the same");
+        }
+    }
+
+    {
+        let shell = ForkingShell::spawn();
+        let pid = shell.pid().to_string();
+        check(
+            "--pid",
+            &["--pid", &pid],
+            shell.pid(),
+            "task-stacks: walking the --pid targets' threads alone",
+            &[TASK_STACKS_NOT_ROOT_PID_NS],
+        );
+    }
+
+    let Some(cgroup_root) = systing::cgroup::cgroup2_root() else {
+        eprintln!("skipping the --cgroup half: no cgroup v2 unified hierarchy on this system");
+        return;
+    };
+    let base = match current_cgroup_v2_path() {
+        Some(p) if p != "/" => cgroup_root.join(p.trim_start_matches('/')),
+        _ => cgroup_root,
+    };
+    let target = base.join(format!("systing-tsw-{}", std::process::id()));
+    let mut fixture = CgroupFixture { dirs: Vec::new() };
+    match fixture.create(&target) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            eprintln!(
+                "skipping the --cgroup half: cannot create a cgroup under {} ({e})",
+                base.display()
+            );
+            return;
+        }
+        Err(e) => panic!("Failed to create cgroup {}: {e}", target.display()),
+    }
+    // After the fixture, so dropped before it: the cgroup empties, then goes.
+    // The sleep the shell forked before the move stays where it was born;
+    // the ones it forks from here on are born in the target.
+    let shell = ForkingShell::spawn();
+    std::fs::write(target.join("cgroup.procs"), shell.pid().to_string())
+        .unwrap_or_else(|e| panic!("Failed to move the shell into {}: {e}", target.display()));
+    let target_path = target.to_str().expect("a cgroup path in UTF-8").to_string();
+    check(
+        "--cgroup",
+        &["--cgroup", &target_path],
+        shell.pid(),
+        "task-stacks: walking the --cgroup targets' processes alone",
+        &[
+            TASK_STACKS_NOT_ROOT_PID_NS,
+            TASK_STACKS_START_TIME_CGROUPS,
+            TASK_STACKS_NO_CSS_TASK_KFUNC,
+            TASK_STACKS_THREADED_SUBTREE,
+        ],
+    );
+}
+
+/// A scoped walk of a process that retires threads all the time. The kernel
+/// ends the walk of one process early when the thread it has just handed over
+/// exits before it advances; the recorder reads a process whose walk came up
+/// short once more, and what that leaves is checked against the recording
+/// itself. The target is this process, with short-lived threads exiting all
+/// the time at no fixed place in its thread list. A thread the recording has
+/// at one snapshot and at a later one was there for every snapshot between
+/// them, so a snapshot it is missing from is a miss nothing else explains. The
+/// walk over every thread on the host, forced, is the control: it steps over a
+/// thread that has gone, so it must show none. The scoped run may show one
+/// only where some process came up short both times it was read, which is what
+/// the design says of it, and the two figures of the closing line are printed
+/// beside the misses counted this way, since they count more than the walks
+/// that were cut.
+///
+/// Twice, at two rates. With a few hundred threads alive and better than a
+/// thousand exiting every second, most walks see a thread exit and so do most
+/// second walks: that run exercises the re-read and the merge of the two
+/// walks, and its last check cannot fail. With some forty alive and a hundred
+/// exiting every second, most walks are whole and a second walk short as well
+/// is rare: there a thread missing from a snapshot in a capture where no
+/// process came up short twice would be a cut the visit count did not see.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_task_stacks_scoped_walk_of_a_process_that_retires_threads() {
+    // One capture of this process: twelve seconds of a snapshot every 50 ms.
+    struct Run {
+        stderr: String,
+        rereads: u64,
+        still_short: u64,
+        coverage: TaskStacksCoverage,
+    }
+
+    fn run(label: &str, full_walk: bool) -> Run {
+        let pid = std::process::id().to_string();
+        let (stderr, out_dir) = task_stacks_capture(&["--pid", &pid], 50, 12, full_walk);
+        let (visited, targeted) = task_stacks_walk_counts(&stderr);
+        let (rereads, still_short) = task_stacks_reread_counts(&stderr);
+        let coverage = task_stacks_coverage(&out_dir);
+        eprintln!(
+            "[{label}] visited {visited} for {targeted} targeted; {rereads} walks came up short \
+             and were read again, {still_short} of them short the second time too; \
+             {} threads over {} thread-snapshots, {} of them missed between two that were \
+             not, {} stated twice",
+            coverage.threads, coverage.covered, coverage.misses, coverage.twice
+        );
+        Run {
+            stderr,
+            rereads,
+            still_short,
+            coverage,
+        }
+    }
+
+    // One rate: `spawners` threads that each start one every `every_ms`, which
+    // lives for 50 to 750 ms and wakes every 10 ms, so that every one of them
+    // has run between any two snapshots and none waits on another; then the
+    // capture as it comes and the one with the full walk forced, and what the
+    // two recordings have to show. At the higher rate fewer than twenty
+    // thousand threads start during one capture, so that no thread id comes
+    // round again inside it where the kernel's ids run to 32768.
+    fn at_rate(rate: &str, spawners: u64, every_ms: u64, least_threads: i64) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let _churn: Vec<_> = (0..spawners)
+            .map(|spawner| {
+                stoppable_workload(move |stop| {
+                    let live = Arc::new(AtomicU64::new(0));
+                    let quit = Arc::new(AtomicBool::new(false));
+                    let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ (spawner + 1);
+                    while !stop.load(Ordering::Relaxed) {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        let until = Instant::now() + Duration::from_millis(50 + seed % 700);
+                        let (live_in, quit_in) = (live.clone(), quit.clone());
+                        live.fetch_add(1, Ordering::Relaxed);
+                        let started = std::thread::Builder::new()
+                            .name("tsw-churn".to_string())
+                            .stack_size(64 * 1024)
+                            .spawn(move || {
+                                while Instant::now() < until && !quit_in.load(Ordering::Relaxed) {
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                                live_in.fetch_sub(1, Ordering::Relaxed);
+                            });
+                        if started.is_err() {
+                            live.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        std::thread::sleep(Duration::from_millis(every_ms));
+                    }
+                    quit.store(true, Ordering::Relaxed);
+                    wait_until("the short-lived threads to exit", || {
+                        live.load(Ordering::Relaxed) == 0
+                    });
+                })
+            })
+            .collect();
+        // Up to their steady number before the first capture starts.
+        std::thread::sleep(Duration::from_secs(1));
+
+        let scoped = run(&format!("{rate}, as it comes"), false);
+        let full = run(&format!("{rate}, full walk forced"), true);
+
+        // Both saw the threads come and go.
+        for (label, threads) in [
+            ("as it comes", scoped.coverage.threads),
+            ("full walk forced", full.coverage.threads),
+        ] {
+            assert!(
+                threads >= least_threads,
+                "[{rate}, {label}] {threads} threads recorded: the short-lived threads are not in it"
+            );
+        }
+        // The control first: if the walk over every thread misses a thread
+        // between two snapshots that have it, the count above is not one of
+        // misses and says nothing about the scoped walk either.
+        assert_eq!(
+            (full.coverage.misses, full.coverage.twice),
+            (0, 0),
+            "[{rate}] the walk over every thread on the host missed a thread between two \
+             snapshots that have it, or stated one twice:\n{}",
+            full.stderr
+        );
+        assert_eq!(
+            scoped.coverage.twice, 0,
+            "[{rate}] a snapshot of scoped walks stated a thread twice:\n{}",
+            scoped.stderr
+        );
+        if !scoped
+            .stderr
+            .contains("task-stacks: walking the --pid targets' threads alone")
+        {
+            // Nothing scoped to check, for the one reason a healthy host can
+            // give a `--pid` capture; any other is a failure, not a skip.
+            assert_eq!(
+                task_stacks_full_walk_reason(&scoped.stderr),
+                Some(TASK_STACKS_NOT_ROOT_PID_NS),
+                "[{rate}] a --pid capture walked every thread on the host for a reason no \
+                 healthy host gives:\n{}",
+                scoped.stderr
+            );
+            eprintln!(
+                "[{rate}] this capture took the walk over every thread on the host \
+                 ({TASK_STACKS_NOT_ROOT_PID_NS}): nothing scoped to check"
+            );
+            return;
+        }
+        assert!(
+            scoped.still_short <= scoped.rereads,
+            "[{rate}] more second walks came up short ({}) than walks were read again ({})",
+            scoped.still_short,
+            scoped.rereads
+        );
+        // A cut that drops a thread which was there when the walk began leaves
+        // the walk short of the count, and the process is read again: only a
+        // second walk cut as well can leave such a thread out of the snapshot.
+        assert!(
+            scoped.coverage.misses == 0 || scoped.still_short > 0,
+            "[{rate}] {} thread-snapshots missed between two that were not, and no process \
+             came up short both times it was read:\n{}",
+            scoped.coverage.misses,
+            scoped.stderr
+        );
+        // Which of the three this run was, since the check above binds in one
+        // of them only.
+        if scoped.rereads == 0 {
+            eprintln!(
+                "[{rate}] no walk came up short in this run: too few threads exited under the \
+                 walks to exercise the re-read on this host"
+            );
+        } else if scoped.still_short == 0 {
+            eprintln!(
+                "[{rate}] no process came up short both times it was read, and no thread is \
+                 missing between two snapshots that have it: here a miss would have been a cut \
+                 the visit count did not see"
+            );
+        } else {
+            eprintln!(
+                "[{rate}] some process came up short both times it was read: a thread missing \
+                 from a snapshot is within what the design allows here, and the check above \
+                 could not have failed"
+            );
+        }
+    }
+
+    at_rate("most walks cut", 4, 3, 1000);
+    at_rate("most walks whole", 1, 10, 300);
+}
+
 /// The names a process gave its threads, read out of live interpreters: the
 /// `threading` module found through sys.modules, its `_active` dict, and each
 /// Thread's `_name` and `_native_id` wherever this instance keeps its
