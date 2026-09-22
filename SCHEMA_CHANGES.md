@@ -445,6 +445,32 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 25 (systing 1.22.0) — 2026-09-22
+
+Heap snapshots: an allocator's own dump of the memory a process had live when
+it wrote the file (jemalloc `prof.dump`), read by the new `systing-heap` tool
+(`heap/`), not by a recorder. This is not `memory_alloc`, which records
+individual malloc/free calls. Stacks go into `frame` / `stack` like every
+recorder's, so the usual stack queries and flamegraphs work on them.
+
+### New tables
+- `heap_snapshot` — one row per snapshot file (id, format, source_path, upid,
+  seq, dump_trigger, dumped_at_unix_ns, sample_period, header_live_objects,
+  header_live_bytes). `format` is `jemalloc` for now. `upid` is the process
+  the file name names (a `process` row per pid, `name` from the dump's first
+  mapped file), NULL for a file renamed without its pid. `seq` and
+  `dump_trigger` (`interval`, `manual`, `gdump`, `final`) come from the file
+  name, `dumped_at_unix_ns` from its mtime, `sample_period` (mean bytes between
+  samples) from its header. `header_live_*` are the header's totals as written:
+  jemalloc 5.3 interval dumps can disagree with the sum of their stacks, so sum
+  `heap_sample` for a snapshot's total.
+- `heap_sample` — one row per distinct allocation stack in a snapshot
+  (snapshot_id, stack_id, live_objects, live_bytes, alloc_objects,
+  alloc_bytes). Counts are as the allocator wrote them; jemalloc >= 5.3
+  un-biases them for sampling already (`prof_unbias`). `alloc_*` are
+  cumulative since start and 0 unless the allocator tracked them
+  (jemalloc `prof_accum`).
+
 ## Schema Version 24 (systing 1.21.0) — 2026-09-15
 
 The task-stacks recorder names Python threads, and the name goes where a

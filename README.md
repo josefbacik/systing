@@ -328,6 +328,18 @@ unchanged-thread skip and the CPU-time deltas hold for up to 65,536 targeted
 threads. `--collect-build-id` does not apply to these stacks. The recorder keeps
 its events until the capture ends, so it cannot be used with `--continuous`.
 
+### Heap Snapshots
+
+`systing-heap` reads heap snapshots that an allocator wrote itself (jemalloc profile dumps for now) into a systing DuckDB database.
+A snapshot shows the memory a process had allocated when it wrote the file, by allocation stack; it is not a recording of malloc calls (that is the `memory-alloc` recorder).
+
+```bash
+cargo build --release -p systing-heap
+systing-heap -o heap.duckdb /data/heap/jeprof   # jemalloc's prof_prefix: latest snapshot per process, older dumps deleted
+```
+
+See [`heap/README.md`](heap/README.md) for producing snapshots, the tables, and queries.
+
 ### Debugging and Verbosity
 
 Use multiple `-v` flags to control verbosity levels:

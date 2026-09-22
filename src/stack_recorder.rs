@@ -2287,8 +2287,9 @@ fn format_symbolized_frame(
 /// Same as [`format_symbolized_frame`] but with a caller-supplied module
 /// name. Used when symbolization went through an indirect source (e.g. a
 /// `map_files` link for a bridged island) whose path would be meaningless to
-/// report.
-fn format_symbolized_frame_forced_module(
+/// report. Public so offline symbolizers (`systing-heap`) name frames the
+/// same way the recorders do.
+pub fn format_symbolized_frame_forced_module(
     sym: &Sym,
     addr: u64,
     module_name: &str,

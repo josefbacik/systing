@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "systing"
-version = "1.21.7"
+version = "1.22.0"
 dependencies = [
  "anyhow",
  "arrow 54.3.1",
@@ -3489,6 +3489,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vsock",
+]
+
+[[package]]
+name = "systing-heap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blazesym",
+ "clap",
+ "duckdb",
+ "libc",
+ "regex",
+ "systing",
+ "tempfile",
 ]
 
 [[package]]
