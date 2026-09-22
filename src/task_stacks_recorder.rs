@@ -815,14 +815,18 @@ impl TaskStacksIter {
         let mut buf = Vec::new();
         let scoped = match self.scoped_targets() {
             Some(tgids) => {
+                // The counters as they stand: one process's read leaves them
+                // as the next one's finds them, since a snapshot is the only
+                // thing that runs the program while it is being taken.
+                let mut stats = self.walk_stats();
                 for tgid in tgids {
-                    if self.read_process(tgid, &mut buf)? {
+                    if self.read_process(tgid, &mut buf, &mut stats)? {
                         // Cut short by a thread that exited under the walk:
                         // once more, for the threads behind it. The second
                         // walk can be cut too; one re-read is the bound, and
                         // the ones that were have a count of their own.
                         self.reread_processes.fetch_add(1, Ordering::Relaxed);
-                        if self.read_process(tgid, &mut buf)? {
+                        if self.read_process(tgid, &mut buf, &mut stats)? {
                             self.still_short_processes.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -855,14 +859,23 @@ impl TaskStacksIter {
     /// pid), and the threads behind it go unvisited. A count that races the
     /// process's own thread starts and exits, so a reason to read once more,
     /// never an error. A link to a process that has gone reads as empty.
-    fn read_process(&self, tgid: u32, buf: &mut Vec<u8>) -> Result<bool> {
-        let before = self.walk_stats();
+    ///
+    /// `stats` is the program's counters as the caller last saw them, and as
+    /// this read leaves them on return.
+    fn read_process(
+        &self,
+        tgid: u32,
+        buf: &mut Vec<u8>,
+        stats: &mut Option<WalkStats>,
+    ) -> Result<bool> {
+        let before = *stats;
         let mut link_info = libbpf_sys::bpf_iter_link_info::default();
         link_info.task.pid = tgid;
         let link = create_iter_link(self.prog.as_fd(), &mut link_info)
             .context("Failed to scope a task-stacks iterator to a process")?;
         read_iter_link(link.as_fd(), buf).context("Failed to read a task-stacks iterator")?;
-        let (Some(before), Some(after)) = (before, self.walk_stats()) else {
+        *stats = self.walk_stats();
+        let (Some(before), Some(after)) = (before, *stats) else {
             return Ok(false);
         };
         let runs = after.visited.wrapping_sub(before.visited);
@@ -1595,18 +1608,23 @@ mod tests {
         // short there. The second hands 11 over again: a header if it has not
         // run since, a full record if it has -- and then that record is the
         // program's baseline, so it is the one to keep, with the CPU time of
-        // both. Thread 12 the first walk never met; 13 has headers alone.
-        let (ran, behind, idle) = (
+        // both. Thread 12 the first walk never met; 13 has headers alone; 14
+        // had not run when the first walk passed it and had when the second
+        // did, and a header gives way to the record that follows it.
+        let (ran, behind, idle, woke) = (
             task(10, 11, "worker"),
             task(10, 12, "worker"),
             task(10, 13, "worker"),
+            task(10, 14, "worker"),
         );
         let mut buf = record_bytes(&ran, 0, (1, 2), &[0xa], &[], &[]);
         buf.extend(record_bytes(&idle, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
+        buf.extend(record_bytes(&woke, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
         buf.extend(record_bytes(&ran, 0, (5, 6), &[0xb], &[], &[]));
         buf.extend(record_bytes(&ran, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
         buf.extend(record_bytes(&behind, 0, (3, 4), &[0xc], &[], &[]));
         buf.extend(record_bytes(&idle, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
+        buf.extend(record_bytes(&woke, 0, (7, 1), &[0xd], &[], &[]));
         let samples = one_entry_per_thread(parse_records(&buf).unwrap());
         let kept: Vec<_> = samples
             .iter()
@@ -1624,6 +1642,7 @@ mod tests {
             [
                 (11, false, vec![0xb], (6, 8, 14)),
                 (13, true, vec![], (0, 0, 0)),
+                (14, false, vec![0xd], (7, 1, 8)),
                 (12, false, vec![0xc], (3, 4, 7)),
             ]
         );

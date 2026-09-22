@@ -294,8 +294,12 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   same threads; the walk in use is printed at start. Setting
   `SYSTING_TASK_STACKS_FULL_WALK` to any non-empty value (`=1` will do) forces
   that walk on any kernel. When the capture ends the recorder prints how many
-  tasks its walks were handed, how many of those were targeted, and how many
-  walks of a process it read again.
+  tasks its walks were handed, how many of those were targeted, how many walks
+  of a process came up short and were read again, and how many of those came
+  up short the second time too. Both of those count more than the walks the
+  kernel cut: a thread that exits ahead of a walk's position lowers its visits
+  the same way, so a process that retires threads steadily reads short, and
+  short again, with nothing missed.
 - The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
   with the stack by `stack_id` into `stack` like every other recorder's. With
   Python frames collected, the `thread` table also gets the name the process
