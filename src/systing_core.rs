@@ -4197,12 +4197,21 @@ struct CgroupTarget {
 /// kfunc (Linux 6.5+)? That is the capability the kernel-side `--cgroup`
 /// matching needs; without it the filter runs in legacy mode.
 fn kernel_has_task_under_cgroup_kfunc() -> bool {
+    kernel_has_kfunc("bpf_task_under_cgroup")
+}
+
+/// Does the running kernel's vmlinux BTF export the kfunc `name`? The
+/// capability probe for anything that takes a kernel primitive where there is
+/// one and runs its older mechanism where there is not: the BTF says what
+/// this kernel has, which a version number does not (a vendor's kernel may
+/// carry a kfunc early, or leave it out). Without the BTF the answer is no.
+pub(crate) fn kernel_has_kfunc(name: &str) -> bool {
     match libbpf_rs::btf::Btf::from_vmlinux() {
-        Ok(btf) => btf_has_func(&btf, "bpf_task_under_cgroup"),
+        Ok(btf) => btf_has_func(&btf, name),
         Err(e) => {
             eprintln!(
                 "Warning: failed to open vmlinux BTF ({e}); \
-                 treating bpf_task_under_cgroup as unavailable"
+                 treating {name} as unavailable"
             );
             false
         }
@@ -6178,13 +6187,20 @@ pub fn systing(
         // released, so a load failure cannot leave it running untraced; its
         // snapshot thread starts after the exec, so the first snapshot sees
         // the command rather than the forked parent. It shares the target
-        // maps filled above.
+        // maps filled above, and takes the --cgroup targets' directories to
+        // walk their processes alone where the kernel can list them.
         let task_stacks_iter = if opts.task_stacks {
+            let cgroup_dirs: Vec<_> = cgroup_filter
+                .targets
+                .iter()
+                .map(|target| target.dir.as_fd())
+                .collect();
             Some(crate::task_stacks_recorder::TaskStacksIter::load(
                 &target_filter,
                 &target_filter_maps(&skel),
                 &shared_pystacks_maps(&skel),
                 task_stack_mode,
+                &cgroup_dirs,
             )?)
         } else {
             None

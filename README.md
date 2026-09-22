@@ -277,6 +277,19 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
 - A thread that has not run since its last snapshot and is still in the same
   non-runnable state cannot have changed its stack: it is not walked again and
   its row is extended instead, so a thread blocked for a minute is one row.
+- A capture with targets walks their threads alone, not every thread on the
+  host, where it can. With `--pid` (or a traced command) each snapshot walks
+  each target process with the task iterator scoped to it, the processes the
+  targets fork during the capture included. With `--cgroup` alone the kernel
+  lists the processes in the target cgroups (`bpf_iter_css_task`, **Linux 6.7
+  or newer**) and each is walked the same way. On an older kernel (no
+  `bpf_iter_css_task_new` in the kernel's BTF), with the start-time `--cgroup`
+  matching, from a pid namespace other than the host's, or past 1024 target
+  processes, a snapshot walks every thread on the host as it always has and
+  records the same threads; the walk in use is printed at start. Setting
+  `SYSTING_TASK_STACKS_FULL_WALK` to any non-empty value (`=1` will do) forces
+  that walk on any kernel. When the capture ends the recorder prints how many
+  tasks its walks visited and how many of those were targeted.
 - The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
   with the stack by `stack_id` into `stack` like every other recorder's. With
   Python frames collected, the `thread` table also gets the name the process

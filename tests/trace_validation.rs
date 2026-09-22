@@ -5340,6 +5340,248 @@ fn test_e2e_task_stacks_recording() {
     );
 }
 
+/// The task-stacks walks scoped to the capture's targets, beside the walk over
+/// every thread on the host that they stand in for. The same capture run both
+/// ways (`SYSTING_TASK_STACKS_FULL_WALK` forces the second) has to record the
+/// same threads, the processes the target forks during the capture among them,
+/// and the scoped run has to have visited a fraction of the tasks the full one
+/// did. Once with `--pid` and once with `--cgroup`. On a kernel without the
+/// css_task iterator the `--cgroup` run is the fallback's own test: it has to
+/// say which walk it took and why, and record the same.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_task_stacks_scoped_walks_record_what_the_full_walk_does() {
+    use std::process::{Command, Stdio};
+
+    // A shell that forks a short sleep a second, for good: whenever the
+    // capture starts, its children are forked during it. Killed and reaped
+    // when the guard drops, on the test's panic path too, so that the cgroup
+    // it was put in can go.
+    struct ForkingShell(std::process::Child);
+
+    impl ForkingShell {
+        fn spawn() -> ForkingShell {
+            ForkingShell(
+                Command::new("sh")
+                    .arg("-c")
+                    .arg("while :; do sleep 1; done")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("Failed to spawn the forking shell"),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for ForkingShell {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // One capture by the binary, so that each has its own environment:
+    // what it printed, and where it wrote.
+    fn capture(target: &[&str], full_walk: bool) -> (String, TempDir) {
+        let out_dir = TempDir::new().expect("Failed to create temp dir");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_systing"));
+        cmd.args([
+            "--only-recorder",
+            "task-stacks",
+            "--task-stacks-frames",
+            "native",
+            "--task-stacks-interval-ms",
+            "250",
+            "--duration",
+            "6",
+            "--parquet-only",
+            "--output-dir",
+        ])
+        .arg(out_dir.path())
+        .args(target)
+        .env_remove("SYSTING_CGROUP_FILTER_LEGACY");
+        if full_walk {
+            cmd.env("SYSTING_TASK_STACKS_FULL_WALK", "1");
+        } else {
+            cmd.env_remove("SYSTING_TASK_STACKS_FULL_WALK");
+        }
+        let output = cmd.output().expect("Failed to run systing");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            output.status.success(),
+            "systing {target:?} (full walk forced: {full_walk}) failed:\n{stderr}"
+        );
+        (stderr, out_dir)
+    }
+
+    // The tasks a capture's walks visited, and those of them it found
+    // targeted, from the recorder's closing line.
+    fn walk_counts(stderr: &str) -> (u64, u64) {
+        let line = stderr
+            .lines()
+            .find(|line| line.starts_with("task-stacks: walked "))
+            .unwrap_or_else(|| panic!("the recorder printed no closing line:\n{stderr}"));
+        let number_after = |marker: &str| -> u64 {
+            let at = line
+                .find(marker)
+                .unwrap_or_else(|| panic!("no {marker:?} in {line:?}"))
+                + marker.len();
+            line[at..]
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("no number after {marker:?} in {line:?}"))
+        };
+        (number_after("visited "), number_after(" tasks for "))
+    }
+
+    // What a capture recorded of the shell and of anything else: the
+    // shell's events, and the other threads that have any.
+    fn recorded(out_dir: &TempDir, shell: u32) -> (i64, i64) {
+        let events = out_dir.path().join("task_stack_event.parquet");
+        let threads = out_dir.path().join("thread.parquet");
+        assert!(
+            events.exists() && threads.exists(),
+            "no task_stack_event.parquet / thread.parquet in {}",
+            out_dir.path().display()
+        );
+        let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+        let count = |select: &str, relation: &str| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT {select} FROM read_parquet('{}') e JOIN read_parquet('{}') t \
+                     ON t.utid = e.utid WHERE t.tid {relation} {shell}",
+                    events.display(),
+                    threads.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("Failed to count the recorded threads")
+        };
+        (count("COUNT(*)", "="), count("COUNT(DISTINCT t.tid)", "<>"))
+    }
+
+    // Both walks of one targeting, read the same way. `scoped_line` is what
+    // the capture prints at start when it takes the scoped walk.
+    fn check(label: &str, target: &[&str], shell: u32, scoped_line: &str) {
+        let (stderr, out_dir) = capture(target, false);
+        let (visited, targeted) = walk_counts(&stderr);
+        let (shell_events, others) = recorded(&out_dir, shell);
+        eprintln!(
+            "[{label}] as it comes: visited {visited} for {targeted} targeted; \
+             {shell_events} events of the shell's, {others} other threads"
+        );
+        let (full_stderr, full_dir) = capture(target, true);
+        let (full_visited, full_targeted) = walk_counts(&full_stderr);
+        let (full_shell_events, full_others) = recorded(&full_dir, shell);
+        eprintln!(
+            "[{label}] full walk forced: visited {full_visited} for {full_targeted} targeted; \
+             {full_shell_events} events of the shell's, {full_others} other threads"
+        );
+
+        assert!(
+            full_stderr
+                .contains("walking every thread on the host: SYSTING_TASK_STACKS_FULL_WALK is set"),
+            "[{label}] the forced run must say which walk it took and why:\n{full_stderr}"
+        );
+        // The same threads either way: the shell, and the sleeps it forked
+        // while each capture ran (six seconds of one a second, less the edges).
+        for (run, shell_events, others) in [
+            ("as it comes", shell_events, others),
+            ("full walk forced", full_shell_events, full_others),
+        ] {
+            assert!(
+                shell_events > 0,
+                "[{label}, {run}] the shell (tid {shell}) was not recorded"
+            );
+            assert!(
+                others >= 3,
+                "[{label}, {run}] {others} threads other than the shell recorded: \
+                 the processes it forked during the capture are missing"
+            );
+        }
+        if stderr.contains(scoped_line) {
+            // Visits are per snapshot: what the scoped walks were handed is
+            // about what was targeted, what the full walk was handed is
+            // every thread on the host, two dozen times over.
+            assert!(
+                visited <= targeted + 4 * 24,
+                "[{label}] the scoped walks visited {visited} tasks for {targeted} targeted"
+            );
+            assert!(
+                visited * 4 < full_visited,
+                "[{label}] the scoped walks visited {visited} tasks, the full walk {full_visited}: \
+                 no fraction of it"
+            );
+            eprintln!("[{label}] scoped: {visited} visits against the full walk's {full_visited}");
+        } else {
+            // The fallback's own leg: a kernel the scoped walk does not run
+            // on has to say so, and has recorded the same above.
+            assert!(
+                stderr.contains("task-stacks: walking every thread on the host: "),
+                "[{label}] a capture with targets that walks every thread must say why:\n{stderr}"
+            );
+            eprintln!("[{label}] this kernel took the full walk and said so; recorded the same");
+        }
+    }
+
+    {
+        let shell = ForkingShell::spawn();
+        let pid = shell.pid().to_string();
+        check(
+            "--pid",
+            &["--pid", &pid],
+            shell.pid(),
+            "task-stacks: walking the --pid targets' threads alone",
+        );
+    }
+
+    let Some(cgroup_root) = systing::cgroup::cgroup2_root() else {
+        eprintln!("skipping the --cgroup half: no cgroup v2 unified hierarchy on this system");
+        return;
+    };
+    let base = match current_cgroup_v2_path() {
+        Some(p) if p != "/" => cgroup_root.join(p.trim_start_matches('/')),
+        _ => cgroup_root,
+    };
+    let target = base.join(format!("systing-tsw-{}", std::process::id()));
+    let mut fixture = CgroupFixture { dirs: Vec::new() };
+    match fixture.create(&target) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            eprintln!(
+                "skipping the --cgroup half: cannot create a cgroup under {} ({e})",
+                base.display()
+            );
+            return;
+        }
+        Err(e) => panic!("Failed to create cgroup {}: {e}", target.display()),
+    }
+    // After the fixture, so dropped before it: the cgroup empties, then goes.
+    // The sleep the shell forked before the move stays where it was born;
+    // the ones it forks from here on are born in the target.
+    let shell = ForkingShell::spawn();
+    std::fs::write(target.join("cgroup.procs"), shell.pid().to_string())
+        .unwrap_or_else(|e| panic!("Failed to move the shell into {}: {e}", target.display()));
+    let target_path = target.to_str().expect("a cgroup path in UTF-8").to_string();
+    check(
+        "--cgroup",
+        &["--cgroup", &target_path],
+        shell.pid(),
+        "task-stacks: walking the --cgroup targets' processes alone",
+    );
+}
+
 /// The names a process gave its threads, read out of live interpreters: the
 /// `threading` module found through sys.modules, its `_active` dict, and each
 /// Thread's `_name` and `_native_id` wherever this instance keeps its
