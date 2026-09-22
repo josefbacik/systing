@@ -53,6 +53,15 @@ enum Commands {
         /// query fails instead of the process being evicted.
         #[arg(long, value_name = "SIZE")]
         max_temp_directory_size: Option<String>,
+        /// Serve the --database file and no other. The tools' `path`
+        /// parameter then accepts that database (in any spelling that
+        /// resolves to it) or nothing, and any other path is refused without
+        /// being opened. For a caller that starts the server for one trace
+        /// and hands it to a client it does not fully trust. With this, a
+        /// --database that is missing or does not open is an error at start
+        /// instead of a warning.
+        #[arg(long, requires = "database")]
+        restrict_to_database: bool,
     },
     /// Print a shell completion script to stdout
     Completions {
@@ -1333,11 +1342,13 @@ fn main() -> Result<()> {
         Commands::Mcp {
             database,
             max_temp_directory_size,
+            restrict_to_database,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(systing::mcp::run_mcp_server(
+            rt.block_on(systing::mcp::run_mcp_server_with_restriction(
                 database,
                 max_temp_directory_size,
+                restrict_to_database,
             ))
         }
         Commands::Completions { shell } => {

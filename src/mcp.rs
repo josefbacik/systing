@@ -43,6 +43,9 @@ type DbResponse = std::result::Result<serde_json::Value, String>;
 /// results via oneshot.
 struct DbHandle {
     sender: mpsc::Sender<(DbRequest, oneshot::Sender<DbResponse>)>,
+    /// The database thread was started bound to one database
+    /// (`--restrict-to-database`) and holds no other.
+    restricted: bool,
 }
 
 impl DbHandle {
@@ -51,34 +54,82 @@ impl DbHandle {
     /// `spill_cap` bounds DuckDB's on-disk spill for every database this
     /// server opens, initial and lazily-opened alike — see
     /// [`AnalyzeDb::open_with_spill_cap`].
-    fn new(initial_db: Option<PathBuf>, spill_cap: Option<String>) -> Result<Self> {
+    ///
+    /// `restrict` binds the server to `initial_db`: that database is opened
+    /// here, before anything is served, and is the only one this server will
+    /// ever hold. A request may then name it, in any spelling that resolves
+    /// to it, or name nothing; see [`get_or_open`]. A bound server with
+    /// nothing bound would open whatever it is asked for, so with `restrict`
+    /// a database that is absent, does not resolve or does not open is an
+    /// error here and not the warning it is without.
+    fn new(initial_db: Option<PathBuf>, spill_cap: Option<String>, restrict: bool) -> Result<Self> {
+        if restrict && initial_db.is_none() {
+            anyhow::bail!("--restrict-to-database needs a database to bind to (-d)");
+        }
         let (sender, mut receiver) = mpsc::channel::<(DbRequest, oneshot::Sender<DbResponse>)>(32);
+        // How the DB thread reports the bound database's open. Only a bound
+        // start waits on it: without `restrict` nothing is sent and start-up
+        // is what it always was.
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
 
         std::thread::spawn(move || {
             let mut dbs: HashMap<PathBuf, AnalyzeDb> = HashMap::new();
             let mut last_used: Option<PathBuf> = None;
+            let mut bound: Option<PathBuf> = None;
             let spill_cap = spill_cap.as_deref();
 
             if let Some(path) = initial_db {
-                match std::fs::canonicalize(&path) {
+                let opened = match std::fs::canonicalize(&path) {
                     Ok(canonical) => match open_locked(&canonical, spill_cap) {
                         Ok(db) => {
                             dbs.insert(canonical.clone(), db);
-                            last_used = Some(canonical);
+                            last_used = Some(canonical.clone());
+                            Ok(canonical)
                         }
-                        Err(e) => eprintln!("Warning: failed to open initial database: {e}"),
+                        Err(e) => Err(format!("failed to open initial database: {e}")),
                     },
-                    Err(e) => eprintln!("Warning: cannot resolve path '{}': {e}", path.display()),
+                    Err(e) => Err(format!("cannot resolve path '{}': {e}", path.display())),
+                };
+                match opened {
+                    Ok(canonical) if restrict => {
+                        bound = Some(canonical);
+                        let _ = opened_tx.send(Ok(()));
+                    }
+                    Ok(_) => {}
+                    Err(e) if restrict => {
+                        let _ = opened_tx.send(Err(e));
+                        return;
+                    }
+                    Err(e) => eprintln!("Warning: {e}"),
                 }
             }
 
             while let Some((request, reply)) = receiver.blocking_recv() {
-                let result = handle_db_request(&mut dbs, &mut last_used, spill_cap, request);
+                let result = handle_db_request(
+                    &mut dbs,
+                    &mut last_used,
+                    spill_cap,
+                    bound.as_deref(),
+                    request,
+                );
                 let _ = reply.send(result);
             }
         });
 
-        Ok(Self { sender })
+        if restrict {
+            match opened_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => anyhow::bail!("--restrict-to-database: {e}"),
+                Err(_) => anyhow::bail!(
+                    "--restrict-to-database: the database thread ended before opening the database"
+                ),
+            }
+        }
+
+        Ok(Self {
+            sender,
+            restricted: restrict,
+        })
     }
 
     /// Send a request to the DB thread and wait for the response.
@@ -111,12 +162,49 @@ fn open_locked(canonical: &Path, spill_cap: Option<&str>) -> Result<AnalyzeDb, S
     Ok(db)
 }
 
+/// What a bound server (`--restrict-to-database`) answers a request that
+/// names any database but its own. One text for every such request, a path
+/// that does not resolve included, and none of the operating system's error
+/// in it, so the answer does not say which files exist; it names the option
+/// and the bound database, which the caller that started the server chose,
+/// and never the path that was asked for.
+fn bound_refusal(bound: &Path) -> String {
+    format!(
+        "This server was started with --restrict-to-database and serves only '{}'. \
+         Omit 'path', or pass that database's own path.",
+        bound.display()
+    )
+}
+
+/// The database a request is for.
+///
+/// Unbound (`bound` is `None`): the request's `path`, or else the database
+/// used last, opened on first use and cached.
+///
+/// Bound: nothing is opened here. The bound database was opened when the
+/// server started and is the only entry `dbs` ever holds; a request's `path`
+/// is only compared with it, after canonicalization on both sides, so the
+/// right path in any spelling (relative, through `..`, through a symlink to
+/// the database) is accepted and every other gets [`bound_refusal`]. Because
+/// the compare never opens anything, a path swapped between the compare and
+/// the use can change the compare's answer and never which file is served.
 fn get_or_open<'a>(
     dbs: &'a mut HashMap<PathBuf, AnalyzeDb>,
     last_used: &mut Option<PathBuf>,
     spill_cap: Option<&str>,
+    bound: Option<&Path>,
     path: Option<PathBuf>,
 ) -> Result<&'a AnalyzeDb, String> {
+    if let Some(bound) = bound {
+        if let Some(requested) = path {
+            match std::fs::canonicalize(&requested) {
+                Ok(canonical) if canonical == bound => {}
+                _ => return Err(bound_refusal(bound)),
+            }
+        }
+        return dbs.get(bound).ok_or_else(|| bound_refusal(bound));
+    }
+
     let raw_path = match path {
         Some(p) => p,
         None => last_used.clone().ok_or_else(|| {
@@ -155,11 +243,12 @@ fn handle_db_request(
     dbs: &mut HashMap<PathBuf, AnalyzeDb>,
     last_used: &mut Option<PathBuf>,
     spill_cap: Option<&str>,
+    bound: Option<&Path>,
     request: DbRequest,
 ) -> DbResponse {
     match request {
         DbRequest::Query(path, sql) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.query(&sql)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -167,7 +256,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Query error: {e}"))
         }
         DbRequest::ListTables(path) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.list_tables()
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -175,7 +264,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Error listing tables: {e}"))
         }
         DbRequest::DescribeTable(path, name) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.describe_table(&name)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -183,7 +272,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Error describing table: {e}"))
         }
         DbRequest::Flamegraph(path, params) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.flamegraph(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -191,7 +280,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Flamegraph error: {e}"))
         }
         DbRequest::SchedStats(path, params) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.sched_stats(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -199,7 +288,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Sched stats error: {e}"))
         }
         DbRequest::CpuStats(path, params) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.cpu_stats(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -207,7 +296,7 @@ fn handle_db_request(
                 .map_err(|e| format!("CPU stats error: {e}"))
         }
         DbRequest::SchedAggregate(path, params) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.sched_aggregate(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -215,7 +304,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Sched aggregate error: {e}"))
         }
         DbRequest::TraceInfo(path) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.trace_info()
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -223,7 +312,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Error getting trace info: {e}"))
         }
         DbRequest::NetworkConnections(path, params) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.network_connections(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -231,7 +320,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Network connections error: {e}"))
         }
         DbRequest::NetworkInterfaces(path, params) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.network_interfaces(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -239,7 +328,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Network interfaces error: {e}"))
         }
         DbRequest::NetworkSocketPairs(path, params) => {
-            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, bound, path)?;
             db.network_socket_pairs(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -884,11 +973,25 @@ Queries return at most 10,000 rows. If results are truncated, the response \
 includes truncated=true and total_row_count. Use SQL LIMIT and OFFSET clauses \
 to paginate through larger result sets.";
 
+/// Appended to the instructions of a bound server (`--restrict-to-database`),
+/// so that a client stops offering paths: the workflow above tells it to pass
+/// one, and on a bound server every path but one is refused.
+const RESTRICTED_INSTRUCTIONS: &str = "\
+# One database
+This server was started with --restrict-to-database: it serves the one database \
+it was started with and no other. Omit `path` on every call (that database's own \
+path is accepted too); any other path is refused.";
+
 #[tool_handler]
 impl ServerHandler for SystingMcpServer {
     fn get_info(&self) -> ServerInfo {
+        let instructions = if self.db.restricted {
+            format!("{SERVER_INSTRUCTIONS}\n\n{RESTRICTED_INSTRUCTIONS}")
+        } else {
+            SERVER_INSTRUCTIONS.to_string()
+        };
         ServerInfo {
-            instructions: Some(SERVER_INSTRUCTIONS.into()),
+            instructions: Some(instructions),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
@@ -903,7 +1006,21 @@ pub async fn run_mcp_server(
     database: Option<PathBuf>,
     max_temp_directory_size: Option<String>,
 ) -> Result<()> {
-    let db_handle = DbHandle::new(database, max_temp_directory_size)?;
+    run_mcp_server_with_restriction(database, max_temp_directory_size, false).await
+}
+
+/// [`run_mcp_server`], with the choice to bind the server to `database`.
+///
+/// `restrict_to_database` binds the server to `database`: it is opened before
+/// anything is served, a tool call can reach no other file through `path`,
+/// and a `database` that is absent or does not open is an error returned from
+/// here before the transport starts. With `false` this is [`run_mcp_server`].
+pub async fn run_mcp_server_with_restriction(
+    database: Option<PathBuf>,
+    max_temp_directory_size: Option<String>,
+    restrict_to_database: bool,
+) -> Result<()> {
+    let db_handle = DbHandle::new(database, max_temp_directory_size, restrict_to_database)?;
     let server = SystingMcpServer::new(db_handle);
 
     let service = server.serve(stdio()).await?;
@@ -930,7 +1047,14 @@ mod tests {
         }
         let mut dbs = HashMap::new();
         let mut last_used = None;
-        let db = get_or_open(&mut dbs, &mut last_used, Some("100MiB"), Some(db_path)).unwrap();
+        let db = get_or_open(
+            &mut dbs,
+            &mut last_used,
+            Some("100MiB"),
+            None,
+            Some(db_path),
+        )
+        .unwrap();
         for sql in [
             "SET memory_limit = '100GB'",
             "SET max_temp_directory_size = '100GB'",
@@ -962,7 +1086,7 @@ mod tests {
             conn.execute_batch("CREATE TABLE t AS SELECT range AS id FROM range(10)")
                 .unwrap();
         }
-        let handle = DbHandle::new(Some(db_path), Some("100MiB".to_string())).unwrap();
+        let handle = DbHandle::new(Some(db_path), Some("100MiB".to_string()), false).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         // No path on the request: the initial database is the one in use.
         let refused = rt.block_on(handle.request(DbRequest::Query(
@@ -982,6 +1106,246 @@ mod tests {
             .block_on(handle.request(DbRequest::Query(None, "SELECT count(*) FROM t".to_string())))
             .unwrap();
         assert_eq!(count["rows"][0][0], serde_json::json!(10));
+    }
+
+    // -- A server bound to one database (`--restrict-to-database`) --
+    //
+    // Every bound below is shown by behaviour: each database holds one table
+    // no other has, so an answer says which file it came from.
+
+    /// A database whose one table is `marker`.
+    fn marker_db(dir: &Path, file: &str, marker: &str) -> PathBuf {
+        let path = dir.join(file);
+        let conn = duckdb::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!("CREATE TABLE {marker} AS SELECT 1 AS one"))
+            .unwrap();
+        path
+    }
+
+    /// A server bound to `bound`, started the way a caller that spawns it for
+    /// one trace starts it: the database named at start, the option on.
+    fn bound_handle(bound: &Path) -> DbHandle {
+        DbHandle::new(Some(bound.to_path_buf()), None, true).unwrap()
+    }
+
+    /// One request of every kind, each naming `path`.
+    fn every_request(path: Option<PathBuf>) -> Vec<DbRequest> {
+        vec![
+            DbRequest::Query(path.clone(), "SELECT 1".to_string()),
+            DbRequest::ListTables(path.clone()),
+            DbRequest::DescribeTable(path.clone(), "bound_marker".to_string()),
+            DbRequest::Flamegraph(
+                path.clone(),
+                FlamegraphParams {
+                    stack_type: StackTypeFilter::Cpu,
+                    pid: None,
+                    tid: None,
+                    start_time: None,
+                    end_time: None,
+                    trace_id: None,
+                    min_count: 1,
+                    top_n: Some(500),
+                    max_depth: None,
+                },
+            ),
+            DbRequest::SchedStats(
+                path.clone(),
+                SchedStatsParams {
+                    pid: None,
+                    tid: None,
+                    trace_id: None,
+                    top_n: 20,
+                },
+            ),
+            DbRequest::CpuStats(path.clone(), CpuStatsParams { trace_id: None }),
+            DbRequest::SchedAggregate(path.clone(), SchedAggregateParams::default()),
+            DbRequest::TraceInfo(path.clone()),
+            DbRequest::NetworkConnections(
+                path.clone(),
+                NetworkConnectionsParams {
+                    trace_id: None,
+                    pid: None,
+                    tid: None,
+                    top_n: Some(50),
+                },
+            ),
+            DbRequest::NetworkInterfaces(path.clone(), NetworkInterfacesParams { trace_id: None }),
+            DbRequest::NetworkSocketPairs(
+                path,
+                NetworkSocketPairsParams {
+                    trace_id: None,
+                    dest_port: None,
+                    ip: None,
+                    top_n: Some(50),
+                    exclude_loopback: false,
+                },
+            ),
+        ]
+    }
+
+    /// Where `request`'s kind stands among `DbRequest`'s. There is no wildcard
+    /// arm on purpose: a new kind of request does not compile until it has a
+    /// place here, and whoever gives it one adds a request of that kind to
+    /// `every_request` too, so that the test below sends a foreign path
+    /// through it. One function serves every kind its database today; that
+    /// test is what stays in the way of a later kind that opens its own.
+    fn kind_index(request: &DbRequest) -> usize {
+        match request {
+            DbRequest::Query(..) => 0,
+            DbRequest::ListTables(..) => 1,
+            DbRequest::DescribeTable(..) => 2,
+            DbRequest::Flamegraph(..) => 3,
+            DbRequest::SchedStats(..) => 4,
+            DbRequest::CpuStats(..) => 5,
+            DbRequest::SchedAggregate(..) => 6,
+            DbRequest::TraceInfo(..) => 7,
+            DbRequest::NetworkConnections(..) => 8,
+            DbRequest::NetworkInterfaces(..) => 9,
+            DbRequest::NetworkSocketPairs(..) => 10,
+        }
+    }
+
+    /// A bound server refuses a foreign database in the same words whichever
+    /// kind of request names it, says nothing of the path it was asked for,
+    /// and goes on serving its own database and only that.
+    #[test]
+    fn test_bound_server_refuses_a_foreign_path_through_every_request_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let bound = marker_db(dir.path(), "bound.duckdb", "bound_marker");
+        let foreign = marker_db(dir.path(), "foreign.duckdb", "foreign_marker");
+        let handle = bound_handle(&bound);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let refusal = bound_refusal(&std::fs::canonicalize(&bound).unwrap());
+
+        let kinds: BTreeSet<usize> = every_request(None).iter().map(kind_index).collect();
+        let every_index: BTreeSet<usize> = (0..every_request(None).len()).collect();
+        assert_eq!(kinds, every_index, "every_request misses or repeats a kind");
+
+        for request in every_request(Some(foreign.clone())) {
+            let kind = kind_index(&request);
+            let answer = rt.block_on(handle.request(request));
+            assert_eq!(answer, Err(refusal.clone()), "request kind {kind}");
+        }
+        assert!(!refusal.contains(foreign.to_str().unwrap()), "{refusal}");
+
+        // With no path every kind is answered by the bound database: some of
+        // these fail on a database this small, none with the refusal.
+        for request in every_request(None) {
+            let kind = kind_index(&request);
+            let answer = rt.block_on(handle.request(request));
+            assert_ne!(answer, Err(refusal.clone()), "request kind {kind}");
+        }
+        let count = |table: &str| {
+            rt.block_on(handle.request(DbRequest::Query(
+                None,
+                format!("SELECT count(*) FROM {table}"),
+            )))
+        };
+        assert_eq!(
+            count("bound_marker").unwrap()["rows"][0][0],
+            serde_json::json!(1)
+        );
+        assert!(count("foreign_marker").is_err());
+    }
+
+    /// The bound database is accepted under any spelling that resolves to it
+    /// and under no other; a path that does not resolve is refused in the
+    /// same words as one that resolves elsewhere, with none of the operating
+    /// system's words and nothing of the path that was asked for.
+    #[test]
+    fn test_bound_server_compares_canonical_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let bound = marker_db(dir.path(), "bound.duckdb", "bound_marker");
+        let foreign = marker_db(dir.path(), "foreign.duckdb", "foreign_marker");
+        let handle = bound_handle(&bound);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let canonical = std::fs::canonicalize(&bound).unwrap();
+        let refusal = bound_refusal(&canonical);
+        let tables = |path: PathBuf| rt.block_on(handle.request(DbRequest::ListTables(Some(path))));
+
+        // Absolute; through `..`; relative to this process's own directory.
+        assert!(tables(canonical.clone()).is_ok());
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(tables(sub.join("..").join("bound.duckdb")).is_ok());
+        let mut relative = PathBuf::new();
+        for _ in std::env::current_dir().unwrap().components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(canonical.strip_prefix("/").unwrap());
+        assert!(relative.is_relative());
+        assert!(tables(relative).is_ok());
+
+        // Through a symlink to the bound database: the same file.
+        let link = dir.path().join("link.duckdb");
+        std::os::unix::fs::symlink(&bound, &link).unwrap();
+        assert!(tables(link).is_ok());
+
+        // A symlink and a hard link to the foreign database are that database.
+        let foreign_link = dir.path().join("foreign-link.duckdb");
+        std::os::unix::fs::symlink(&foreign, &foreign_link).unwrap();
+        assert_eq!(tables(foreign_link), Err(refusal.clone()));
+        let foreign_hard = dir.path().join("foreign-hard.duckdb");
+        std::fs::hard_link(&foreign, &foreign_hard).unwrap();
+        assert_eq!(tables(foreign_hard), Err(refusal.clone()));
+
+        // A hard link to the bound database under another name is another
+        // path: refused too, the same bytes though it holds.
+        let bound_hard = dir.path().join("bound-hard.duckdb");
+        std::fs::hard_link(&bound, &bound_hard).unwrap();
+        assert_eq!(tables(bound_hard), Err(refusal.clone()));
+
+        let answer = tables(dir.path().join("missing.duckdb")).unwrap_err();
+        assert_eq!(answer, refusal);
+        assert!(!answer.contains("No such file"), "{answer}");
+        assert!(!answer.contains("missing.duckdb"), "{answer}");
+    }
+
+    /// A bound server with nothing bound would open whatever it is asked for:
+    /// it does not start.
+    #[test]
+    fn test_bound_server_needs_its_database_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(DbHandle::new(None, None, true).is_err());
+        assert!(DbHandle::new(Some(dir.path().join("missing.duckdb")), None, true).is_err());
+        let not_a_database = dir.path().join("not-a-database.duckdb");
+        std::fs::write(&not_a_database, vec![0x5a; 16 * 1024]).unwrap();
+        assert!(DbHandle::new(Some(not_a_database), None, true).is_err());
+    }
+
+    /// Without the option nothing changes: a second database still opens by
+    /// its path, and a database that cannot be opened at start is a warning
+    /// and a server that starts.
+    #[test]
+    fn test_unbound_server_is_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = marker_db(dir.path(), "first.duckdb", "first_marker");
+        let second = marker_db(dir.path(), "second.duckdb", "second_marker");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = DbHandle::new(Some(first), None, false).unwrap();
+        let count = rt
+            .block_on(handle.request(DbRequest::Query(
+                Some(second),
+                "SELECT count(*) FROM second_marker".to_string(),
+            )))
+            .unwrap();
+        assert_eq!(count["rows"][0][0], serde_json::json!(1));
+
+        let handle = DbHandle::new(Some(dir.path().join("missing.duckdb")), None, false).unwrap();
+        let answer = rt.block_on(handle.request(DbRequest::ListTables(None)));
+        assert!(answer.unwrap_err().contains("No database path provided"));
+    }
+
+    /// Only a bound server tells its client to stop passing paths.
+    #[test]
+    fn test_instructions_carry_the_rider_only_when_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = marker_db(dir.path(), "bound.duckdb", "bound_marker");
+        let bound = SystingMcpServer::new(bound_handle(&db));
+        let unbound = SystingMcpServer::new(DbHandle::new(None, None, false).unwrap());
+        let text = |server: &SystingMcpServer| server.get_info().instructions.unwrap();
+        assert!(text(&bound).ends_with(RESTRICTED_INSTRUCTIONS));
+        assert_eq!(text(&unbound), SERVER_INSTRUCTIONS);
     }
 
     /// Verify that the MCP tool router contains exactly the expected set of tools.
