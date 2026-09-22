@@ -1002,12 +1002,20 @@ impl ServerHandler for SystingMcpServer {
 ///
 /// `max_temp_directory_size` bounds DuckDB's on-disk spill for every
 /// database the server opens — see [`AnalyzeDb::open_with_spill_cap`].
+pub async fn run_mcp_server(
+    database: Option<PathBuf>,
+    max_temp_directory_size: Option<String>,
+) -> Result<()> {
+    run_mcp_server_with_restriction(database, max_temp_directory_size, false).await
+}
+
+/// [`run_mcp_server`], with the choice to bind the server to `database`.
 ///
 /// `restrict_to_database` binds the server to `database`: it is opened before
 /// anything is served, a tool call can reach no other file through `path`,
 /// and a `database` that is absent or does not open is an error returned from
-/// here before the transport starts.
-pub async fn run_mcp_server(
+/// here before the transport starts. With `false` this is [`run_mcp_server`].
+pub async fn run_mcp_server_with_restriction(
     database: Option<PathBuf>,
     max_temp_directory_size: Option<String>,
     restrict_to_database: bool,

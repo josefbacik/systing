@@ -1345,7 +1345,7 @@ fn main() -> Result<()> {
             restrict_to_database,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(systing::mcp::run_mcp_server(
+            rt.block_on(systing::mcp::run_mcp_server_with_restriction(
                 database,
                 max_temp_directory_size,
                 restrict_to_database,
