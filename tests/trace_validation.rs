@@ -5447,18 +5447,20 @@ fn task_stacks_reread_counts(stderr: &str) -> (u64, u64) {
     )
 }
 
-/// What a recording says of its own coverage, over every thread in it.
+/// What a recording says of its own coverage, over every thread in it. Counted
+/// per iteration and not from each thread's totals, where a snapshot a thread
+/// is missing from and a snapshot that states it twice would cancel.
 struct TaskStacksCoverage {
     /// The threads that have any event.
     threads: i64,
-    /// The iterations their events cover.
+    /// The thread-snapshots their events state, each counted once.
     covered: i64,
     /// The iterations between a thread's first and last that none of its
     /// events covers: each a snapshot the thread is missing from though it was
     /// there before and after.
     misses: i64,
-    /// The iterations covered more than once: a thread stated twice in one
-    /// snapshot.
+    /// The statements beyond the first of a thread in one iteration: a thread
+    /// stated twice in one snapshot.
     twice: i64,
 }
 
@@ -5473,12 +5475,16 @@ fn task_stacks_coverage(out_dir: &TempDir) -> TaskStacksCoverage {
     conn.query_row(
         &format!(
             "SELECT CAST(COUNT(*) AS BIGINT), \
-                    CAST(COALESCE(SUM(covered), 0) AS BIGINT), \
-                    CAST(COALESCE(SUM(GREATEST(span - covered, 0)), 0) AS BIGINT), \
-                    CAST(COALESCE(SUM(GREATEST(covered - span, 0)), 0) AS BIGINT) \
-             FROM (SELECT CAST(MAX(end_iteration) - MIN(start_iteration) + 1 AS BIGINT) AS span, \
-                          CAST(SUM(end_iteration - start_iteration + 1) AS BIGINT) AS covered \
-                   FROM read_parquet('{}') GROUP BY utid)",
+                    CAST(COALESCE(SUM(stated), 0) AS BIGINT), \
+                    CAST(COALESCE(SUM(span - stated), 0) AS BIGINT), \
+                    CAST(COALESCE(SUM(statements - stated), 0) AS BIGINT) \
+             FROM (SELECT CAST(MAX(it) - MIN(it) + 1 AS BIGINT) AS span, \
+                          CAST(COUNT(DISTINCT it) AS BIGINT) AS stated, \
+                          CAST(COUNT(*) AS BIGINT) AS statements \
+                   FROM (SELECT utid, \
+                                UNNEST(range(start_iteration, end_iteration + 1)) AS it \
+                         FROM read_parquet('{}')) \
+                   GROUP BY utid)",
             events.display()
         ),
         [],
@@ -5714,66 +5720,27 @@ fn test_e2e_task_stacks_scoped_walks_record_what_the_full_walk_does() {
 /// ends the walk of one process early when the thread it has just handed over
 /// exits before it advances; the recorder reads a process whose walk came up
 /// short once more, and what that leaves is checked against the recording
-/// itself. The target is this process, with a few hundred short-lived threads
-/// alive at any time and better than a thousand exiting every second, at no
-/// fixed place in its thread list. A thread the recording has at one snapshot
-/// and at a later one was there for every snapshot between them, so a snapshot
-/// it is missing from is a miss nothing else explains. The walk over every
-/// thread on the host, forced, is the control: it steps over a thread that has
-/// gone, so it must show none. The scoped run may show one only where some
-/// process came up short both times it was read, which is what the design says
-/// of it, and the two figures of the closing line are printed beside the
-/// misses counted this way, since they count more than the walks that were
-/// cut.
+/// itself. The target is this process, with short-lived threads exiting all
+/// the time at no fixed place in its thread list. A thread the recording has
+/// at one snapshot and at a later one was there for every snapshot between
+/// them, so a snapshot it is missing from is a miss nothing else explains. The
+/// walk over every thread on the host, forced, is the control: it steps over a
+/// thread that has gone, so it must show none. The scoped run may show one
+/// only where some process came up short both times it was read, which is what
+/// the design says of it, and the two figures of the closing line are printed
+/// beside the misses counted this way, since they count more than the walks
+/// that were cut.
+///
+/// Twice, at two rates. With a few hundred threads alive and better than a
+/// thousand exiting every second, most walks see a thread exit and so do most
+/// second walks: that run exercises the re-read and the merge of the two
+/// walks, and its last check cannot fail. With some forty alive and a hundred
+/// exiting every second, most walks are whole and a second walk short as well
+/// is rare: there a thread missing from a snapshot in a capture where no
+/// process came up short twice would be a cut the visit count did not see.
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_task_stacks_scoped_walk_of_a_process_that_retires_threads() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    // Four threads that each start one every 3 ms, which lives for 50 to 750
-    // ms and wakes every 10 ms: every one of them has run between any two
-    // snapshots, and none waits on another. Fewer than twenty thousand start
-    // during one capture, so that no thread id comes round again inside it
-    // where the kernel's ids run to 32768.
-    let _churn: Vec<_> = (0..4u64)
-        .map(|spawner| {
-            stoppable_workload(move |stop| {
-                let live = Arc::new(AtomicU64::new(0));
-                let quit = Arc::new(AtomicBool::new(false));
-                let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ (spawner + 1);
-                while !stop.load(Ordering::Relaxed) {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    let until = Instant::now() + Duration::from_millis(50 + seed % 700);
-                    let (live_in, quit_in) = (live.clone(), quit.clone());
-                    live.fetch_add(1, Ordering::Relaxed);
-                    let started = std::thread::Builder::new()
-                        .name("tsw-churn".to_string())
-                        .stack_size(64 * 1024)
-                        .spawn(move || {
-                            while Instant::now() < until && !quit_in.load(Ordering::Relaxed) {
-                                std::thread::sleep(Duration::from_millis(10));
-                            }
-                            live_in.fetch_sub(1, Ordering::Relaxed);
-                        });
-                    if started.is_err() {
-                        live.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    std::thread::sleep(Duration::from_millis(3));
-                }
-                quit.store(true, Ordering::Relaxed);
-                wait_until("the short-lived threads to exit", || {
-                    live.load(Ordering::Relaxed) == 0
-                });
-            })
-        })
-        .collect();
-    // Up to their steady number before the first capture starts.
-    std::thread::sleep(Duration::from_secs(1));
-
     // One capture of this process: twelve seconds of a snapshot every 50 ms.
     struct Run {
         stderr: String,
@@ -5803,75 +5770,142 @@ fn test_e2e_task_stacks_scoped_walk_of_a_process_that_retires_threads() {
         }
     }
 
-    let scoped = run("as it comes", false);
-    let full = run("full walk forced", true);
+    // One rate: `spawners` threads that each start one every `every_ms`, which
+    // lives for 50 to 750 ms and wakes every 10 ms, so that every one of them
+    // has run between any two snapshots and none waits on another; then the
+    // capture as it comes and the one with the full walk forced, and what the
+    // two recordings have to show. At the higher rate fewer than twenty
+    // thousand threads start during one capture, so that no thread id comes
+    // round again inside it where the kernel's ids run to 32768.
+    fn at_rate(rate: &str, spawners: u64, every_ms: u64, least_threads: i64) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
 
-    // Both saw the threads come and go.
-    for (label, threads) in [
-        ("as it comes", scoped.coverage.threads),
-        ("full walk forced", full.coverage.threads),
-    ] {
-        assert!(
-            threads >= 1000,
-            "[{label}] {threads} threads recorded: the short-lived threads are not in it"
-        );
-    }
-    // The control first: if the walk over every thread misses a thread
-    // between two snapshots that have it, the count above is not one of
-    // misses and says nothing about the scoped walk either.
-    assert_eq!(
-        (full.coverage.misses, full.coverage.twice),
-        (0, 0),
-        "the walk over every thread on the host missed a thread between two snapshots that \
-         have it, or stated one twice:\n{}",
-        full.stderr
-    );
-    assert_eq!(
-        scoped.coverage.twice, 0,
-        "a snapshot of scoped walks stated a thread twice:\n{}",
-        scoped.stderr
-    );
-    if !scoped
-        .stderr
-        .contains("task-stacks: walking the --pid targets' threads alone")
-    {
-        // Nothing scoped to check, for the one reason a healthy host can give
-        // a `--pid` capture; any other is a failure, not a skip.
+        let _churn: Vec<_> = (0..spawners)
+            .map(|spawner| {
+                stoppable_workload(move |stop| {
+                    let live = Arc::new(AtomicU64::new(0));
+                    let quit = Arc::new(AtomicBool::new(false));
+                    let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ (spawner + 1);
+                    while !stop.load(Ordering::Relaxed) {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        let until = Instant::now() + Duration::from_millis(50 + seed % 700);
+                        let (live_in, quit_in) = (live.clone(), quit.clone());
+                        live.fetch_add(1, Ordering::Relaxed);
+                        let started = std::thread::Builder::new()
+                            .name("tsw-churn".to_string())
+                            .stack_size(64 * 1024)
+                            .spawn(move || {
+                                while Instant::now() < until && !quit_in.load(Ordering::Relaxed) {
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                                live_in.fetch_sub(1, Ordering::Relaxed);
+                            });
+                        if started.is_err() {
+                            live.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        std::thread::sleep(Duration::from_millis(every_ms));
+                    }
+                    quit.store(true, Ordering::Relaxed);
+                    wait_until("the short-lived threads to exit", || {
+                        live.load(Ordering::Relaxed) == 0
+                    });
+                })
+            })
+            .collect();
+        // Up to their steady number before the first capture starts.
+        std::thread::sleep(Duration::from_secs(1));
+
+        let scoped = run(&format!("{rate}, as it comes"), false);
+        let full = run(&format!("{rate}, full walk forced"), true);
+
+        // Both saw the threads come and go.
+        for (label, threads) in [
+            ("as it comes", scoped.coverage.threads),
+            ("full walk forced", full.coverage.threads),
+        ] {
+            assert!(
+                threads >= least_threads,
+                "[{rate}, {label}] {threads} threads recorded: the short-lived threads are not in it"
+            );
+        }
+        // The control first: if the walk over every thread misses a thread
+        // between two snapshots that have it, the count above is not one of
+        // misses and says nothing about the scoped walk either.
         assert_eq!(
-            task_stacks_full_walk_reason(&scoped.stderr),
-            Some(TASK_STACKS_NOT_ROOT_PID_NS),
-            "a --pid capture walked every thread on the host for a reason no healthy host \
-             gives:\n{}",
+            (full.coverage.misses, full.coverage.twice),
+            (0, 0),
+            "[{rate}] the walk over every thread on the host missed a thread between two \
+             snapshots that have it, or stated one twice:\n{}",
+            full.stderr
+        );
+        assert_eq!(
+            scoped.coverage.twice, 0,
+            "[{rate}] a snapshot of scoped walks stated a thread twice:\n{}",
             scoped.stderr
         );
-        eprintln!(
-            "this capture took the walk over every thread on the host \
-             ({TASK_STACKS_NOT_ROOT_PID_NS}): nothing scoped to check"
+        if !scoped
+            .stderr
+            .contains("task-stacks: walking the --pid targets' threads alone")
+        {
+            // Nothing scoped to check, for the one reason a healthy host can
+            // give a `--pid` capture; any other is a failure, not a skip.
+            assert_eq!(
+                task_stacks_full_walk_reason(&scoped.stderr),
+                Some(TASK_STACKS_NOT_ROOT_PID_NS),
+                "[{rate}] a --pid capture walked every thread on the host for a reason no \
+                 healthy host gives:\n{}",
+                scoped.stderr
+            );
+            eprintln!(
+                "[{rate}] this capture took the walk over every thread on the host \
+                 ({TASK_STACKS_NOT_ROOT_PID_NS}): nothing scoped to check"
+            );
+            return;
+        }
+        assert!(
+            scoped.still_short <= scoped.rereads,
+            "[{rate}] more second walks came up short ({}) than walks were read again ({})",
+            scoped.still_short,
+            scoped.rereads
         );
-        return;
-    }
-    assert!(
-        scoped.still_short <= scoped.rereads,
-        "more second walks came up short ({}) than walks were read again ({})",
-        scoped.still_short,
-        scoped.rereads
-    );
-    // A cut that drops a thread which was there when the walk began leaves the
-    // walk short of the count, and the process is read again: only a second
-    // walk cut as well can leave such a thread out of the snapshot.
-    assert!(
-        scoped.coverage.misses == 0 || scoped.still_short > 0,
-        "{} thread-snapshots missed between two that were not, and no process came up short \
-         both times it was read:\n{}",
-        scoped.coverage.misses,
-        scoped.stderr
-    );
-    if scoped.rereads == 0 {
-        eprintln!(
-            "no walk came up short in this run: too few threads exited under the walks to \
-             exercise the re-read on this host"
+        // A cut that drops a thread which was there when the walk began leaves
+        // the walk short of the count, and the process is read again: only a
+        // second walk cut as well can leave such a thread out of the snapshot.
+        assert!(
+            scoped.coverage.misses == 0 || scoped.still_short > 0,
+            "[{rate}] {} thread-snapshots missed between two that were not, and no process \
+             came up short both times it was read:\n{}",
+            scoped.coverage.misses,
+            scoped.stderr
         );
+        // Which of the three this run was, since the check above binds in one
+        // of them only.
+        if scoped.rereads == 0 {
+            eprintln!(
+                "[{rate}] no walk came up short in this run: too few threads exited under the \
+                 walks to exercise the re-read on this host"
+            );
+        } else if scoped.still_short == 0 {
+            eprintln!(
+                "[{rate}] no process came up short both times it was read, and no thread is \
+                 missing between two snapshots that have it: here a miss would have been a cut \
+                 the visit count did not see"
+            );
+        } else {
+            eprintln!(
+                "[{rate}] some process came up short both times it was read: a thread missing \
+                 from a snapshot is within what the design allows here, and the check above \
+                 could not have failed"
+            );
+        }
     }
+
+    at_rate("most walks cut", 4, 3, 1000);
+    at_rate("most walks whole", 1, 10, 300);
 }
 
 /// The names a process gave its threads, read out of live interpreters: the

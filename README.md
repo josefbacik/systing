@@ -282,7 +282,10 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   each target process with the task iterator scoped to it, the processes the
   targets fork during the capture included. With `--cgroup` alone the kernel
   lists the processes in the target cgroups (`bpf_iter_css_task`, **Linux 6.7
-  or newer**) and each is walked the same way. The kernel ends the walk of one
+  or newer**) and each is walked the same way. That listing leaves out a
+  process whose every thread has exited and which waits to be reaped (a
+  zombie): the `--cgroup` walk never visits it, where the walk over every
+  thread does, and records its row. The kernel ends the walk of one
   process early when the thread it has just visited exits before it moves on;
   a walk that came up short of the process's thread count is read once more
   within the snapshot. On an older kernel (no
@@ -299,7 +302,8 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   up short the second time too. Both of those count more than the walks the
   kernel cut: a thread that exits ahead of a walk's position lowers its visits
   the same way, so a process that retires threads steadily reads short, and
-  short again, with nothing missed.
+  short again, even when nothing was missed. The two figures are upper bounds
+  on the walks that lost a thread.
 - The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
   with the stack by `stack_id` into `stack` like every other recorder's. With
   Python frames collected, the `thread` table also gets the name the process
