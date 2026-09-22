@@ -1210,6 +1210,17 @@ mod tests {
                 .unwrap_err();
             assert_external_access_blocked(&read_err);
 
+            // So is listing files, and reading one as text or as bytes.
+            for function in ["glob", "read_text", "read_blob"] {
+                let err = db
+                    .query(&format!(
+                        "SELECT * FROM {function}('{}')",
+                        csv_path.display()
+                    ))
+                    .unwrap_err();
+                assert_external_access_blocked(&err);
+            }
+
             // Writing external files is blocked.
             let copy_err = db
                 .query(&format!(

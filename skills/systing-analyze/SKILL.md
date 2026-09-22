@@ -33,6 +33,8 @@ Systing stores traces in **DuckDB**. The `systing-analyze` MCP server exposes st
 
 There is also a CLI with the same analyses: `systing-analyze query|stacktrace flamegraph|sched stats|sched cpu-stats|sched aggregate|network connections|network interfaces|network socket-pairs` (and `systing-analyze mcp` to start this server).
 
+A server started with `systing-analyze mcp -d <trace.duckdb> --restrict-to-database` serves that one database: omit `path` on every call (that database's own path is accepted too), and any other path is refused without being opened.
+
 ## Key schema for `query`
 
 ### Timestamps
