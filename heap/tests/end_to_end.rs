@@ -91,3 +91,22 @@ fn a_dump_becomes_named_stacks_and_heap_rows() {
         .unwrap();
     assert_eq!((alloc_objects, alloc_bytes), (5, 4096));
 }
+
+#[test]
+fn a_dump_naming_a_device_is_not_opened() {
+    // A dump is untrusted input: its maps could point symbolization at a
+    // device or FIFO that never ends. /dev/zero must be refused, not read.
+    let dump = "heap_v2/524288\n  t*: 1: 64 [0: 0]\n@ 0x1010\n  t*: 1: 64 [0: 0]\n\
+                \nMAPPED_LIBRARIES:\n\
+                00001000-00002000 r-xp 00000000 00:05 4 /dev/zero\n";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jeprof.1.0.f.heap");
+    std::fs::write(&path, dump).unwrap();
+    let snapshots = vec![jemalloc::read(&path).unwrap()];
+    let symbolized = symbolize::symbolize(&snapshots);
+    assert_eq!(
+        symbolized.stats.refused_files,
+        vec![std::path::PathBuf::from("/dev/zero")]
+    );
+    assert_eq!(symbolized.frames[0][0], vec!["unknown (zero) <0x1010>"]);
+}

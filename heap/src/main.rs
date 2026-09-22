@@ -93,6 +93,12 @@ fn main() -> Result<()> {
             f.display()
         );
     }
+    for f in &stats.refused_files {
+        eprintln!(
+            "warning: {} is not a regular file; not opened, its frames stay unresolved",
+            f.display()
+        );
+    }
     for f in &stats.changed_files {
         eprintln!(
             "warning: {} is not the file the process mapped (different inode); its names may be wrong",
@@ -133,32 +139,31 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Write a new database beside `out` and rename it over `out`, so a failed
-/// run leaves the previous database whole.
+/// Write a new database in a private, randomly named directory beside `out`
+/// and rename it over `out`, so a failed run leaves the previous database
+/// whole and no one else can plant a file or symlink at the temporary path.
 fn write_replacing<T>(out: &Path, write: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+    let parent = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
     let name = out
         .file_name()
         .with_context(|| format!("{}: not a file path", out.display()))?;
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    let tmp = out.with_file_name(tmp_name);
-    let tmp_wal = wal_path(&tmp);
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&tmp_wal);
-
-    let result = write(&tmp);
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(&tmp_wal);
-        return result;
-    }
+    // Created with mode 0700 and a random name; removed with its contents
+    // when dropped, whether or not the write succeeded.
+    let tmp_dir = tempfile::Builder::new()
+        .prefix(".systing-heap.")
+        .tempdir_in(parent)
+        .with_context(|| format!("creating a temporary directory in {}", parent.display()))?;
+    let tmp = tmp_dir.path().join(name);
+    let result = write(&tmp)?;
     // A write-ahead log left by a crashed writer of the old database would
     // be replayed against the new one.
     let _ = std::fs::remove_file(wal_path(out));
     std::fs::rename(&tmp, out)
         .with_context(|| format!("renaming {} to {}", tmp.display(), out.display()))?;
-    result
+    Ok(result)
 }
 
 fn wal_path(db: &Path) -> PathBuf {

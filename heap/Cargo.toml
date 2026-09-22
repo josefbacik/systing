@@ -24,6 +24,5 @@ duckdb = "1.10504"
 libc = "0.2"
 regex = "1.11.1"
 systing = { path = ".." }
-
-[dev-dependencies]
 tempfile = "3.13"
+

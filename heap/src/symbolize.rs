@@ -29,6 +29,9 @@ pub struct Stats {
     pub resolved: usize,
     /// Files the dumps name that are not on this machine.
     pub missing_files: Vec<PathBuf>,
+    /// Paths the dumps name that are not regular files (devices, FIFOs,
+    /// /proc, /dev, /sys), so they were not opened.
+    pub refused_files: Vec<PathBuf>,
     /// Files on this machine whose inode differs from the dump's: possibly a
     /// different build, so their names may be wrong.
     pub changed_files: Vec<PathBuf>,
@@ -64,8 +67,22 @@ pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
     for (&path, offsets) in &wanted {
         let offsets: Vec<u64> = offsets.iter().copied().collect();
         stats.lookups += offsets.len();
+        // The path comes from the dump, which anyone could have written:
+        // open only regular files, never a device, FIFO or pseudo-file that
+        // could hang the read or never end.
+        if ["/proc/", "/dev/", "/sys/"]
+            .iter()
+            .any(|p| path.starts_with(p))
+        {
+            stats.refused_files.push(PathBuf::from(path));
+            continue;
+        }
         let meta = match std::fs::metadata(path) {
-            Ok(m) => m,
+            Ok(m) if m.is_file() => m,
+            Ok(_) => {
+                stats.refused_files.push(PathBuf::from(path));
+                continue;
+            }
             Err(_) => {
                 stats.missing_files.push(PathBuf::from(path));
                 continue;
