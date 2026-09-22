@@ -282,7 +282,10 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   each target process with the task iterator scoped to it, the processes the
   targets fork during the capture included. With `--cgroup` alone the kernel
   lists the processes in the target cgroups (`bpf_iter_css_task`, **Linux 6.7
-  or newer**) and each is walked the same way. On an older kernel (no
+  or newer**) and each is walked the same way. The kernel ends the walk of one
+  process early when the thread it has just visited exits before it moves on;
+  a walk that came up short of the process's thread count is read once more
+  within the snapshot. On an older kernel (no
   `bpf_iter_css_task_new` in the kernel's BTF), with the start-time `--cgroup`
   matching, from a pid namespace other than the host's, or past 1024 target
   processes, a snapshot walks every thread on the host as it always has and

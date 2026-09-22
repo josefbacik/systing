@@ -117,10 +117,23 @@ struct {
  * thread there is to record a few. Userspace reads the pair for its closing
  * note, and the tests to tell which walk ran. One slot, and one reader of the
  * capture's links at a time, so the adds never contend.
+ *
+ * group_threads is how userspace tells a walk of one process that the kernel
+ * cut short. A walk scoped to a process has no cursor in its thread list: to
+ * advance, the iterator looks the thread it last handed over up again by pid,
+ * and if that thread has exited meanwhile -- it may, while this program is
+ * unwinding it -- the walk ends there and the threads behind it are not
+ * visited. (The walk over every thread steps to the next pid that exists and
+ * has no such window.) So the program notes how many threads the group it has
+ * just entered has, userspace sets that against the threads its read visited
+ * -- the runs less the ones whose record did not fit the seq buffer, which the
+ * kernel hands over again -- and reads a process that came up short once more.
  */
 struct task_stacks_walk_stats {
 	u64 visited;
 	u64 targeted;
+	u64 unsent;
+	u64 group_threads;
 };
 
 struct {
@@ -327,8 +340,14 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	/* Runs of the program, so a task whose record did not fit the seq
 	 * buffer and is handed over again counts again: it cost again. */
 	stats = bpf_map_lookup_elem(&task_stacks_walk_stats, &zero);
-	if (stats)
+	if (stats) {
 		__sync_fetch_and_add(&stats->visited, 1);
+		/* A group leader: the first task a walk scoped to a process is
+		 * handed, so what this holds when that read ends is that
+		 * process's thread count. */
+		if (task->pid == task->tgid)
+			stats->group_threads = task->signal->nr_threads;
+	}
 	/* The iterator runs in the reader's context: skip systing itself. */
 	if (task->tgid == bpf_get_current_pid_tgid() >> 32)
 		return 0;
@@ -363,7 +382,9 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 		e->kernel_stack_len = 0;
 		e->user_stack_len = 0;
 		e->py_len = 0;
-		bpf_seq_write(seq, e, sizeof(*e));
+		err = bpf_seq_write(seq, e, sizeof(*e));
+		if (err && stats)
+			__sync_fetch_and_add(&stats->unsent, 1);
 		return 0;
 	}
 
@@ -402,6 +423,8 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	 */
 	if (!err)
 		bpf_map_update_elem(&task_status, &tid, &now, BPF_ANY);
+	else if (stats)
+		__sync_fetch_and_add(&stats->unsent, 1);
 	return 0;
 }
 

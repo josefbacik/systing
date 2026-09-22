@@ -547,6 +547,8 @@ pub struct TaskStacksIter {
     walk_stats: OwnedFd,
     /// The snapshots of a scoped capture that took the full walk instead.
     full_walk_snapshots: AtomicU64,
+    /// The scoped walks of one process that came up short and were read again.
+    reread_processes: AtomicU64,
 }
 
 impl TaskStacksIter {
@@ -600,6 +602,7 @@ impl TaskStacksIter {
             member_links: loaded.member_links,
             walk_stats: loaded.walk_stats,
             full_walk_snapshots: AtomicU64::new(0),
+            reread_processes: AtomicU64::new(0),
         })
     }
 
@@ -789,16 +792,17 @@ impl TaskStacksIter {
     /// host for the program to pick them from, or each target process's own.
     pub fn snapshot(&self) -> Result<Vec<TaskSample>> {
         let mut buf = Vec::new();
+        let mut read_twice = false;
         match self.scoped_targets() {
             Some(tgids) => {
                 for tgid in tgids {
-                    let mut link_info = libbpf_sys::bpf_iter_link_info::default();
-                    link_info.task.pid = tgid;
-                    // A link to a process that has gone reads as empty.
-                    let link = create_iter_link(self.prog.as_fd(), &mut link_info)
-                        .context("Failed to scope a task-stacks iterator to a process")?;
-                    read_iter_link(link.as_fd(), &mut buf)
-                        .context("Failed to read a task-stacks iterator")?;
+                    if self.read_process(tgid, &mut buf)? {
+                        // Cut short by a thread that exited under the walk:
+                        // once more, for the threads behind it.
+                        self.reread_processes.fetch_add(1, Ordering::Relaxed);
+                        self.read_process(tgid, &mut buf)?;
+                        read_twice = true;
+                    }
                 }
             }
             None => {
@@ -808,29 +812,90 @@ impl TaskStacksIter {
                     .context("Failed to read the task-stacks iterator")?;
             }
         }
-        parse_records(&buf)
+        let mut samples = parse_records(&buf)?;
+        if read_twice {
+            keep_first_per_thread(&mut samples);
+        }
+        Ok(samples)
     }
 
-    /// The tasks the capture's walks handed the program so far, and of those
-    /// the ones it found targeted; `None` if the counters cannot be read.
-    pub fn walk_stats(&self) -> Option<(u64, u64)> {
+    /// Walk process `tgid`'s threads through a link of the iterator program
+    /// scoped to it, appending their records to `buf`. `true` when the walk
+    /// visited fewer threads than the process had as the walk entered it: the
+    /// kernel ends such a walk early when the thread it has just handed over
+    /// exits before it advances (it finds its place again by that thread's
+    /// pid), and the threads behind it go unvisited. A count that races the
+    /// process's own thread starts and exits, so a reason to read once more,
+    /// never an error. A link to a process that has gone reads as empty.
+    fn read_process(&self, tgid: u32, buf: &mut Vec<u8>) -> Result<bool> {
+        let before = self.walk_stats();
+        let mut link_info = libbpf_sys::bpf_iter_link_info::default();
+        link_info.task.pid = tgid;
+        let link = create_iter_link(self.prog.as_fd(), &mut link_info)
+            .context("Failed to scope a task-stacks iterator to a process")?;
+        read_iter_link(link.as_fd(), buf).context("Failed to read a task-stacks iterator")?;
+        let (Some(before), Some(after)) = (before, self.walk_stats()) else {
+            return Ok(false);
+        };
+        let runs = after.visited.wrapping_sub(before.visited);
+        let resent = after.unsent.wrapping_sub(before.unsent);
+        Ok(runs > 0 && runs.saturating_sub(resent) < after.group_threads)
+    }
+
+    /// The program's counters so far; `None` if they cannot be read.
+    pub fn walk_stats(&self) -> Option<WalkStats> {
         let key = 0u32;
-        let mut stats = [0u64; 2];
-        // SAFETY: the map's one value is two u64, which `stats` is.
+        let mut stats = WalkStats::default();
+        // SAFETY: the map's one value is a `struct task_stacks_walk_stats`,
+        // which `WalkStats` mirrors field for field (its size is checked
+        // against the skeleton's at compile time).
         let ret = unsafe {
             libbpf_sys::bpf_map_lookup_elem(
                 self.walk_stats.as_raw_fd(),
                 &key as *const u32 as *const c_void,
-                stats.as_mut_ptr() as *mut c_void,
+                &mut stats as *mut WalkStats as *mut c_void,
             )
         };
-        (ret == 0).then_some((stats[0], stats[1]))
+        (ret == 0).then_some(stats)
     }
 
     /// The snapshots of a scoped capture that took the full walk instead.
     pub fn full_walk_snapshots(&self) -> u64 {
         self.full_walk_snapshots.load(Ordering::Relaxed)
     }
+
+    /// The scoped walks of one process that came up short and were read again.
+    pub fn reread_processes(&self) -> u64 {
+        self.reread_processes.load(Ordering::Relaxed)
+    }
+}
+
+/// Userspace mirror of the BPF side's `struct task_stacks_walk_stats`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkStats {
+    /// Runs of the iterator program: a task whose record did not fit the seq
+    /// buffer is handed over again and counts again.
+    pub visited: u64,
+    /// The runs that found their task in the capture's target set.
+    pub targeted: u64,
+    /// The runs whose record did not fit the seq buffer.
+    pub unsent: u64,
+    /// The thread count of the thread group the walk last entered.
+    pub group_threads: u64,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<WalkStats>() == std::mem::size_of::<skel::types::task_stacks_walk_stats>()
+);
+
+/// Keep each thread's first record and drop its later ones: a process read
+/// twice in one snapshot hands over the threads its first walk reached a
+/// second time (as unchanged, their record having gone out), and a snapshot
+/// says one thing about a thread.
+fn keep_first_per_thread(samples: &mut Vec<TaskSample>) {
+    let mut seen = HashSet::with_capacity(samples.len());
+    samples.retain(|sample| seen.insert(tid(&sample.task)));
 }
 
 /// How many snapshots a capture of `duration` holds, one every `interval`
@@ -1037,14 +1102,25 @@ impl TaskStacksThread {
                 }
                 // What the walks cost: the tasks the program was handed
                 // against those it had records to write for.
-                if let Some((visited, targeted)) = iter.walk_stats() {
-                    let full_walks = match iter.full_walk_snapshots() {
-                        0 => String::new(),
-                        n => format!("; {n} snapshots walked every thread on the host instead"),
-                    };
+                if let Some(stats) = iter.walk_stats() {
+                    let mut asides = String::new();
+                    match iter.full_walk_snapshots() {
+                        0 => {}
+                        n => asides.push_str(&format!(
+                            "; {n} snapshots walked every thread on the host instead"
+                        )),
+                    }
+                    match iter.reread_processes() {
+                        0 => {}
+                        n => asides.push_str(&format!(
+                            "; {n} walks of a process came up short and were read again"
+                        )),
+                    }
                     eprintln!(
-                        "task-stacks: walked {} and visited {visited} tasks for {targeted} targeted{full_walks}",
-                        iter.walk().describe()
+                        "task-stacks: walked {} and visited {} tasks for {} targeted{asides}",
+                        iter.walk().describe(),
+                        stats.visited,
+                        stats.targeted
                     );
                 }
             })?;
@@ -1447,6 +1523,25 @@ mod tests {
         append_member_tgids(&10u32.to_ne_bytes(), &mut seen, &mut tgids);
         append_member_tgids(&40u32.to_ne_bytes(), &mut seen, &mut tgids);
         assert_eq!(tgids, [30, 10, 20, 40]);
+    }
+
+    #[test]
+    fn a_process_read_twice_keeps_each_threads_first_record() {
+        // The first walk of the process wrote thread 11's record and was cut
+        // short there; the second hands 11 over again, unchanged now that its
+        // record has gone out, and goes on to 12, which the first never met.
+        let (first, behind) = (task(10, 11, "worker"), task(10, 12, "worker"));
+        let mut buf = record_bytes(&first, 0, (1, 2), &[0xa], &[], &[]);
+        buf.extend(record_bytes(&first, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
+        buf.extend(record_bytes(&behind, 0, (3, 4), &[0xb], &[], &[]));
+        let mut samples = parse_records(&buf).unwrap();
+        assert_eq!(samples.len(), 3);
+        keep_first_per_thread(&mut samples);
+        let kept: Vec<_> = samples
+            .iter()
+            .map(|sample| (tid(&sample.task), sample.unchanged))
+            .collect();
+        assert_eq!(kept, [(11, false), (12, false)]);
     }
 
     #[test]
