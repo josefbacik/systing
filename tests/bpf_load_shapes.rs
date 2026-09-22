@@ -9,8 +9,10 @@
 //! nothing about code only the memory recorder's configuration enables.
 //! `every_shape_loads` is the load-time positive control for that class:
 //! every shape in `systing::bpf_load_shapes::shape_table()` must load on this
-//! kernel, with the rejecting verifier log printed in full. It loads at
-//! verifier log level 0 and takes a few minutes even on the VM rig's
+//! kernel, with the rejecting verifier log printed in full, and so must every
+//! shape of the task-stacks recorder's own object
+//! (`task_stacks_shape_table()`), which no row of the first table opens. It
+//! loads at verifier log level 0 and takes a few minutes even on the VM rig's
 //! KVM-less guest.
 //!
 //! `every_instruction_is_verified_by_some_shape` is the coverage read: any
@@ -29,8 +31,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use systing::bpf_load_shapes::{coverage_gaps, ranges, shape_table, LoadReport};
+use systing::bpf_load_shapes::{
+    coverage_gaps, ranges, shape_table, task_stacks_shape_table, LoadReport,
+};
 use systing::systing_core::{bpf_load_probe, kallsyms_has_funcs, NETWORK_TW_SYMBOLS};
+use systing::task_stacks_recorder::TaskStacksIter;
 
 /// Instructions known to be unreachable at every shipping shape, with the
 /// reason. Add a row only with the reason; the entry is `(program, ranges)`
@@ -68,7 +73,14 @@ const SELECTED_ELSEWHERE: &[(&str, &str)] = &[
 /// where one is missing. They are allowed unselected ONLY on a kernel that
 /// lacks one of the functions; on a kernel that has them all, an unselected
 /// program here is a real finding. `inet_twsk_hashdance_schedule` exists from
-/// 6.11 (b334b924c9b7), so the 6.6 series takes this branch.
+/// 6.11 (b334b924c9b7), so the 6.6 series takes this branch. The task-stacks
+/// object's cgroup-members program is the same case by its kfunc: the
+/// recorder asks for it only where the kernel has the css_task iterator
+/// (6.7, 9c66dc94b62a), and its row selects it there and nowhere else. The
+/// recorder and the probe read that from the kernel's BTF and this allowance
+/// from kallsyms: two reads of one fact, and a kernel on which they disagree
+/// (the function present, its BTF entry absent) fails the gate, which is the
+/// side to err on.
 const SELECTED_WHEN_KERNEL_HAS: &[(&str, &[&str])] = &[
     ("tcp_time_wait_fentry", NETWORK_TW_SYMBOLS),
     ("tcp_time_wait_entry", NETWORK_TW_SYMBOLS),
@@ -76,7 +88,14 @@ const SELECTED_WHEN_KERNEL_HAS: &[(&str, &[&str])] = &[
     ("inet_twsk_hashdance_schedule_entry", NETWORK_TW_SYMBOLS),
     ("inet_twsk_deschedule_put_fentry", NETWORK_TW_SYMBOLS),
     ("inet_twsk_deschedule_put_entry", NETWORK_TW_SYMBOLS),
+    (TASK_STACKS_MEMBERS_PROG, CSS_TASK_ITER_SYMBOLS),
 ];
+
+/// The task-stacks object's cgroup-members program.
+const TASK_STACKS_MEMBERS_PROG: &str = "systing_task_stacks_members";
+
+/// The kfunc the cgroup-members program is written with.
+const CSS_TASK_ITER_SYMBOLS: &[&str] = &["bpf_iter_css_task_new"];
 
 fn allowed(program: &str) -> Option<(&'static str, &'static str)> {
     ALLOWED_UNVISITED
@@ -179,8 +198,9 @@ fn selection_findings(reports: &[(String, LoadReport)]) -> Vec<String> {
     }
 }
 
-/// The gate: every shape in the table loads on this kernel, and every
-/// program in the object is selected by some shape (or documented).
+/// The gate: every shape in both tables — the main object's and the
+/// task-stacks object's — loads on this kernel, and every program in each
+/// object is selected by some shape of its table (or documented).
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn every_shape_loads() {
@@ -204,8 +224,45 @@ fn every_shape_loads() {
         reports.push((shape.name.to_string(), report));
     }
 
+    // The task-stacks recorder's own object, which a capture that asks for
+    // the recorder loads beside the main one: its rows, the same read. A
+    // refused program fails its row's whole load (the probe has no second
+    // load without it), so a rejection reads as one here.
+    let task_stacks_shapes = task_stacks_shape_table();
+    let mut task_stacks_reports: Vec<(String, LoadReport)> = Vec::new();
+    for shape in &task_stacks_shapes {
+        let started = std::time::Instant::now();
+        let report = TaskStacksIter::load_probe(&shape.filter, shape.mode, shape.members, &|_| 0)
+            .unwrap_or_else(|e| panic!("[{}] probe failed before load: {e:#}", shape.name));
+        let selected = report.programs.iter().filter(|p| p.autoload).count();
+        eprintln!(
+            "[{}] loaded={} programs selected={} in {:.1?}",
+            shape.name,
+            report.loaded,
+            selected,
+            started.elapsed()
+        );
+        // The probe leaves the cgroup-members program out for one reason
+        // only, decided before it loads anything. Say so where it happens,
+        // so that a selection finding below explains itself.
+        if shape.members
+            && !report
+                .programs
+                .iter()
+                .any(|p| p.autoload && p.name == TASK_STACKS_MEMBERS_PROG)
+        {
+            eprintln!(
+                "[{}] the cgroup-members program was left unselected: this kernel's BTF does not export {}",
+                shape.name, CSS_TASK_ITER_SYMBOLS[0]
+            );
+        }
+        record_rejections(shape.name, &report, &mut rejected);
+        task_stacks_reports.push((shape.name.to_string(), report));
+    }
+
     let mut failures = rejection_findings(&rejected);
     failures.extend(selection_findings(&reports));
+    failures.extend(selection_findings(&task_stacks_reports));
     assert!(
         failures.is_empty(),
         "{} finding(s):\n  {}",
@@ -217,6 +274,8 @@ fn every_shape_loads() {
 /// The coverage read: the union over all shapes of the instructions the
 /// verifier visited covers every instruction of every program that loaded.
 /// Level-2 logging is requested only for programs not yet fully covered.
+/// The main object's shapes only: the task-stacks object's rows are loaded by
+/// the gate above and are not folded in here yet.
 #[test]
 #[ignore] // Requires root/BPF privileges; slow (level-2 verifier logs)
 fn every_instruction_is_verified_by_some_shape() {

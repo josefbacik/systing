@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use libbpf_rs::libbpf_sys;
-use libbpf_rs::skel::{OpenSkel, SkelBuilder};
+use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::pystacks::thread_names::ThreadNames;
@@ -357,6 +357,10 @@ const ROOT_PID_NS_INO: u64 = 0xEFFF_FFFC;
 /// The kfunc that starts a walk over a cgroup's tasks (Linux 6.7).
 const CSS_TASK_ITER_KFUNC: &str = "bpf_iter_css_task_new";
 
+/// The cgroup-members program, which is written with it: the one program of
+/// the object that loads only when asked for (`SEC("?iter/cgroup")`).
+const MEMBERS_PROG: &str = "systing_task_stacks_members";
+
 /// How a snapshot reaches the threads it records. Whichever it is, the BPF
 /// program tests every task it is handed against the capture's targets: a
 /// scoped walk narrows what is visited, never what is recorded.
@@ -627,21 +631,17 @@ impl TaskStacksIter {
         })
     }
 
-    /// Open, configure, load and attach the object; with `member_dirs`, the
-    /// cgroup-members program too, a link of it on each directory and the
-    /// cgroups below it.
-    fn load_object(
+    /// Configure the opened object for a capture targeted as `filter` that
+    /// collects the stacks `mode` names; with `members`, select the
+    /// cgroup-members program too. What a capture loads and what a load
+    /// probe loads are configured here and nowhere else, so the two cannot
+    /// drift apart.
+    fn configure(
+        open_skel: &mut skel::OpenTaskStacksSkel<'_>,
         filter: &TargetFilter,
-        maps: &TargetFilterMaps<'_>,
-        pystacks_maps: &SharedPystacksMaps<'_>,
         mode: TaskStackFrames,
-        member_dirs: &[BorrowedFd<'_>],
-    ) -> Result<LoadedObject> {
-        let mut storage = MaybeUninit::uninit();
-        let mut open_skel = skel::TaskStacksSkelBuilder::default()
-            .open(&mut storage)
-            .context("Failed to open the task-stacks BPF object")?;
-
+        members: bool,
+    ) {
         let rodata = open_skel
             .maps
             .rodata_data
@@ -668,12 +668,29 @@ impl TaskStacksIter {
         }
 
         // Off in the object ("?iter/cgroup"): on for the capture that reads it.
-        if !member_dirs.is_empty() {
+        if members {
             open_skel
                 .progs
                 .systing_task_stacks_members
                 .set_autoload(true);
         }
+    }
+
+    /// Open, configure, load and attach the object; with `member_dirs`, the
+    /// cgroup-members program too, a link of it on each directory and the
+    /// cgroups below it.
+    fn load_object(
+        filter: &TargetFilter,
+        maps: &TargetFilterMaps<'_>,
+        pystacks_maps: &SharedPystacksMaps<'_>,
+        mode: TaskStackFrames,
+        member_dirs: &[BorrowedFd<'_>],
+    ) -> Result<LoadedObject> {
+        let mut storage = MaybeUninit::uninit();
+        let mut open_skel = skel::TaskStacksSkelBuilder::default()
+            .open(&mut storage)
+            .context("Failed to open the task-stacks BPF object")?;
+        Self::configure(&mut open_skel, filter, mode, !member_dirs.is_empty());
 
         let m = &mut open_skel.maps;
         maps.reuse_in(
@@ -727,6 +744,81 @@ impl TaskStacksIter {
             walk_stats,
             member_links,
         })
+    }
+
+    /// Load-only probe of the object at one configuration: open it, configure
+    /// it exactly as a capture targeted as `filter` and collecting `mode`
+    /// does (`configure`, which a capture's own load goes through), load it
+    /// into the kernel and attach nothing.
+    /// With `members`, the cgroup-members program is selected too, where this
+    /// kernel's BTF exports the iterator it is written with; a kernel without
+    /// it never selects the program, and the report says so (not selected).
+    ///
+    /// The main object's maps are not reused here: the object's own are
+    /// created as declared. A capture's reused maps can differ from those in
+    /// size (the main object resizes some of its maps before it loads); the
+    /// probe rests on the verdict not turning on a map's size, since the
+    /// programs reach those maps only through lookups and the ring's
+    /// reserve. What the probe leaves unread is what needs a target: the
+    /// links (`bpf_link_create` with a pid or a cgroup directory) and the
+    /// walks themselves.
+    ///
+    /// The report, `log_level` and the requirements are
+    /// [`crate::systing_core::bpf_load_probe`]'s, whose lock and libbpf print
+    /// capture this shares. A refused program fails the whole load, as in a
+    /// capture: there is no second load without it here, so a refusal cannot
+    /// read as a pass.
+    pub fn load_probe(
+        filter: &TargetFilter,
+        mode: TaskStackFrames,
+        members: bool,
+        log_level: &dyn Fn(&str) -> u32,
+    ) -> Result<crate::bpf_load_shapes::LoadReport> {
+        let probe = crate::systing_core::probe_lock();
+
+        let members = members && crate::systing_core::kernel_has_kfunc(CSS_TASK_ITER_KFUNC);
+        let mut storage = MaybeUninit::uninit();
+        let mut open_skel = skel::TaskStacksSkelBuilder::default()
+            .open(&mut storage)
+            .context("Failed to open the task-stacks BPF object")?;
+        Self::configure(&mut open_skel, filter, mode, members);
+
+        let mut autoloaded: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for mut prog in open_skel.open_object_mut().progs_mut() {
+            let name = prog
+                .name()
+                .to_str()
+                .expect("BPF program name is not valid UTF-8")
+                .to_string();
+            // The object's one optional program; every other one always loads.
+            if name != MEMBERS_PROG || members {
+                let level = log_level(&name);
+                if level > 0 {
+                    prog.set_log_level(level);
+                }
+                autoloaded.push(name);
+            } else {
+                skipped.push(name);
+            }
+        }
+
+        let (load_result, log) =
+            crate::systing_core::capture_libbpf_print(&probe, || open_skel.load());
+
+        // Instruction counts from the LOADED object, which holds each
+        // program with its subprograms appended: what the verifier log indexes.
+        let outcome: std::result::Result<HashMap<String, usize>, String> = match load_result {
+            Ok(skel) => Ok(skel
+                .object()
+                .progs()
+                .map(|p| (p.name().to_string_lossy().into_owned(), p.insn_cnt()))
+                .collect()),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        Ok(crate::bpf_load_shapes::LoadReport::from_load(
+            autoloaded, skipped, &log, outcome,
+        ))
     }
 
     /// The walk this capture's snapshots take.

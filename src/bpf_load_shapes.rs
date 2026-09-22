@@ -18,10 +18,18 @@
 //! returns the per-program visited sets, read from the verifier's level-2
 //! log; this module owns the shape table, the log parsing, and the coverage
 //! arithmetic, all of which are plain functions with unit tests.
+//!
+//! The task-stacks recorder loads an object of its own beside that one. Its
+//! rows are [`task_stacks_shape_table`] and its probe
+//! [`crate::task_stacks_recorder::TaskStacksIter::load_probe`]: the same
+//! report, the load read only for now (the coverage read does not take the
+//! second object's rows yet).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::systing_core::{Config, KernelHooks};
+use crate::target_filter::TargetFilter;
+use crate::task_stacks_recorder::TaskStackFrames;
 
 /// One program's outcome in a load probe.
 #[derive(Debug, Clone)]
@@ -50,6 +58,54 @@ pub struct LoadReport {
 }
 
 impl LoadReport {
+    /// The report of one load: the programs the probe selected (`autoloaded`)
+    /// and left out (`skipped`), libbpf's captured print output, and the
+    /// load's outcome — the loaded object's instruction count per program, or
+    /// libbpf's error. Whichever object a probe loads, its report is built
+    /// here.
+    pub(crate) fn from_load(
+        autoloaded: Vec<String>,
+        skipped: Vec<String>,
+        log: &str,
+        outcome: Result<HashMap<String, usize>, String>,
+    ) -> Self {
+        let (loaded, error, insn_counts) = match outcome {
+            Ok(counts) => (true, None, counts),
+            Err(e) => (false, Some(e), HashMap::new()),
+        };
+        let sections = split_prog_load_logs(log);
+        let mut programs = Vec::new();
+        for name in autoloaded {
+            let visited: BTreeSet<u32> = sections
+                .get(name.as_str())
+                .map(|s| visited_insns(s))
+                .unwrap_or_default();
+            let verifier_log = sections.get(name.as_str()).cloned();
+            let insn_total = insn_counts.get(&name).copied().unwrap_or(0);
+            programs.push(ProgramLoad {
+                name,
+                autoload: true,
+                insn_total,
+                visited,
+                verifier_log,
+            });
+        }
+        for name in skipped {
+            programs.push(ProgramLoad {
+                name,
+                autoload: false,
+                insn_total: 0,
+                visited: BTreeSet::new(),
+                verifier_log: None,
+            });
+        }
+        LoadReport {
+            loaded,
+            error,
+            programs,
+        }
+    }
+
     /// The programs libbpf reported as rejected by the verifier at this
     /// shape (their log section starts with libbpf's failure line).
     pub fn failed_programs(&self) -> Vec<&ProgramLoad> {
@@ -421,6 +477,114 @@ pub fn shape_table() -> Vec<LoadShape> {
     shapes
 }
 
+/// One row of the task-stacks object's table. The recorder loads its own
+/// object beside the main one (`task_stacks.bpf.o`), which
+/// [`crate::systing_core::bpf_load_probe`] never opens, so its shapes have a
+/// table and a probe of their own
+/// ([`crate::task_stacks_recorder::TaskStacksIter::load_probe`]). A row is
+/// the object's whole configuration: the `target_filter` rodata a capture's
+/// `--pid` / `--cgroup` targeting writes, the frames it collects, and whether
+/// it asks for the cgroup-members program.
+pub struct TaskStacksLoadShape {
+    pub name: &'static str,
+    pub filter: TargetFilter,
+    pub mode: TaskStackFrames,
+    /// Select the cgroup-members program, as a `--cgroup` capture does where
+    /// the kernel lists a cgroup's processes.
+    pub members: bool,
+}
+
+/// The configurations of the task-stacks object that ship. The filter rows
+/// are rodata only: `num_cgroup_targets` is 1 with no target in the map,
+/// whose contents are a capture-time input the verifier never reads.
+pub fn task_stacks_shape_table() -> Vec<TaskStacksLoadShape> {
+    let no_targets = TargetFilter::default();
+    let by_pid = TargetFilter {
+        filter_pid: true,
+        ..TargetFilter::default()
+    };
+    // `--cgroup` where the kernel decides membership (`bpf_task_under_cgroup`).
+    let by_cgroup = TargetFilter {
+        filter_cgroup: true,
+        cgroup_match_kernel: true,
+        num_cgroup_targets: 1,
+        ..TargetFilter::default()
+    };
+    // `--cgroup` against the start-time set of cgroup ids.
+    let by_cgroup_legacy = TargetFilter {
+        cgroup_match_kernel: false,
+        ..by_cgroup
+    };
+    let row = |name, filter, mode, members| TaskStacksLoadShape {
+        name,
+        filter,
+        mode,
+        members,
+    };
+    vec![
+        // No targets: the walk over every thread, each frames mode.
+        row(
+            "task-stacks-native",
+            no_targets,
+            TaskStackFrames::Native,
+            false,
+        ),
+        row(
+            "task-stacks-python",
+            no_targets,
+            TaskStackFrames::Python,
+            false,
+        ),
+        row("task-stacks-all", no_targets, TaskStackFrames::All, false),
+        // `--pid`: the walk by process.
+        row(
+            "task-stacks-pid-native",
+            by_pid,
+            TaskStackFrames::Native,
+            false,
+        ),
+        // `--cgroup`, and `--pid` with it (the two intersect in the program).
+        row(
+            "task-stacks-cgroup-native",
+            by_cgroup,
+            TaskStackFrames::Native,
+            false,
+        ),
+        row(
+            "task-stacks-cgroup-pid-all",
+            TargetFilter {
+                filter_pid: true,
+                ..by_cgroup
+            },
+            TaskStackFrames::All,
+            false,
+        ),
+        row(
+            "task-stacks-cgroup-legacy-native",
+            by_cgroup_legacy,
+            TaskStackFrames::Native,
+            false,
+        ),
+        row(
+            "task-stacks-cgroup-legacy-pid-all",
+            TargetFilter {
+                filter_pid: true,
+                ..by_cgroup_legacy
+            },
+            TaskStackFrames::All,
+            false,
+        ),
+        // `--cgroup` alone where the kernel has the css_task iterator: the
+        // cgroup-members program loads beside the recording one.
+        row(
+            "task-stacks-cgroup-members",
+            by_cgroup,
+            TaskStackFrames::Native,
+            true,
+        ),
+    ]
+}
+
 /// Instructions of a program that no shape in the run reached, with the
 /// shapes that loaded the program. Programs that never loaded successfully
 /// at any shape are reported as such (their instruction count is unknown).
@@ -655,5 +819,83 @@ R0 unbounded memory access\n\
         assert!(shapes.iter().any(|s| s.config.network
             && s.config.kernel_hooks == KernelHooks::Trampoline
             && s.legs == LegSelection::Host));
+    }
+
+    #[test]
+    fn task_stacks_table_names_are_unique_and_cover_the_object() {
+        let shapes = task_stacks_shape_table();
+        let names: BTreeSet<&str> = shapes.iter().map(|s| s.name).collect();
+        assert_eq!(names.len(), shapes.len(), "duplicate shape name");
+        // One gate prints both tables' rows: a name says which object it is.
+        let main_names: BTreeSet<&str> = shape_table().iter().map(|s| s.name).collect();
+        assert!(names.is_disjoint(&main_names), "a name of the main table");
+        // Every frames mode, each of which prunes a different part of the
+        // recording program.
+        for mode in [
+            TaskStackFrames::Native,
+            TaskStackFrames::Python,
+            TaskStackFrames::All,
+        ] {
+            assert!(shapes.iter().any(|s| s.mode == mode), "no {mode:?} row");
+        }
+        // Every branch of the program's target test: no targets, --pid,
+        // --cgroup by the kernel's test and by the start-time set, and the
+        // two together.
+        assert!(shapes.iter().any(|s| s.filter == TargetFilter::default()));
+        assert!(shapes
+            .iter()
+            .any(|s| s.filter.filter_pid && !s.filter.filter_cgroup));
+        assert!(shapes.iter().any(|s| !s.filter.filter_pid
+            && s.filter.filter_cgroup
+            && s.filter.cgroup_match_kernel));
+        assert!(shapes.iter().any(|s| !s.filter.filter_pid
+            && s.filter.filter_cgroup
+            && !s.filter.cgroup_match_kernel));
+        assert!(shapes
+            .iter()
+            .any(|s| s.filter.filter_pid && s.filter.filter_cgroup));
+        // The cgroup-members program has exactly one row, targeted the way
+        // the only capture that loads it is: --cgroup alone, by the kernel's
+        // test.
+        let members: Vec<&TaskStacksLoadShape> = shapes.iter().filter(|s| s.members).collect();
+        assert_eq!(members.len(), 1);
+        assert!(
+            !members[0].filter.filter_pid
+                && members[0].filter.filter_cgroup
+                && members[0].filter.cgroup_match_kernel
+        );
+    }
+
+    #[test]
+    fn report_from_load_tells_selected_from_skipped_and_loaded_from_refused() {
+        let counts: HashMap<String, usize> = [("systing_a".to_string(), 3usize)].into();
+        let loaded = LoadReport::from_load(
+            vec!["systing_a".to_string()],
+            vec!["systing_b".to_string()],
+            SAMPLE,
+            Ok(counts),
+        );
+        assert!(loaded.loaded && loaded.error.is_none());
+        assert_eq!(loaded.programs.len(), 2);
+        let a = &loaded.programs[0];
+        assert!(a.autoload && a.insn_total == 3 && a.verifier_log.is_some());
+        let b = &loaded.programs[1];
+        assert!(!b.autoload && b.insn_total == 0 && b.verifier_log.is_none());
+        assert!(loaded.failed_programs().is_empty());
+
+        // A refused load: no instruction counts, the error kept, and the
+        // program whose section carries libbpf's failure line named.
+        let refused = LoadReport::from_load(
+            vec!["systing_a".to_string(), "systing_b".to_string()],
+            Vec::new(),
+            SAMPLE,
+            Err("refused".to_string()),
+        );
+        assert!(!refused.loaded);
+        assert_eq!(refused.error.as_deref(), Some("refused"));
+        assert!(refused.programs.iter().all(|p| p.insn_total == 0));
+        let failed = refused.failed_programs();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].name, "systing_b");
     }
 }
