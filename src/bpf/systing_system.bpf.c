@@ -6115,10 +6115,14 @@ int BPF_PROG(systing_brk_fexit, const struct pt_regs *regs, long ret)
  * — one SRCU plus one RCU grace period, serialized, once per program, so
  * six times for the classic set — while a raw tracepoint's last probe
  * removal takes tracepoint_remove_func()'s RCU-state snapshot and frees the
- * probe array through call_rcu, with no grace period waited on the stop
- * path (kernel/tracepoint.c, the same on 6.6, 6.12 and 6.18); the phase
- * the difference lands in is the "detach bpf programs" stop phase, of
- * which this set is the memory lane's share (see SCHEMA_CHANGES.md,
+ * probe array through call_rcu, with no tasks-trace wait and, when the
+ * pair was the tracepoint's last probe, no wait at all on the stop path;
+ * when another probe stays registered on sys_enter / sys_exit, the 2->1
+ * branch of tracepoint_remove_func() may wait one classic-RCU + SRCU
+ * grace period (tp_rcu_cond_sync; kernel/tracepoint.c, the same on 6.6,
+ * 6.12 and 6.18) — once per tracepoint, against the classic set's six. The
+ * phase the difference lands in is the "detach bpf programs" stop phase,
+ * of which this set is the memory lane's share (see SCHEMA_CHANGES.md,
  * schema 20). Both forms register the same two tracepoints, so the
  * static-key flip and syscall_regfunc()'s task walk at the first
  * registration and last removal are paid either way.
@@ -6138,7 +6142,10 @@ int BPF_PROG(systing_brk_fexit, const struct pt_regs *regs, long ret)
  *
  * The arguments are the pt_regs reads the trampoline form makes and the
  * rows are built by the shared *_common helpers, so a row is byte-identical
- * whichever form produced it. Selection: loaded only under the
+ * whichever form produced it — and a 32-bit compat task's syscalls are
+ * skipped under every form (systing_in_compat_syscall, below: the classic
+ * events skip them in the kernel, the trampoline form never attaches the
+ * compat wrappers). Selection: loaded only under the
  * raw-tracepoint form and when vmlinux BTF has the btf_trace_sys_enter /
  * btf_trace_sys_exit typedefs (a tp_btf target resolves at LOAD, and a
  * missing one fails the whole object — the same gate systing_rss_stat_btf
@@ -6162,12 +6169,64 @@ static __always_inline long systing_syscall_nr(const struct pt_regs *regs)
 #endif
 }
 
+/* Whether the syscall being entered or exited is a 32-bit COMPAT task's.
+ * The classic syscalls/sys_{enter,exit}_* events make this test for their
+ * programs — trace_get_syscall_nr() returns -1 for a compat syscall under
+ * ARCH_TRACE_IGNORE_COMPAT_SYSCALLS (kernel/trace/trace_syscalls.c; x86's
+ * arch_trace_is_compat_syscall() is in_32bit_syscall(), arm64's and
+ * riscv's is_compat_task()), so the six classic programs never see one —
+ * while the raw sys_enter / sys_exit tracepoints fire for a compat task
+ * with the COMPAT table's number (kernel/entry/common.c). The pair makes
+ * the same test itself, or an ia32 link (9) / execve (11) / chdir (12)
+ * would land as an mmap / munmap / brk row with the x86-64 argument
+ * registers read as addr / size, and an arm64 compat setgid32 (214) /
+ * setfsuid32 (215) as a brk / munmap row.
+ *
+ * x86: TS_COMPAT in thread_info.status, set by syscall_32_enter() before
+ * sys_enter fires and cleared by arch_exit_to_user_mode_prepare() after
+ * sys_exit has fired (arch/x86/entry/common.c, arch/x86/include/asm/
+ * entry-common.h, kernel/entry/common.c), so both programs read the same
+ * bit; a kernel built without IA32_EMULATION never sets it. x32 needs no
+ * test: its numbers carry __X32_SYSCALL_BIT and never pass the number
+ * test. arm64: TIF_32BIT in thread_info.flags, the flag is_compat_task()
+ * reads. riscv: the ISA's sstatus.UXL field in the saved status, which
+ * start_thread() sets to 32 for a compat task (arch/riscv/kernel/process.c)
+ * — used in place of riscv's TIF_32BIT, whose bit number moved between
+ * kernel series (11 at v6.12, 16 at v6.18). TS_COMPAT is 0x0002 and arm64's
+ * TIF_32BIT is 22 at v6.6, v6.12 and v6.18 alike (the macros are not in
+ * vmlinux.h, so the values are spelled here); every load is a direct read
+ * of a BTF-typed pointer, the shape systing_syscall_nr uses for orig_ax. */
+#if defined(__TARGET_ARCH_x86)
+#define SYSTING_TS_COMPAT 0x0002 /* arch/x86/include/asm/thread_info.h */
+#elif defined(__TARGET_ARCH_arm64)
+#define SYSTING_TIF_32BIT_MASK (1UL << 22) /* arch/arm64/include/asm/thread_info.h */
+#elif defined(__TARGET_ARCH_riscv)
+#define SYSTING_SR_UXL 0x300000000UL /* arch/riscv/include/asm/csr.h */
+#define SYSTING_SR_UXL_32 0x100000000UL
+#endif
+
+static __always_inline bool systing_in_compat_syscall(const struct task_struct *task,
+						      const struct pt_regs *regs)
+{
+#if defined(__TARGET_ARCH_x86)
+	return (task->thread_info.status & SYSTING_TS_COMPAT) != 0;
+#elif defined(__TARGET_ARCH_arm64)
+	return (task->thread_info.flags & SYSTING_TIF_32BIT_MASK) != 0;
+#elif defined(__TARGET_ARCH_riscv)
+	return (regs->status & SYSTING_SR_UXL) == SYSTING_SR_UXL_32;
+#else
+	return false;
+#endif
+}
+
 SEC("tp_btf/sys_enter")
 int BPF_PROG(systing_sys_enter, struct pt_regs *regs, long id)
 {
 	if (id != SYSTING_NR_MMAP && id != SYSTING_NR_MUNMAP && id != SYSTING_NR_BRK)
 		return 0;
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (systing_in_compat_syscall(task, regs))
+		return 0;
 	if (!trace_task(task))
 		return 0;
 	if (id == SYSTING_NR_MMAP)
@@ -6188,6 +6247,8 @@ int BPF_PROG(systing_sys_exit, struct pt_regs *regs, long ret)
 	if (id != SYSTING_NR_MMAP && id != SYSTING_NR_MUNMAP && id != SYSTING_NR_BRK)
 		return 0;
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (systing_in_compat_syscall(task, regs))
+		return 0;
 	if (!trace_task(task))
 		return 0;
 	if (id == SYSTING_NR_MMAP)

@@ -606,6 +606,249 @@ fn test_memory_syscall_hooks_raw_fall_back_to_tracepoints() {
     eprintln!("\ntest_memory_syscall_hooks_raw_fall_back_to_tracepoints: all checks passed");
 }
 
+/// The number of ia32 `chdir(".")` + `link()` pairs the compat workload
+/// issues through `int 0x80` after its probe call.
+#[cfg(target_arch = "x86_64")]
+const COMPAT_SYSCALL_ROUNDS: i64 = 200;
+
+/// The compat workload for an x86-64 host: a 64-bit python3 process that
+/// issues ia32 syscalls through `int 0x80` — the kernel runs them on the
+/// COMPAT table with `TS_COMPAT` set, exactly as a 32-bit binary's syscalls
+/// run, so no 32-bit toolchain is needed. A 9-byte stub in a `MAP_32BIT`
+/// executable mapping (`mov eax,edx; mov ebx,edi; mov ecx,esi; int 0x80;
+/// ret`) is called through ctypes as `long f(void *p1, void *p2, unsigned
+/// nr)`; the path strings live in the same low mapping because the ia32
+/// ABI passes 32-bit pointers. Each round is one ia32 `chdir(".")` (number
+/// 12 = x86-64 `brk`) and one ia32 `link(src, fresh name)` (number 9 =
+/// x86-64 `mmap`), both SUCCEEDING (return 0), which is what would make the
+/// raw pair without its compat test emit a row: the exit helpers drop a
+/// negative return, but a 0 passes as a break of 0 (a brk row with addr 0
+/// and a delta of minus the whole heap address) and as an mmap at address 0
+/// (an mmap row with addr 0). The first round's return values and the
+/// mapping's base go to `out` so the test can tell "the compat calls ran
+/// and succeeded" from "nothing happened"; then the allocator loop of the
+/// other tests, so the capture's positive twin (real mmap rows for this
+/// pid) is on the same process.
+#[cfg(target_arch = "x86_64")]
+fn compat_workload_program(
+    rounds: i64,
+    work_dir: &std::path::Path,
+    out: &std::path::Path,
+) -> String {
+    format!(
+        "import ctypes, mmap, os, time\n\
+         MAP_32BIT = 0x40\n\
+         d = {work_dir:?}\n\
+         out = {out:?}\n\
+         buf = mmap.mmap(-1, 1 << 16, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_32BIT,\n\
+         \x20                prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)\n\
+         buf[0:9] = bytes.fromhex('89d089fb89f1cd80c3')\n\
+         base = ctypes.addressof(ctypes.c_char.from_buffer(buf))\n\
+         f = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint)(base)\n\
+         def put(off, s):\n\
+         \x20   b = s.encode() + bytes([0])\n\
+         \x20   buf[off:off + len(b)] = b\n\
+         \x20   return base + off\n\
+         dot = put(256, '.')\n\
+         src = os.path.join(d, 'link-src')\n\
+         open(src, 'w').close()\n\
+         p_src = put(512, src)\n\
+         chdir_ret = f(dot, 0, 12)\n\
+         link_ret = f(p_src, put(1024, os.path.join(d, 'link-0')), 9)\n\
+         with open(out, 'w') as fh:\n\
+         \x20   fh.write(str(chdir_ret) + ' ' + str(link_ret) + ' ' + str(base) + chr(10))\n\
+         for i in range(1, {rounds} + 1):\n\
+         \x20   f(dot, 0, 12)\n\
+         \x20   f(p_src, put(1024, os.path.join(d, 'link-' + str(i))), 9)\n\
+         bufs = []\n\
+         for _ in range({count}):\n\
+         \x20   b = bytearray({size})\n\
+         \x20   b[0] = 1; b[-1] = 1\n\
+         \x20   bufs.append(b)\n\
+         del bufs\n\
+         time.sleep(0.2)\n",
+        count = ALLOC_COUNT,
+        size = ALLOC_SIZE_BYTES,
+    )
+}
+
+/// The probe file the compat workload writes: the first ia32 chdir's and
+/// link's return values and the low mapping's base.
+#[cfg(target_arch = "x86_64")]
+fn read_compat_probe(out: &std::path::Path) -> Option<(i64, i64, i64)> {
+    let text = std::fs::read_to_string(out).ok()?;
+    let mut it = text.split_whitespace().map(|s| s.parse::<i64>().ok());
+    Some((it.next()??, it.next()??, it.next()??))
+}
+
+/// One capture of the compat workload under `form`; returns the DuckDB
+/// connection, the workload's pid and `sysinfo.memory_syscall_leg`.
+#[cfg(target_arch = "x86_64")]
+fn record_compat_capture(
+    dir: &TempDir,
+    label: &str,
+    form: KernelHooks,
+) -> (duckdb::Connection, i32, String) {
+    let work_dir = dir.path().join(format!("work-{label}"));
+    std::fs::create_dir_all(&work_dir).expect("Failed to create the workload dir");
+    let out = work_dir.join("probe.txt");
+    let prog = compat_workload_program(COMPAT_SYSCALL_ROUNDS, &work_dir, &out);
+    let run_cmd = vec!["python3".to_string(), "-c".to_string(), prog];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+    let child_pid = traced_child.pid as i32;
+    eprintln!("Recording memory trace ({label}, pid {child_pid})...");
+
+    let trace_dir = dir.path().join(format!("trace-{label}"));
+    std::fs::create_dir_all(&trace_dir).expect("Failed to create the trace dir");
+    let config = Config {
+        memory: true,
+        kernel_hooks: form,
+        parquet_only: true,
+        output_dir: trace_dir.clone(),
+        output: trace_dir.join("trace.pb"),
+        ..Config::default()
+    };
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(exit_code, 0, "the compat workload should exit with code 0");
+    let (chdir_ret, link_ret, _base) = read_compat_probe(&out)
+        .expect("the compat workload must write its probe line before the loops");
+    assert_eq!(
+        (chdir_ret, link_ret),
+        (0, 0),
+        "the traced workload's ia32 chdir/link must succeed (the probe run said they do)"
+    );
+
+    let duckdb_path = trace_dir.join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(&trace_dir, &duckdb_path, label)
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    let syscall_leg = read_syscall_leg(&conn);
+    (conn, child_pid, syscall_leg)
+}
+
+/// The rows a compat task's ia32 syscalls would leave if the pair read
+/// them on the x86-64 table: brk rows at address 0 (a successful ia32
+/// chdir read as brk returning 0) and mmap rows at address 0 (a successful
+/// ia32 link read as mmap returning 0). Neither happens to a real process:
+/// brk never returns 0 and mmap never maps at 0.
+#[cfg(target_arch = "x86_64")]
+fn compat_shaped_rows(conn: &duckdb::Connection, child_pid: i32) -> (i64, i64) {
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FILTER (WHERE event_type = 'brk' AND addr = 0),
+                    COUNT(*) FILTER (WHERE event_type = 'mmap' AND addr = 0)
+             FROM memory_map WHERE utid IN {UTIDS_FOR_PID}"
+        ),
+        [child_pid as i64],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .expect("Failed to query memory_map")
+}
+
+/// The raw-tracepoint pair skips a 32-bit compat task's syscalls, as the
+/// classic `syscalls/*` events do in the kernel: the raw `sys_enter` /
+/// `sys_exit` tracepoints fire for a compat syscall with the COMPAT table's
+/// number, so without the pair's own test an ia32 `chdir` (12) / `link`
+/// (9) is read as x86-64 `brk` / `mmap`. The workload issues both through
+/// `int 0x80` from a 64-bit python3 (the kernel sets `TS_COMPAT` for that
+/// entry exactly as for a 32-bit binary), and the test asserts the rows
+/// such a misread would leave (brk / mmap rows at address 0 for this pid)
+/// are absent under the pair AND under the classic set, while the pid's
+/// real mmap rows are present under both (the positive twin, so the
+/// absence is the pair's test and not a blind capture). Run against the
+/// tree before the pair's compat test, the raw-form leg of this test FAILS
+/// with about `COMPAT_SYSCALL_ROUNDS` rows of each kind — the negative
+/// control the change's PR records. SKIPS, printing why, on a kernel that
+/// does not run ia32 syscalls (`CONFIG_IA32_EMULATION` off, or
+/// `ia32_emulation=0`: `int 0x80` then raises SIGSEGV in the probe run) or
+/// whose BTF lacks the pair's typedefs (the classic set would run under
+/// both forms and the test would compare a form with itself).
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_syscall_hooks_raw_tracepoint_skips_compat_tasks() {
+    use std::os::unix::process::ExitStatusExt;
+
+    if !host_has_raw_syscall_btf() {
+        eprintln!(
+            "SKIP: vmlinux BTF lacks btf_trace_sys_enter/btf_trace_sys_exit; \
+             the raw pair never loads here and the classic set would run under both forms"
+        );
+        return;
+    }
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    // The probe: the workload untraced, with no rounds. A kernel without
+    // ia32 emulation delivers SIGSEGV on `int 0x80`; anything else that
+    // keeps the two calls from returning 0 is reported and skips too.
+    let probe_dir = dir.path().join("probe");
+    std::fs::create_dir_all(&probe_dir).expect("Failed to create the probe dir");
+    let probe_out = probe_dir.join("probe.txt");
+    let probe = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(compat_workload_program(0, &probe_dir, &probe_out))
+        .output()
+        .expect("Failed to run the compat probe");
+    if let Some(signal) = probe.status.signal() {
+        eprintln!(
+            "SKIP: the compat probe died with signal {signal}: this kernel does not run ia32 \
+             syscalls (CONFIG_IA32_EMULATION off or ia32_emulation=0), so no compat task can \
+             reach the pair"
+        );
+        return;
+    }
+    match read_compat_probe(&probe_out) {
+        Some((0, 0, base)) => {
+            assert!(
+                (1..(1i64 << 31)).contains(&base),
+                "the compat stub must sit in a 32-bit mapping (MAP_32BIT), got base {base:#x}"
+            );
+            eprintln!("    compat probe: ia32 chdir/link returned 0/0, stub base {base:#x}");
+        }
+        other => {
+            eprintln!(
+                "SKIP: the compat probe did not succeed ({other:?}; exit {:?}; stderr: {})",
+                probe.status.code(),
+                String::from_utf8_lossy(&probe.stderr).trim()
+            );
+            return;
+        }
+    }
+
+    for (label, form) in [
+        ("raw-compat", KernelHooks::RawTracepoint),
+        ("classic-compat", KernelHooks::Classic),
+    ] {
+        let (conn, child_pid, syscall_leg) = record_compat_capture(&dir, label, form);
+        let expected_leg = match form {
+            KernelHooks::RawTracepoint => "raw_tracepoint",
+            _ => "tracepoint",
+        };
+        assert_eq!(
+            syscall_leg, expected_leg,
+            "[sysinfo] memory_syscall_leg under {label}: the form under test must be the one \
+             that ran"
+        );
+        // The positive twin first: the capture saw this pid's real syscalls.
+        let (mmap_rows, munmap_rows) = assert_syscall_rows(&conn, child_pid, label);
+        let (brk_at_zero, mmap_at_zero) = compat_shaped_rows(&conn, child_pid);
+        eprintln!(
+            "    {label}: memory_syscall_leg = {syscall_leg}; {mmap_rows} big mmap + \
+             {munmap_rows} munmap rows; compat-shaped rows: {brk_at_zero} brk at 0, \
+             {mmap_at_zero} mmap at 0 (workload rounds {COMPAT_SYSCALL_ROUNDS})"
+        );
+        assert_eq!(
+            (brk_at_zero, mmap_at_zero),
+            (0, 0),
+            "[memory_map] {label}: a 32-bit compat task's ia32 chdir/link must not be recorded \
+             as brk/mmap rows (the classic events skip compat syscalls; the raw pair mirrors \
+             that with its own test)"
+        );
+    }
+    eprintln!("\ntest_memory_syscall_hooks_raw_tracepoint_skips_compat_tasks: all checks passed");
+}
+
 /// One second of a syscall storm: the CLOCK_BOOTTIME stamps that bound it
 /// (the trace's own clock, so a second can be placed against the capture's
 /// traced window) and the `getpid()` calls made in it across every thread.
