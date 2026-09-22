@@ -519,8 +519,8 @@ fn read_iter_link(link: BorrowedFd<'_>, buf: &mut Vec<u8>) -> std::io::Result<()
 /// `tgids` in the order written, each once: a process is in one cgroup, but
 /// one target may lie below another.
 fn append_member_tgids(bytes: &[u8], seen: &mut HashSet<u32>, tgids: &mut Vec<u32>) {
-    for tgid in bytes.chunks_exact(std::mem::size_of::<u32>()) {
-        let tgid = u32::from_ne_bytes(tgid.try_into().expect("chunks of four bytes"));
+    for tgid in bytes.as_chunks::<4>().0 {
+        let tgid = u32::from_ne_bytes(*tgid);
         if seen.insert(tgid) {
             tgids.push(tgid);
         }
