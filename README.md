@@ -287,12 +287,15 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   a walk that came up short of the process's thread count is read once more
   within the snapshot. On an older kernel (no
   `bpf_iter_css_task_new` in the kernel's BTF), with the start-time `--cgroup`
-  matching, from a pid namespace other than the host's, or past 1024 target
-  processes, a snapshot walks every thread on the host as it always has and
-  records the same threads; the walk in use is printed at start. Setting
+  matching, with a `--cgroup` target inside a threaded subtree (cgroup v2's
+  threaded mode, where a thread need not be in its process's cgroup), from a
+  pid namespace other than the host's, or past 1024 target processes, a
+  snapshot walks every thread on the host as it always has and records the
+  same threads; the walk in use is printed at start. Setting
   `SYSTING_TASK_STACKS_FULL_WALK` to any non-empty value (`=1` will do) forces
   that walk on any kernel. When the capture ends the recorder prints how many
-  tasks its walks visited and how many of those were targeted.
+  tasks its walks were handed, how many of those were targeted, and how many
+  walks of a process it read again.
 - The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
   with the stack by `stack_id` into `stack` like every other recorder's. With
   Python frames collected, the `thread` table also gets the name the process

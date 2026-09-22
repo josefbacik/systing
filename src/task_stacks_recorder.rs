@@ -458,6 +458,18 @@ fn choose_walk(filter: &TargetFilter, facts: &WalkFacts) -> (TaskWalk, Option<&'
     (TaskWalk::ByCgroup, None)
 }
 
+/// Whether `dir`, a `--cgroup` target's directory, is a member of a threaded
+/// subtree (cgroup v2's threaded mode). There a thread and its process can sit
+/// in different cgroups, and the kernel lists a cgroup by process: a thread
+/// placed in the target whose process sits beside it would never be walked,
+/// where the walk over every thread matches it by its own cgroup. A type that
+/// cannot be read is taken for a domain's, in which every thread of a process
+/// is where its process is.
+fn in_threaded_subtree(dir: BorrowedFd<'_>) -> bool {
+    std::fs::read_to_string(format!("/proc/self/fd/{}/cgroup.type", dir.as_raw_fd()))
+        .is_ok_and(|kind| kind.trim() == "threaded")
+}
+
 /// Create an iterator link of `prog` with `link_info`'s parameters: what
 /// libbpf's own attach does, by file descriptor, so the link needs nothing of
 /// the skeleton the program came from. libbpf-rs's `attach_iter` only knows
@@ -549,6 +561,8 @@ pub struct TaskStacksIter {
     full_walk_snapshots: AtomicU64,
     /// The scoped walks of one process that came up short and were read again.
     reread_processes: AtomicU64,
+    /// Of those, the ones whose second walk came up short too.
+    still_short_processes: AtomicU64,
 }
 
 impl TaskStacksIter {
@@ -568,6 +582,12 @@ impl TaskStacksIter {
             (walk, why_full) = (
                 TaskWalk::Full,
                 Some("there is no --cgroup directory to list"),
+            );
+        }
+        if walk == TaskWalk::ByCgroup && cgroup_dirs.iter().any(|dir| in_threaded_subtree(*dir)) {
+            (walk, why_full) = (
+                TaskWalk::Full,
+                Some("a --cgroup target is in a threaded subtree, where a thread need not be in its process's cgroup"),
             );
         }
         let loaded = if walk == TaskWalk::ByCgroup {
@@ -603,6 +623,7 @@ impl TaskStacksIter {
             walk_stats: loaded.walk_stats,
             full_walk_snapshots: AtomicU64::new(0),
             reread_processes: AtomicU64::new(0),
+            still_short_processes: AtomicU64::new(0),
         })
     }
 
@@ -792,31 +813,38 @@ impl TaskStacksIter {
     /// host for the program to pick them from, or each target process's own.
     pub fn snapshot(&self) -> Result<Vec<TaskSample>> {
         let mut buf = Vec::new();
-        let mut read_twice = false;
-        match self.scoped_targets() {
+        let scoped = match self.scoped_targets() {
             Some(tgids) => {
                 for tgid in tgids {
                     if self.read_process(tgid, &mut buf)? {
                         // Cut short by a thread that exited under the walk:
-                        // once more, for the threads behind it.
+                        // once more, for the threads behind it. The second
+                        // walk can be cut too; one re-read is the bound, and
+                        // the ones that were have a count of their own.
                         self.reread_processes.fetch_add(1, Ordering::Relaxed);
-                        self.read_process(tgid, &mut buf)?;
-                        read_twice = true;
+                        if self.read_process(tgid, &mut buf)? {
+                            self.still_short_processes.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
+                true
             }
             None => {
                 let mut iter = libbpf_rs::Iter::new(&self.link)
                     .context("Failed to create a task-stacks iterator")?;
                 iter.read_to_end(&mut buf)
                     .context("Failed to read the task-stacks iterator")?;
+                false
             }
-        }
-        let mut samples = parse_records(&buf)?;
-        if read_twice {
-            keep_first_per_thread(&mut samples);
-        }
-        Ok(samples)
+        };
+        let samples = parse_records(&buf)?;
+        // The walk over every thread steps through the pids in order and
+        // meets each once; the scoped walks can hand a thread over again.
+        Ok(if scoped {
+            one_entry_per_thread(samples)
+        } else {
+            samples
+        })
     }
 
     /// Walk process `tgid`'s threads through a link of the iterator program
@@ -868,6 +896,12 @@ impl TaskStacksIter {
     pub fn reread_processes(&self) -> u64 {
         self.reread_processes.load(Ordering::Relaxed)
     }
+
+    /// Of those, the ones whose second walk came up short too: what says
+    /// whether one re-read is enough.
+    pub fn still_short_processes(&self) -> u64 {
+        self.still_short_processes.load(Ordering::Relaxed)
+    }
 }
 
 /// Userspace mirror of the BPF side's `struct task_stacks_walk_stats`.
@@ -889,13 +923,41 @@ const _: () = assert!(
     std::mem::size_of::<WalkStats>() == std::mem::size_of::<skel::types::task_stacks_walk_stats>()
 );
 
-/// Keep each thread's first record and drop its later ones: a process read
-/// twice in one snapshot hands over the threads its first walk reached a
-/// second time (as unchanged, their record having gone out), and a snapshot
-/// says one thing about a thread.
-fn keep_first_per_thread(samples: &mut Vec<TaskSample>) {
-    let mut seen = HashSet::with_capacity(samples.len());
-    samples.retain(|sample| seen.insert(tid(&sample.task)));
+/// One entry per thread out of a snapshot of scoped walks, which can hand a
+/// thread over more than once: the second walk of a process read twice meets
+/// again the threads the first reached, and a kernel older than 6.8 can return
+/// a thread group's leader twice to a walk that races an exec by another of
+/// its threads. The recorder takes one statement about a thread per snapshot.
+///
+/// The program moves a thread's baseline every time a full record of it goes
+/// out, so the baseline it holds when the snapshot ends is the LAST full
+/// record's: that is the one to keep, or the thread's next "unchanged" would
+/// extend a stack the program has since replaced. Its CPU-time deltas run from
+/// the record before it, so the full records' deltas are summed. A header
+/// after a record says no more than the record did, and a thread with headers
+/// alone keeps one.
+fn one_entry_per_thread(samples: Vec<TaskSample>) -> Vec<TaskSample> {
+    let mut merged: Vec<TaskSample> = Vec::with_capacity(samples.len());
+    let mut at: HashMap<u32, usize> = HashMap::with_capacity(samples.len());
+    for mut sample in samples {
+        match at.get(&tid(&sample.task)).copied() {
+            None => {
+                at.insert(tid(&sample.task), merged.len());
+                merged.push(sample);
+            }
+            Some(_) if sample.unchanged => {}
+            Some(i) => {
+                let earlier = &merged[i];
+                if !earlier.unchanged {
+                    sample.utime_delta += earlier.utime_delta;
+                    sample.stime_delta += earlier.stime_delta;
+                    sample.runtime_delta += earlier.runtime_delta;
+                }
+                merged[i] = sample;
+            }
+        }
+    }
+    merged
 }
 
 /// How many snapshots a capture of `duration` holds, one every `interval`
@@ -1113,7 +1175,9 @@ impl TaskStacksThread {
                     match iter.reread_processes() {
                         0 => {}
                         n => asides.push_str(&format!(
-                            "; {n} walks of a process came up short and were read again"
+                            "; {n} walks of a process came up short and were read again, \
+                             {} of them short the second time too",
+                            iter.still_short_processes()
                         )),
                     }
                     eprintln!(
@@ -1526,22 +1590,43 @@ mod tests {
     }
 
     #[test]
-    fn a_process_read_twice_keeps_each_threads_first_record() {
+    fn a_process_read_twice_keeps_each_threads_last_full_record() {
         // The first walk of the process wrote thread 11's record and was cut
-        // short there; the second hands 11 over again, unchanged now that its
-        // record has gone out, and goes on to 12, which the first never met.
-        let (first, behind) = (task(10, 11, "worker"), task(10, 12, "worker"));
-        let mut buf = record_bytes(&first, 0, (1, 2), &[0xa], &[], &[]);
-        buf.extend(record_bytes(&first, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
-        buf.extend(record_bytes(&behind, 0, (3, 4), &[0xb], &[], &[]));
-        let mut samples = parse_records(&buf).unwrap();
-        assert_eq!(samples.len(), 3);
-        keep_first_per_thread(&mut samples);
+        // short there. The second hands 11 over again: a header if it has not
+        // run since, a full record if it has -- and then that record is the
+        // program's baseline, so it is the one to keep, with the CPU time of
+        // both. Thread 12 the first walk never met; 13 has headers alone.
+        let (ran, behind, idle) = (
+            task(10, 11, "worker"),
+            task(10, 12, "worker"),
+            task(10, 13, "worker"),
+        );
+        let mut buf = record_bytes(&ran, 0, (1, 2), &[0xa], &[], &[]);
+        buf.extend(record_bytes(&idle, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
+        buf.extend(record_bytes(&ran, 0, (5, 6), &[0xb], &[], &[]));
+        buf.extend(record_bytes(&ran, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
+        buf.extend(record_bytes(&behind, 0, (3, 4), &[0xc], &[], &[]));
+        buf.extend(record_bytes(&idle, FLAG_UNCHANGED, (0, 0), &[], &[], &[]));
+        let samples = one_entry_per_thread(parse_records(&buf).unwrap());
         let kept: Vec<_> = samples
             .iter()
-            .map(|sample| (tid(&sample.task), sample.unchanged))
+            .map(|sample| {
+                (
+                    tid(&sample.task),
+                    sample.unchanged,
+                    sample.kernel_stack.clone(),
+                    (sample.utime_delta, sample.stime_delta, sample.runtime_delta),
+                )
+            })
             .collect();
-        assert_eq!(kept, [(11, false), (12, false)]);
+        assert_eq!(
+            kept,
+            [
+                (11, false, vec![0xb], (6, 8, 14)),
+                (13, true, vec![], (0, 0, 0)),
+                (12, false, vec![0xc], (3, 4, 7)),
+            ]
+        );
     }
 
     #[test]

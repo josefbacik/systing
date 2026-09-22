@@ -438,11 +438,14 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
  *
  * It lists and does no more, for two reasons of the kernel's. A cgroup
  * iterator's program runs with cgroup_mutex held: every cgroup operation on
- * the host waits for it, so it must not unwind stacks there. And what it
- * writes for one cgroup has to fit the iterator's seq buffer, eight pages and
- * never grown: over that the read fails with E2BIG. On 4K pages the tgids of
- * 8192 processes of one cgroup fit it; the records of a dozen threads with
- * deep stacks fill it.
+ * the host waits for it, so it must not unwind stacks there. And a cgroup
+ * iterator has one read session: all it writes, for the target and every
+ * cgroup below it, has to fit the iterator's seq buffer, eight pages and never
+ * grown. One cgroup's output over that fails the read with E2BIG, several
+ * cgroups' with EOPNOTSUPP once the first buffer has been read. On 4K pages
+ * the tgids of 8192 processes under one target fit it; the records of a dozen
+ * threads with deep stacks fill it. A read that fails is a snapshot that walks
+ * every thread instead.
  *
  * "?": loaded only where userspace asks for it, which it does where the
  * kernel has the css_task iterator and the capture is one it is for. Elsewhere
