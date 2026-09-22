@@ -5386,6 +5386,28 @@ fn task_stacks_closing_line(stderr: &str) -> &str {
         .unwrap_or_else(|| panic!("the recorder printed no closing line:\n{stderr}"))
 }
 
+/// Why a task-stacks capture with targets may walk every thread on the host
+/// and nothing be wrong: what the recorder prints at start for each reason it
+/// knows before it loads anything. A kernel that refuses a program the capture
+/// asked it to load ends up on that walk too, with none of these, and a test
+/// that took any reason for a fallback would pass on that refusal.
+const TASK_STACKS_NOT_ROOT_PID_NS: &str =
+    "systing is not in the root pid namespace, which the targets' pids are counted in";
+const TASK_STACKS_START_TIME_CGROUPS: &str =
+    "--cgroup is matched against a start-time snapshot of cgroup ids here";
+const TASK_STACKS_NO_CSS_TASK_KFUNC: &str =
+    "this kernel's BTF does not export bpf_iter_css_task_new";
+const TASK_STACKS_THREADED_SUBTREE: &str =
+    "a --cgroup target is in a threaded subtree, where a thread need not be in its process's cgroup";
+
+/// The reason a capture gave at start for walking every thread on the host, if
+/// it gave one.
+fn task_stacks_full_walk_reason(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("task-stacks: walking every thread on the host: "))
+}
+
 /// The tasks a capture's walks visited, and those of them it found targeted,
 /// from the recorder's closing line.
 fn task_stacks_walk_counts(stderr: &str) -> (u64, u64) {
@@ -5549,8 +5571,16 @@ fn test_e2e_task_stacks_scoped_walks_record_what_the_full_walk_does() {
     }
 
     // Both walks of one targeting, read the same way. `scoped_line` is what
-    // the capture prints at start when it takes the scoped walk.
-    fn check(label: &str, target: &[&str], shell: u32, scoped_line: &str) {
+    // the capture prints at start when it takes the scoped walk, and
+    // `healthy_fallbacks` the reasons for which it may take the other one
+    // with nothing wrong.
+    fn check(
+        label: &str,
+        target: &[&str],
+        shell: u32,
+        scoped_line: &str,
+        healthy_fallbacks: &[&str],
+    ) {
         let (stderr, out_dir) = capture(target, false);
         let (visited, targeted) = task_stacks_walk_counts(&stderr);
         let (shell_events, others) = recorded(&out_dir, shell);
@@ -5602,13 +5632,22 @@ fn test_e2e_task_stacks_scoped_walks_record_what_the_full_walk_does() {
             );
             eprintln!("[{label}] scoped: {visited} visits against the full walk's {full_visited}");
         } else {
-            // The fallback's own leg: a kernel the scoped walk does not run
-            // on has to say so, and has recorded the same above.
+            // The fallback's own leg: a host the scoped walk does not run on
+            // has to say so, and has recorded the same above. Only a reason
+            // known before anything is loaded counts. A kernel that refuses
+            // the iterator falls back as well, and that is a failure: on a
+            // kernel that has the iterator it is the only sign of one.
+            let why = task_stacks_full_walk_reason(&stderr).unwrap_or_else(|| {
+                panic!(
+                    "[{label}] a capture with targets that walks every thread must say why:\n{stderr}"
+                )
+            });
             assert!(
-                stderr.contains("task-stacks: walking every thread on the host: "),
-                "[{label}] a capture with targets that walks every thread must say why:\n{stderr}"
+                healthy_fallbacks.contains(&why),
+                "[{label}] the capture walked every thread on the host for a reason no healthy \
+                 host gives ({why:?}):\n{stderr}"
             );
-            eprintln!("[{label}] this kernel took the full walk and said so; recorded the same");
+            eprintln!("[{label}] this host took the full walk ({why}); recorded the same");
         }
     }
 
@@ -5620,6 +5659,7 @@ fn test_e2e_task_stacks_scoped_walks_record_what_the_full_walk_does() {
             &["--pid", &pid],
             shell.pid(),
             "task-stacks: walking the --pid targets' threads alone",
+            &[TASK_STACKS_NOT_ROOT_PID_NS],
         );
     }
 
@@ -5661,6 +5701,12 @@ fn test_e2e_task_stacks_scoped_walks_record_what_the_full_walk_does() {
         &["--cgroup", &target_path],
         shell.pid(),
         "task-stacks: walking the --cgroup targets' processes alone",
+        &[
+            TASK_STACKS_NOT_ROOT_PID_NS,
+            TASK_STACKS_START_TIME_CGROUPS,
+            TASK_STACKS_NO_CSS_TASK_KFUNC,
+            TASK_STACKS_THREADED_SUBTREE,
+        ],
     );
 }
 
@@ -5789,9 +5835,18 @@ fn test_e2e_task_stacks_scoped_walk_of_a_process_that_retires_threads() {
         .stderr
         .contains("task-stacks: walking the --pid targets' threads alone")
     {
+        // Nothing scoped to check, for the one reason a healthy host can give
+        // a `--pid` capture; any other is a failure, not a skip.
+        assert_eq!(
+            task_stacks_full_walk_reason(&scoped.stderr),
+            Some(TASK_STACKS_NOT_ROOT_PID_NS),
+            "a --pid capture walked every thread on the host for a reason no healthy host \
+             gives:\n{}",
+            scoped.stderr
+        );
         eprintln!(
-            "this capture took the walk over every thread on the host: \
-             nothing scoped to check"
+            "this capture took the walk over every thread on the host \
+             ({TASK_STACKS_NOT_ROOT_PID_NS}): nothing scoped to check"
         );
         return;
     }
