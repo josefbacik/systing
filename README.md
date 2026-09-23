@@ -370,8 +370,9 @@ GROUP BY 1 ORDER BY 2 DESC;
   with no section table.
 - What is read: the ELF headers and two small sections of each distinct
   executable, never its symbols; then 104 bytes of the process's memory, the
-  record the library publishes, every field of which is checked against the
-  tracer's own numbers before anything is believed. Per sample, in BPF, the
+  record the library publishes ([what it holds](crates/task-context/README.md#what-the-library-publishes)),
+  every field of which is checked against the tracer's own numbers before
+  anything is believed. Per sample, in BPF, the
   thread pointer, the slot it leads to (8 bytes at the published offset or,
   for a library built with `-DTASK_CONTEXT_DTV`, four 8-byte reads through the
   thread's DTV) and 24 bytes of the thread's block; a process that publishes

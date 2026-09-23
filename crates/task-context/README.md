@@ -44,6 +44,47 @@ module's TLS block, and the library reports the module's id and the variable's
 offset in that block; a reader finds the block through the thread's DTV, the
 way the dynamic linker does. Either way a reader never parses a relocation.
 
+### What the library publishes
+
+The library keeps one record per process, `struct task_context_info_v1`, 104
+bytes, in an ELF section named `task_context_info`. It is also exported as the
+dynamic symbol `task_context_info_v1`. The record says where to look: it holds
+no values. The values live in per-thread blocks in one 16 MiB region that the
+record points to. The first word of a block is a sequence number that changes
+with every set or clear and doubles as the 8-byte context id a tracer stores
+with each sample.
+
+| Offset | Field | What it holds |
+|---|---|---|
+| 0 | `magic` | `"TCX1"`, fixed at build time |
+| 4, 6 | `version`, `info_size` | 1 and 104, fixed at build time |
+| 8 | `recipe_tag` | how to find a thread's slot: 0 not published yet, 1 a fixed distance from the thread pointer, 2 through the thread's DTV |
+| 12 | `recipe_generation` | 1 at first publication |
+| 16 | `tp_offset` | tag 1: distance from the thread pointer to the slot (negative on x86-64, positive on aarch64); 0 under tag 2 |
+| 24, 32 | `dtv_modid`, `dtv_block_offset` | tag 2: the library's TLS module id, and the slot's offset in that module's block |
+| 48 | `self_address` | the record's own run-time address, so a reader can check its arithmetic |
+| 56, 64 | `region_base`, `region_size` | the region every thread's block lives in |
+| 72 to 84 | `block_size`, `block_hdr_size`, `slot_size`, `nslots`, `name_max`, `value_max` | the geometry: 2560, 32, 296, 8, 32 and 256, fixed at build time |
+| 88, 96 | two counters | sets refused because the region is full, or because a call interrupted its own thread's update |
+
+The rest (offsets 40 and 44) is reserved and 0.
+
+How a tracer uses it:
+
+- It finds the section by name in the ELF file, before it touches the process,
+  and checks the fixed fields there. It then reads the record from the
+  process, at the section's address plus the file's load bias. A stripped
+  static binary still has the section, because `strip` keeps allocated
+  sections. A file with no section table is not found.
+- The library fills in everything else first and writes `recipe_tag` last,
+  with release ordering, so a reader that sees a tag sees the whole record. A
+  tag of 0 means the process links the library and has not published yet.
+- The tracer treats every field as untrusted: it refuses the record unless the
+  geometry equals its own constants, the region is page-aligned, at most
+  16 MiB and inside user addresses, and `self_address` matches.
+- What it hands to BPF is five numbers per process: `tp_offset`, the region's
+  base and size, and the module id and block offset.
+
 ## Using it
 
 **C.** `set_task_context(name, value)` is a C11 `_Generic` macro over the two
