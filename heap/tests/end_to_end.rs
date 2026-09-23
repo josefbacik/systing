@@ -110,3 +110,49 @@ fn a_dump_naming_a_device_is_not_opened() {
     );
     assert_eq!(symbolized.frames[0][0], vec!["unknown (zero) <0x1010>"]);
 }
+
+fn anon_exec_dump(dir: &std::path::Path) -> std::path::PathBuf {
+    // 0x20008 is in an anonymous executable mapping, as a perf trampoline is.
+    let dump = "heap_v2/524288\n  t*: 1: 64 [0: 0]\n@ 0x20008 0x20028\n  t*: 1: 64 [0: 0]\n\
+                \nMAPPED_LIBRARIES:\n\
+                00020000-00021000 r-xp 00000000 00:00 0 \n";
+    let path = dir.join("jeprof.77.0.f.heap");
+    std::fs::write(&path, dump).unwrap();
+    path
+}
+
+#[test]
+fn perf_map_names_python_trampoline_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut snapshot = jemalloc::read(&anon_exec_dump(dir.path())).unwrap();
+    snapshot.perf_map = Some(std::sync::Arc::new(systing_heap::perfmap::PerfMap::parse(
+        "20000 10 py::leak:/srv/app/work.py\n20020 10 py::Outer.run:/srv/app/work.py\n",
+    )));
+    let snapshots = vec![snapshot];
+    let symbolized = symbolize::symbolize(&snapshots);
+    // Root first: the caller (0x20028, looked up one byte back) then the leaf.
+    assert_eq!(
+        symbolized.frames[0][0],
+        vec!["Outer.run (python) [work.py]", "leak (python) [work.py]"]
+    );
+    assert_eq!(
+        symbolized
+            .files
+            .get("leak (python) [work.py]")
+            .map(String::as_str),
+        Some("/srv/app/work.py")
+    );
+    assert!(symbolized.stats.unnamed_generated.is_empty());
+}
+
+#[test]
+fn generated_code_without_a_perf_map_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let snapshots = vec![jemalloc::read(&anon_exec_dump(dir.path())).unwrap()];
+    let symbolized = symbolize::symbolize(&snapshots);
+    assert_eq!(symbolized.frames[0][0][1], "unknown ([anon]) <0x20008>");
+    assert_eq!(
+        symbolized.stats.unnamed_generated,
+        vec![snapshots[0].source_path.clone()]
+    );
+}

@@ -1,0 +1,157 @@
+//! Perf maps: `/tmp/perf-<pid>.map`, where a process names code it generated
+//! at runtime. Python's perf trampolines (3.12+, `-X perf`,
+//! `PYTHONPERFSUPPORT=1`) write one line per Python function,
+//! `<start hex> <size hex> py::<qualname>:<file>`, so the trampoline frames in
+//! a heap snapshot's stacks name the Python functions they ran.
+
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub start: u64,
+    pub end: u64,
+    pub name: String,
+}
+
+/// A parsed perf map, sorted by start address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PerfMap {
+    entries: Vec<Entry>,
+}
+
+/// What a perf-map entry names.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Symbol<'a> {
+    /// A Python function's trampoline.
+    Python { qualname: &'a str, file: &'a str },
+    /// Anything else a JIT wrote there.
+    Other(&'a str),
+}
+
+impl PerfMap {
+    /// Parse perf-map text; lines that do not parse are skipped (the process
+    /// may have been writing the last one).
+    pub fn parse(text: &str) -> PerfMap {
+        let mut entries: Vec<Entry> = text
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.splitn(3, ' ');
+                let start = u64::from_str_radix(f.next()?, 16).ok()?;
+                let size = u64::from_str_radix(f.next()?, 16).ok()?;
+                let name = f.next()?.trim();
+                (size > 0 && !name.is_empty()).then(|| Entry {
+                    start,
+                    end: start.saturating_add(size),
+                    name: name.to_string(),
+                })
+            })
+            .collect();
+        // A later line for the same address wins: stable sort keeps file
+        // order, and lookup takes the last match.
+        entries.sort_by_key(|e| e.start);
+        PerfMap { entries }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The entry holding `addr`.
+    pub fn lookup(&self, addr: u64) -> Option<&Entry> {
+        let i = self.entries.partition_point(|e| e.start <= addr);
+        let e = self.entries.get(i.checked_sub(1)?)?;
+        (addr < e.end).then_some(e)
+    }
+}
+
+impl Entry {
+    pub fn symbol(&self) -> Symbol<'_> {
+        if let Some(rest) = self.name.strip_prefix("py::") {
+            // Qualified names never contain ':'; file names may.
+            if let Some((qualname, file)) = rest.split_once(':') {
+                return Symbol::Python { qualname, file };
+            }
+        }
+        Symbol::Other(&self.name)
+    }
+}
+
+/// Where to look for `perf-<pid>.map`, in order: `dir` (--perf-map-dir),
+/// beside the snapshot, then /tmp where the process wrote it.
+pub fn find(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Option<PathBuf> {
+    let name = format!("perf-{pid}.map");
+    let beside = snapshot.parent().map(|p| p.join(&name));
+    [
+        dir.map(|d| d.join(&name)),
+        beside,
+        Some(Path::new("/tmp").join(&name)),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAP: &str = "\
+7f75cb8c74e0 8 py::<module>:/srv/app/alloc.py
+7f75cb8c7500 8 py::outer:/srv/app/alloc.py
+7f75cb8c7520 8 py::Leaker.leak:C:/odd:path.py
+7f75cb8c7600 20 some_jit_stub
+garbage line
+";
+
+    #[test]
+    fn lookup_names_python_functions() {
+        let m = PerfMap::parse(MAP);
+        let e = m.lookup(0x7f75cb8c7506).unwrap();
+        assert_eq!(
+            e.symbol(),
+            Symbol::Python {
+                qualname: "outer",
+                file: "/srv/app/alloc.py"
+            }
+        );
+        assert_eq!(
+            m.lookup(0x7f75cb8c7520).unwrap().symbol(),
+            Symbol::Python {
+                qualname: "Leaker.leak",
+                file: "C:/odd:path.py"
+            }
+        );
+        assert_eq!(
+            m.lookup(0x7f75cb8c7610).unwrap().symbol(),
+            Symbol::Other("some_jit_stub")
+        );
+    }
+
+    #[test]
+    fn end_is_exclusive_and_gaps_miss() {
+        let m = PerfMap::parse(MAP);
+        assert!(m.lookup(0x7f75cb8c7508).is_none());
+        assert!(m.lookup(0x10).is_none());
+    }
+
+    #[test]
+    fn find_prefers_the_named_dir_then_beside_the_snapshot() {
+        let d = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let snap = d.path().join("jeprof.4242.0.f.heap");
+        assert_eq!(
+            find(4242, &snap, None).is_some(),
+            Path::new("/tmp/perf-4242.map").is_file()
+        );
+        std::fs::write(d.path().join("perf-4242.map"), MAP).unwrap();
+        assert_eq!(
+            find(4242, &snap, None),
+            Some(d.path().join("perf-4242.map"))
+        );
+        std::fs::write(other.path().join("perf-4242.map"), MAP).unwrap();
+        assert_eq!(
+            find(4242, &snap, Some(other.path())),
+            Some(other.path().join("perf-4242.map"))
+        );
+    }
+}

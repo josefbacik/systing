@@ -172,6 +172,7 @@ pub fn parse(text: &str) -> Result<Snapshot> {
         header_live_bytes,
         samples,
         maps,
+        perf_map: None,
     })
 }
 

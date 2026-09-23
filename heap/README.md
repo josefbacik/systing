@@ -83,6 +83,51 @@ A frame in a known file with no symbol is `unknown (module) <0xaddr>`.
 Stripped system libraries (libc, the distro's libjemalloc) have no symbols for their internal functions, so those frames stay `unknown`.
 Every frame except the innermost is a return address, so the tool looks up the byte before it to land on the call itself.
 
+## Python stacks
+
+A Python program's heap stacks can show its Python functions among the native frames:
+
+```
+_start → … → outer (python) [app.py] → leak_in_python (python) [app.py] → PyByteArray… → malloc
+```
+
+Two things make this work, and the program chooses both at runtime with the helper in `hooks/`:
+
+- **Perf trampolines** (Python 3.12+). Python gives each Python function a small piece of generated code of its own, so a native stack shows one frame per Python function, and names that code in `/tmp/perf-<pid>.map`.
+- **A backtrace that walks through them.** The distro jemalloc captures stacks with libgcc's unwinder, which stops at the first trampoline, so only the innermost Python function shows. libunwind walks through them. The hook makes jemalloc use libunwind (`libunwind.so.8`, loaded at runtime).
+
+```bash
+make -C heap/hooks          # builds heap/hooks/libsysting_heap_hooks.so
+```
+
+```python
+import systing_heap_hooks   # heap/hooks on PYTHONPATH, or copy the .py and .so together
+print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
+# {'backtrace': 'libunwind', 'trampolines': True, 'reasons': []}
+```
+
+What can't be done is skipped with a warning, and the result says what is active.
+For example, without libunwind8 you get `{'backtrace': 'default', ..., 'reasons': ['libunwind.so.8 not found']}`, and stacks keep only the innermost Python function.
+It also reports when jemalloc isn't the process's allocator, when profiling is off (`MALLOC_CONF` without `prof:true`), and when jemalloc is older than 5.3.
+Pass `strict=True` to raise instead.
+`backtrace="default"` puts jemalloc's own back.
+
+The options, from most to least complete:
+
+| Setup | Stacks show |
+|---|---|
+| Trampolines + `backtrace="libunwind"` | Every Python function, among the native frames |
+| Trampolines + a jemalloc built with `--enable-prof-libunwind` (no hook) | The same, expected: jemalloc's libunwind backend makes the same call as the hook; not tested here |
+| Trampolines + jemalloc's default | Only the innermost Python function |
+| No trampolines | Native frames only (the interpreter's C functions) |
+
+Things to know:
+
+- **Turn trampolines on early.** Trampolines only wrap functions called after they are on, so a frame already running (the module that calls `install()`) has none. `PYTHONPERFSUPPORT=1` turns them on at startup. The hook applies only to allocations sampled after `install()`.
+- **Function granularity.** A trampoline is per function, so Python frames name the function and file (full path in `frame_file`), not the line.
+- **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps. Without it, Python frames show as `unknown ([anon])` and the tool warns.
+- **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran about 40% slower. Code that spends its time in C pays far less. The hook itself runs only for sampled allocations.
+
 ## Tables
 
 `heap_snapshot` has one row per snapshot file.

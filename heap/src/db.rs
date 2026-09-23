@@ -124,10 +124,15 @@ pub fn write(
 
     {
         let mut frames = tx.appender("frame")?;
+        let mut frame_files = tx.appender("frame_file")?;
         for (name, id) in &frame_ids {
             frames.append_row(params![trace_id, id, name])?;
+            if let Some(file) = symbolized.files.get(*name) {
+                frame_files.append_row(params![trace_id, id, file])?;
+            }
         }
         frames.flush()?;
+        frame_files.flush()?;
     }
 
     // The appender takes no list values: stage (stack, position, frame) rows

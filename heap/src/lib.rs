@@ -15,6 +15,7 @@ pub mod db;
 pub mod format;
 pub mod jemalloc;
 pub mod maps;
+pub mod perfmap;
 pub mod retention;
 pub mod symbolize;
 
@@ -45,6 +46,9 @@ pub struct Snapshot {
     pub samples: Vec<Sample>,
     /// The process's memory map as of the dump, for symbolization.
     pub maps: Maps,
+    /// The process's perf map (`perf-<pid>.map`), naming code it generated
+    /// at runtime such as Python's perf trampolines; None if not found.
+    pub perf_map: Option<std::sync::Arc<perfmap::PerfMap>>,
 }
 
 /// One allocation stack and what is allocated from it.

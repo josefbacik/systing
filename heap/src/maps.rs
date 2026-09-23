@@ -10,6 +10,8 @@ pub struct Mapping {
     /// File offset of `start`.
     pub offset: u64,
     pub inode: u64,
+    /// Mapped executable (`x` in the permissions).
+    pub exec: bool,
     /// The pathname column: a file path, a `[bracketed]` kernel name, or
     /// empty for anonymous memory.
     pub path: String,
@@ -71,7 +73,7 @@ fn parse_line(line: &str) -> Option<Mapping> {
     // start-end perms offset dev inode [path]; the path may contain spaces.
     let mut fields = line.splitn(6, char::is_whitespace);
     let range = fields.next()?;
-    let _perms = fields.next()?;
+    let perms = fields.next()?;
     let offset = fields.next()?;
     let _dev = fields.next()?;
     let inode = fields.next()?;
@@ -82,6 +84,7 @@ fn parse_line(line: &str) -> Option<Mapping> {
         end: u64::from_str_radix(end, 16).ok()?,
         offset: u64::from_str_radix(offset, 16).ok()?,
         inode: inode.parse().ok()?,
+        exec: perms.as_bytes().get(2) == Some(&b'x'),
         path,
     })
 }
@@ -106,6 +109,8 @@ mod tests {
         assert_eq!(m.path, "/tmp/je/t");
         assert_eq!(0x56326ffdd225 - m.start + m.offset, 0x1225);
         assert_eq!(m.label(), Some("t"));
+        assert!(m.exec);
+        assert!(!maps.lookup(0x56326ffdc000).unwrap().exec);
     }
 
     #[test]

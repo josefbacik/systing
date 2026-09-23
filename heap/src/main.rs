@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use systing_heap::perfmap::{self, PerfMap};
 use systing_heap::{db, jemalloc, retention, symbolize, Format, Snapshot};
 
 /// Parse allocator heap snapshots (jemalloc prof dumps), symbolize their
@@ -41,6 +45,12 @@ struct Cli {
     /// Print what would be loaded and deleted; write and delete nothing.
     #[arg(long)]
     dry_run: bool,
+
+    /// Where to look first for each process's perf-<pid>.map, which names
+    /// Python functions when it ran with perf trampolines
+    /// (PYTHONPERFSUPPORT=1). Then beside the snapshot, then /tmp.
+    #[arg(long)]
+    perf_map_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -70,6 +80,7 @@ fn main() -> Result<()> {
     if snapshots.is_empty() {
         bail!("no snapshots found in {:?}", cli.inputs);
     }
+    attach_perf_maps(&mut snapshots, cli.perf_map_dir.as_deref());
     // Ids follow dump order: by process, then the allocator's sequence.
     snapshots.sort_by(|a, b| (a.pid, a.seq, &a.source_path).cmp(&(b.pid, b.seq, &b.source_path)));
 
@@ -99,6 +110,13 @@ fn main() -> Result<()> {
             f.display()
         );
     }
+    for f in &stats.unnamed_generated {
+        eprintln!(
+            "warning: {} has frames in generated code (Python perf trampolines?) that no perf-<pid>.map names; \
+             keep the process's /tmp/perf-<pid>.map beside the snapshot or pass --perf-map-dir",
+            f.display()
+        );
+    }
     for f in &stats.changed_files {
         eprintln!(
             "warning: {} is not the file the process mapped (different inode); its names may be wrong",
@@ -116,14 +134,15 @@ fn main() -> Result<()> {
         db::write(tmp, &cli.trace_id, &source, &snapshots, &symbolized)
     })?;
     println!(
-        "{}: {} snapshot(s), {} sample(s), {} stack(s), {} frame(s); {}/{} addresses symbolized",
+        "{}: {} snapshot(s), {} sample(s), {} stack(s), {} frame(s); {}/{} addresses symbolized, {} Python function(s) from perf maps",
         cli.output.display(),
         written.snapshots,
         written.samples,
         written.stacks,
         written.frames,
         stats.resolved,
-        stats.lookups
+        stats.lookups,
+        stats.perf_map_frames
     );
 
     // Only now that the database is in place do older dumps go.
@@ -137,6 +156,28 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Give each snapshot its process's perf map, when one is found. A map is
+/// read once however many snapshots share it.
+fn attach_perf_maps(snapshots: &mut [Snapshot], dir: Option<&Path>) {
+    let mut cache: HashMap<PathBuf, Option<Arc<PerfMap>>> = HashMap::new();
+    for s in snapshots {
+        let Some(pid) = s.pid else { continue };
+        let Some(path) = perfmap::find(pid, &s.source_path, dir) else {
+            continue;
+        };
+        s.perf_map = cache
+            .entry(path)
+            .or_insert_with_key(|path| match std::fs::read_to_string(path) {
+                Ok(text) => Some(Arc::new(PerfMap::parse(&text))),
+                Err(e) => {
+                    eprintln!("warning: reading {}: {e}", path.display());
+                    None
+                }
+            })
+            .clone();
+    }
 }
 
 /// Write a new database in a private, randomly named directory beside `out`
