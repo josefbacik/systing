@@ -16,8 +16,8 @@ use crate::trace::{
     NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
     ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord, SliceRecord,
     SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord,
-    TaskStackEventRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord,
-    TpuOpRecord, TrackRecord, WakeupNewRecord,
+    TaskContextRecord, TaskStackEventRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord,
+    TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -159,6 +159,10 @@ pub trait RecordCollector {
     /// Add a task-stacks event: a thread's state and stack over a run of
     /// iterations.
     fn add_task_stack_event(&mut self, record: TaskStackEventRecord) -> Result<()>;
+
+    /// Add one named value of one task_context id of one thread
+    /// (`--include-task-context`).
+    fn add_task_context(&mut self, record: TaskContextRecord) -> Result<()>;
 
     /// Set the system info record (only one per trace).
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()>;
@@ -386,6 +390,7 @@ impl RecordCollector for SharedCollector {
         add_memory_thp(MemoryThpRecord),
         add_memory_vmstat(MemoryVmstatRecord),
         add_task_stack_event(TaskStackEventRecord),
+        add_task_context(TaskContextRecord),
         set_sysinfo(SysInfoRecord),
         add_cpu_info(CpuInfoRecord),
         add_tpu_device(TpuDeviceRecord),
@@ -631,6 +636,11 @@ impl RecordCollector for InMemoryCollector {
         Ok(())
     }
 
+    fn add_task_context(&mut self, record: TaskContextRecord) -> Result<()> {
+        self.data.task_contexts.push(record);
+        Ok(())
+    }
+
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()> {
         self.data.sysinfo = Some(record);
         Ok(())
@@ -724,6 +734,7 @@ mod tests {
                 add_memory_thp(MemoryThpRecord),
                 add_memory_vmstat(MemoryVmstatRecord),
                 add_task_stack_event(TaskStackEventRecord),
+                add_task_context(TaskContextRecord),
                 set_sysinfo(SysInfoRecord),
                 add_cpu_info(CpuInfoRecord),
                 add_tpu_device(TpuDeviceRecord),
