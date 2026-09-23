@@ -304,7 +304,7 @@ pub(crate) fn validate_info(record: &[u8; INFO_SIZE], address: u64) -> Finding {
     let region_base = u64_at(record, INFO_REGION_BASE_AT);
     let region_size = u64_at(record, INFO_REGION_SIZE_AT);
     let region_ok = region_base >= USER_ADDR_MIN
-        && region_base % 4096 == 0
+        && region_base.is_multiple_of(4096)
         && (BLOCK_STRIDE..=REGION_SIZE_MAX).contains(&region_size)
         && region_base
             .checked_add(region_size)
@@ -454,10 +454,10 @@ fn mapped_file_name(name: &str) -> &str {
 }
 
 /// The lowest mapping among `maps` that `wanted` accepts.
-fn lowest_mapping<'a>(
-    maps: &'a [MemoryMapping],
+fn lowest_mapping(
+    maps: &[MemoryMapping],
     wanted: impl Fn(&MemoryMapping) -> bool,
-) -> Option<&'a MemoryMapping> {
+) -> Option<&MemoryMapping> {
     maps.iter()
         .filter(|mapping| !mapping.name.is_empty() && wanted(mapping))
         .min_by_key(|mapping| mapping.start)
