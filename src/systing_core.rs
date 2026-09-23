@@ -6131,7 +6131,6 @@ pub fn systing(
             let restricted = skel
                 .maps
                 .rodata_data
-                .as_deref()
                 .is_some_and(|rodata| rodata.task_context_config.restricted != 0);
             let utids = recorder
                 .stack_recorder
