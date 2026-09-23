@@ -14,9 +14,10 @@ name: bpf-load-shapes
 # Each guest job then boots its kernel a second time and runs the task_context
 # end-to-end cases (tests/task_context_record.rs) as root: a program that uses the
 # task-context library is traced - started by the tracer and already running, with
-# the library linked in and as a shared object - and the trace must carry what it
-# set; under the confidentiality mode, and under a recipe planted on a process it is
-# wrong for, it must carry nothing. Those cases are `#[ignore]`d for an unprivileged
+# the library linked in, as a shared object, and as a shared object whose slot is
+# found through the thread's DTV - and the trace must carry what it set; under the
+# confidentiality mode, and under a recipe planted on a process it is wrong for, it
+# must carry nothing. Those cases are `#[ignore]`d for an unprivileged
 # `cargo test` and return early without a C compiler;
 # scripts/ci/vmtest-task-context-e2e.sh decides by the lines the cases and the
 # tracer print, so a green row means every case ran to its end and the reader's own

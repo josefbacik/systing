@@ -1,17 +1,19 @@
 //! The example program, built two ways and checked from OUTSIDE the process.
 //!
 //! One C source (`examples/tcx_example.c`) is linked once against a static
-//! archive with `-static` and once against a shared object, each built here
-//! from the library's one C file with the system compiler. Each program is
-//! run as a child, and the test then does what a reader does, with no help
-//! from the child beyond the thread pointer it prints:
+//! archive with `-static` and twice against a shared object (built the
+//! default way, and with `-DTASK_CONTEXT_DTV`), each built here from the
+//! library's one C file with the system compiler. Each program is run as a
+//! child, and the test then does what a reader does, with no help from the
+//! child beyond the thread pointer it prints:
 //!
 //! 1. find the info record in the ELF file by its section name, add the load
 //!    bias taken from the child's map, and read the record out of the child's
 //!    memory — it must carry its own address;
-//! 2. for every thread, read the slot at thread pointer + the PUBLISHED
-//!    offset, follow it to the block, and compare the id, the names and the
-//!    values found there with the line the thread printed;
+//! 2. for every thread, find the slot by the PUBLISHED recipe (thread pointer
+//!    + offset, or the walk through the thread's DTV), follow it to the block,
+//!    and compare the id, the names and the values found there with the line
+//!    the thread printed;
 //! 3. let the program change a value and clear a name, and see the id move
 //!    and the name go.
 //!
@@ -55,6 +57,12 @@ const SLOTS: usize = 8;
 const VALUE_MAX: usize = 256;
 const THREADS: usize = 3;
 const RECIPE_UNSET: u32 = 0;
+const RECIPE_TP_OFFSET: u32 = 1;
+const RECIPE_DTV: u32 = 2;
+/// glibc's DTV as `task_context.h` ("The DTV walk") lays it out for a reader.
+const DTV_ENTRY_SIZE: u64 = 16;
+const TCB_DTV_OFFSET: u64 = if cfg!(target_arch = "aarch64") { 0 } else { 8 };
+const DTV_UNALLOCATED: u64 = u64::MAX;
 
 // ---------------------------------------------------------------------------
 // Skipping, and building the two programs
@@ -112,11 +120,13 @@ fn compile(arguments: &[&str], inputs: &[&Path], output: &Path) -> Result<(), St
     run_tool(&mut command)
 }
 
-/// A program to run, and the ELF file that holds the library's info record.
+/// A program to run, the ELF file that holds the library's info record, and
+/// the recipe that record is expected to publish.
 struct Fixture {
     program: PathBuf,
     record_is_in: PathBuf,
     library_dir: Option<PathBuf>,
+    recipe: u32,
 }
 
 fn have_a_compiler() -> bool {
@@ -156,26 +166,30 @@ fn build_static() -> Option<Fixture> {
         record_is_in: program.clone(),
         program,
         library_dir: None,
+        recipe: RECIPE_TP_OFFSET,
     })
 }
 
-fn build_dynamic() -> Option<Fixture> {
+/// The example against a shared object the executable names as a dependency.
+/// With `dtv`, the shared object is built with `-DTASK_CONTEXT_DTV`: its
+/// thread-local is general-dynamic and the recipe it publishes is the walk
+/// through the thread's DTV.
+fn build_dynamic(dtv: bool) -> Option<Fixture> {
     if !have_a_compiler() {
         return None;
     }
-    let dir = fresh_dir("dynamic");
+    let dir = fresh_dir(if dtv { "dynamic_dtv" } else { "dynamic" });
     let source = crate_dir().join("src/task_context.c");
     let example = crate_dir().join("examples/tcx_example.c");
     let library = dir.join("libtask_context.so");
     let program = dir.join("tcx_example_dynamic");
 
     // nodelete: a thread's exit handler and the record point into the object.
-    compile(
-        &["-fPIC", "-shared", "-Wl,-z,nodelete"],
-        &[&source],
-        &library,
-    )
-    .expect("the shared object builds");
+    let mut flags = vec!["-fPIC", "-shared", "-Wl,-z,nodelete"];
+    if dtv {
+        flags.push("-DTASK_CONTEXT_DTV");
+    }
+    compile(&flags, &[&source], &library).expect("the shared object builds");
     let mut command = Command::new(compiler());
     command
         .args(["-O2", "-Wall", "-Wextra", "-pthread", "-I"])
@@ -191,6 +205,7 @@ fn build_dynamic() -> Option<Fixture> {
         program,
         record_is_in: library,
         library_dir: Some(dir),
+        recipe: if dtv { RECIPE_DTV } else { RECIPE_TP_OFFSET },
     })
 }
 
@@ -234,6 +249,7 @@ fn build_two_copies(symbolic: bool) -> Option<Fixture> {
         record_is_in: program.clone(),
         program,
         library_dir: Some(dir),
+        recipe: RECIPE_TP_OFFSET,
     })
 }
 
@@ -509,11 +525,18 @@ impl Memory {
     }
 }
 
+/// How a thread's slot is found, as the record publishes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recipe {
+    TpOffset(i64),
+    Dtv { modid: u64, block_offset: u64 },
+}
+
 /// The fields of the info record this test uses.
 #[derive(Debug)]
 struct Info {
     address: u64,
-    tp_offset: i64,
+    recipe: Recipe,
     region_base: u64,
 }
 
@@ -535,13 +558,14 @@ fn read_the_record(fixture: &Fixture, pid: u32, memory: &Memory) -> (u64, Vec<u8
     (address, memory.bytes(address, INFO_SIZE))
 }
 
-/// Step 1: the record, found, and checked.
+/// Step 1: the record, found, and checked against what the library was built
+/// to publish.
 fn find_the_record(fixture: &Fixture, pid: u32, memory: &Memory) -> Info {
     let (address, record) = read_the_record(fixture, pid, memory);
     assert_eq!(u32_at(&record, 0), INFO_MAGIC, "magic");
     assert_eq!(u16_at(&record, 4), 1, "version");
     assert_eq!(u16_at(&record, 6) as usize, INFO_SIZE, "info_size");
-    assert_eq!(u32_at(&record, 8), 1, "recipe_tag: thread pointer + offset");
+    assert_eq!(u32_at(&record, 8), fixture.recipe, "recipe_tag");
     assert!(u32_at(&record, 12) >= 1, "recipe_generation");
     assert_eq!(
         u64_at(&record, 48),
@@ -558,37 +582,81 @@ fn find_the_record(fixture: &Fixture, pid: u32, memory: &Memory) -> Info {
     assert_eq!(u16_at(&record, 78) as usize, SLOT_SIZE, "slot_size");
     assert_eq!(u16_at(&record, 80) as usize, SLOTS, "nslots");
     assert_eq!(u32_at(&record, 84) as usize, VALUE_MAX, "value_max");
+    let recipe = if fixture.recipe == RECIPE_DTV {
+        let modid = u64_at(&record, 24);
+        let block_offset = u64_at(&record, 32);
+        // The example has thread-local data of its own, so it is module 1
+        // and the library, loaded beside it, is not.
+        assert!(modid > 1, "dtv_modid {modid}: the library is not module 1");
+        assert_eq!(block_offset % 8, 0, "dtv_block_offset {block_offset}");
+        assert_eq!(
+            u64_at(&record, 16),
+            0,
+            "tp_offset is unused under the DTV recipe"
+        );
+        Recipe::Dtv {
+            modid,
+            block_offset,
+        }
+    } else {
+        let tp_offset = u64_at(&record, 16) as i64;
+        if cfg!(target_arch = "x86_64") {
+            assert!(tp_offset < 0, "static TLS lies below the thread pointer");
+        } else if cfg!(target_arch = "aarch64") {
+            assert!(tp_offset > 0, "static TLS lies above the thread pointer");
+        }
+        Recipe::TpOffset(tp_offset)
+    };
     let info = Info {
         address,
-        tp_offset: u64_at(&record, 16) as i64,
+        recipe,
         region_base: u64_at(&record, 56),
     };
     assert_ne!(info.region_base, 0);
     assert_eq!(info.region_base % 4096, 0);
-    if cfg!(target_arch = "x86_64") {
-        assert!(
-            info.tp_offset < 0,
-            "static TLS lies below the thread pointer"
-        );
-    } else if cfg!(target_arch = "aarch64") {
-        assert!(
-            info.tp_offset > 0,
-            "static TLS lies above the thread pointer"
-        );
-    }
     info
+}
+
+/// Where the recipe says a thread's slot is: what a reader computes from the
+/// thread pointer alone.
+fn slot_by_the_recipe(memory: &Memory, info: &Info, thread_pointer: u64, who: &str) -> u64 {
+    match info.recipe {
+        Recipe::TpOffset(offset) => thread_pointer.wrapping_add(offset as u64),
+        Recipe::Dtv {
+            modid,
+            block_offset,
+        } => {
+            let word = |address: u64| u64_at(&memory.bytes(address, 8), 0);
+            let dtv = word(thread_pointer + TCB_DTV_OFFSET);
+            assert_ne!(dtv, 0, "{who}: the thread pointer's block holds a DTV");
+            let length = word(dtv - DTV_ENTRY_SIZE);
+            assert!(modid <= length, "{who}: the DTV holds {length} modules");
+            let block = word(dtv + modid * DTV_ENTRY_SIZE);
+            assert!(
+                block != 0 && block != DTV_UNALLOCATED,
+                "{who}: no block for module {modid}: {block:#x}"
+            );
+            block + block_offset
+        }
+    }
 }
 
 /// Step 2: from a thread pointer to that thread's values.
 fn check_thread(memory: &Memory, info: &Info, line: &ThreadLine) {
     let who = format!("thread {}", line.tid);
-    assert_eq!(line.offset, info.tp_offset, "{who}: one offset per process");
+    if let Recipe::TpOffset(offset) = info.recipe {
+        assert_eq!(line.offset, offset, "{who}: one offset per process");
+        assert_eq!(
+            line.slot.wrapping_sub(line.thread_pointer) as i64,
+            offset,
+            "{who}"
+        );
+    }
+    let slot = slot_by_the_recipe(memory, info, line.thread_pointer, &who);
     assert_eq!(
-        line.slot.wrapping_sub(line.thread_pointer) as i64,
-        info.tp_offset,
-        "{who}"
+        slot, line.slot,
+        "{who}: the recipe leads to the slot the thread printed"
     );
-    let slot = line.thread_pointer.wrapping_add(info.tp_offset as u64);
     let block = u64_at(&memory.bytes(slot, 8), 0);
     assert_eq!(
         block, line.block,
@@ -734,7 +802,7 @@ fn check_fixture(fixture: &Fixture) {
     // The record did not move or change its recipe while the program ran.
     let again = find_the_record(fixture, running.pid, &memory);
     assert_eq!(again.address, info.address);
-    assert_eq!(again.tp_offset, info.tp_offset);
+    assert_eq!(again.recipe, info.recipe);
     assert_eq!(again.region_base, info.region_base);
 
     running.finish();
@@ -750,7 +818,17 @@ fn the_statically_linked_example_is_found_by_its_published_recipe() {
 
 #[test]
 fn the_dynamically_linked_example_is_found_by_its_published_recipe() {
-    let Some(fixture) = build_dynamic() else {
+    let Some(fixture) = build_dynamic(false) else {
+        return;
+    };
+    check_fixture(&fixture);
+}
+
+/// The general-dynamic build: no static TLS, the slot found through the
+/// thread's DTV, by a module id above 1.
+#[test]
+fn the_dtv_recipe_leads_every_thread_to_its_slot() {
+    let Some(fixture) = build_dynamic(true) else {
         return;
     };
     check_fixture(&fixture);
@@ -812,6 +890,7 @@ fn a_second_copy_with_a_record_of_its_own_refuses() {
         record_is_in: library,
         program: fixture.program.clone(),
         library_dir: fixture.library_dir.clone(),
+        recipe: RECIPE_UNSET,
     };
     let (address, record) = read_the_record(&other, running.pid, &memory);
     assert_ne!(address, info.address, "two records");
@@ -832,4 +911,147 @@ fn a_second_copy_with_a_record_of_its_own_refuses() {
     running.go_on();
     let _ = running.phase(2);
     running.finish();
+}
+
+/// A program that loads the library with dlopen, reports what its record says
+/// before anything has called set, and then sets a value from the loading
+/// thread and from a second one.
+const DLOPEN_PROBE: &str = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdio.h>
+#include "task_context.h"
+
+typedef int (*set_fn)(const char *, unsigned long);
+
+static void *worker(void *arg)
+{
+	return (void *)(long)((set_fn)arg)("worker", 2);
+}
+
+int main(int argc, char **argv)
+{
+	void *library = dlopen(argv[1], RTLD_NOW);
+	struct task_context_info_v1 *info;
+	set_fn set;
+	pthread_t thread;
+	void *worker_rc;
+	unsigned tag;
+	unsigned long long modid;
+	int main_rc;
+
+	if (!library) {
+		printf("TCX-DLOPEN failed %s\n", dlerror());
+		return 1;
+	}
+	info = dlsym(library, "task_context_info_v1");
+	set = (set_fn)dlsym(library, "set_task_context_u64");
+	tag = info->recipe_tag;
+	modid = info->dtv_modid;
+	main_rc = set("main", 1);
+	pthread_create(&thread, NULL, worker, (void *)set);
+	pthread_join(thread, &worker_rc);
+	printf("TCX-DLOPEN tag=%u modid=%llu main=%d worker=%ld\n", tag, modid,
+	       main_rc, (long)worker_rc);
+	return 0;
+}
+"#;
+
+/// Builds the library with `-DTASK_CONTEXT_DTV` at -O3 plus `flags`, loads it
+/// with dlopen in a fresh process and returns what the probe printed. `None`
+/// when the library could not be built with `flags` (after a skip).
+fn dlopen_probe(name: &str, flags: &[&str], environment: &[(&str, &str)]) -> Option<String> {
+    if !have_a_compiler() {
+        return None;
+    }
+    let dir = fresh_dir(name);
+    let source = crate_dir().join("src/task_context.c");
+    let library = dir.join("libtask_context.so");
+    let probe_source = dir.join("dlopen_probe.c");
+    let probe = dir.join("dlopen_probe");
+    fs::write(&probe_source, DLOPEN_PROBE).expect("the probe's source is written");
+
+    let mut library_flags = vec!["-O3", "-fPIC", "-shared", "-DTASK_CONTEXT_DTV"];
+    library_flags.extend_from_slice(flags);
+    if let Err(error) = compile(&library_flags, &[&source], &library) {
+        skip(&format!(
+            "the shared object does not build with {flags:?}: {error}"
+        ));
+        return None;
+    }
+    // dlopen is in libdl on a C library older than glibc 2.34.
+    compile(&["-Wl,--no-as-needed", "-ldl"], &[&probe_source], &probe).expect("the probe builds");
+
+    let mut command = Command::new(&probe);
+    command.arg(&library);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let output = command.output().expect("the probe runs");
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(output.status.success(), "the probe failed: {text}");
+    // Shown with --nocapture, which the arm64 job uses: which recipe a
+    // machine's loader ended up with is worth seeing.
+    eprintln!("dlopen probe ({name}): {text}");
+    Some(text)
+}
+
+/// What every dlopen'd DTV library must do, whichever recipe it ended up
+/// with: be published by the time dlopen returns, before any set, and work in
+/// the loading thread and in another.
+fn assert_published_and_working(text: &str) {
+    assert!(
+        !text.contains(&format!("tag={RECIPE_UNSET} ")),
+        "the record was not published by dlopen: {text}"
+    );
+    assert!(
+        text.contains("main=0 worker=0"),
+        "a set failed after dlopen: {text}"
+    );
+}
+
+/// Loading with dlopen is the hard case for a recipe that walks the DTV: the
+/// loader allocates a dynamic module's block for a thread only when the
+/// thread first touches the variable, so publishing means touching it first.
+/// Built at -O3 on purpose: gcc there moves a touch that only `noinline` held
+/// in place to after the loads that need it. Where the default keeps the
+/// variable dynamic (x86-64), the DTV recipe is what must come out.
+#[test]
+fn a_dlopened_dtv_library_publishes_at_load_and_works() {
+    let Some(text) = dlopen_probe("dlopen_dtv", &[], &[]) else {
+        return;
+    };
+    assert_published_and_working(&text);
+    if cfg!(target_arch = "x86_64") {
+        assert!(
+            text.contains(&format!("tag={RECIPE_DTV} ")),
+            "the DTV recipe was not the one published: {text}"
+        );
+    }
+}
+
+/// TLS descriptors, the aarch64 default, which x86-64 gcc offers as
+/// `-mtls-dialect=gnu2`. For a library loaded with dlopen the loader then
+/// puts the variable in static TLS when there is room, and an access never
+/// fills the DTV entry: a recipe that only walked the DTV published nothing
+/// and refused every set. The library falls back to the fixed-distance recipe
+/// there. With the room taken away the loader keeps the variable dynamic, and
+/// the walk works.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_dlopened_dtv_library_works_with_tls_descriptors() {
+    let Some(text) = dlopen_probe("dlopen_desc", &["-mtls-dialect=gnu2"], &[]) else {
+        return;
+    };
+    assert_published_and_working(&text);
+
+    let Some(dynamic) = dlopen_probe(
+        "dlopen_desc_dynamic",
+        &["-mtls-dialect=gnu2"],
+        &[("GLIBC_TUNABLES", "glibc.rtld.optional_static_tls=0")],
+    ) else {
+        return;
+    };
+    assert_published_and_working(&dynamic);
 }

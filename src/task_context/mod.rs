@@ -332,13 +332,17 @@ fn discovery_thread(
             pass.not_reached
         );
     }
-    for (pid, words) in &planted {
-        let mut bytes = [0u8; 24];
-        for (at, word) in words.iter().enumerate() {
-            bytes[at * 8..at * 8 + 8].copy_from_slice(&word.to_ne_bytes());
-        }
+    for (pid, [tp_offset, region_base, region_size]) in &planted {
+        // A thread-pointer recipe: the words are as given, and no module.
+        let recipe = Recipe {
+            tp_offset: *tp_offset as i64,
+            region_base: *region_base,
+            region_size: *region_size,
+            dtv_modid: 0,
+            dtv_block_offset: 0,
+        };
         if recipes
-            .update(&pid.to_ne_bytes(), &bytes, MapFlags::ANY)
+            .update(&pid.to_ne_bytes(), &recipe.to_bytes(), MapFlags::ANY)
             .is_err()
         {
             discovery.counters.map_errors += 1;
@@ -573,6 +577,8 @@ mod tests {
         tp_offset: -8,
         region_base: 0x7f00_0000_0000,
         region_size: 16 * 1024 * 1024,
+        dtv_modid: 0,
+        dtv_block_offset: 0,
     };
 
     fn options(restricted: bool, pids: &[u32]) -> Options {
@@ -667,11 +673,18 @@ mod tests {
     }
 
     #[test]
-    fn a_recipe_is_three_native_words() {
-        let bytes = RECIPE.to_bytes();
+    fn a_recipe_is_five_native_words() {
+        let recipe = Recipe {
+            dtv_modid: 2,
+            dtv_block_offset: 24,
+            ..RECIPE
+        };
+        let bytes = recipe.to_bytes();
         assert_eq!(bytes[0..8], (-8i64).to_ne_bytes());
         assert_eq!(bytes[8..16], 0x7f00_0000_0000u64.to_ne_bytes());
         assert_eq!(bytes[16..24], (16u64 * 1024 * 1024).to_ne_bytes());
+        assert_eq!(bytes[24..32], 2u64.to_ne_bytes());
+        assert_eq!(bytes[32..40], 24u64.to_ne_bytes());
     }
 
     #[test]

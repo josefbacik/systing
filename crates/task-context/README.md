@@ -34,12 +34,15 @@ written and the rule by which they must be read, and the limits. The same file
 is included by the library and by a tracer's BPF code.
 
 In one paragraph: the library owns exactly one pointer-sized thread-local,
-compiled with the initial-exec TLS model, holding the address of the thread's
-block (or NULL). Static TLS puts that variable at the same distance from the
-thread pointer in every thread of the process, and the library reports that
-distance. A reader therefore never derives an offset from a TLS module id,
-never walks a DTV and never parses a relocation: it reads thread pointer +
-offset, follows the pointer, and checks what it lands on.
+holding the address of the thread's block (or NULL). By default it is compiled
+with the initial-exec TLS model: static TLS puts that variable at the same
+distance from the thread pointer in every thread of the process, and the
+library reports that distance, so a reader reads thread pointer + offset,
+follows the pointer, and checks what it lands on. Built with
+`-DTASK_CONTEXT_DTV` the variable is general-dynamic instead: it lives in its
+module's TLS block, and the library reports the module's id and the variable's
+offset in that block; a reader finds the block through the thread's DTV, the
+way the dynamic linker does. Either way a reader never parses a relocation.
 
 ## Using it
 
@@ -73,6 +76,19 @@ cc -O2 -pthread -I include your_program.c -L. -ltask_context -o your_program
 
 `-z nodelete` keeps the shared object mapped for the life of the process: a
 thread's exit handler and the published record both point into it.
+
+**The DTV build.** Add `-DTASK_CONTEXT_DTV` when compiling `task_context.c`
+(static or shared) and the thread-local is general-dynamic: the library needs
+no static TLS, and publishes the recipe that walks the thread's DTV. This is
+glibc's layout on x86-64 and aarch64; the file refuses to compile with the
+flag on another C library. Where the loader puts the variable in static TLS
+anyway (TLS descriptors, the aarch64 default, do that to a library loaded with
+`dlopen`), the library publishes the fixed-distance recipe instead of the walk,
+and the calls below still hold. The cost is in the calls: the dynamic linker
+allocates the thread-local on a thread's first touch and updates a thread's
+DTV, under its own lock, after another thread has loaded a library with TLS,
+so a call may allocate or take that lock, and none of them is
+async-signal-safe.
 
 **One copy.** A process holds one copy of the library. A second copy — a
 static one in the executable beside a shared object — is refused: the copy
@@ -118,8 +134,10 @@ Values are copied into traces: do not put a secret in one.
 ## The example, and what the tests check
 
 [`examples/tcx_example.c`](examples/tcx_example.c) is the usage above in a
-program of three threads. It is one source built two ways — statically linked,
-and dynamically linked at program start — and prints, per thread, one line in
+program of three threads. It is one source built three ways — statically
+linked, dynamically linked at program start, and dynamically linked against a
+library built with `-DTASK_CONTEXT_DTV` (the program has a thread-local of its
+own, so that library is not TLS module 1) — and prints, per thread, one line in
 the form the header fixes (`TCX1 tid=… tp=… slot=… off=… block=… id=… set=…`).
 With `--hold` it waits for a line on standard input between phases, so that
 something outside the process has time to look; with `--busy-ms N` every
@@ -127,13 +145,13 @@ thread stays on a CPU for N milliseconds after each phase, because a sampling
 profiler only ever sees a thread that is running.
 
 `cargo test -p task-context` runs the library's unit tests and then
-`tests/examples.rs`, which builds both programs with the system C compiler,
+`tests/examples.rs`, which builds the programs with the system C compiler,
 runs each, and checks them **from outside the process**: it finds the record
 in the ELF file by its section name, reads it out of the child's memory, and
-for every thread follows thread pointer + the published offset to the block
-and compares what is there with the line the thread printed. Two more cases
-link a second copy of the library into the program and check that the copy
-that publishes second is refused. What it cannot
+for every thread follows the published recipe (thread pointer + offset, or the
+walk through the thread's DTV) to the block and compares what is there with
+the line the thread printed. Two more cases link a second copy of the library
+into the program and check that the copy that publishes second is refused. What it cannot
 do is read the thread pointer the way a tracer does, from the task's saved
 registers: the program prints it. A missing tool (no C compiler, no static C
 library, no leave to read a child's memory) makes these tests skip with a

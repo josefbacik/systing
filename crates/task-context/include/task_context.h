@@ -20,16 +20,32 @@
  *   a small accessor used by the examples and the tests.
  *
  * HOW A READER FINDS A THREAD'S VALUES, in one paragraph.  The library owns
- * exactly ONE pointer-sized thread-local variable, compiled with the
- * initial-exec TLS model.  Its value is NULL ("this thread has no context")
- * or the address of the thread's block.  Because the variable is in STATIC
- * TLS, its distance from the thread pointer is the same for every thread of
- * the process and never changes - whether the library was linked statically,
- * loaded at program start, or (glibc, within limits, see "Limits") loaded
- * with dlopen.  The library REPORTS that distance in its info record.  A
- * reader therefore never derives an offset from a TLS module id, never walks
- * a DTV and never parses a relocation: it reads thread pointer + tp_offset,
- * follows the pointer, and checks what it lands on.
+ * exactly ONE pointer-sized thread-local variable.  Its value is NULL ("this
+ * thread has no context") or the address of the thread's block.  The library
+ * is built one of two ways, and the info record says which:
+ *
+ *   TP_OFFSET (tag 1, the default).  The variable is compiled with the
+ *   initial-exec TLS model, so it is in STATIC TLS and its distance from the
+ *   thread pointer is the same for every thread of the process and never
+ *   changes - whether the library was linked statically, loaded at program
+ *   start, or (glibc, within limits, see "Limits") loaded with dlopen.  The
+ *   library REPORTS that distance in its info record.  A reader reads thread
+ *   pointer + tp_offset, follows the pointer, and checks what it lands on.
+ *
+ *   DTV (tag 2, built with -DTASK_CONTEXT_DTV).  The variable is compiled
+ *   general-dynamic, so it lives in its module's TLS block and is found the
+ *   way the dynamic linker finds it: the thread's DTV holds the block of each
+ *   module, and the variable sits at a fixed offset in it.  The library
+ *   REPORTS its module id and that offset; a reader walks the DTV (see "The
+ *   DTV walk") and follows the same pointer.  It needs no static TLS, and it
+ *   is glibc's layout only.  Where the loader puts the variable in static
+ *   TLS anyway, and so never fills the DTV entry for it (TLS descriptors,
+ *   aarch64's default, do that to a library loaded with dlopen when there is
+ *   room), the library publishes tag 1 instead: the walk is only ever the
+ *   recipe when the library has seen it work.
+ *
+ * Either way a reader never parses a relocation, and it trusts nothing it
+ * reads until the block's own header checks out.
  *
  *   thread pointer:  x86-64  the FS base          (TLS variant 2: static TLS
  *                            lies BELOW it, so tp_offset is NEGATIVE)
@@ -112,10 +128,38 @@ typedef int64_t  tcx_s64;
 /* recipe_tag: how a reader gets from a thread to its slot. */
 #define TASK_CONTEXT_RECIPE_UNSET	0u	/* not published yet          */
 #define TASK_CONTEXT_RECIPE_TP_OFFSET	1u	/* slot = thread pointer + tp_offset */
-#define TASK_CONTEXT_RECIPE_DTV		2u	/* reserved: via the DTV entry of dtv_modid */
+#define TASK_CONTEXT_RECIPE_DTV		2u	/* slot = the DTV's block of dtv_modid + dtv_block_offset */
 #define TASK_CONTEXT_RECIPE_PTHREAD_KEY	3u	/* reserved: via pthread_key  */
 /* Tags 0x100 and up are reserved for recipes a READER makes up for a
  * process that does not link this library; the library never publishes one. */
+
+/*
+ * THE DTV WALK (tag 2).  glibc's layout, which both architectures share
+ * except for where the thread pointer's own block keeps the DTV's address:
+ *
+ *	dtv    = *(u64 *)(thread pointer + TASK_CONTEXT_TCB_DTV_OFFSET)
+ *	length = *(u64 *)(dtv - TASK_CONTEXT_DTV_ENTRY_SIZE)	   dtv[-1].counter
+ *	block  = *(u64 *)(dtv + dtv_modid * TASK_CONTEXT_DTV_ENTRY_SIZE)
+ *							       dtv[modid].pointer.val
+ *	slot   = block + dtv_block_offset
+ *
+ * A thread whose DTV stops short of dtv_modid (length < modid), or whose
+ * entry is 0 or TASK_CONTEXT_DTV_UNALLOCATED, has never touched the library's
+ * thread-local - the loader allocates a dynamic module's block on first
+ * touch - so it has no context: the same answer as a NULL slot.  dtv_modid is
+ * 1 or more and at most TASK_CONTEXT_DTV_MODID_MAX; the executable, when it
+ * has TLS of its own, is module 1.  dtv_block_offset is a multiple of 8 and
+ * at most TASK_CONTEXT_DTV_BLOCK_OFFSET_MAX.
+ */
+#define TASK_CONTEXT_DTV_ENTRY_SIZE	16	/* glibc's dtv_t, 64-bit       */
+#define TASK_CONTEXT_DTV_MODID_MAX	4096
+#define TASK_CONTEXT_DTV_BLOCK_OFFSET_MAX (1ull << 30)
+#define TASK_CONTEXT_DTV_UNALLOCATED	(~0ull)	/* glibc's TLS_DTV_UNALLOCATED */
+#if defined(__x86_64__)
+#define TASK_CONTEXT_TCB_DTV_OFFSET	8	/* tcbhead_t: tcb, dtv, self  */
+#elif defined(__aarch64__)
+#define TASK_CONTEXT_TCB_DTV_OFFSET	0	/* tcbhead_t: dtv, private    */
+#endif
 
 /*
  * The library defines exactly one object of this type,
@@ -142,10 +186,12 @@ struct task_context_info_v1 {
 	tcx_u32 recipe_tag;		/*   8 TASK_CONTEXT_RECIPE_*; written LAST  */
 	tcx_u32 recipe_generation;	/*  12 1 at first publication, +1 each time
 					 *     the recipe is published again     */
-	tcx_s64 tp_offset;		/*  16 tag 1: &slot - thread pointer       */
-	tcx_u64 dtv_modid;		/*  24 tag 2 (reserved)                    */
-	tcx_u64 dtv_block_offset;	/*  32 tag 2 (reserved): &slot - start of
-					 *     this module's TLS block           */
+	tcx_s64 tp_offset;		/*  16 tag 1: &slot - thread pointer; 0
+					 *     under tag 2                       */
+	tcx_u64 dtv_modid;		/*  24 tag 2: the TLS module id of the
+					 *     object that holds the slot        */
+	tcx_u64 dtv_block_offset;	/*  32 tag 2: &slot - start of that
+					 *     module's TLS block                */
 	tcx_u32 pthread_key;		/*  40 tag 3 (reserved)                    */
 	tcx_u32 flags;			/*  44 0                                   */
 	tcx_u64 self_address;		/*  48 this record's own run-time address:
@@ -165,7 +211,8 @@ struct task_context_info_v1 {
 
 /*
  * PUBLICATION RULE.  The library fills self_address, region_base,
- * region_size and tp_offset, and only then stores recipe_generation and
+ * region_size and its recipe's own fields (tp_offset; or dtv_modid and
+ * dtv_block_offset), and only then stores recipe_generation and
  * recipe_tag with release ordering (recipe_tag last).  A reader that finds
  * recipe_tag == TASK_CONTEXT_RECIPE_UNSET has found a process that links the
  * library and has not published yet: it reads nothing further and looks
@@ -175,10 +222,12 @@ struct task_context_info_v1 {
  * first set returns.  The two counters may change at any time and are
  * statistics, nothing more.
  *
- * SELF-CHECK (writer).  On every thread's first call the library recomputes
- * &slot - thread pointer and compares it with tp_offset.  A difference means
- * the variable is not in static TLS in this process: the call returns
- * TASK_CONTEXT_EUNSUPPORTED and nothing is published for that thread.
+ * SELF-CHECK (writer).  On every thread's first call the library does what a
+ * reader will do: it recomputes &slot - thread pointer and compares it with
+ * tp_offset (tag 2: it walks the thread's DTV and compares the slot the walk
+ * ends at with &slot).  A difference means the variable is not where the
+ * recipe says in this process: the call returns TASK_CONTEXT_EUNSUPPORTED and
+ * nothing is published for that thread.
  *
  * ONE COPY (writer).  A process holds ONE copy of the library.  A second
  * copy - a static one in the executable beside a shared object - would make a
@@ -305,7 +354,9 @@ TCX_INLINE tcx_u64 task_context_seq_next(tcx_u64 s)
  *      magic is not 0, the version is at least 1, the sequence word is never
  *      0.  "No context" is a NULL slot that was read SUCCESSFULLY.
  *   1. No published recipe for the process: read nothing.
- *   2. Read the 8-byte slot at thread pointer + tp_offset.  NULL: no context.
+ *   2. Find the slot: thread pointer + tp_offset (tag 1), or the end of the
+ *      DTV walk (tag 2; a walk that finds no block is "no context").  Read
+ *      the 8-byte slot.  NULL: no context.
  *      A reader that copies from ANOTHER task's address space first checks
  *      that the thread pointer is plausible for the architecture and, after
  *      the slot read, that the block address lies inside
@@ -350,8 +401,15 @@ TCX_INLINE tcx_u64 task_context_seq_next(tcx_u64 s)
  *   library needs 8 of them, and if they are gone dlopen fails with the
  *   loader's own error.  musl refuses to dlopen a library with initial-exec
  *   TLS at all.  Neither case is silent.  Linking statically or at program
- *   start has no such limit.  (Tags 2 and 3 exist so that a later version
- *   can serve those cases; version 1 publishes tag 1 only.)
+ *   start has no such limit, and neither has a build with
+ *   -DTASK_CONTEXT_DTV, whose variable is in dynamic TLS, or in static TLS
+ *   under tag 1 where the loader chose that (glibc only: the build refuses
+ *   to compile elsewhere).  Such a library must stay loaded
+ *   (-Wl,-z,nodelete): its recipe names its module id, which the loader may
+ *   give to another library after a dlclose, and a reader that followed the
+ *   stale recipe would land in the other module's block - where the region,
+ *   stride and magic checks refuse it, but where it would read nothing.
+ *   (Tag 3 is reserved for a later version.)
  * - A thread that never called set has a NULL slot and no block.
  * - Thread exit: one process-wide pthread key's destructor sets the slot to
  *   NULL and returns the block to a lock-free free list.  The region is
@@ -366,7 +424,12 @@ TCX_INLINE tcx_u64 task_context_seq_next(tcx_u64 s)
  *   returns TASK_CONTEXT_ENOBLOCK and region_full_count goes up.
  * - Signal handlers: set and clear are refused (TASK_CONTEXT_EBUSY) when
  *   they interrupt the same thread's own update, and must not be a thread's
- *   FIRST call (that call takes a block and may create the pthread key).
+ *   FIRST call (that call takes a block and may create the pthread key).  In
+ *   a -DTASK_CONTEXT_DTV build there is one more limit: the dynamic linker
+ *   allocates the thread-local on a thread's first touch and updates a
+ *   thread's DTV, under its own lock, after another thread has loaded a
+ *   library with TLS - so a call may allocate or take that lock, and none of
+ *   them is async-signal-safe.
  * - 64-bit processes only.  A thread that rewrites its own thread pointer,
  *   and runtimes that move a task between OS threads, are out of scope: the
  *   context belongs to the OS thread.
@@ -416,8 +479,8 @@ extern "C" {
 #define TASK_CONTEXT_EBUSY		(-5)	/* nested call, see "Signal handlers"   */
 #define TASK_CONTEXT_ENOBLOCK		(-6)	/* the block region is full             */
 #define TASK_CONTEXT_ENOMEM		(-7)	/* the region could not be reserved     */
-#define TASK_CONTEXT_EUNSUPPORTED	(-8)	/* the thread-local is not in static
-						 * TLS in this process                  */
+#define TASK_CONTEXT_EUNSUPPORTED	(-8)	/* the thread-local is not where the
+						 * published recipe says it is          */
 #define TASK_CONTEXT_EDUPLICATE		(-9)	/* another copy of the library in this
 						 * process published first: see "ONE COPY" */
 

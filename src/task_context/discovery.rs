@@ -1,9 +1,10 @@
 //! Which processes publish a task_context recipe, and what it is.
 //!
 //! The writer library (`crates/task-context`) keeps one 104-byte record per
-//! process, in a section of its own, and reports in it how far its one
-//! thread-local slot sits from the thread pointer and which region every
-//! block lives in. This file finds that record, from OUTSIDE the process:
+//! process, in a section of its own, and reports in it where its one
+//! thread-local slot is - how far from the thread pointer, or in which
+//! module's TLS block (the DTV recipe) - and which region every block lives
+//! in. This file finds that record, from OUTSIDE the process:
 //!
 //! 1. The process's EXECUTABLE is opened through `/proc/<pid>/exe` and its
 //!    ELF facts are read once per distinct file: does it carry the section
@@ -52,6 +53,7 @@ pub(crate) const INFO_SIZE: usize = 104;
 const INFO_MAGIC: u32 = 0x3158_4354; // "TCX1"
 const RECIPE_UNSET: u32 = 0;
 const RECIPE_TP_OFFSET: u32 = 1;
+const RECIPE_DTV: u32 = 2;
 const BLOCK_STRIDE: u64 = 2560;
 const REGION_SIZE_MAX: u64 = 16 * 1024 * 1024;
 
@@ -59,6 +61,8 @@ const INFO_VERSION_AT: usize = 4;
 const INFO_SIZE_AT: usize = 6;
 const INFO_TAG_AT: usize = 8;
 const INFO_TP_OFFSET_AT: usize = 16;
+const INFO_DTV_MODID_AT: usize = 24;
+const INFO_DTV_BLOCK_OFFSET_AT: usize = 32;
 const INFO_SELF_ADDRESS_AT: usize = 48;
 const INFO_REGION_BASE_AT: usize = 56;
 const INFO_REGION_SIZE_AT: usize = 64;
@@ -72,6 +76,11 @@ const INFO_VALUE_MAX_AT: usize = 84;
 /// The farthest a slot in static TLS can plausibly sit from the thread
 /// pointer. Static TLS of a whole process is kilobytes to a few megabytes.
 const TP_OFFSET_MAX: u64 = 1 << 30;
+/// The DTV recipe's bounds (`TASK_CONTEXT_DTV_MODID_MAX` and
+/// `TASK_CONTEXT_DTV_BLOCK_OFFSET_MAX`): a process has a few dozen TLS
+/// modules at most, and a module's TLS block is far smaller than a gigabyte.
+const DTV_MODID_MAX: u64 = 4096;
+const DTV_BLOCK_OFFSET_MAX: u64 = 1 << 30;
 /// The lowest and highest address a region can have in a 64-bit process.
 const USER_ADDR_MIN: u64 = 0x1_0000;
 const USER_ADDR_MAX: u64 = 0x00ff_ffff_ffff_ffff;
@@ -90,21 +99,33 @@ const DYNAMIC_SECTION_MAX: u64 = 1 << 20;
 
 /// One process's recipe, as the BPF side takes it: the layout of
 /// `struct task_context_recipe` in `task_context_reader.bpf.h`.
+///
+/// A recipe is one of two kinds, told apart by `dtv_modid`: 0 is the
+/// thread-pointer recipe (`tp_offset` says where the slot is), anything else
+/// is the DTV recipe (the slot is `dtv_block_offset` into the thread's TLS
+/// block of that module).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recipe {
-    /// `&slot - thread pointer`.
+    /// `&slot - thread pointer`; 0 under the DTV recipe.
     pub tp_offset: i64,
     pub region_base: u64,
     pub region_size: u64,
+    /// The TLS module id of the object that holds the slot; 0 under the
+    /// thread-pointer recipe.
+    pub dtv_modid: u64,
+    /// `&slot - the start of that module's TLS block`.
+    pub dtv_block_offset: u64,
 }
 
 impl Recipe {
-    /// The map value: three native-endian 8-byte words.
-    pub fn to_bytes(self) -> [u8; 24] {
-        let mut bytes = [0u8; 24];
+    /// The map value: five native-endian 8-byte words.
+    pub fn to_bytes(self) -> [u8; 40] {
+        let mut bytes = [0u8; 40];
         bytes[0..8].copy_from_slice(&self.tp_offset.to_ne_bytes());
         bytes[8..16].copy_from_slice(&self.region_base.to_ne_bytes());
         bytes[16..24].copy_from_slice(&self.region_size.to_ne_bytes());
+        bytes[24..32].copy_from_slice(&self.dtv_modid.to_ne_bytes());
+        bytes[32..40].copy_from_slice(&self.dtv_block_offset.to_ne_bytes());
         bytes
     }
 }
@@ -129,10 +150,13 @@ pub(crate) enum Refusal {
     /// An offset that is zero, unaligned, too far or on the wrong side of
     /// the thread pointer for this architecture.
     TpOffset,
+    /// A DTV recipe with a module id or a block offset out of bounds, or on
+    /// an architecture whose DTV this reader does not know.
+    Dtv,
 }
 
 /// How many reasons `Refusal` has.
-const REFUSAL_KINDS: usize = 9;
+const REFUSAL_KINDS: usize = 10;
 
 impl Refusal {
     const ALL: [Refusal; REFUSAL_KINDS] = [
@@ -145,6 +169,7 @@ impl Refusal {
         Refusal::Geometry,
         Refusal::Region,
         Refusal::TpOffset,
+        Refusal::Dtv,
     ];
 
     fn name(self) -> &'static str {
@@ -158,6 +183,7 @@ impl Refusal {
             Refusal::Geometry => "geometry",
             Refusal::Region => "region",
             Refusal::TpOffset => "tp_offset",
+            Refusal::Dtv => "dtv",
         }
     }
 }
@@ -292,9 +318,10 @@ pub(crate) fn validate_info(record: &[u8; INFO_SIZE], address: u64) -> Finding {
     if let Err(refusal) = constants_ok(record) {
         return Finding::Refused(refusal);
     }
-    match u32_at(record, INFO_TAG_AT) {
+    let tag = u32_at(record, INFO_TAG_AT);
+    match tag {
         RECIPE_UNSET => return Finding::NotYet,
-        RECIPE_TP_OFFSET => {}
+        RECIPE_TP_OFFSET | RECIPE_DTV => {}
         _ => return Finding::Refused(Refusal::Tag),
     }
     if u64_at(record, INFO_SELF_ADDRESS_AT) != address {
@@ -311,6 +338,26 @@ pub(crate) fn validate_info(record: &[u8; INFO_SIZE], address: u64) -> Finding {
             .is_some_and(|end| end <= USER_ADDR_MAX);
     if !region_ok {
         return Finding::Refused(Refusal::Region);
+    }
+
+    if tag == RECIPE_DTV {
+        let dtv_modid = u64_at(record, INFO_DTV_MODID_AT);
+        let dtv_block_offset = u64_at(record, INFO_DTV_BLOCK_OFFSET_AT);
+        let known_arch = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+        if !known_arch
+            || !(1..=DTV_MODID_MAX).contains(&dtv_modid)
+            || !dtv_block_offset.is_multiple_of(8)
+            || dtv_block_offset > DTV_BLOCK_OFFSET_MAX
+        {
+            return Finding::Refused(Refusal::Dtv);
+        }
+        return Finding::Published(Recipe {
+            tp_offset: 0,
+            region_base,
+            region_size,
+            dtv_modid,
+            dtv_block_offset,
+        });
     }
 
     let tp_offset = u64_at(record, INFO_TP_OFFSET_AT) as i64;
@@ -332,6 +379,8 @@ pub(crate) fn validate_info(record: &[u8; INFO_SIZE], address: u64) -> Finding {
         tp_offset,
         region_base,
         region_size,
+        dtv_modid: 0,
+        dtv_block_offset: 0,
     })
 }
 
@@ -772,6 +821,8 @@ mod tests {
                 tp_offset: good_tp_offset(),
                 region_base: 0x7f00_0000_0000,
                 region_size: REGION_SIZE_MAX,
+                dtv_modid: 0,
+                dtv_block_offset: 0,
             })
         );
         // A later, longer record is read as far as this reader knows it.
@@ -787,13 +838,82 @@ mod tests {
         let unset = with(record_at(ADDRESS), INFO_TAG_AT, &RECIPE_UNSET.to_ne_bytes());
         assert_eq!(validate_info(&unset, ADDRESS), Finding::NotYet);
         // The reserved recipes are not this reader's.
-        for tag in [2u32, 3, 0x100] {
+        for tag in [3u32, 0x100] {
             let other = with(record_at(ADDRESS), INFO_TAG_AT, &tag.to_ne_bytes());
             assert_eq!(
                 validate_info(&other, ADDRESS),
                 Finding::Refused(Refusal::Tag)
             );
         }
+    }
+
+    /// A published DTV record: module 2, a block offset of 24.
+    fn dtv_record_at(address: u64) -> [u8; INFO_SIZE] {
+        let mut record = with(record_at(address), INFO_TAG_AT, &RECIPE_DTV.to_ne_bytes());
+        record = with(record, INFO_TP_OFFSET_AT, &0i64.to_ne_bytes());
+        record = with(record, INFO_DTV_MODID_AT, &2u64.to_ne_bytes());
+        with(record, INFO_DTV_BLOCK_OFFSET_AT, &24u64.to_ne_bytes())
+    }
+
+    #[test]
+    fn a_dtv_record_gives_its_recipe_and_no_thread_pointer_offset() {
+        assert_eq!(
+            validate_info(&dtv_record_at(ADDRESS), ADDRESS),
+            Finding::Published(Recipe {
+                tp_offset: 0,
+                region_base: 0x7f00_0000_0000,
+                region_size: REGION_SIZE_MAX,
+                dtv_modid: 2,
+                dtv_block_offset: 24,
+            })
+        );
+        // The thread-pointer offset is not looked at under this recipe: a
+        // writer leaves it 0, which the other recipe would refuse.
+        let stray = with(
+            dtv_record_at(ADDRESS),
+            INFO_TP_OFFSET_AT,
+            &12345i64.to_ne_bytes(),
+        );
+        assert!(matches!(
+            validate_info(&stray, ADDRESS),
+            Finding::Published(_)
+        ));
+    }
+
+    #[test]
+    fn a_dtv_record_is_refused_for_a_module_or_an_offset_it_cannot_have() {
+        let good = dtv_record_at(ADDRESS);
+        let refused = |record: [u8; INFO_SIZE]| match validate_info(&record, ADDRESS) {
+            Finding::Refused(refusal) => refusal,
+            other => panic!("not refused: {other:?}"),
+        };
+        for modid in [0u64, DTV_MODID_MAX + 1, u64::MAX] {
+            let record = with(good, INFO_DTV_MODID_AT, &modid.to_ne_bytes());
+            assert_eq!(refused(record), Refusal::Dtv, "modid {modid}");
+        }
+        for offset in [4u64, 25, DTV_BLOCK_OFFSET_MAX + 8, u64::MAX - 7] {
+            let record = with(good, INFO_DTV_BLOCK_OFFSET_AT, &offset.to_ne_bytes());
+            assert_eq!(refused(record), Refusal::Dtv, "offset {offset}");
+        }
+        // The largest values that are believed.
+        for (modid, offset) in [(1u64, 0u64), (DTV_MODID_MAX, DTV_BLOCK_OFFSET_MAX)] {
+            let record = with(
+                with(good, INFO_DTV_MODID_AT, &modid.to_ne_bytes()),
+                INFO_DTV_BLOCK_OFFSET_AT,
+                &offset.to_ne_bytes(),
+            );
+            assert!(matches!(
+                validate_info(&record, ADDRESS),
+                Finding::Published(_)
+            ));
+        }
+        // The rest of the record is checked as for the other recipe.
+        assert_eq!(
+            validate_info(&good, ADDRESS + 8),
+            Finding::Refused(Refusal::SelfAddress)
+        );
+        let bad_region = with(good, INFO_REGION_SIZE_AT, &0u64.to_ne_bytes());
+        assert_eq!(refused(bad_region), Refusal::Region);
     }
 
     #[test]

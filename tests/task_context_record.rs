@@ -5,11 +5,14 @@
 //! in the `task_context` table, the two joined by (`utid`, id).
 //!
 //! The traced program is the library's own example
-//! (`crates/task-context/examples/tcx_example.c`), built here twice with the
-//! system C compiler: once with the library's source linked into the
+//! (`crates/task-context/examples/tcx_example.c`), built here three times with
+//! the system C compiler: once with the library's source linked into the
 //! executable, once against a shared object the executable names as a
-//! dependency. Those are the two ways a process is found (see
-//! `src/task_context/discovery.rs`). Three threads go through three phases
+//! dependency, and once against a shared object built with
+//! `-DTASK_CONTEXT_DTV`, whose slot the reader finds through the thread's DTV
+//! instead of at a fixed distance from the thread pointer. The first two are
+//! the two ways a process is found (see `src/task_context/discovery.rs`), the
+//! third the second recipe the library can publish. Three threads go through three phases
 //! and stay on a CPU after each, so every (thread, phase) pair is a context
 //! the sampler must have seen:
 //!
@@ -139,13 +142,20 @@ fn build_linked_in(dir: &Path) -> PathBuf {
 }
 
 /// The example against a shared object: the executable only names the
-/// library as a dependency, and the record is in the shared object.
-fn build_against_shared_object(dir: &Path) -> PathBuf {
+/// library as a dependency, and the record is in the shared object. With
+/// `dtv` the shared object is built with `-DTASK_CONTEXT_DTV` (a
+/// general-dynamic thread-local, published as the DTV recipe); the example has
+/// thread-local data of its own, so the library is not TLS module 1.
+fn build_against_shared_object(dir: &Path, dtv: bool) -> PathBuf {
     let library = dir.join("libtask_context.so");
     let program = dir.join("tcx_example_shared");
     // nodelete: a thread's exit handler and the record point into the object.
+    let mut flags = vec!["-fPIC", "-shared", "-Wl,-z,nodelete"];
+    if dtv {
+        flags.push("-DTASK_CONTEXT_DTV");
+    }
     compile(
-        &["-fPIC", "-shared", "-Wl,-z,nodelete"],
+        &flags,
         &[&library_dir().join("src/task_context.c")],
         &library,
     )
@@ -495,9 +505,21 @@ fn a_program_that_names_the_library_as_a_dependency_is_traced_with_its_contexts(
         return;
     }
     let build = TempDir::new().expect("a directory to build in");
-    let program = build_against_shared_object(build.path());
+    let program = build_against_shared_object(build.path(), false);
     let trace = record_command(&example_command(&program), |_| {});
     check_example_trace(trace.path(), "shared object", 3);
+}
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn a_program_whose_library_is_found_through_its_dtv_is_traced_with_its_contexts() {
+    if !have_a_compiler() {
+        return;
+    }
+    let build = TempDir::new().expect("a directory to build in");
+    let program = build_against_shared_object(build.path(), true);
+    let trace = record_command(&example_command(&program), |_| {});
+    check_example_trace(trace.path(), "shared object, dtv", 3);
 }
 
 /// Ends the process when the test leaves, however it leaves.

@@ -43,8 +43,13 @@ pub const REGION_SIZE: usize = 16 * 1024 * 1024;
 pub const INFO_MAGIC: u32 = 0x3158_4354;
 /// `magic` of a thread's block.
 pub const BLOCK_MAGIC: u32 = 0x4258_4354;
-/// The one recipe version 1 publishes: slot = thread pointer + `tp_offset`.
+/// The recipe this crate's build publishes: slot = thread pointer +
+/// `tp_offset`.
 pub const RECIPE_TP_OFFSET: u32 = 1;
+/// The recipe of a C build with `-DTASK_CONTEXT_DTV`: slot = the thread's DTV
+/// block of module `dtv_modid`, plus `dtv_block_offset`. This crate does not
+/// build that way.
+pub const RECIPE_DTV: u32 = 2;
 
 /// Why a call was refused. Nothing is ever truncated or partly applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +69,7 @@ pub enum Error {
     NoBlock,
     /// The region could not be reserved.
     NoMemory,
-    /// The library's thread-local is not in static TLS in this process.
+    /// The library's thread-local is not where the published recipe says.
     Unsupported,
     /// Another copy of the library in this process published first: two
     /// copies (a static one beside a shared object, say) are refused.
@@ -104,7 +109,7 @@ impl fmt::Display for Error {
             Error::Busy => write!(f, "the call interrupted this thread's own update"),
             Error::NoBlock => write!(f, "the block region is full"),
             Error::NoMemory => write!(f, "the block region could not be reserved"),
-            Error::Unsupported => write!(f, "the thread-local is not in static TLS"),
+            Error::Unsupported => write!(f, "the thread-local is not where the recipe says"),
             Error::Duplicate => write!(
                 f,
                 "another copy of the task_context library in this process published first"

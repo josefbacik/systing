@@ -20,13 +20,15 @@
  *
  * HOW IT WORKS. User space (src/task_context/discovery.rs) finds each process
  * that links the writer library, validates the record the library publishes
- * and writes ONE immutable recipe per process - the distance from the thread
- * pointer to the library's thread-local slot, and the bounds of the region
- * every block lives in - into task_context_recipes, keyed by tgid. For a
- * sample of the CURRENT thread the helper below then follows the ABI's reader
- * rule: thread pointer + offset -> the slot -> the block's first 24 bytes ->
- * the sequence word, which IS the 8-byte context id the sample carries. The
- * values themselves travel once per id, on a ring of their own.
+ * and writes ONE immutable recipe per process - where the library's
+ * thread-local slot is (a distance from the thread pointer, or, for a library
+ * built general-dynamic, the module it is in and its offset in that module's
+ * TLS block) and the bounds of the region every block lives in - into
+ * task_context_recipes, keyed by tgid. For a sample of the CURRENT thread the
+ * helper below then follows the ABI's reader rule: thread pointer + offset
+ * (or the DTV walk) -> the slot -> the block's first 24 bytes -> the sequence
+ * word, which IS the 8-byte context id the sample carries. The values
+ * themselves travel once per id, on a ring of their own.
  *
  * WHAT IT NEVER DOES. It never reads kernel memory at an address a process
  * supplied: every copy of a process's bytes is bpf_probe_read_user(), and
@@ -89,9 +91,10 @@ enum task_context_reason {
 	TASK_CONTEXT_R_NOT_CURRENT, /* the task is not the current task */
 	TASK_CONTEXT_R_NO_USER_CONTEXT, /* a kernel thread */
 	TASK_CONTEXT_R_UNSUPPORTED_ARCH,
-	TASK_CONTEXT_R_TP_IMPLAUSIBLE, /* thread pointer or slot address */
-	TASK_CONTEXT_R_SLOT_READ_FAILED,
-	TASK_CONTEXT_R_UNSET, /* a NULL slot, read successfully */
+	TASK_CONTEXT_R_TP_IMPLAUSIBLE, /* thread pointer, DTV or slot address */
+	TASK_CONTEXT_R_SLOT_READ_FAILED, /* the slot, or a DTV word on the way */
+	TASK_CONTEXT_R_UNSET, /* a NULL slot, read successfully, or a DTV
+			       * that holds no block for the library yet */
 	TASK_CONTEXT_R_EMPTY, /* a block with no name set: no context */
 	TASK_CONTEXT_R_OUT_OF_RANGE, /* block address not in the region:
 				      * refused, nothing read */
@@ -112,11 +115,18 @@ enum task_context_reason {
  * one block stride and at most the reader's own ceiling (user space refuses
  * anything else), so the range test below cannot be made a no-op by a record
  * that claims the whole address space.
+ *
+ * Two kinds, told apart by dtv_modid. Zero: the slot is at the thread pointer
+ * + tp_offset. Not zero: the slot is dtv_block_offset into this thread's TLS
+ * block of module dtv_modid, found through the thread's DTV (the ABI's "The
+ * DTV walk"); user space bounds both numbers.
  */
 struct task_context_recipe {
-	s64 tp_offset; /* &slot - thread pointer */
+	s64 tp_offset; /* &slot - thread pointer; 0 under the DTV recipe */
 	u64 region_base;
 	u64 region_size;
+	u64 dtv_modid; /* 0: the thread-pointer recipe */
+	u64 dtv_block_offset; /* &slot - the module's TLS block */
 };
 
 /*
@@ -299,6 +309,75 @@ static __always_inline u64 task_context_thread_pointer(struct task_struct *task)
 }
 
 /*
+ * The slot's address by the DTV recipe, or 0 after counting why there is
+ * none. The ABI's walk, step for step: the thread pointer's block holds the
+ * address of the thread's DTV; the DTV holds its own length just before it
+ * and, for each module, that module's TLS block for this thread; the slot is
+ * a fixed offset into that block. A DTV that does not reach the module yet, or
+ * holds no block for it, belongs to a thread that never touched the library's
+ * thread-local (the loader allocates it on first touch): no context, the same
+ * answer as a NULL slot. Every read is one 8-byte bpf_probe_read_user() of
+ * the current task's memory, its return tested before its destination is
+ * looked at.
+ */
+static __always_inline u64
+task_context_dtv_slot(u64 tp, const struct task_context_recipe *recipe)
+{
+#ifdef TASK_CONTEXT_TCB_DTV_OFFSET
+	u64 modid = recipe->dtv_modid, dtv = 0, length = 0, block = 0, slot;
+
+	if (!modid || modid > TASK_CONTEXT_DTV_MODID_MAX ||
+	    recipe->dtv_block_offset > TASK_CONTEXT_DTV_BLOCK_OFFSET_MAX ||
+	    !task_context_user_range_ok(tp + TASK_CONTEXT_TCB_DTV_OFFSET,
+					sizeof(dtv))) {
+		task_context_count(TASK_CONTEXT_R_TP_IMPLAUSIBLE);
+		return 0;
+	}
+	if (bpf_probe_read_user(&dtv, sizeof(dtv),
+				(void *)(tp + TASK_CONTEXT_TCB_DTV_OFFSET))) {
+		task_context_count(TASK_CONTEXT_R_SLOT_READ_FAILED);
+		return 0;
+	}
+	/* From dtv[-1], which holds the length, to the entry of the module. */
+	if (dtv < TASK_CONTEXT_USER_ADDR_MIN + TASK_CONTEXT_DTV_ENTRY_SIZE ||
+	    !task_context_user_range_ok(dtv - TASK_CONTEXT_DTV_ENTRY_SIZE,
+					(modid + 2) * TASK_CONTEXT_DTV_ENTRY_SIZE)) {
+		task_context_count(TASK_CONTEXT_R_TP_IMPLAUSIBLE);
+		return 0;
+	}
+	if (bpf_probe_read_user(&length, sizeof(length),
+				(void *)(dtv - TASK_CONTEXT_DTV_ENTRY_SIZE))) {
+		task_context_count(TASK_CONTEXT_R_SLOT_READ_FAILED);
+		return 0;
+	}
+	if (modid > length) {
+		task_context_count(TASK_CONTEXT_R_UNSET);
+		return 0;
+	}
+	if (bpf_probe_read_user(&block, sizeof(block),
+				(void *)(dtv + modid * TASK_CONTEXT_DTV_ENTRY_SIZE))) {
+		task_context_count(TASK_CONTEXT_R_SLOT_READ_FAILED);
+		return 0;
+	}
+	if (block == 0 || block == TASK_CONTEXT_DTV_UNALLOCATED) {
+		task_context_count(TASK_CONTEXT_R_UNSET);
+		return 0;
+	}
+	slot = block + recipe->dtv_block_offset;
+	if (!task_context_user_range_ok(block, 0) ||
+	    !task_context_user_range_ok(slot, sizeof(block))) {
+		task_context_count(TASK_CONTEXT_R_TP_IMPLAUSIBLE);
+		return 0;
+	}
+	return slot;
+#else
+	/* No DTV layout is known for this architecture: never reached, since
+	 * the read helper turns such a build away first. */
+	return 0;
+#endif
+}
+
+/*
  * The id a sample carries when the thread's block cannot be read whole right
  * now: the last one the thread's values travelled under - but only if it is
  * THIS block's. A word's top bits are the index its block was given when it
@@ -371,13 +450,20 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	if (!recipe)
 		return 0;
 
-	/* 2. The 8-byte slot at thread pointer + tp_offset. */
+	/* 2. The 8-byte slot: at thread pointer + tp_offset, or where the DTV
+	 * walk ends (which counts and returns 0 when there is nothing to read). */
 	tp = task_context_thread_pointer(task);
 	if (!task_context_user_range_ok(tp, 0)) {
 		task_context_count(TASK_CONTEXT_R_TP_IMPLAUSIBLE);
 		return 0;
 	}
-	slot_addr = tp + (u64)recipe->tp_offset;
+	if (recipe->dtv_modid) {
+		slot_addr = task_context_dtv_slot(tp, recipe);
+		if (!slot_addr)
+			return 0;
+	} else {
+		slot_addr = tp + (u64)recipe->tp_offset;
+	}
 	if (!task_context_user_range_ok(slot_addr, sizeof(block))) {
 		task_context_count(TASK_CONTEXT_R_TP_IMPLAUSIBLE);
 		return 0;
@@ -576,9 +662,7 @@ int BPF_PROG(task_context_fork, struct task_struct *parent,
 		return 0;
 	/* Through the stack: the value of an update must not point into the
 	 * map being updated. */
-	copy.tp_offset = recipe->tp_offset;
-	copy.region_base = recipe->region_base;
-	copy.region_size = recipe->region_size;
+	copy = *recipe;
 	if (bpf_map_update_elem(&task_context_recipes, &child_tgid, &copy, BPF_ANY))
 		task_context_count(TASK_CONTEXT_R_RECIPES_FULL);
 	return 0;

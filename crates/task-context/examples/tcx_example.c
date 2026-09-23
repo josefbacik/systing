@@ -56,6 +56,16 @@ static int phase_done[NPHASES];	/* threads that finished each phase */
 static int stopping;
 static long busy_ms;		/* --busy-ms: time on a CPU after each phase */
 
+/*
+ * A thread-local of the program's own, unrelated to task_context.  It gives
+ * the executable a TLS segment, and an executable that has one is TLS module
+ * 1: a library loaded beside it gets a module id above 1, so that a reader
+ * which resolves the library's module id (a build with -DTASK_CONTEXT_DTV)
+ * is tested with an id that is not the trivial one.  `used` keeps it in the
+ * file even though nothing reads it.
+ */
+static __thread int own_thread_local __attribute__((used));
+
 /* What one thread currently has set, kept here only to print it. */
 struct my_values {
 	int has_request;

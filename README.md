@@ -372,8 +372,10 @@ GROUP BY 1 ORDER BY 2 DESC;
   executable, never its symbols; then 104 bytes of the process's memory, the
   record the library publishes, every field of which is checked against the
   tracer's own numbers before anything is believed. Per sample, in BPF, the
-  thread pointer, 8 bytes at the published offset and 24 bytes of the thread's
-  block; a process that publishes nothing costs a sample one map lookup. Names
+  thread pointer, the slot it leads to (8 bytes at the published offset or,
+  for a library built with `-DTASK_CONTEXT_DTV`, four 8-byte reads through the
+  thread's DTV) and 24 bytes of the thread's block; a process that publishes
+  nothing costs a sample one map lookup. Names
   and values are whatever the traced process chose to set: a name outside
   `[A-Za-z0-9_.:-]` is dropped, a string has invalid UTF-8 and control
   characters replaced, and neither is ever more than the process's own say-so.

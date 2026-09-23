@@ -25,13 +25,29 @@
 
 /*
  * dlopen(), dlsym() and dlclose() are used for one check only (see
- * tcx_is_second_copy()).  Weak, so that a program that does not link them - a
+ * tcx_another_copy_is_ahead()).  Weak, so that a program that does not link them - a
  * static one, or a dynamic one on a C library that keeps them in a separate
  * libdl - still links, and skips it.
  */
 #pragma weak dlopen
 #pragma weak dlsym
 #pragma weak dlclose
+
+/*
+ * The library is built one of two ways (see task_context.h): by default its
+ * thread-local is initial-exec and the recipe is a fixed distance from the
+ * thread pointer; with -DTASK_CONTEXT_DTV it is general-dynamic and the
+ * recipe is the DTV walk.  The walk is glibc's layout.
+ */
+#if defined(TASK_CONTEXT_DTV)
+#if !defined(__GLIBC__)
+#error "task_context: -DTASK_CONTEXT_DTV reads glibc's DTV layout"
+#endif
+#include <link.h>
+#define TCX_TLS_MODEL "global-dynamic"
+#else
+#define TCX_TLS_MODEL "initial-exec"
+#endif
 
 #define TCX_NBLOCKS (TASK_CONTEXT_REGION_SIZE / TASK_CONTEXT_BLOCK_STRIDE)
 
@@ -62,10 +78,12 @@ struct task_context_info_v1 task_context_info_v1
 /*
  * The per-thread slot: NULL, or the address of the thread's block.  The
  * initial-exec model puts it in static TLS, which is what makes its distance
- * from the thread pointer one constant for the whole process.
+ * from the thread pointer one constant for the whole process; the
+ * general-dynamic model puts it in its module's block, which a reader finds
+ * through the thread's DTV.
  */
 static __thread struct task_context_block_v1 *tcx_slot
-	__attribute__((tls_model("initial-exec")));
+	__attribute__((tls_model(TCX_TLS_MODEL)));
 
 /* ---------------------------------------------------------------------- */
 /* Process-wide state                                                      */
@@ -85,6 +103,7 @@ _Static_assert(TCX_NBLOCKS > 0 && TCX_NBLOCKS < 0xffffffffu,
 
 static pthread_mutex_t tcx_init_lock = PTHREAD_MUTEX_INITIALIZER;
 static int tcx_ready;		/* 1 once the recipe is published */
+static int tcx_refused;		/* 1 once another copy was found to publish first */
 static int tcx_key_made;
 static int tcx_atfork_made;
 static pthread_key_t tcx_key;
@@ -109,6 +128,128 @@ static inline uintptr_t tcx_thread_pointer(void)
 static inline tcx_s64 tcx_slot_offset(void)
 {
 	return (tcx_s64)((intptr_t)&tcx_slot - (intptr_t)tcx_thread_pointer());
+}
+
+#if defined(TASK_CONTEXT_DTV)
+/*
+ * The DTV walk of task_context.h, done for the calling thread: the start of
+ * this thread's TLS block of module `modid`, or NULL when the thread's DTV
+ * does not reach the module or holds no block for it yet.  The walk a reader
+ * makes for another thread, word for word.
+ */
+static inline uintptr_t tcx_word_at(uintptr_t address)
+{
+	uintptr_t word;
+
+	memcpy(&word, (const void *)address, sizeof(word));
+	return word;
+}
+
+static void *tcx_dtv_block(tcx_u64 modid)
+{
+	uintptr_t dtv = tcx_word_at(tcx_thread_pointer() +
+				    TASK_CONTEXT_TCB_DTV_OFFSET);
+	uintptr_t block;
+
+	if (!dtv || modid == 0 || modid > TASK_CONTEXT_DTV_MODID_MAX)
+		return NULL;
+	if (modid > tcx_word_at(dtv - TASK_CONTEXT_DTV_ENTRY_SIZE))
+		return NULL;
+	block = tcx_word_at(dtv + modid * TASK_CONTEXT_DTV_ENTRY_SIZE);
+	if (block == TASK_CONTEXT_DTV_UNALLOCATED)
+		return NULL;
+	return (void *)block;
+}
+
+/*
+ * The slot's address in this thread.  Taking it makes the loader allocate
+ * this thread's block of a dynamic module, and the DTV walk that follows
+ * must find that block, so the touch has to happen HERE.  `noinline` is not
+ * enough: the compiler infers that a function which only takes an address is
+ * pure and moves the call after the loads it should precede (gcc -O3 does).
+ * The empty volatile asm is a side effect the compiler cannot move or drop,
+ * and its memory clobber keeps the walk's loads behind it.
+ */
+static __attribute__((noinline)) uintptr_t tcx_slot_address(void)
+{
+	uintptr_t address = (uintptr_t)&tcx_slot;
+
+	__asm__ volatile("" : "+r"(address) : : "memory");
+	return address;
+}
+
+struct tcx_module_search {
+	uintptr_t address;	/* looked for */
+	size_t modid;		/* the TLS module id of the object that holds it */
+};
+
+/* dl_iterate_phdr callback: the object whose loadable segments hold the address. */
+static int tcx_module_holding(struct dl_phdr_info *info, size_t size, void *arg)
+{
+	struct tcx_module_search *search = arg;
+	ElfW(Half) i;
+
+	if (size < offsetof(struct dl_phdr_info, dlpi_tls_modid) +
+			   sizeof(info->dlpi_tls_modid))
+		return 0;
+	for (i = 0; i < info->dlpi_phnum; i++) {
+		const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+		uintptr_t start = info->dlpi_addr + ph->p_vaddr;
+
+		if (ph->p_type == PT_LOAD && search->address >= start &&
+		    search->address - start < ph->p_memsz) {
+			search->modid = info->dlpi_tls_modid;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * The recipe of this build: the module id of the object this file is in, and
+ * where the slot sits in that module's block - measured by the walk a reader
+ * will make, so that the two cannot disagree.
+ */
+static int tcx_dtv_measure(tcx_u64 *modid_out, tcx_u64 *offset_out)
+{
+	/* An address that cannot have been interposed: a static function's,
+	 * which is in this object whoever else defines the record. */
+	struct tcx_module_search search = {
+		.address = (uintptr_t)&tcx_module_holding,
+	};
+	uintptr_t slot = tcx_slot_address();
+	uintptr_t block;
+
+	if (!dl_iterate_phdr(tcx_module_holding, &search) || search.modid == 0)
+		return TASK_CONTEXT_EUNSUPPORTED;
+	block = (uintptr_t)tcx_dtv_block(search.modid);
+	if (!block || slot < block ||
+	    slot - block > TASK_CONTEXT_DTV_BLOCK_OFFSET_MAX || (slot - block) % 8)
+		return TASK_CONTEXT_EUNSUPPORTED;
+	*modid_out = search.modid;
+	*offset_out = slot - block;
+	return TASK_CONTEXT_OK;
+}
+#endif /* TASK_CONTEXT_DTV */
+
+/*
+ * The writer's self-check: in THIS thread the slot must sit where the
+ * published recipe says every thread's slot sits.
+ */
+static int tcx_slot_is_where_the_recipe_says(void)
+{
+#if defined(TASK_CONTEXT_DTV)
+	if (__atomic_load_n(&task_context_info_v1.recipe_tag, __ATOMIC_ACQUIRE) ==
+	    TASK_CONTEXT_RECIPE_DTV) {
+		uintptr_t slot = tcx_slot_address();
+		uintptr_t block =
+			(uintptr_t)tcx_dtv_block(task_context_info_v1.dtv_modid);
+
+		return block && slot >= block &&
+		       slot - block == task_context_info_v1.dtv_block_offset;
+	}
+#endif
+	return tcx_slot_offset() == task_context_info_v1.tp_offset;
 }
 
 static inline struct tcx_block_private *
@@ -255,33 +396,40 @@ static void *tcx_first_record_in_the_program(void)
 }
 
 /*
- * Is another copy of this library already in the process?  Two ways to be the
- * second.  By default the dynamic linker binds every copy's references to the
- * first definition of the record it finds, so the copies share one record and
- * the one that publishes second finds it published.  A copy linked with
- * -Bsymbolic keeps a record of its own; then another copy's record is the
- * first in the program's global scope, and this copy is behind it.  A copy
- * whose record the program does not export is not seen, and is not counted as
- * a second one.
+ * Is another copy of this library the first in the process?  Two ways to be
+ * behind one.  By default the dynamic linker binds every copy's references to
+ * the first definition of the record it finds, so the copies share one record
+ * and the one that publishes second finds it published (checked under the
+ * lock, in tcx_publish_locked()).  A copy linked with -Bsymbolic keeps a
+ * record of its own; then another copy's record is the first in the program's
+ * global scope, and this copy is behind it (checked here).  A copy whose
+ * record the program does not export is not seen, and is not counted as a
+ * second one.  Asks the dynamic linker, so it is never called under our lock.
  */
-static int tcx_is_second_copy(void)
+static int tcx_another_copy_is_ahead(void)
 {
-	struct task_context_info_v1 *info = &task_context_info_v1;
-	void *first;
+	void *first = tcx_first_record_in_the_program();
 
-	if (__atomic_load_n(&info->recipe_tag, __ATOMIC_ACQUIRE) !=
-	    TASK_CONTEXT_RECIPE_UNSET)
-		return 1;
-	first = tcx_first_record_in_the_program();
-	return first && first != (void *)info;
+	return first && first != (void *)&task_context_info_v1;
 }
 
-static int tcx_publish_locked(void)
+/*
+ * `modid` and `block_offset` are the DTV recipe's numbers, measured before
+ * the lock was taken (see tcx_publish()); 0 where there is none - a default
+ * build, or a DTV build whose variable the loader put in static TLS.
+ */
+static int tcx_publish_locked(tcx_u64 modid, tcx_u64 block_offset)
 {
 	struct task_context_info_v1 *info = &task_context_info_v1;
+	tcx_u32 tag = modid ? TASK_CONTEXT_RECIPE_DTV : TASK_CONTEXT_RECIPE_TP_OFFSET;
 
-	if (tcx_is_second_copy())
+	/* The record is already published, and not by this copy (a copy that
+	 * had would have set tcx_ready): another copy shares it. */
+	if (__atomic_load_n(&info->recipe_tag, __ATOMIC_ACQUIRE) !=
+	    TASK_CONTEXT_RECIPE_UNSET) {
+		__atomic_store_n(&tcx_refused, 1, __ATOMIC_RELEASE);
 		return TASK_CONTEXT_EDUPLICATE;
+	}
 	if (!tcx_atfork_made) {
 		/* A failure leaves only the narrow case above uncovered. */
 		(void)pthread_atfork(NULL, NULL, tcx_after_fork_in_child);
@@ -314,25 +462,55 @@ static int tcx_publish_locked(void)
 	info->self_address = (tcx_u64)(uintptr_t)info;
 	info->region_base = (tcx_u64)(uintptr_t)tcx_region;
 	info->region_size = TASK_CONTEXT_REGION_SIZE;
-	info->tp_offset = tcx_slot_offset();
+	if (modid) {
+		info->tp_offset = 0;
+		info->dtv_modid = modid;
+		info->dtv_block_offset = block_offset;
+	} else {
+		info->tp_offset = tcx_slot_offset();
+	}
 	__atomic_store_n(&info->recipe_generation, info->recipe_generation + 1,
 			 __ATOMIC_RELEASE);
 	/* The tag last: a reader that sees it sees everything above. */
-	__atomic_store_n(&info->recipe_tag, TASK_CONTEXT_RECIPE_TP_OFFSET,
-			 __ATOMIC_RELEASE);
+	__atomic_store_n(&info->recipe_tag, tag, __ATOMIC_RELEASE);
 	__atomic_store_n(&tcx_ready, 1, __ATOMIC_RELEASE);
 	return TASK_CONTEXT_OK;
 }
 
 static int tcx_publish(void)
 {
+	tcx_u64 modid = 0, block_offset = 0;
 	int rc = TASK_CONTEXT_OK;
 
 	if (__atomic_load_n(&tcx_ready, __ATOMIC_ACQUIRE))
 		return TASK_CONTEXT_OK;
+	if (__atomic_load_n(&tcx_refused, __ATOMIC_ACQUIRE))
+		return TASK_CONTEXT_EDUPLICATE;
+	/*
+	 * Whatever needs the dynamic linker's locks is done before ours is
+	 * taken, never under it: a thread inside dlopen() holds theirs while a
+	 * library's constructor may call in here for ours.  Two threads that
+	 * both get this far measure the same numbers.
+	 */
+	if (tcx_another_copy_is_ahead()) {
+		__atomic_store_n(&tcx_refused, 1, __ATOMIC_RELEASE);
+		return TASK_CONTEXT_EDUPLICATE;
+	}
+#if defined(TASK_CONTEXT_DTV)
+	/*
+	 * If the walk cannot find the block after the touch, the loader put the
+	 * variable in static TLS and never fills this thread's DTV entry for it:
+	 * TLS descriptors, aarch64's default, do that for a library loaded with
+	 * dlopen.  The variable is then a fixed distance from the thread pointer
+	 * in every thread, and the recipe is that distance - checked in each
+	 * thread's first call, as in a default build.
+	 */
+	if (tcx_dtv_measure(&modid, &block_offset) != TASK_CONTEXT_OK)
+		modid = 0;
+#endif
 	pthread_mutex_lock(&tcx_init_lock);
 	if (!tcx_ready)
-		rc = tcx_publish_locked();
+		rc = tcx_publish_locked(modid, block_offset);
 	pthread_mutex_unlock(&tcx_init_lock);
 	return rc;
 }
@@ -360,11 +538,7 @@ static struct task_context_block_v1 *tcx_first_call(int *rc_out)
 		*rc_out = rc;
 		return NULL;
 	}
-	/*
-	 * The writer's self-check: in this thread the slot must sit where
-	 * the published recipe says every thread's slot sits.
-	 */
-	if (tcx_slot_offset() != task_context_info_v1.tp_offset) {
+	if (!tcx_slot_is_where_the_recipe_says()) {
 		*rc_out = TASK_CONTEXT_EUNSUPPORTED;
 		return NULL;
 	}
