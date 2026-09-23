@@ -40,7 +40,9 @@ struct Cli {
     #[arg(long, default_value = "heap")]
     trace_id: String,
 
-    /// With a prefix input, load every snapshot and delete nothing.
+    /// With a prefix input, load every snapshot and delete nothing. (A
+    /// Perfetto output loads every snapshot anyway, for its timeline, and
+    /// without this deletes the older ones once it is written.)
     #[arg(long)]
     keep_all: bool,
 
@@ -58,6 +60,7 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let as_perfetto = perfetto::is_perfetto_output(&cli.output);
     let mut snapshots: Vec<Snapshot> = Vec::new();
     let mut plans: Vec<retention::Plan> = Vec::new();
     for input in &cli.inputs {
@@ -66,7 +69,7 @@ fn main() -> Result<()> {
                 snapshots.push(read(&path, format)?);
             }
         } else {
-            let mut plan = retention::scan(input, cli.keep_all)?;
+            let mut plan = retention::scan(input, cli.keep_all || as_perfetto, !cli.keep_all)?;
             snapshots.append(&mut plan.load);
             plans.push(plan);
         }
@@ -132,7 +135,6 @@ fn main() -> Result<()> {
         .map(|p| p.to_string_lossy())
         .collect::<Vec<_>>()
         .join(",");
-    let as_perfetto = perfetto::is_perfetto_output(&cli.output);
     let written = write_replacing(&cli.output, !as_perfetto, |tmp| {
         if as_perfetto {
             perfetto::write(tmp, &snapshots, &symbolized)
@@ -152,7 +154,7 @@ fn main() -> Result<()> {
         stats.perf_map_frames
     );
 
-    // Only now that the database is in place do older dumps go.
+    // Only now that the output is in place do older dumps go.
     for plan in &plans {
         let (deleted, kept) = retention::delete(plan);
         for p in deleted {

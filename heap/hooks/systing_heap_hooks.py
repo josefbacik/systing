@@ -31,6 +31,7 @@ worker) are named in no map the child's dumps can use.
 
 import ctypes
 import os
+import stat
 import sys
 import warnings
 
@@ -131,10 +132,25 @@ def keep_perf_map_across_fork(strict=False):
             # CPython starts the child's own map before these run. Its
             # persist-after-fork setting is not used: that stops the child
             # making trampolines, so what the child runs later is unnamed.
-            def add_parent_map():
-                copy(f"/tmp/perf-{os.getppid()}.map".encode())
+            # The forking process's pid is taken before the fork: getppid()
+            # in the child is 1 once the parent has exited.
+            forking = [None]
 
-            os.register_at_fork(after_in_child=add_parent_map)
+            def note_parent():
+                forking[0] = os.getpid()
+
+            def add_parent_map():
+                path = f"/tmp/perf-{forking[0]}.map"
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    return
+                # /tmp is shared: only a regular file of ours, which the
+                # sticky bit keeps anyone else from replacing.
+                if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
+                    copy(path.encode())
+
+            os.register_at_fork(before=note_parent, after_in_child=add_parent_map)
             _copy_on_fork = True
         return True
     message = "systing_heap_hooks: " + why

@@ -204,7 +204,7 @@ It deletes only regular files directly in that folder whose names start with the
 |---|---|
 | `--dry-run` | Print what would be loaded and deleted; change nothing. Try this first. |
 | `--keep-all` | Load every snapshot and delete nothing, for example to see how the heap grew over time. |
-| `-o heap.pb` | Write a Perfetto trace instead (also `.perfetto`, `.pftrace`, `.perfetto-trace`). Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process has a heap-profile track with a marker per snapshot, and clicking one shows its flamegraph. |
+| `-o heap.pb` | Write a Perfetto trace instead (also `.perfetto`, `.pftrace`, `.perfetto-trace`). Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process has a heap-profile track with a marker per snapshot, and clicking one shows its flamegraph. It loads every snapshot on disk, so the timeline shows all of them, then deletes the older ones as above. |
 | `--perf-map-dir DIR` | Where to look first for Python's `perf-<pid>.map` (part 2). Without it, the tool looks beside the snapshots, then in `/tmp`. |
 
 Named files or a folder (`systing-heap -o heap.duckdb /heap-dumps/`) are only loaded, never deleted.

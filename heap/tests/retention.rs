@@ -248,3 +248,40 @@ fn a_failed_write_deletes_nothing() {
     assert!(!out.status.success());
     assert_eq!(names(d), before);
 }
+
+#[test]
+fn perfetto_output_loads_every_snapshot_then_deletes_older_ones() {
+    use perfetto_protos::trace::Trace;
+    use protobuf::Message;
+
+    let (dir, _elsewhere) = setup();
+    let d = dir.path();
+    let out_dir = tempfile::tempdir().unwrap();
+    let pb = out_dir.path().join("heap.pb");
+    let before = names(d);
+    let out = Command::new(BIN)
+        .arg(d.join("jeprof"))
+        .arg("-o")
+        .arg(&pb)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The timeline has every dump that parsed: three of pid 10, one of 11.
+    let trace = Trace::parse_from_bytes(&std::fs::read(&pb).unwrap()).unwrap();
+    let mut pids: Vec<u64> = trace
+        .packet
+        .iter()
+        .filter(|p| p.has_profile_packet())
+        .flat_map(|p| p.profile_packet().process_dumps.iter().map(|d| d.pid()))
+        .collect();
+    pids.sort();
+    assert_eq!(pids, vec![10, 10, 10, 11]);
+    // Then the disk is as after a DuckDB run.
+    let after = names(d);
+    let deleted: Vec<&String> = before.iter().filter(|n| !after.contains(n)).collect();
+    assert_eq!(deleted, vec!["jeprof.10.0.i0.heap", "jeprof.10.1.i1.heap"]);
+}

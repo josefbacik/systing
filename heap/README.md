@@ -54,7 +54,7 @@ Run it one-shot, from cron or a loop, as often as you want the database refreshe
 Give `-o` a Perfetto extension (`.pb`, as systing's traces use, or `.perfetto`, `.pftrace`, `.perfetto-trace`) and the snapshots are written as native heap profiles, the format Perfetto's own heap profiler (heapprofd) writes, instead of a DuckDB database:
 
 ```bash
-systing-heap -o heap.pb /data/heap/jeprof --keep-all
+systing-heap -o heap.pb /data/heap/jeprof
 ```
 
 Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process gets a heap-profile track with a marker per snapshot, and clicking a marker shows its flamegraph.
@@ -62,7 +62,7 @@ Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process gets a heap-
 - **Frames are split like task stacks'.** A frame is named after the function alone, its module is the frame's mapping, and the source file and line are its symbols (Python frames: the file and line 0, since a trampoline names a function and its file but not a line). Python frames' mapping is `[python]`. Mappings carry a `systing-heap:<module>` build id, which Perfetto needs to attach the symbols; it is not an ELF build id.
 - **The numbers are estimates.** Each stack's sampled counts are unbiased before anything is added up (see Sampling and unbiasing), the same `est_*` values the DuckDB tables hold.
 - **Each snapshot holds its increase since the previous one,** and Perfetto adds them up, so the flamegraph at a marker shows the state at that snapshot. "Unreleased" is the live estimate. "Total allocated" is jemalloc's cumulative total when it ran with `prof_accum:true`; otherwise it is the smallest total consistent with the live counts seen, which is a lower bound.
-- **Retention works the same.** With a prefix input and no `--keep-all` there is one snapshot per process, so one marker.
+- **Every snapshot is loaded.** A timeline is for history, so with a prefix input a Perfetto output loads every snapshot on disk, then, once the trace is written, deletes each process's older ones as the DuckDB output does. The history is in the trace; each run's trace covers the snapshots written since the last run. `--keep-all` deletes nothing.
 
 ## One snapshot per process
 
@@ -71,8 +71,8 @@ Users usually care about the current state, so with a prefix input the tool keep
 - **Which files.** Files directly in the prefix's directory whose names start with the prefix's file name. Subdirectories are never read.
 - **Which process.** The pid is the number jemalloc writes right after the prefix (`<prefix>.<pid>.<seq>...`). Nothing after the sequence number is examined.
 - **Which snapshot.** The highest sequence number for that pid. If a name has no sequence number, the file's modification time decides.
-- **Loaded.** Each pid's latest snapshot. If the latest does not parse (jemalloc may still be writing it), the newest one that parses is loaded, and the unparsed newer file is kept.
-- **Deleted.** That pid's files older than the loaded one, and only after the new database is in place and synced. Each deletion is printed. Their contents are in no database: only the latest is loaded.
+- **Loaded.** Each pid's latest snapshot. If the latest does not parse (jemalloc may still be writing it), the newest one that parses is loaded, and the unparsed newer file is kept. A Perfetto output loads the older ones too (see Perfetto output).
+- **Deleted.** That pid's files older than the loaded one, and only after the new output is in place and synced. Each deletion is printed. With a DuckDB output their contents are in no database: only the latest is loaded.
 - **Kept.** The loaded file itself, and any newer unparsed file.
 
 A file is never read or deleted unless it is a regular file (symlinks are not followed) and its first line is `heap_v2/`.

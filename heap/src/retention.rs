@@ -59,7 +59,7 @@ pub struct Skipped {
 /// What one prefix contributes to a run.
 pub struct Plan {
     /// Parsed snapshots to load: each pid's latest, or every dump with
-    /// `keep_all`.
+    /// `load_all`.
     pub load: Vec<Snapshot>,
     /// Older dumps to delete after the database is written.
     pub delete: Vec<Dump>,
@@ -72,7 +72,9 @@ pub struct Plan {
 }
 
 /// Scan `prefix` (a jemalloc `prof_prefix`, e.g. `/data/heap/jeprof`).
-pub fn scan(prefix: &Path, keep_all: bool) -> Result<Plan> {
+/// Each pid's newest dump that parses is loaded; `load_all` loads the older
+/// ones too, and `delete_older` deletes them once the output is written.
+pub fn scan(prefix: &Path, load_all: bool, delete_older: bool) -> Result<Plan> {
     let name_prefix = prefix
         .file_name()
         .with_context(|| format!("{}: a prefix needs a file-name part", prefix.display()))?
@@ -162,17 +164,26 @@ pub fn scan(prefix: &Path, keep_all: bool) -> Result<Plan> {
         }
         let mut loaded_one = false;
         for d in dumps {
-            if loaded_one && !keep_all {
-                plan.delete.push(d);
+            let older = loaded_one;
+            if older && !load_all {
+                if delete_older {
+                    plan.delete.push(d);
+                }
                 continue;
             }
             match load(&plan.dir, &d) {
                 Ok(s) => {
                     plan.load.push(s);
                     loaded_one = true;
+                    if older && delete_older {
+                        plan.delete.push(d);
+                    }
                 }
-                // Not deleted: a newer dump may be mid-write, an older one
-                // is still the user's data.
+                // An older dump goes whether or not it parses, as it would
+                // unread.
+                Err(_) if older && delete_older => plan.delete.push(d),
+                // Kept: a newer dump may be mid-write, and with nothing
+                // deleted an older one is still the user's data.
                 Err(e) => plan.unparsed.push(Skipped {
                     path: d.path.clone(),
                     reason: format!("{e:#}"),
