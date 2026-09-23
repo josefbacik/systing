@@ -20,7 +20,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2
+          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2 libunwind8
       - name: Install clang 21 (the release build's BPF compiler)
         run: |
           wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh
@@ -64,7 +64,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2
+          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2 libunwind8
       - name: Install clang 21 (the release build's BPF compiler)
         run: |
           wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh

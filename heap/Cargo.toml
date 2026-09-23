@@ -7,6 +7,14 @@ license = "MIT"
 description = "Reads allocator heap snapshots (jemalloc prof dumps) into a systing DuckDB database"
 publish = false
 
+[features]
+# Build DuckDB from source, as systing's own default does. CI's
+# --no-default-features rows link a prebuilt libduckdb instead; without this
+# pass-through the heap crate would switch the bundled build back on for the
+# whole workspace.
+default = ["duckdb-bundled"]
+duckdb-bundled = ["systing/duckdb-bundled"]
+
 [[bin]]
 name = "systing-heap"
 path = "src/main.rs"
@@ -23,6 +31,6 @@ clap = { version = "4.5.20", features = ["derive"] }
 duckdb = "1.10504"
 libc = "0.2"
 regex = "1.11.1"
-systing = { path = ".." }
+systing = { path = "..", default-features = false }
 tempfile = "3.13"
 

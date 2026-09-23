@@ -6,7 +6,8 @@
 //! at the same paths (the host, or the image the process ran in).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use blazesym::symbolize::source::{Elf, Source};
@@ -36,8 +37,9 @@ pub struct Stats {
     /// Paths the dumps name that are not regular files (devices, FIFOs,
     /// /proc, /dev, /sys), so they were not opened.
     pub refused_files: Vec<PathBuf>,
-    /// Files on this machine whose inode differs from the dump's: possibly a
-    /// different build, so their names may be wrong.
+    /// Files on this machine that are not the one the process mapped (the
+    /// device or inode differs): a copy or another build, so their names
+    /// may be wrong.
     pub changed_files: Vec<PathBuf>,
     /// Distinct return addresses named as Python functions from a perf map
     /// (Python's perf trampolines).
@@ -58,6 +60,9 @@ enum Target<'a> {
     Perf(&'a Entry),
     /// Anonymous executable memory no perf map names.
     Generated,
+    /// Anonymous memory that is not executable: a PC here is recycled code
+    /// or unwind garbage.
+    AnonData,
     Label(&'a str),
     Unmapped,
 }
@@ -65,14 +70,14 @@ enum Target<'a> {
 pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
     // Every (file, offset) to look up, by file, so each file is opened once.
     let mut wanted: BTreeMap<&str, HashSet<u64>> = BTreeMap::new();
-    let mut inodes: HashMap<&str, u64> = HashMap::new();
+    let mut identities: HashMap<&str, ((u32, u32), u64)> = HashMap::new();
     for s in snapshots {
         for sample in &s.samples {
             for (i, &addr) in sample.addrs.iter().enumerate() {
                 if let Target::File { path, lookup } = target(s, addr, i == 0) {
                     wanted.entry(path).or_default().insert(lookup);
                     let m = s.maps.lookup(addr).expect("target found it");
-                    inodes.entry(path).or_insert(m.inode);
+                    identities.entry(path).or_insert((m.dev, m.inode));
                 }
             }
         }
@@ -82,37 +87,50 @@ pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
     let mut stats = Stats::default();
     // (file, offset) -> its symbol, or None when the file has none there.
     let mut names: HashMap<(&str, u64), Option<blazesym::symbolize::Sym<'_>>> = HashMap::new();
+    // Every opened file stays open until symbolization ends: each is
+    // symbolized as /proc/self/fd/N, and the symbolizer caches by path, so
+    // a closed file's fd number reused by the next would get its symbols.
+    let mut open_files: Vec<std::fs::File> = Vec::new();
     for (&path, offsets) in &wanted {
         let offsets: Vec<u64> = offsets.iter().copied().collect();
         stats.lookups += offsets.len();
         // The path comes from the dump, which anyone could have written:
-        // open only regular files, never a device, FIFO or pseudo-file that
-        // could hang the read or never end.
-        if ["/proc/", "/dev/", "/sys/"]
-            .iter()
-            .any(|p| path.starts_with(p))
+        // open it once, then check what was opened, so no device, FIFO or
+        // pseudo-file can hang the read or never end, and symbolize through
+        // that same handle.
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
         {
-            stats.refused_files.push(PathBuf::from(path));
-            continue;
-        }
-        let meta = match std::fs::metadata(path) {
-            Ok(m) if m.is_file() => m,
-            Ok(_) => {
-                stats.refused_files.push(PathBuf::from(path));
-                continue;
-            }
-            Err(_) => {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 stats.missing_files.push(PathBuf::from(path));
                 continue;
             }
+            Err(_) => {
+                stats.refused_files.push(PathBuf::from(path));
+                continue;
+            }
         };
-        if inodes
-            .get(path)
-            .is_some_and(|&ino| ino != 0 && ino != meta.ino())
-        {
+        let Some(meta) = file
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file() && !on_pseudo_fs(&file))
+        else {
+            stats.refused_files.push(PathBuf::from(path));
+            continue;
+        };
+        if identities.get(path).is_some_and(|&((maj, min), ino)| {
+            ino != 0
+                && (ino != meta.ino()
+                    || (maj, min) != (libc::major(meta.dev()), libc::minor(meta.dev())))
+        }) {
             stats.changed_files.push(PathBuf::from(path));
         }
-        let src = Source::Elf(Elf::new(path));
+        let fd = file.as_raw_fd();
+        open_files.push(file);
+        let src = Source::Elf(Elf::new(format!("/proc/self/fd/{fd}")));
         let Ok(results) = symbolizer.symbolize(&src, Input::FileOffset(&offsets)) else {
             continue;
         };
@@ -122,6 +140,7 @@ pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
             names.insert((path, *off), sym);
         }
     }
+    drop(open_files);
 
     let mut files: HashMap<String, String> = HashMap::new();
     for (si, s) in snapshots.iter().enumerate() {
@@ -181,24 +200,28 @@ pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
 /// the call itself, so an inlined call or a `noreturn` tail resolves to the
 /// right line.
 fn target(s: &Snapshot, addr: u64, leaf: bool) -> Target<'_> {
-    let perf = |pc: u64| s.perf_map.as_deref().and_then(|p| p.lookup(pc));
     let Some(m) = s.maps.lookup(addr) else {
-        let pc = if leaf { addr } else { addr.saturating_sub(1) };
-        return perf(pc).map_or(Target::Unmapped, Target::Perf);
+        return Target::Unmapped;
     };
     if !m.is_file() {
+        if let Some(label) = m.label() {
+            return Target::Label(label);
+        }
+        if !m.exec {
+            return Target::AnonData;
+        }
+        // Only where the dump's own map says there is generated code does
+        // a perf map name it: a stale map cannot name data or a hole.
         let pc = if leaf || addr == m.start {
             addr
         } else {
             addr - 1
         };
-        if let Some(e) = perf(pc) {
-            return Target::Perf(e);
-        }
-        if m.exec && m.label().is_none() {
-            return Target::Generated;
-        }
-        return m.label().map_or(Target::Unmapped, Target::Label);
+        return s
+            .perf_map
+            .as_deref()
+            .and_then(|p| p.lookup(pc))
+            .map_or(Target::Generated, Target::Perf);
     }
     let pc = if leaf || addr == m.start {
         addr
@@ -231,15 +254,22 @@ fn render(
                         .file_name()
                         .and_then(|f| f.to_str())
                         .unwrap_or(file);
-                    (
-                        format!("{qualname} (python) [{base}]"),
-                        Some(file.to_string()),
-                    )
+                    // pystacks' module prefix for library code, so a frame
+                    // here and the same function in a capture share a name.
+                    let module = systing::pystacks::symbols::get_module_name_from_filename(file);
+                    let func = if module.is_empty() {
+                        qualname.to_string()
+                    } else {
+                        format!("{module}:{qualname}")
+                    };
+                    (format!("{func} (python) [{base}]"), Some(file.to_string()))
                 }
                 Symbol::Other(name) => (format!("{name} ([jit]) <{addr:#x}>"), None),
             };
         }
-        Target::Generated => format!("unknown ([anon]) <{addr:#x}>"),
+        // The recorders' labels for these classes (sandbox_maps).
+        Target::Generated => format!("unknown ([anon:exec]) <{addr:#x}>"),
+        Target::AnonData => format!("unknown ([anon]) <{addr:#x}>"),
         Target::File { path, lookup } => {
             let module = Path::new(path)
                 .file_name()
@@ -253,7 +283,24 @@ fn render(
             }
         }
         Target::Label(label) => format!("unknown ({label}) <{addr:#x}>"),
-        Target::Unmapped => format!("0x{addr:x}"),
+        Target::Unmapped => format!("unknown ([unmapped]) <{addr:#x}>"),
     };
     (name, None)
+}
+
+/// Whether `file` is on procfs, sysfs, debugfs or tracefs, whose "regular"
+/// files are generated and can be endless.
+fn on_pseudo_fs(file: &std::fs::File) -> bool {
+    const PROC: i64 = 0x9fa0;
+    const SYSFS: i64 = 0x6265_6572;
+    const DEBUGFS: i64 = 0x6462_6720;
+    const TRACEFS: i64 = 0x7472_6163;
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid fd and a writable statfs.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut sfs) } != 0 {
+        return true;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let kind = sfs.f_type as i64;
+    matches!(kind, PROC | SYSFS | DEBUGFS | TRACEFS)
 }

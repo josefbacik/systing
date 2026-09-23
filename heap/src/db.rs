@@ -36,9 +36,25 @@ pub fn write(
     let mut conn = Connection::open(out).with_context(|| format!("creating {}", out.display()))?;
     let tx = conn.transaction()?;
     create_schema(&tx)?;
+    // This systing both "recorded" (read the dumps) and imported the trace,
+    // so the recorder columns name it too: NULL there means "imported from a
+    // directory with no manifest", which would be wrong here.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_nanos()).ok());
     tx.execute(
-        "INSERT INTO _traces (trace_id, source_path, systing_version) VALUES (?, ?, ?)",
-        params![trace_id, source_path, SYSTING_VERSION],
+        "INSERT INTO _traces (trace_id, source_path, systing_version, recorder_version,
+                              recorder_schema_version, recorded_at_unix_ns)
+         VALUES (?, ?, ?, ?, ?, ?)",
+        params![
+            trace_id,
+            source_path,
+            SYSTING_VERSION,
+            SYSTING_VERSION,
+            SCHEMA_VERSION,
+            now_ns
+        ],
     )?;
     tx.execute(
         "INSERT OR REPLACE INTO _schema_version (id, version) VALUES (1, ?)",
@@ -51,8 +67,11 @@ pub fn write(
     let mut upids: HashMap<i32, i64> = HashMap::new();
     let mut written = Written::default();
 
+    // By column name: `process` belongs to the recorders and gains columns
+    // (thread.py_name came at schema 24); the rest take their defaults.
+    let mut process =
+        tx.prepare("INSERT INTO process (trace_id, upid, pid, name) VALUES (?, ?, ?, ?)")?;
     {
-        let mut process = tx.appender("process")?;
         let mut snapshot_rows = tx.appender("heap_snapshot")?;
         let mut sample_rows = tx.appender("heap_sample")?;
         for (si, s) in snapshots.iter().enumerate() {
@@ -63,19 +82,7 @@ pub fn write(
                     None => {
                         let u = upids.len() as i64 + 1;
                         upids.insert(pid, u);
-                        // Only the columns a dump can fill; the rest take
-                        // their defaults.
-                        process.append_row(params![
-                            trace_id,
-                            u,
-                            pid,
-                            s.maps.exe_name(),
-                            None::<i64>,
-                            None::<String>,
-                            false,
-                            0u64,
-                            None::<String>
-                        ])?;
+                        process.execute(params![trace_id, u, pid, s.maps.exe_name()])?;
                         u
                     }
                 }),
@@ -117,10 +124,10 @@ pub fn write(
             }
             written.snapshots += 1;
         }
-        process.flush()?;
         snapshot_rows.flush()?;
         sample_rows.flush()?;
     }
+    drop(process);
 
     {
         let mut frames = tx.appender("frame")?;

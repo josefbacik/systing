@@ -158,25 +158,34 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Give each snapshot its process's perf map, when one is found. A map is
-/// read once however many snapshots share it.
+/// Give each snapshot its process's perf map: the first candidate that may
+/// be read, a refused one falling through to the next. A map is read once
+/// however many snapshots share it, and the one used is printed, so a wrong
+/// or stale map is visible.
 fn attach_perf_maps(snapshots: &mut [Snapshot], dir: Option<&Path>) {
     let mut cache: HashMap<PathBuf, Option<Arc<PerfMap>>> = HashMap::new();
+    let mut announced: std::collections::HashSet<PathBuf> = Default::default();
     for s in snapshots {
         let Some(pid) = s.pid else { continue };
-        let Some(path) = perfmap::find(pid, &s.source_path, dir) else {
-            continue;
-        };
-        s.perf_map = cache
-            .entry(path)
-            .or_insert_with_key(|path| match perfmap::read(path) {
-                Ok(map) => Some(Arc::new(map)),
-                Err(e) => {
-                    eprintln!("warning: not using {}: {e}", path.display());
-                    None
+        for path in perfmap::candidates(pid, &s.source_path, dir) {
+            let map = cache
+                .entry(path.clone())
+                .or_insert_with_key(|path| match perfmap::read(path) {
+                    Ok(map) => Some(Arc::new(map)),
+                    Err(e) => {
+                        eprintln!("warning: not using {}: {e}", path.display());
+                        None
+                    }
+                })
+                .clone();
+            if let Some(map) = map {
+                if announced.insert(path.clone()) {
+                    eprintln!("pid {pid}: Python frames named from {}", path.display());
                 }
-            })
-            .clone();
+                s.perf_map = Some(map);
+                break;
+            }
+        }
     }
 }
 
@@ -204,6 +213,11 @@ fn write_replacing<T>(out: &Path, write: impl FnOnce(&Path) -> Result<T>) -> Res
     let _ = std::fs::remove_file(wal_path(out));
     std::fs::rename(&tmp, out)
         .with_context(|| format!("renaming {} to {}", tmp.display(), out.display()))?;
+    // Make the rename durable before any dump is deleted: after a power
+    // loss the deletions must not survive without the new database.
+    std::fs::File::open(parent)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("syncing {}", parent.display()))?;
     Ok(result)
 }
 

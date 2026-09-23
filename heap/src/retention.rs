@@ -11,13 +11,18 @@
 //! Before a file is read or deleted it must be a regular file (not a
 //! symlink, never followed) and start with `heap_v2/`. Every access goes
 //! through one open handle on the directory (`openat`, `fstatat`,
-//! `unlinkat` with a single name component), and a delete first checks the
-//! name still refers to the file that was examined, so a swapped-in file or
-//! symlink is never removed.
+//! `unlinkat` with a single name component), so nothing outside that
+//! directory is ever removed and a symlink's target is never touched. A
+//! delete first checks that the name still refers to the file examined (same
+//! device, inode and mtime); Linux has no unlink-by-inode, so a file swapped
+//! in between that check and the unlink is still removed, and only someone
+//! who can write the directory can do that.
 //!
 //! One pid is one process: two processes that wrote the same pid into the
 //! same directory (a restart that got its pid back, pid 1 in several
 //! containers) count as one, and the higher sequence numbers win.
+//!
+//! Every read is bounded by [`crate::jemalloc::MAX_DUMP_BYTES`].
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
@@ -108,6 +113,12 @@ pub fn scan(prefix: &Path, keep_all: bool) -> Result<Plan> {
             continue;
         }
         match read_at(&dir, &name, Some(16)) {
+            // The inode checked for the header is the one recorded: a swap
+            // between the stat and this open is caught here.
+            Ok((_, ino)) if ino != st.st_ino => {
+                skipped.push(skip("changed while it was examined"));
+                continue;
+            }
             Ok((head, _)) if head.starts_with(b"heap_v2/") => {}
             Ok(_) => {
                 skipped.push(skip("not a jemalloc heap_v2 dump"));
@@ -141,8 +152,14 @@ pub fn scan(prefix: &Path, keep_all: bool) -> Result<Plan> {
         dir,
     };
     for (_, mut dumps) in by_pid {
-        // Newest first: by sequence, then mtime where a name has no sequence.
-        dumps.sort_by_key(|d| std::cmp::Reverse((d.seq.unwrap_or(0), d.mtime_ns)));
+        // Newest first: by sequence, or by mtime alone when any of this
+        // pid's names has no sequence (one rule per pid keeps the order
+        // total).
+        if dumps.iter().all(|d| d.seq.is_some()) {
+            dumps.sort_by_key(|d| std::cmp::Reverse((d.seq, d.mtime_ns)));
+        } else {
+            dumps.sort_by_key(|d| std::cmp::Reverse(d.mtime_ns));
+        }
         let mut loaded_one = false;
         for d in dumps {
             if loaded_one && !keep_all {
@@ -174,7 +191,10 @@ pub fn delete(plan: &Plan) -> (Vec<PathBuf>, Vec<Skipped>) {
     let mut kept = Vec::new();
     for d in &plan.delete {
         let same = stat_at(&plan.dir, &d.name).is_some_and(|st| {
-            st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_dev == d.dev && st.st_ino == d.ino
+            st.st_mode & libc::S_IFMT == libc::S_IFREG
+                && st.st_dev == d.dev
+                && st.st_ino == d.ino
+                && st.st_mtime * 1_000_000_000 + st.st_mtime_nsec == d.mtime_ns
         });
         if !same {
             kept.push(Skipped {
@@ -219,9 +239,13 @@ fn pid_and_seq(prefix: &[u8], name: &[u8]) -> Option<(i32, Option<u64>)> {
 }
 
 fn load(dir: &File, d: &Dump) -> Result<Snapshot> {
-    let (bytes, ino) = read_at(dir, &d.name, None)?;
+    let cap = jemalloc::MAX_DUMP_BYTES;
+    let (bytes, ino) = read_at(dir, &d.name, Some(cap + 1))?;
     if ino != d.ino {
         bail!("replaced since it was examined");
+    }
+    if bytes.len() as u64 > cap {
+        bail!("larger than {cap} bytes");
     }
     let text = String::from_utf8(bytes).context("not UTF-8")?;
     let mut s = jemalloc::parse(&text)?;
@@ -260,8 +284,8 @@ fn stat_at(dir: &File, name: &OsStr) -> Option<libc::stat> {
     (rc == 0).then_some(st)
 }
 
-/// Read a file in `dir` without following symlinks, all of it or its first
-/// `limit` bytes, with the inode of what was read.
+/// Read a file in `dir` without following symlinks, its first `limit`
+/// bytes, with the inode of what was read.
 fn read_at(dir: &File, name: &OsStr, limit: Option<u64>) -> std::io::Result<(Vec<u8>, u64)> {
     let c = cstr(name);
     // O_NONBLOCK: a FIFO swapped in after the stat must not hang the open.

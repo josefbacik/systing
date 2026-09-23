@@ -26,8 +26,10 @@ use regex::Regex;
 use crate::maps::Maps;
 use crate::{Format, Sample, Snapshot};
 
+// A thread line in the header ends with the thread's name when it has one
+// (mallctl "thread.prof.name", or prof_sys_thread_name), blanks allowed.
 static COUNTS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^t(\*|\d+):\s+(\d+):\s+(\d+)\s+\[\s*(\d+):\s+(\d+)\s*\]$").unwrap()
+    Regex::new(r"^t(\*|\d+):\s+(\d+):\s+(\d+)\s+\[\s*(\d+):\s+(\d+)\s*\](?:\s+.*)?$").unwrap()
 });
 
 static FILE_NAME_RE: LazyLock<Regex> =
@@ -67,10 +69,22 @@ pub fn trigger_for_kind(kind: char) -> Option<&'static str> {
     }
 }
 
+/// The largest dump read. A dump is one short line per allocation stack plus
+/// the process's maps, so real ones are megabytes; the cap only stops a file
+/// named like a dump from filling memory.
+pub const MAX_DUMP_BYTES: u64 = 1 << 30;
+
 /// Read one dump file.
 pub fn read(path: &Path) -> Result<Snapshot> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    use std::io::Read;
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut text = String::new();
+    file.take(MAX_DUMP_BYTES + 1)
+        .read_to_string(&mut text)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if text.len() as u64 > MAX_DUMP_BYTES {
+        bail!("{}: larger than {MAX_DUMP_BYTES} bytes", path.display());
+    }
     let mut snapshot = parse(&text).with_context(|| format!("parsing {}", path.display()))?;
     let name = parse_file_name(path);
     snapshot.source_path = path.to_path_buf();
@@ -226,6 +240,15 @@ MAPPED_LIBRARIES:
         );
         assert_eq!(s.maps.mappings().len(), 2);
         assert_eq!(s.maps.lookup(0x56326ffdd225).unwrap().path, "/tmp/je/t");
+    }
+
+    #[test]
+    fn named_threads_do_not_break_the_header() {
+        let dump = "heap_v2/4096\n  t*: 2: 200 [0: 0]\n  t0: 1: 100 [0: 0] worker-1\n  \
+                    t3: 1: 100 [0: 0] io pool 2\n@ 0x1\n  t*: 2: 200 [0: 0]\n  t0: 1: 100 [0: 0]\n";
+        let s = parse(dump).unwrap();
+        assert_eq!(s.header_live_bytes, 200);
+        assert_eq!(s.samples.len(), 1);
     }
 
     #[test]

@@ -51,7 +51,8 @@ fn a_dump_becomes_named_stacks_and_heap_rows() {
         .unwrap();
     assert_eq!(version, systing::duckdb::SCHEMA_VERSION as i32);
 
-    // Root first: the unmapped 0x10 is the outermost frame, the function the
+    // Root first: the unmapped 0x10 is the outermost frame (the recorders'
+    // label for an address in no mapping), the function the
     // leaf; the caller frame resolved to the same function via addr - 1.
     let names: Vec<String> = conn
         .prepare(
@@ -65,7 +66,7 @@ fn a_dump_becomes_named_stacks_and_heap_rows() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(names.len(), 3, "{names:?}");
-    assert_eq!(names[0], "0x10");
+    assert_eq!(names[0], "unknown ([unmapped]) <0x10>");
     for n in &names[1..] {
         assert!(n.starts_with("heap_e2e_allocating_function ("), "{n}");
     }
@@ -150,9 +151,58 @@ fn generated_code_without_a_perf_map_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let snapshots = vec![jemalloc::read(&anon_exec_dump(dir.path())).unwrap()];
     let symbolized = symbolize::symbolize(&snapshots);
-    assert_eq!(symbolized.frames[0][0][1], "unknown ([anon]) <0x20008>");
+    assert_eq!(
+        symbolized.frames[0][0][1],
+        "unknown ([anon:exec]) <0x20008>"
+    );
     assert_eq!(
         symbolized.stats.unnamed_generated,
         vec![snapshots[0].source_path.clone()]
+    );
+}
+
+#[test]
+fn a_perf_map_names_only_generated_code() {
+    // 0x30008 is in writable anonymous memory, 0x50008 in no mapping: a
+    // stale perf map that covers them must not name them.
+    let dump = "heap_v2/524288\n  t*: 1: 64 [0: 0]\n@ 0x30008 0x50008\n  t*: 1: 64 [0: 0]\n\
+                \nMAPPED_LIBRARIES:\n\
+                00030000-00031000 rw-p 00000000 00:00 0 \n";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jeprof.78.0.f.heap");
+    std::fs::write(&path, dump).unwrap();
+    let mut snapshot = jemalloc::read(&path).unwrap();
+    snapshot.perf_map = Some(std::sync::Arc::new(systing_heap::perfmap::PerfMap::parse(
+        "30000 100 py::stale:/srv/a.py\n50000 100 py::stale2:/srv/a.py\n",
+    )));
+    let snapshots = vec![snapshot];
+    let symbolized = symbolize::symbolize(&snapshots);
+    assert_eq!(
+        symbolized.frames[0][0],
+        vec![
+            "unknown ([unmapped]) <0x50008>",
+            "unknown ([anon]) <0x30008>"
+        ]
+    );
+}
+
+#[test]
+fn library_python_frames_carry_the_module_like_pystacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut snapshot = jemalloc::read(&anon_exec_dump(dir.path())).unwrap();
+    let file = "/usr/lib/python3.13/site-packages/pkg/mod.py";
+    snapshot.perf_map = Some(std::sync::Arc::new(systing_heap::perfmap::PerfMap::parse(
+        &format!("20000 10 py::Cls.run:{file}\n20020 10 py::main:/srv/app.py\n"),
+    )));
+    let snapshots = vec![snapshot];
+    let symbolized = symbolize::symbolize(&snapshots);
+    let module = systing::pystacks::symbols::get_module_name_from_filename(file);
+    assert!(!module.is_empty());
+    assert_eq!(
+        symbolized.frames[0][0],
+        vec![
+            "main (python) [app.py]".to_string(),
+            format!("{module}:Cls.run (python) [mod.py]"),
+        ]
     );
 }

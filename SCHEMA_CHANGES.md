@@ -458,18 +458,40 @@ recorder's, so the usual stack queries and flamegraphs work on them.
   seq, dump_trigger, dumped_at_unix_ns, sample_period, header_live_objects,
   header_live_bytes). `format` is `jemalloc` for now. `upid` is the process
   the file name names (a `process` row per pid, `name` from the dump's first
-  mapped file), NULL for a file renamed without its pid. `seq` and
-  `dump_trigger` (`interval`, `manual`, `gdump`, `final`) come from the file
-  name, `dumped_at_unix_ns` from its mtime, `sample_period` (mean bytes between
-  samples) from its header. `header_live_*` are the header's totals as written:
-  jemalloc 5.3 interval dumps can disagree with the sum of their stacks, so sum
-  `heap_sample` for a snapshot's total.
+  mapped file), NULL for a file renamed without its pid. That pid is the one
+  the writing process saw, in its own pid namespace (1 in many containers),
+  and it is the row's only process identity: two containers' dumps read into
+  one database share a `process` row, and a heap trace does not join a
+  capture of the same host by pid. `seq` and `dump_trigger` (`interval`,
+  `manual`, `gdump`, `final`) come from the file name. `dumped_at_unix_ns` is
+  the file's mtime when it was read, wall-clock (the trace tables' `ts` are
+  boot-monotonic): a copy that does not keep times moves it.
+  `sample_period` (mean bytes between samples) is from the header.
+  `header_live_*` are the header's totals as written, in the same form as
+  `heap_sample`'s counts (below): neither they nor a plain sum of
+  `heap_sample` is the snapshot's estimated total, which is the sum of the
+  rows once each is scaled.
 - `heap_sample` — one row per distinct allocation stack in a snapshot
   (snapshot_id, stack_id, live_objects, live_bytes, alloc_objects,
-  alloc_bytes). Counts are as the allocator wrote them; jemalloc >= 5.3
-  un-biases them for sampling already (`prof_unbias`). `alloc_*` are
-  cumulative since start and 0 unless the allocator tracked them
-  (jemalloc `prof_accum`).
+  alloc_bytes). Counts are as jemalloc wrote them, which are jeprof's
+  **inputs**, not estimates of the true totals: jemalloc 5.3 writes, per
+  stack, the values that jeprof's own per-stack scaling turns into its
+  estimate (`prof_do_unbias`), and older versions write the raw sampled
+  counts. Both need the same step: scale each row by
+  `1 / (1 - exp(-(bytes / objects) / sample_period))`, both `live_*` and
+  `alloc_*`. The factor depends on object size, so unscaled rows rank stacks
+  wrongly: about 1.02× for 64 KiB objects at a 16 KiB period, about 64× for
+  256-byte ones. `alloc_*` are cumulative since start and 0 unless the
+  allocator tracked them (jemalloc `prof_accum`).
+
+Python frames (named from a perf map, with perf trampolines) are
+function-level: `module:qualname (python) [file.py]` like pystacks' for
+library code, with no line.
+
+The two tables are in `DATA_TABLES`, so a DuckDB merge by a schema-25 reader
+keeps them. A schema-24 reader merging a heap database leaves them out without
+a message, and they have no parquet files, so an export to parquet and back
+drops them too.
 
 ## Schema Version 24 (systing 1.21.0) — 2026-09-15
 

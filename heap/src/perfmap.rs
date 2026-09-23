@@ -84,9 +84,10 @@ impl Entry {
 }
 
 /// Where to look for `perf-<pid>.map`, in order: `dir` (--perf-map-dir),
-/// beside the snapshot, then /tmp where the process wrote it. Only names a
-/// candidate; [`read`] decides whether it may be used.
-pub fn find(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Option<PathBuf> {
+/// beside the snapshot, then /tmp where the process wrote it. Only the
+/// candidates that exist; [`read`] decides whether one may be used, and a
+/// refused one falls through to the next.
+pub fn candidates(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Vec<PathBuf> {
     let name = format!("perf-{pid}.map");
     let beside = snapshot.parent().map(|p| p.join(&name));
     [
@@ -96,7 +97,8 @@ pub fn find(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Option<PathBuf> {
     ]
     .into_iter()
     .flatten()
-    .find(|p| p.symlink_metadata().is_ok())
+    .filter(|p| p.symlink_metadata().is_ok())
+    .collect()
 }
 
 /// Read a perf map found by [`find`]. Anyone can write /tmp, so the file is
@@ -207,23 +209,30 @@ garbage line
     }
 
     #[test]
-    fn find_prefers_the_named_dir_then_beside_the_snapshot() {
+    fn candidates_are_the_named_dir_then_beside_the_snapshot_then_tmp() {
         let d = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let snap = d.path().join("jeprof.4242.0.f.heap");
-        assert_eq!(
-            find(4242, &snap, None).is_some(),
-            Path::new("/tmp/perf-4242.map").is_file()
-        );
+        let tmp = Path::new("/tmp/perf-4242.map");
+        let tail: Vec<PathBuf> = tmp
+            .symlink_metadata()
+            .is_ok()
+            .then(|| tmp.to_path_buf())
+            .into_iter()
+            .collect();
+        assert_eq!(candidates(4242, &snap, None), tail);
         std::fs::write(d.path().join("perf-4242.map"), MAP).unwrap();
         assert_eq!(
-            find(4242, &snap, None),
-            Some(d.path().join("perf-4242.map"))
+            candidates(4242, &snap, None).first(),
+            Some(&d.path().join("perf-4242.map"))
         );
         std::fs::write(other.path().join("perf-4242.map"), MAP).unwrap();
         assert_eq!(
-            find(4242, &snap, Some(other.path())),
-            Some(other.path().join("perf-4242.map"))
+            candidates(4242, &snap, Some(other.path()))[..2],
+            [
+                other.path().join("perf-4242.map"),
+                d.path().join("perf-4242.map")
+            ]
         );
     }
 }

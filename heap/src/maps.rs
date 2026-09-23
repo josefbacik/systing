@@ -10,6 +10,8 @@ pub struct Mapping {
     /// File offset of `start`.
     pub offset: u64,
     pub inode: u64,
+    /// The file's device, (major, minor): with `inode`, the file's identity.
+    pub dev: (u32, u32),
     /// Mapped executable (`x` in the permissions).
     pub exec: bool,
     /// The pathname column: a file path, a `[bracketed]` kernel name, or
@@ -75,7 +77,7 @@ fn parse_line(line: &str) -> Option<Mapping> {
     let range = fields.next()?;
     let perms = fields.next()?;
     let offset = fields.next()?;
-    let _dev = fields.next()?;
+    let dev = fields.next()?;
     let inode = fields.next()?;
     let path = fields.next().unwrap_or("").trim().to_string();
     let (start, end) = range.split_once('-')?;
@@ -84,6 +86,13 @@ fn parse_line(line: &str) -> Option<Mapping> {
         end: u64::from_str_radix(end, 16).ok()?,
         offset: u64::from_str_radix(offset, 16).ok()?,
         inode: inode.parse().ok()?,
+        dev: {
+            let (maj, min) = dev.split_once(':')?;
+            (
+                u32::from_str_radix(maj, 16).ok()?,
+                u32::from_str_radix(min, 16).ok()?,
+            )
+        },
         exec: perms.as_bytes().get(2) == Some(&b'x'),
         path,
     })
@@ -110,6 +119,7 @@ mod tests {
         assert_eq!(0x56326ffdd225 - m.start + m.offset, 0x1225);
         assert_eq!(m.label(), Some("t"));
         assert!(m.exec);
+        assert_eq!(m.dev, (0, 0x2a8));
         assert!(!maps.lookup(0x56326ffdc000).unwrap().exec);
     }
 

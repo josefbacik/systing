@@ -707,19 +707,20 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             upid BIGINT, -- process.upid; NULL when the file name has no pid
             seq BIGINT, -- the allocator's dump sequence number, NULL if none
             dump_trigger VARCHAR, -- jemalloc: 'interval', 'manual', 'gdump', 'final'
-            dumped_at_unix_ns BIGINT, -- the file's mtime
+            dumped_at_unix_ns BIGINT, -- the file's mtime when read (wall clock)
             sample_period BIGINT, -- mean bytes between samples, as the dump states it
-            -- The dump's header totals, as written. Not always the sum of its
-            -- stacks (jemalloc 5.3 interval dumps disagree); sum heap_sample
-            -- for a snapshot's total.
+            -- The dump's header totals, as written: jeprof inputs like
+            -- heap_sample's counts. The estimated total is the sum of
+            -- heap_sample's rows once each is scaled.
             header_live_objects BIGINT,
             header_live_bytes BIGINT
         );
 
-        -- One row per distinct allocation stack in a snapshot. Counts are the
-        -- allocator's as written in the file (jemalloc >= 5.3 already
-        -- un-biases them for sampling); alloc_* are cumulative since start
-        -- and 0 unless the allocator tracked them (jemalloc prof_accum).
+        -- One row per distinct allocation stack in a snapshot. Counts are as
+        -- jemalloc wrote them: jeprof's inputs, not estimates. Scale each row
+        -- by 1 / (1 - exp(-(bytes / objects) / sample_period)) for its
+        -- estimate (see SCHEMA_CHANGES.md, schema 25). alloc_* are cumulative
+        -- since start and 0 unless the allocator tracked them (prof_accum).
         CREATE TABLE IF NOT EXISTS heap_sample (
             trace_id VARCHAR,
             snapshot_id BIGINT,

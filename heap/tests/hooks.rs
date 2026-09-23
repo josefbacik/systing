@@ -64,7 +64,7 @@ fn setup() -> Option<Env> {
         ])
         .arg(&lib)
         .arg(Path::new(HOOKS).join("systing_heap_hooks.c"))
-        .arg("-ldl")
+        .args(["-ldl", "-lpthread"])
         .status();
     if !built.is_ok_and(|s| s.success()) {
         eprintln!("skipped: no C compiler to build the hooks library");
@@ -174,9 +174,20 @@ fn python_frames(frames: &[String]) -> Vec<&str> {
         .collect()
 }
 
+fn have_libunwind() -> bool {
+    Command::new("ldconfig")
+        .arg("-p")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("libunwind.so.8 "))
+}
+
 #[test]
 fn libunwind_hook_keeps_every_python_caller() {
     let Some(env) = setup() else { return };
+    if !have_libunwind() {
+        eprintln!("skipped: needs libunwind.so.8");
+        return;
+    }
     let (reported, frames) = run(&env, "libunwind", None);
     assert_eq!(reported, "libunwind");
     assert_eq!(

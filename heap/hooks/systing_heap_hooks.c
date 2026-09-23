@@ -14,11 +14,12 @@
  *   "libunwind"  unw_backtrace() from libunwind.so.8, loaded at runtime so
  *                this library loads on machines without it
  *
- * The library links nothing but libdl, and does nothing until
+ * The library links only libdl and libpthread, and does nothing until
  * systing_heap_hooks_install() is called.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,10 +29,12 @@
 typedef int (*mallctl_fn)(const char *, void *, size_t *, void *, size_t);
 typedef void (*prof_backtrace_hook_t)(void **, unsigned *, unsigned);
 typedef int (*unw_backtrace_fn)(void **, int);
+typedef int (*unw_set_caching_policy_fn)(void *, int);
 
-/* The deepest stack jemalloc asks for is PROF_BT_MAX_LIMIT (256). */
-#define MAX_FRAMES 512
+#define UNW_CACHE_PER_THREAD 2
 
+/* install() runs from any thread; this guards the statics below. */
+static pthread_mutex_t install_lock = PTHREAD_MUTEX_INITIALIZER;
 static mallctl_fn mallctl_p;
 static prof_backtrace_hook_t jemalloc_default;
 static unw_backtrace_fn unw_backtrace_p;
@@ -40,18 +43,17 @@ static const char *active = "default";
 static void libunwind_backtrace(void **vec, unsigned *len, unsigned max_len)
 {
 	/*
-	 * One frame more than asked for, to drop this function's own frame:
-	 * jemalloc's stacks then start where its own backends' do.
+	 * Unwind into jemalloc's own array (no buffer of ours on the stack
+	 * inside malloc), then drop this function's frame so jemalloc's stacks
+	 * start where its own backends' do. At full depth that costs the
+	 * outermost frame.
 	 */
-	void *buf[MAX_FRAMES + 1];
-	if (max_len > MAX_FRAMES)
-		max_len = MAX_FRAMES;
-	int n = unw_backtrace_p(buf, (int)max_len + 1);
+	int n = unw_backtrace_p(vec, (int)max_len);
 	if (n <= 1) {
 		*len = 0;
 		return;
 	}
-	memcpy(vec, buf + 1, (size_t)(n - 1) * sizeof(void *));
+	memmove(vec, vec + 1, (size_t)(n - 1) * sizeof(void *));
 	*len = (unsigned)(n - 1);
 }
 
@@ -81,13 +83,38 @@ static int set_hook(prof_backtrace_hook_t hook)
 	return SHH_OK;
 }
 
+/*
+ * libunwind's global cache takes a lock, and libunwind registers no fork
+ * handler: a fork while another thread unwinds would leave the child's lock
+ * held. A per-thread cache takes no such lock. Best effort: the names are
+ * per architecture, and without them the default policy stays.
+ */
+static void per_thread_caching(void *h)
+{
+#if defined(__x86_64__)
+	const char *set = "_ULx86_64_set_caching_policy";
+	const char *as = "_ULx86_64_local_addr_space";
+#elif defined(__aarch64__)
+	const char *set = "_ULaarch64_set_caching_policy";
+	const char *as = "_ULaarch64_local_addr_space";
+#else
+	const char *set = NULL, *as = NULL;
+#endif
+	if (!set)
+		return;
+	unw_set_caching_policy_fn f = (unw_set_caching_policy_fn)dlsym(h, set);
+	void **space = dlsym(h, as);
+	if (f && space && *space)
+		f(*space, UNW_CACHE_PER_THREAD);
+}
+
 static int load_libunwind(void)
 {
 	if (unw_backtrace_p)
 		return SHH_OK;
 	/* SYSTING_HEAP_HOOKS_LIBUNWIND names another library (or, in tests, a
-	 * missing one). */
-	const char *name = getenv("SYSTING_HEAP_HOOKS_LIBUNWIND");
+	 * missing one); ignored in a setuid or file-capability process. */
+	const char *name = secure_getenv("SYSTING_HEAP_HOOKS_LIBUNWIND");
 	const char *const names[] = {name ? name : "libunwind.so.8",
 				     name ? NULL : "libunwind.so"};
 	for (size_t i = 0; i < 2 && names[i]; i++) {
@@ -97,6 +124,7 @@ static int load_libunwind(void)
 		void *p = dlsym(h, "unw_backtrace");
 		if (p) {
 			unw_backtrace_p = (unw_backtrace_fn)p;
+			per_thread_caching(h);
 			return SHH_OK;
 		}
 		dlclose(h);
@@ -104,7 +132,17 @@ static int load_libunwind(void)
 	return SHH_ERR_NO_LIBUNWIND;
 }
 
+static int install_locked(const char *backtrace);
+
 int systing_heap_hooks_install(const char *backtrace)
+{
+	pthread_mutex_lock(&install_lock);
+	int rc = install_locked(backtrace);
+	pthread_mutex_unlock(&install_lock);
+	return rc;
+}
+
+static int install_locked(const char *backtrace)
 {
 	if (!backtrace)
 		return SHH_ERR_UNKNOWN_BACKTRACE;
@@ -145,7 +183,10 @@ int systing_heap_hooks_install(const char *backtrace)
 
 const char *systing_heap_hooks_active(void)
 {
-	return active;
+	pthread_mutex_lock(&install_lock);
+	const char *a = active;
+	pthread_mutex_unlock(&install_lock);
+	return a;
 }
 
 const char *systing_heap_hooks_strerror(int code)
