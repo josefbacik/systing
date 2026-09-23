@@ -113,6 +113,7 @@ PYTHONPERFSUPPORT=1
 
 Python then gives each Python function its own native frame (a "perf trampoline"), and writes `/tmp/perf-<pid>.map` naming them.
 **Keep that file** with the snapshots: without it, Python frames can't be named.
+Each process, forked workers included, writes its own map, named by its pid.
 Setting this in the environment, rather than from code, also covers the frames already running at startup, such as the main module and a long-lived loop.
 
 ### 2. Keep every Python caller in the stack (recommended)
@@ -129,7 +130,9 @@ print(systing_heap_hooks.install(backtrace="libunwind"))
 If something is missing (no libunwind8, jemalloc not preloaded, profiling off), it falls back to jemalloc's own stacks and says why in `reasons`; it never stops the service.
 Pass `strict=True` to fail instead.
 
-> **Services that fork workers** (gunicorn, multiprocessing with fork): call `install()` in each worker after it forks, for example in gunicorn's `post_fork` hook, not in the parent before forking.
+> **Services that fork workers** (gunicorn, multiprocessing with fork): call `install()` in each worker after it forks, for example in gunicorn's `post_fork` hook.
+> On Python 3.13+, also call `systing_heap_hooks.keep_perf_map_across_fork()` once in the parent at startup, before any worker forks.
+> Without it, frames the worker inherited already running from the parent, such as the server's own loop under every request, can't be named in the worker's snapshots.
 
 ### Part 1 + part 2 as pod environment
 
@@ -195,13 +198,13 @@ systing-heap -o heap.duckdb /heap-dumps/jeprof
 
 It loads the **latest snapshot of each process**, writes the database, and only then **deletes that process's older snapshots**, so interval snapshots don't pile up on disk.
 Each run replaces `heap.duckdb`.
-It never touches files it can't be sure are jemalloc snapshots with that prefix, and it prints every file it deletes.
+It deletes only regular files directly in that folder whose names start with the prefix and a pid, and whose first line is jemalloc's `heap_v2/` header, and it prints every file it deletes.
 
 | Option | What it does |
 |---|---|
 | `--dry-run` | Print what would be loaded and deleted; change nothing. Try this first. |
 | `--keep-all` | Load every snapshot and delete nothing, for example to see how the heap grew over time. |
-| `-o heap.perfetto` | Write a Perfetto trace instead (also `.pb`, `.pftrace`, `.perfetto-trace`). Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process has a heap-profile track with a marker per snapshot, and clicking one shows its flamegraph. |
+| `-o heap.pb` | Write a Perfetto trace instead (also `.perfetto`, `.pftrace`, `.perfetto-trace`). Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process has a heap-profile track with a marker per snapshot, and clicking one shows its flamegraph. |
 | `--perf-map-dir DIR` | Where to look first for Python's `perf-<pid>.map` (part 2). Without it, the tool looks beside the snapshots, then in `/tmp`. |
 
 Named files or a folder (`systing-heap -o heap.duckdb /heap-dumps/`) are only loaded, never deleted.
@@ -210,18 +213,22 @@ Named files or a folder (`systing-heap -o heap.duckdb /heap-dumps/`) are only lo
 
 Each row of `heap_sample` is one allocation stack in one snapshot.
 Use the `est_*` columns: they are the estimates for the whole process.
-The other count columns are the raw samples and far too small.
+The other count columns are the raw samples, far too small as totals, but they say how many samples an estimate rests on: a stack with only one or two sampled objects has a rough estimate.
 
 ```sql
 -- estimated live heap per snapshot
 SELECT snapshot_id, sum(est_live_bytes) AS est_live_bytes
 FROM heap_sample GROUP BY snapshot_id;
 
--- the biggest stacks in the latest snapshot
+-- the biggest stacks in each process's newest snapshot
+WITH newest AS (
+  SELECT trace_id, id FROM heap_snapshot
+  QUALIFY row_number() OVER (PARTITION BY trace_id, upid ORDER BY seq DESC) = 1
+)
 SELECT h.est_live_bytes, sf.frame_names
 FROM heap_sample h
+JOIN newest n ON n.trace_id = h.trace_id AND n.id = h.snapshot_id
 JOIN stack_frames sf ON sf.trace_id = h.trace_id AND sf.id = h.stack_id
-WHERE h.snapshot_id = (SELECT max(id) FROM heap_snapshot)
 ORDER BY h.est_live_bytes DESC LIMIT 10;
 ```
 
@@ -240,7 +247,7 @@ Coming soon: how to run this remotely, without a shell in the service's containe
 | Snapshots | Disk: a few KB to a few MB each, as often as the interval fires. |
 | `PYTHONMALLOC=malloc` | Some CPU and memory for small objects, which now go through jemalloc instead of Python's pools. Measure it on your workload. |
 | Perf trampolines (part 2) | An extra native call on every Python function call: about 40% slower on a benchmark made only of Python calls, far less for code that spends its time in C (numpy, torch). |
-| The hook (part 2) | Runs only when jemalloc samples an allocation. |
+| The hook (part 2) | Runs only when jemalloc samples an allocation, so a lower `lg_prof_sample` runs it more often; threads unwinding at the same moment wait for one another. |
 
 ## Check that it works
 
@@ -249,6 +256,6 @@ Coming soon: how to run this remotely, without a shell in the service's containe
 
 ## Known limits
 
-- **No Python line numbers yet.** Python frames name the function and file, not the line.
+- **No Python line numbers yet.** Python frames name the function and file, not the line, so two functions with the same name in files with the same name show as one.
 - **One service per snapshot folder.** Processes are told apart by pid, and containers often share pid 1, so two services writing to one folder would mix.
 - **Same binaries later.** Stacks are resolved from the service's own binaries after the fact, so the image must still be available where the snapshots are loaded.

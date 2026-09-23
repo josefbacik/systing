@@ -70,9 +70,9 @@ impl Reported {
     fn next(self, [live_b, live_n, acc_b, acc_n]: [u64; 4]) -> Reported {
         let grow = |prev_alloc: u64, prev_freed: u64, live: u64, acc: u64| {
             let allocated = if acc > 0 {
-                prev_alloc.max(acc).max(prev_freed + live)
+                prev_alloc.max(acc).max(prev_freed.saturating_add(live))
             } else {
-                prev_alloc + live.saturating_sub(prev_alloc - prev_freed)
+                prev_alloc.saturating_add(live.saturating_sub(prev_alloc - prev_freed))
             };
             let freed = prev_freed.max(allocated.saturating_sub(live));
             (allocated, freed)
@@ -102,9 +102,21 @@ struct Sequence {
     frame_defs: Vec<Frame>,
     callstack_defs: Vec<Callstack>,
     reported: BTreeMap<u64, Reported>,
+    /// The last snapshot's timestamp, to keep this process's in order.
+    last_ts: Option<u64>,
+}
+
+/// State shared by every process in the trace. Perfetto merges every
+/// process's mapping of one module and attaches symbols by (mapping,
+/// rel_pc), so what those are keyed by must mean the same frame in every
+/// process.
+#[derive(Default)]
+struct Trace {
+    /// The rel_pc of each frame with no address (Python functions), by name.
+    addressless: HashMap<String, u64>,
     /// Frames with a source file, for the symbols sent at the end:
-    /// (module, rel_pc, function, file, line).
-    sourced: Vec<(String, u64, String, String, Option<i64>)>,
+    /// (module, rel_pc) -> (function, file, line).
+    sourced: BTreeMap<(String, u64), (String, String, Option<i64>)>,
 }
 
 impl Sequence {
@@ -119,7 +131,7 @@ impl Sequence {
             frame_defs: Vec::new(),
             callstack_defs: Vec::new(),
             reported: BTreeMap::new(),
-            sourced: Vec::new(),
+            last_ts: None,
         }
     }
 
@@ -156,7 +168,7 @@ impl Sequence {
 
     /// The frame for a systing frame name, split into function, module and
     /// source; `full_path` is the source's full path where known.
-    fn frame(&mut self, name: &str, full_path: Option<&str>) -> u64 {
+    fn frame(&mut self, name: &str, full_path: Option<&str>, trace: &mut Trace) -> u64 {
         if let Some(&iid) = self.frames.get(name) {
             return iid;
         }
@@ -175,22 +187,23 @@ impl Sequence {
         f.set_function_name_id(function);
         f.set_mapping_id(mapping);
         // The frame's identity within its mapping: the address where there
-        // is one, else a value no address takes, so frames that differ only
-        // by their source are not merged.
+        // is one, else a value no address takes, one per frame name across
+        // the trace, so frames that differ only by their source are not
+        // merged and one process's frame never takes another's symbols.
         let address = parts
             .address
             .and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok());
-        let rel_pc = address.unwrap_or(u64::MAX - iid);
+        let rel_pc = address.unwrap_or_else(|| {
+            let next = u64::MAX - trace.addressless.len() as u64 - 1;
+            *trace.addressless.entry(name.to_string()).or_insert(next)
+        });
         f.set_rel_pc(rel_pc);
         self.frame_defs.push(f);
         if let Some(file) = full_path.or(parts.file) {
-            self.sourced.push((
-                module,
-                rel_pc,
-                parts.function.to_string(),
-                file.to_string(),
-                parts.line,
-            ));
+            trace
+                .sourced
+                .entry((module, rel_pc))
+                .or_insert_with(|| (parts.function.to_string(), file.to_string(), parts.line));
         }
         iid
     }
@@ -249,6 +262,10 @@ pub fn write(out: &Path, snapshots: &[Snapshot], symbolized: &Symbolized) -> Res
         writer.flush()?;
     }
     buf.flush()?;
+    // On disk before the caller deletes the dumps it was made from.
+    buf.get_ref()
+        .sync_all()
+        .with_context(|| format!("syncing {}", out.display()))?;
     Ok(written)
 }
 
@@ -304,6 +321,7 @@ fn write_packets(
 
     // Snapshots in dump order per process (the caller sorts by pid, seq).
     let mut sequences: BTreeMap<Option<i32>, Sequence> = BTreeMap::new();
+    let mut trace = Trace::default();
     let mut frame_count = 0;
     for (si, s) in snapshots.iter().enumerate() {
         let seq = sequences.entry(s.pid).or_insert_with(Sequence::new);
@@ -322,6 +340,11 @@ fn write_packets(
             .dumped_at_unix_ns
             .and_then(|t| u64::try_from(t).ok())
             .unwrap_or(si as u64 * 1_000_000_000);
+        // Each snapshot holds its increase since the previous one in
+        // sequence order, and Perfetto adds them up in time order: keep the
+        // two the same where a copy moved the files' mtimes.
+        let ts = seq.last_ts.map_or(ts, |last| ts.max(last + 1));
+        seq.last_ts = Some(ts);
         dump.set_timestamp(ts);
 
         // This snapshot's estimates per stack: two rows can share a stack
@@ -332,14 +355,14 @@ fn write_packets(
                 .iter()
                 .map(|n| {
                     let full = symbolized.files.get(n).map(String::as_str);
-                    seq.frame(n, full)
+                    seq.frame(n, full, &mut trace)
                 })
                 .collect();
             let callstack = seq.callstack(frames);
             let est = sample.estimates(s.sample_period);
             let sum = now.entry(callstack).or_default();
             for (a, b) in sum.iter_mut().zip(est) {
-                *a += b;
+                *a = a.saturating_add(b);
             }
             written.samples += 1;
         }
@@ -396,8 +419,10 @@ fn write_packets(
     for seq in sequences.values() {
         frame_count += seq.frame_defs.len();
         written.stacks += seq.callstack_defs.len();
+    }
+    {
         let mut by_module: BTreeMap<&str, Vec<AddressSymbols>> = BTreeMap::new();
-        for (module, rel_pc, function, file, line) in &seq.sourced {
+        for ((module, rel_pc), (function, file, line)) in &trace.sourced {
             let mut l = Line::default();
             l.set_function_name(function.clone());
             l.set_source_file_name(file.clone());

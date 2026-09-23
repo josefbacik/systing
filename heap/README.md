@@ -51,10 +51,10 @@ Run it one-shot, from cron or a loop, as often as you want the database refreshe
 
 ## Perfetto output
 
-Give `-o` a Perfetto extension (`.pb`, `.perfetto`, `.pftrace` or `.perfetto-trace`) and the snapshots are written as native heap profiles, the format Perfetto's own heap profiler (heapprofd) writes, instead of a DuckDB database:
+Give `-o` a Perfetto extension (`.pb`, as systing's traces use, or `.perfetto`, `.pftrace`, `.perfetto-trace`) and the snapshots are written as native heap profiles, the format Perfetto's own heap profiler (heapprofd) writes, instead of a DuckDB database:
 
 ```bash
-systing-heap -o heap.perfetto /data/heap/jeprof --keep-all
+systing-heap -o heap.pb /data/heap/jeprof --keep-all
 ```
 
 Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process gets a heap-profile track with a marker per snapshot, and clicking a marker shows its flamegraph.
@@ -93,7 +93,8 @@ Symbolization is offline.
 Each jemalloc dump ends with a copy of the process's `/proc/self/maps`.
 The tool uses it to turn each address into a file and a file offset, then reads symbols from that file on the machine running `systing-heap`.
 So the binaries must exist at the same paths, on the same host or in the same image the process ran in.
-The tool warns about files that are missing, and about files whose inode differs from the one in the dump, since those may be a different build.
+The tool warns about files that are missing, and about files whose device and inode differ from the ones in the dump, since those may be a different build.
+On an overlay filesystem (most container images) the pair the dump records and the pair the file shows can differ for the same file, so there the warning means "not provably the same file", not "changed".
 
 Frames are named the way systing's recorders name them: `function (module [file:line]) <0xaddr>`.
 A frame in a known file with no symbol is `unknown (module) <0xaddr>`.
@@ -141,10 +142,11 @@ The options, from most to least complete:
 Things to know:
 
 - **Turn trampolines on early.** Trampolines only wrap functions called after they are on, so a frame already running (the module that calls `install()`, a long-lived main loop) has none, in this and every later snapshot. `PYTHONPERFSUPPORT=1` turns them on at startup. The hook applies only to allocations sampled after `install()`.
-- **Forking processes.** Install in each worker after it forks, not in the parent before. The hook asks libunwind for per-thread caches, which avoids its global lock, but libunwind registers no fork handler of its own.
-- **Function granularity.** A trampoline is per function, so Python frames name the function and file (full path in `frame_file`), not the line. Library code gets pystacks' module prefix (`pkg.mod:Cls.run (python) [mod.py]`), so the same function has the same name as in a capture's stacks, apart from the line.
+- **Forking processes.** Each worker starts a perf map of its own, so the frames it inherited already running from the parent (a pre-fork server's loop, under every worker's stacks) are named in none the worker's dumps can use. On Python 3.13+, call `systing_heap_hooks.keep_perf_map_across_fork()` once in the parent, with trampolines on, before it forks: each child then adds the parent's map to its own. (CPython's own persist-after-fork setting is not used: it stops the child making trampolines, so what the worker runs afterwards goes unnamed.) The hook itself is fork-safe: unwinds take one lock, and a fork waits for any unwind in progress, since libunwind's cache lock has no fork handler of its own.
+- **Function granularity.** A trampoline is per function, so Python frames name the function and file (full path in `frame_file`), not the line. Library code gets pystacks' module prefix (`pkg.mod:Cls.run (python) [mod.py]`), so the same function has the same name as in a capture's stacks, apart from the line: pystacks writes `[mod.py:42]`, so drop the `:<line>` (`regexp_replace(name, ':\d+\]$', ']')`) to join the two by name.
+Application code has no module prefix, so two functions with the same qualified name in files with the same base name are one frame.
 - **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps. Without it, Python frames show as `unknown ([anon:exec])` and the tool warns. It prints which map named each process's frames, and a map is consulted only for addresses the dump's own memory map puts in anonymous executable memory, so a stale map cannot name data. A refused candidate falls through to the next. A map is read only if it is a regular file (symlinks are not followed) of at most 256 MiB, and one in a world-writable directory such as `/tmp` only if you or root own it, as perf requires: otherwise another user could name your frames.
-- **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran about 40% slower. Code that spends its time in C pays far less. The hook itself runs only for sampled allocations.
+- **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran about 40% slower. Code that spends its time in C pays far less. The hook runs only for sampled allocations, so a finer sample period runs it more often (32 times as often per byte at a 16 KiB period as at the 512 KiB default), and threads unwinding at the same moment wait for one another.
 
 ## Sampling and unbiasing
 
@@ -168,11 +170,11 @@ jemalloc 5.3 writes each stack's counts so that this per-stack step gives jemall
 **Scale first, then add up.**
 The factor depends on the object size, so it must be applied to each stack on its own, and only the scaled values added together, across stacks, snapshots or machines.
 Adding the raw counts first and scaling the sum under-counts small objects badly, as jemalloc's own notes explain ([PROFILING_INTERNALS.md, "Aggregation must be done after unbiasing samples"](https://github.com/jemalloc/jemalloc/blob/dev/doc_internal/PROFILING_INTERNALS.md#aggregation-must-be-done-after-unbiasing-samples)).
-This is why the tables store the estimate of every row (`est_*`) and not the dump's header totals, which are exactly such a sum.
+This is why the tables store the estimate of every row (`est_*`) and not the dump's header totals, which are a sum over stacks (in jemalloc 5.3 interval dumps not always equal to the rows' own sum).
 
 **How close it gets.**
-For a Python program holding 97.1 MB (jemalloc's own count, with sampling off) in a mix of small, medium and large objects, the sum of `est_live_bytes` came to 86 to 102 MB over three runs at the default period, and to within 1 to 2% at a 16 KiB period.
-The sampled counts alone came to 3% and 6% of the real heap.
+For a Python program holding 97.1 MB (jemalloc's own count, with sampling off) in a mix of small, medium and large objects, the sum of `est_live_bytes` came to 86 to 102 MB over three runs at the default period, and to within 2% at a 16 KiB period.
+The sampled counts alone came to 3% and 6% of the real heap; how far off they are depends on object size, and for objects several times the period they come close.
 A finer period gives a closer estimate, but sampling itself costs memory: jemalloc keeps each sampled object in a larger block, so the process's real heap grew from 97 MB to 159 MB at the 16 KiB period.
 `heap/tests/estimates.rs` checks this end to end.
 
@@ -199,7 +201,10 @@ A finer period gives a closer estimate, but sampling itself costs memory: jemall
 | `stack_id` | `stack.id` |
 | `est_live_objects`, `est_live_bytes` | **Estimated** objects and bytes allocated from this stack and not yet freed, in the whole process. Use these. |
 | `est_alloc_objects`, `est_alloc_bytes` | Estimated cumulative allocations since start; 0 unless jemalloc ran with `prof_accum:true` |
-| `live_objects`, `live_bytes`, `alloc_objects`, `alloc_bytes` | The sampled counts as jemalloc wrote them, before unbiasing. Kept for reference; never add them up as totals |
+| `live_objects`, `live_bytes`, `alloc_objects`, `alloc_bytes` | The sampled counts as jemalloc wrote them, before unbiasing. Never add them up as totals |
+
+A total over many rows is close; one row's estimate is only as good as the samples behind it, about ±1/√`live_objects`.
+One sampled 256-byte object at a 16 KiB period reads 16,512 bytes, give or take all of it, so check `live_objects` before trusting a small stack's estimate.
 
 Pids are the writing process's own, in its pid namespace.
 Two containers whose main process is pid 1 share one `process` row when their dumps are read into one database, and heap rows carry no host or container of their own; `source_path` says where each came from.
@@ -207,11 +212,13 @@ A DuckDB merge keeps these tables; a schema-24 reader's merge, or an export to p
 
 ## Queries
 
+Ids are per trace, so a database holding more than one trace (a merge) groups by `trace_id` as well.
+
 A snapshot's estimated live heap:
 
 ```sql
-SELECT snapshot_id, sum(est_live_bytes) AS est_live_bytes
-FROM heap_sample GROUP BY snapshot_id ORDER BY snapshot_id;
+SELECT trace_id, snapshot_id, sum(est_live_bytes) AS est_live_bytes
+FROM heap_sample GROUP BY trace_id, snapshot_id ORDER BY trace_id, snapshot_id;
 ```
 
 Estimated live bytes by the function that allocated, per snapshot: the innermost frame of each stack that is in the program's own binary (`myprogram` here):
@@ -244,6 +251,7 @@ ORDER BY h.est_live_bytes DESC;
 Growth between each process's first and last snapshot, by stack.
 Stack ids compare only within one process (frames carry absolute addresses, which differ between processes), and one stack id can have more than one row in a snapshot, hence the sums.
 With a prefix input and no `--keep-all` there is one snapshot per process, so read with `--keep-all` for this.
+A snapshot whose file name lost its pid or its sequence number has none to order by, and drops out.
 
 ```sql
 WITH rows AS (
@@ -251,12 +259,13 @@ WITH rows AS (
   JOIN heap_snapshot s ON s.trace_id = h.trace_id AND s.id = h.snapshot_id
 ),
 ends AS (
-  SELECT upid, min(seq) AS first_seq, max(seq) AS last_seq FROM heap_snapshot GROUP BY upid
+  SELECT trace_id, upid, min(seq) AS first_seq, max(seq) AS last_seq
+  FROM heap_snapshot GROUP BY trace_id, upid
 )
-SELECT r.upid, r.stack_id,
+SELECT r.trace_id, r.upid, r.stack_id,
        coalesce(sum(r.est_live_bytes) FILTER (WHERE r.seq = ends.last_seq), 0)
      - coalesce(sum(r.est_live_bytes) FILTER (WHERE r.seq = ends.first_seq), 0) AS growth
-FROM rows r JOIN ends USING (upid)
+FROM rows r JOIN ends USING (trace_id, upid)
 GROUP BY ALL ORDER BY growth DESC;
 ```
 

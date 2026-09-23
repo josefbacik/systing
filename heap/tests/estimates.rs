@@ -2,7 +2,9 @@
 //! jemalloc allocates a known mix of object sizes, jemalloc counts its live
 //! bytes with sampling off (`stats.allocated`), and the sum of `heap_sample`'s
 //! estimates for a dump of the same program must come close. Skipped (with a
-//! note) where there is no jemalloc or Python 3.12+.
+//! note) where there is no jemalloc or Python 3.12+; see `common::skip`.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,25 +36,10 @@ print(allocated.value)
 "#;
 
 fn setup() -> Option<(PathBuf, String)> {
-    let jemalloc = [
-        "/lib/x86_64-linux-gnu/libjemalloc.so.2",
-        "/usr/lib64/libjemalloc.so.2",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.exists());
-    let python = ["python3.14", "python3.13", "python3.12"]
-        .into_iter()
-        .find(|p| {
-            Command::new(p)
-                .arg("-V")
-                .output()
-                .is_ok_and(|o| o.status.success())
-        });
-    match (jemalloc, python) {
-        (Some(j), Some(p)) => Some((j, p.to_string())),
+    match (common::jemalloc(), common::python()) {
+        (Some(j), Some((p, _))) => Some((j, p)),
         _ => {
-            eprintln!("skipped: needs libjemalloc.so.2 and Python 3.12+");
+            common::skip("needs libjemalloc.so.2 and Python 3.12+");
             None
         }
     }

@@ -21,6 +21,12 @@ active, so one call works on machines with and without libunwind8:
 
 strict=True raises instead. The C library is found by the lib argument, then
 SYSTING_HEAP_HOOKS_LIB, then libsysting_heap_hooks.so next to this file.
+
+A server that forks workers (gunicorn, multiprocessing) calls install() in
+each worker after the fork, and keep_perf_map_across_fork() once in the
+parent before it: a child starts a perf map of its own, and without this the
+frames it inherited running from the parent (the parent's loop under every
+worker) are named in no map the child's dumps can use.
 """
 
 import ctypes
@@ -28,7 +34,7 @@ import os
 import sys
 import warnings
 
-__all__ = ["install"]
+__all__ = ["install", "keep_perf_map_across_fork"]
 
 _LIB_NAME = "libsysting_heap_hooks.so"
 _lib = None
@@ -99,3 +105,40 @@ def install(backtrace="libunwind", trampolines=True, strict=False, lib=None):
             raise RuntimeError(message)
         warnings.warn(message, RuntimeWarning, stacklevel=2)
     return result
+
+
+_copy_on_fork = False
+
+
+def keep_perf_map_across_fork(strict=False):
+    """Make each child this process forks add this process's perf map to its
+    own (CPython 3.13+). Call it in the parent, before the fork, with perf
+    trampolines on. Returns whether it is on."""
+    global _copy_on_fork
+    why = None
+    copy = None
+    if not getattr(sys, "is_stack_trampoline_active", lambda: False)():
+        why = "keeping the perf map across fork: perf trampolines are not active"
+    else:
+        copy = getattr(ctypes.pythonapi, "PyUnstable_CopyPerfMapFile", None)
+        if copy is None:
+            why = "keeping the perf map across fork needs Python 3.13+"
+    if why is None:
+        if not _copy_on_fork:
+            copy.argtypes = [ctypes.c_char_p]
+            copy.restype = ctypes.c_int
+
+            # CPython starts the child's own map before these run. Its
+            # persist-after-fork setting is not used: that stops the child
+            # making trampolines, so what the child runs later is unnamed.
+            def add_parent_map():
+                copy(f"/tmp/perf-{os.getppid()}.map".encode())
+
+            os.register_at_fork(after_in_child=add_parent_map)
+            _copy_on_fork = True
+        return True
+    message = "systing_heap_hooks: " + why
+    if strict:
+        raise RuntimeError(message)
+    warnings.warn(message, RuntimeWarning, stacklevel=2)
+    return False

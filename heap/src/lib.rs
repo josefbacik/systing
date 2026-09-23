@@ -86,10 +86,14 @@ fn unbias(bytes: u64, objects: u64, sample_period: u64) -> (u64, u64) {
     }
     let mean = bytes as f64 / objects as f64;
     let scale = 1.0 / (1.0 - (-mean / sample_period as f64).exp());
-    (
-        (bytes as f64 * scale).round() as u64,
-        (objects as f64 * scale).round() as u64,
-    )
+    // Only a malformed dump gets here (objects but no bytes, or a period too
+    // large for mean / period to register): there is no estimate to make.
+    if !scale.is_finite() {
+        return (bytes, objects);
+    }
+    // Estimates are stored as BIGINT: the cast to i64 saturates there.
+    let clamp = |v: f64| (v.round() as i64).max(0) as u64;
+    (clamp(bytes as f64 * scale), clamp(objects as f64 * scale))
 }
 
 #[cfg(test)]
@@ -114,5 +118,10 @@ mod tests {
         assert_eq!(b, 66759);
         // Nothing sampled stays nothing.
         assert_eq!(sample(0, 0).estimates(16384), [0, 0, 0, 0]);
+        // A malformed row keeps its counts rather than turning infinite.
+        assert_eq!(sample(0, 3).estimates(16384), [0, 3, 0, 0]);
+        assert_eq!(sample(1, 1).estimates(u64::MAX), [1, 1, 0, 0]);
+        let [b, n, _, _] = sample(u64::MAX, 1 << 40).estimates(1);
+        assert!(b <= i64::MAX as u64 && n <= i64::MAX as u64);
     }
 }

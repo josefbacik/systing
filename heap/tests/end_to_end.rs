@@ -51,6 +51,24 @@ fn a_dump_becomes_named_stacks_and_heap_rows() {
         .unwrap();
     assert_eq!(version, systing::duckdb::SCHEMA_VERSION as i32);
 
+    // The trace names its recorder: NULL recorder columns would read as
+    // "imported from a directory with no manifest".
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+        - 3_600_000_000_000;
+    let (recorder, recorder_schema, recorded_at): (String, i32, i64) = conn
+        .query_row(
+            "SELECT recorder_version, recorder_schema_version, recorded_at_unix_ns FROM _traces",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(recorder, systing::duckdb::SYSTING_VERSION);
+    assert_eq!(recorder_schema, systing::duckdb::SCHEMA_VERSION as i32);
+    assert!(recorded_at > before, "{recorded_at}");
+
     // Root first: the unmapped 0x10 is the outermost frame (the recorders'
     // label for an address in no mapping), the function the
     // leaf; the caller frame resolved to the same function via addr - 1.
@@ -301,4 +319,101 @@ fn perfetto_output_splits_frames_and_reports_cumulative_counts() {
     assert!(f1 > 0 && f1 < a0, "{f1} of {a0} freed");
     assert_eq!(dumps[0].pid(), 91);
     assert_eq!(dumps[0].heap_name(), "jemalloc");
+}
+
+#[test]
+fn perfetto_output_keeps_processes_and_snapshot_order_apart() {
+    use perfetto_protos::trace::Trace;
+    use protobuf::Message;
+    use std::time::{Duration, SystemTime};
+
+    // Two processes whose Python functions sit at the same addresses, and a
+    // copy that left process 91's first dump newer than its second.
+    let dir = tempfile::tempdir().unwrap();
+    let maps = "00020000-00021000 r-xp 00000000 00:00 0 \n";
+    let dump = "heap_v2/1\n  t*: 1: 64 [0: 0]\n@ 0x20008 0x20028\n  t*: 1: 64 [0: 0]\n\
+                \nMAPPED_LIBRARIES:\n"
+        .to_string()
+        + maps;
+    let now = SystemTime::now();
+    for (name, age) in [
+        ("jeprof.91.0.i0.heap", 0),
+        ("jeprof.91.1.i1.heap", 60),
+        ("jeprof.92.0.i0.heap", 30),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &dump).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(age))
+            .unwrap();
+    }
+    for (pid, leaf, outer) in [(91, "leak", "Outer.run"), (92, "fetch", "Client.get")] {
+        std::fs::write(
+            dir.path().join(format!("perf-{pid}.map")),
+            format!("20000 10 py::{leaf}:/srv/{pid}.py\n20020 10 py::{outer}:/srv/{pid}.py\n"),
+        )
+        .unwrap();
+    }
+    let out = dir.path().join("heap.pb");
+    let st = std::process::Command::new(env!("CARGO_BIN_EXE_systing-heap"))
+        .arg(dir.path().join("jeprof"))
+        .args(["--keep-all", "-o"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let trace = Trace::parse_from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    // Perfetto merges both processes' [python] mapping and attaches symbols
+    // by rel_pc, so each rel_pc must stand for one function in every packet.
+    let mut symbol_at = std::collections::HashMap::new();
+    let mut frames = Vec::new();
+    let mut timestamps = Vec::new();
+    for p in &trace.packet {
+        if p.has_module_symbols() {
+            for a in &p.module_symbols().address_symbols {
+                let f = a.lines[0].function_name().to_string();
+                assert!(
+                    symbol_at.insert(a.address(), f.clone()).is_none(),
+                    "two symbols at {:#x}",
+                    a.address()
+                );
+            }
+        }
+        if p.has_profile_packet() {
+            let pp = p.profile_packet();
+            let strings: std::collections::HashMap<u64, String> = pp
+                .strings
+                .iter()
+                .map(|s| (s.iid(), String::from_utf8(s.str().to_vec()).unwrap()))
+                .collect();
+            for f in &pp.frames {
+                frames.push((strings[&f.function_name_id()].clone(), f.rel_pc()));
+            }
+            for d in &pp.process_dumps {
+                timestamps.push((d.pid(), d.timestamp()));
+            }
+        }
+    }
+    for (name, rel_pc) in &frames {
+        assert_eq!(&symbol_at[rel_pc], name, "frame {name} at {rel_pc:#x}");
+    }
+    let mut named: Vec<&String> = symbol_at.values().collect();
+    named.sort();
+    assert_eq!(named, vec!["Client.get", "Outer.run", "fetch", "leak"]);
+    // Snapshots are in sequence order per process, and so are their times.
+    let t91: Vec<u64> = timestamps
+        .iter()
+        .filter(|t| t.0 == 91)
+        .map(|t| t.1)
+        .collect();
+    assert_eq!(t91.len(), 2);
+    assert!(t91[0] < t91[1], "{t91:?}");
 }

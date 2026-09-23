@@ -480,9 +480,10 @@ recorder's, so the usual stack queries and flamegraphs work on them.
   must come before any sum: summing stacks first under-counts small objects
   badly (jemalloc's PROFILING_INTERNALS.md, "Aggregation must be done after
   unbiasing samples"). `live_*` / `alloc_*` are the counts as written, before
-  unbiasing, kept for reference: summed, they come to a few percent of the
-  real heap. `alloc_*` are cumulative since start and 0 unless the allocator
-  tracked them (jemalloc `prof_accum`).
+  unbiasing, kept for reference: summed, they under-count, by how much
+  depending on object size (3% and 6% of the real heap for the test's
+  mostly small objects). `alloc_*` are cumulative since start and 0 unless
+  the allocator tracked them (jemalloc `prof_accum`).
 
 Python frames (named from a perf map, with perf trampolines) are
 function-level: `module:qualname (python) [file.py]` like pystacks' for

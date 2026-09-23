@@ -94,13 +94,14 @@ pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
     for (&path, offsets) in &wanted {
         let offsets: Vec<u64> = offsets.iter().copied().collect();
         stats.lookups += offsets.len();
-        // The path comes from the dump, which anyone could have written:
-        // open it once, then check what was opened, so no device, FIFO or
-        // pseudo-file can hang the read or never end, and symbolize through
-        // that same handle.
-        let file = match std::fs::OpenOptions::new()
+        // The path comes from the dump, which anyone could have written.
+        // An O_PATH handle names the file without opening it, so no device
+        // or FIFO is opened before it is checked, and no pseudo-file read
+        // can hang or never end; a file that passes is reopened through
+        // that handle, so the file read is the one checked.
+        let handle = match std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
             .open(path)
         {
             Ok(f) => f,
@@ -113,10 +114,18 @@ pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
                 continue;
             }
         };
-        let Some(meta) = file
+        let Some(meta) = handle
             .metadata()
             .ok()
-            .filter(|m| m.is_file() && !on_pseudo_fs(&file))
+            .filter(|m| m.is_file() && !on_pseudo_fs(&handle))
+        else {
+            stats.refused_files.push(PathBuf::from(path));
+            continue;
+        };
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{}", handle.as_raw_fd()))
         else {
             stats.refused_files.push(PathBuf::from(path));
             continue;
@@ -288,19 +297,30 @@ fn render(
     (name, None)
 }
 
-/// Whether `file` is on procfs, sysfs, debugfs or tracefs, whose "regular"
-/// files are generated and can be endless.
+/// Whether `file` is on a kernel pseudo-filesystem, whose "regular" files
+/// are generated, can be endless, and can act when read.
 fn on_pseudo_fs(file: &std::fs::File) -> bool {
-    const PROC: i64 = 0x9fa0;
-    const SYSFS: i64 = 0x6265_6572;
-    const DEBUGFS: i64 = 0x6462_6720;
-    const TRACEFS: i64 = 0x7472_6163;
+    // Magic numbers from linux/magic.h.
+    const PSEUDO: [u32; 12] = [
+        0x9fa0,      // proc
+        0x6265_6572, // sysfs
+        0x6462_6720, // debugfs
+        0x7472_6163, // tracefs
+        0x0027_e0eb, // cgroup
+        0x6367_7270, // cgroup2
+        0x7363_6673, // securityfs
+        0x6265_6570, // configfs
+        0xcafe_4a11, // bpf
+        0xde5e_81e4, // efivarfs
+        0x6165_676c, // pstore
+        0xf97c_ff8c, // selinuxfs
+    ];
     let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: a valid fd and a writable statfs.
     if unsafe { libc::fstatfs(file.as_raw_fd(), &mut sfs) } != 0 {
         return true;
     }
-    #[allow(clippy::unnecessary_cast)]
-    let kind = sfs.f_type as i64;
-    matches!(kind, PROC | SYSFS | DEBUGFS | TRACEFS)
+    // f_type is a long on some targets and an int on others; the magic
+    // numbers are 32 bits either way.
+    PSEUDO.contains(&(sfs.f_type as u32))
 }

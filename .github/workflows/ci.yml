@@ -47,6 +47,8 @@ jobs:
           DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
           LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
           SYSTING_BPF_CLANG: "clang-21"
+          # The heap tests that run Python under jemalloc fail rather than skip.
+          SYSTING_HEAP_REQUIRE_TEST_DEPS: "1"
         run: cargo test --workspace --no-default-features
 
   fmt:

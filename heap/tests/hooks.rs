@@ -1,6 +1,9 @@
 //! The hooks library and its Python helper, for real: Python under jemalloc
 //! with perf trampolines, then systing-heap on the dump. Skipped (with a
-//! note) where there is no jemalloc, C compiler, or Python 3.12+.
+//! note) where there is no jemalloc, C compiler, or Python 3.12+; see
+//! `common::skip`.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,31 +27,41 @@ def outer():
 outer()
 "#;
 
+// A pre-fork server: serve() is running when the worker forks, and the
+// worker's own allocation happens under it.
+const FORK_APP: &str = r#"
+import ctypes, os, sys
+import systing_heap_hooks
+r = systing_heap_hooks.install(backtrace="libunwind", strict=True)
+if sys.argv[1] == "keep":
+    systing_heap_hooks.keep_perf_map_across_fork(strict=True)
+keep = []
+def leak_in_worker(n):
+    for _ in range(n):
+        keep.append(bytearray(64 * 1024))
+def serve():
+    pid = os.fork()
+    if pid == 0:
+        leak_in_worker(64)
+        ctypes.CDLL(None).mallctl(b"prof.dump", None, None, None, ctypes.c_size_t(0))
+        os._exit(0)
+    os.waitpid(pid, 0)
+    print(os.getpid(), pid)
+serve()
+"#;
+
 struct Env {
     jemalloc: PathBuf,
     python: String,
+    python_minor: u32,
     lib: PathBuf,
     dir: tempfile::TempDir,
 }
 
 fn setup() -> Option<Env> {
-    let jemalloc = [
-        "/lib/x86_64-linux-gnu/libjemalloc.so.2",
-        "/usr/lib64/libjemalloc.so.2",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.exists());
-    let python = ["python3.14", "python3.13", "python3.12"]
-        .into_iter()
-        .find(|p| {
-            Command::new(p)
-                .arg("-V")
-                .output()
-                .is_ok_and(|o| o.status.success())
-        });
-    let (Some(jemalloc), Some(python)) = (jemalloc, python) else {
-        eprintln!("skipped: needs libjemalloc.so.2 and Python 3.12+");
+    let (Some(jemalloc), Some((python, python_minor))) = (common::jemalloc(), common::python())
+    else {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
         return None;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -67,13 +80,15 @@ fn setup() -> Option<Env> {
         .args(["-ldl", "-lpthread"])
         .status();
     if !built.is_ok_and(|s| s.success()) {
-        eprintln!("skipped: no C compiler to build the hooks library");
+        common::skip("no C compiler to build the hooks library");
         return None;
     }
     std::fs::write(dir.path().join("app.py"), APP).unwrap();
+    std::fs::write(dir.path().join("fork_app.py"), FORK_APP).unwrap();
     Some(Env {
         jemalloc,
-        python: python.to_string(),
+        python,
+        python_minor,
         lib,
         dir,
     })
@@ -174,18 +189,11 @@ fn python_frames(frames: &[String]) -> Vec<&str> {
         .collect()
 }
 
-fn have_libunwind() -> bool {
-    Command::new("ldconfig")
-        .arg("-p")
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("libunwind.so.8 "))
-}
-
 #[test]
 fn libunwind_hook_keeps_every_python_caller() {
     let Some(env) = setup() else { return };
-    if !have_libunwind() {
-        eprintln!("skipped: needs libunwind.so.8");
+    if !common::have_libunwind() {
+        common::skip("needs libunwind.so.8");
         return;
     }
     let (reported, frames) = run(&env, "libunwind", None);
@@ -228,5 +236,98 @@ fn without_libunwind_install_falls_back_to_the_default() {
         python_frames(&frames),
         vec!["leak_in_python (python) [app.py]"],
         "{frames:#?}"
+    );
+}
+
+/// Run the pre-fork app; return the Python frames of the worker's largest
+/// stack.
+fn run_fork(env: &Env, mode: &str) -> Vec<String> {
+    let dumps = env.dir.path().join(format!("fork-{mode}"));
+    std::fs::create_dir(&dumps).unwrap();
+    let out = Command::new(&env.python)
+        .arg(env.dir.path().join("fork_app.py"))
+        .arg(mode)
+        .env("LD_PRELOAD", &env.jemalloc)
+        .env(
+            "MALLOC_CONF",
+            format!(
+                "prof:true,lg_prof_sample:12,prof_prefix:{}/jeprof",
+                dumps.display()
+            ),
+        )
+        .env("SYSTING_HEAP_HOOKS_LIB", &env.lib)
+        .env("PYTHONPATH", HOOKS)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pids = String::from_utf8_lossy(&out.stdout).to_string();
+    let (parent, worker) = pids.trim().split_once(' ').unwrap();
+    for pid in [parent, worker] {
+        let tmp_map = PathBuf::from(format!("/tmp/perf-{pid}.map"));
+        if tmp_map.exists() {
+            if pid == worker {
+                std::fs::copy(&tmp_map, dumps.join(format!("perf-{pid}.map"))).unwrap();
+            }
+            let _ = std::fs::remove_file(&tmp_map);
+        }
+    }
+    let db = dumps.join("heap.duckdb");
+    let st = Command::new(BIN)
+        .arg(&dumps)
+        .arg("-o")
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let conn = Connection::open(&db).unwrap();
+    let frames: Vec<String> = conn
+        .prepare(
+            "SELECT unnest(sf.frame_names) FROM heap_sample h
+             JOIN stack_frames sf ON sf.trace_id = h.trace_id AND sf.id = h.stack_id
+             WHERE h.stack_id = (SELECT stack_id FROM heap_sample ORDER BY live_bytes DESC LIMIT 1)",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    python_frames(&frames)
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn a_forked_worker_names_the_frames_it_inherited() {
+    let Some(env) = setup() else { return };
+    if !common::have_libunwind() {
+        common::skip("needs libunwind.so.8");
+        return;
+    }
+    // The CPython API it rests on is 3.13's; not a missing dependency.
+    if env.python_minor < 13 {
+        eprintln!("skipped: keep_perf_map_across_fork needs Python 3.13+");
+        return;
+    }
+    // Without it, the worker's map starts empty: serve(), entered in the
+    // parent, has no name there.
+    assert_eq!(
+        run_fork(&env, "plain"),
+        vec!["leak_in_worker (python) [fork_app.py]"]
+    );
+    assert_eq!(
+        run_fork(&env, "keep"),
+        vec![
+            "serve (python) [fork_app.py]",
+            "leak_in_worker (python) [fork_app.py]"
+        ]
     );
 }
