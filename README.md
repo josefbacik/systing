@@ -328,6 +328,102 @@ unchanged-thread skip and the CPU-time deltas hold for up to 65,536 targeted
 threads. `--collect-build-id` does not apply to these stacks. The recorder keeps
 its events until the capture ends, so it cannot be used with `--continuous`.
 
+### Task Context
+
+A program can say what each of its threads is working on, a request id or an
+iteration number, with the task-context library (`crates/task-context`; its
+README has the calls). `--include-task-context` records it: every
+running-stack sample then carries the id of its thread's context, and the
+`task_context` table holds the names and values each id stood for. To add it to
+an app and collect it, see the [Task context quick start](docs/TASK_CONTEXT.md).
+
+```bash
+sudo systing --include-task-context --pid 1234 -d 10 --output trace.duckdb
+```
+
+```sql
+-- CPU samples by request
+SELECT c.value_str AS request, count(*) AS samples
+FROM stack_sample s
+JOIN task_context c
+  ON c.trace_id = s.trace_id AND c.utid = s.utid AND c.id = s.task_context_id
+WHERE c.name = 'request_id'
+GROUP BY 1 ORDER BY 2 DESC;
+```
+
+- A thread's id changes with every set or clear, and the values of an id are
+  stored once, not with every sample: `stack_sample.task_context_id` is the
+  id, and the rows of `task_context` with that (`utid`, `id`) are what the
+  thread had set. Ids are unique within a thread only, so join on both. NULL
+  means none: the thread had nothing set, its process does not use the library
+  or was not found, or the read missed (each kind of miss is counted, below).
+- Which samples: the running stacks (`stack_event_type = 1`), the CPU
+  sampler's and the ones the probe recorders emit. Sleep stacks and the other
+  recorders' events do not carry an id yet.
+- Which processes: one whose executable carries the library (linked in), or
+  names it as a dependency of its own (`libtask_context*.so`). A process is
+  looked at when the capture starts (the targets, or every process on the host
+  without one) and again whenever it starts a new program, within a fraction of
+  a second, so the very first samples of a new process can lack an id. A
+  library that arrives any other way, by `dlopen`, as a dependency of another
+  library or preloaded, is not looked for, and neither is an executable
+  with no section table.
+- What is read: the ELF headers and two small sections of each distinct
+  executable, never its symbols; then 104 bytes of the process's memory, the
+  record the library publishes ([what it holds](crates/task-context/README.md#what-the-library-publishes)),
+  every field of which is checked against the tracer's own numbers before
+  anything is believed. Per sample, in BPF, the
+  thread pointer, the slot it leads to (8 bytes at the published offset or,
+  for a library built with `-DTASK_CONTEXT_DTV`, four 8-byte reads through the
+  thread's DTV) and 24 bytes of the thread's block; a process that publishes
+  nothing costs a sample one map lookup. Names
+  and values are whatever the traced process chose to set: a name outside
+  `[A-Za-z0-9_.:-]` is dropped, a string has invalid UTF-8 and control
+  characters replaced, and neither is ever more than the process's own say-so.
+- In the kernel's lockdown confidentiality mode nothing of this runs: no
+  process is looked at and no sample carries an id.
+- Without the flag none of the feature's BPF programs or maps is loaded. With
+  it: two ring buffers (4 MiB and 64 KiB), two small hash maps, and one thread
+  that looks at processes. A thread's values travel once per new id, at most
+  200 value records a second a CPU; past that, or with the ring full, a sample
+  keeps its id and the values are tried again at a later one.
+- Written for Linux 6.12 and newer (the kernels the object is load-tested on),
+  x86-64 and aarch64. The Perfetto trace does not show the context yet; the
+  tables do.
+
+When the capture ends it prints three lines: `task_context samples:` (what the
+BPF side did, by reason: `new_id`, `same_id`, and each kind of miss, such as
+`unset`, `out_of_range`, `bad_header`, `rate_limited`), `task_context
+discovery:` (processes looked at, recipes published or refused and why) and
+`task_context values:` (rows written, names dropped).
+
+To try it end to end with the library's example (three threads, three phases,
+each thread on a CPU for a second after every phase):
+
+```bash
+cc -O2 -g -pthread -I crates/task-context/include \
+   crates/task-context/src/task_context.c \
+   crates/task-context/examples/tcx_example.c -o /tmp/tcx_example
+sudo systing --include-task-context --output /tmp/tcx.duckdb -- /tmp/tcx_example --busy-ms 1000
+systing-analyze query -d /tmp/tcx.duckdb -s "
+  WITH seen AS (
+    SELECT trace_id, utid, task_context_id AS id, count(*) AS samples
+    FROM stack_sample WHERE task_context_id IS NOT NULL
+    GROUP BY trace_id, utid, task_context_id)
+  SELECT t.tid, c.id, any_value(seen.samples) AS samples,
+         string_agg(c.name || '=' || coalesce(c.value_str, c.value_u64::VARCHAR), ' ' ORDER BY c.name) AS context
+  FROM task_context c
+  JOIN thread t ON t.trace_id = c.trace_id AND t.utid = c.utid
+  LEFT JOIN seen ON seen.trace_id = c.trace_id AND seen.utid = c.utid AND seen.id = c.id
+  GROUP BY t.tid, c.id
+  ORDER BY t.tid, min(c.ts)"
+```
+
+Each thread prints the id it has after each phase (`TCX1 tid=... id=0x...`);
+the same ids, as decimal numbers, are the `id` column. `tests/task_context_record.rs`
+runs this, for the library linked in and as a shared object, and checks the
+rows (`./scripts/run-integration-tests.sh task_context_record`).
+
 ### Debugging and Verbosity
 
 Use multiple `-v` flags to control verbosity levels:

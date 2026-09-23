@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "systing"
-version = "1.21.7"
+version = "1.22.0"
 dependencies = [
  "anyhow",
  "arrow 54.3.1",
@@ -3506,6 +3506,14 @@ dependencies = [
  "filetime",
  "libc",
  "xattr",
+]
+
+[[package]]
+name = "task-context"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "object",
 ]
 
 [[package]]

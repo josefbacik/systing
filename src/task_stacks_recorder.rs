@@ -505,9 +505,47 @@ fn create_iter_link(
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Open a seq file on iterator link `link` and append all it has to `buf`:
-/// the read is what runs the link's program, in this thread.
-fn read_iter_link(link: BorrowedFd<'_>, buf: &mut Vec<u8>) -> std::io::Result<()> {
+/// The length every read of an iterator's seq file asks for: the kernel's own
+/// buffer for one, eight pages, never grown. A read ends the iterator's read
+/// session once what it has gathered reaches the length asked for, as it does
+/// once its own buffer is full, and a cgroup iterator has one session: asked
+/// for less than the whole of what its program writes, it cannot be read to
+/// the end at all, and the read after the short one fails with EOPNOTSUPP.
+/// Asked for the kernel's buffer in full, a read is never what ends a session
+/// before that buffer would.
+fn iter_read_len() -> usize {
+    // SAFETY: sysconf reads a constant of the running system.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    // A page size the system does not give is taken for the smallest there is.
+    usize::try_from(page).unwrap_or(4096).max(4096) * 8
+}
+
+/// Append all `seq` has to `buf`, reading into `into` and asking for the whole
+/// of its length at every read, never for fewer: the caller gives it the
+/// length `iter_read_len()` says and keeps it for all the reads of a snapshot.
+/// `Read::read_to_end` will not do for an iterator with one read session: it
+/// sizes each read by the room to spare in the vector it fills, and into a
+/// vector with none it opens with a read of a few dozen bytes, to see whether
+/// there is anything to read at all.
+fn read_in_full_lengths(
+    seq: &mut impl Read,
+    into: &mut [u8],
+    buf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    loop {
+        match seq.read(into) {
+            Ok(0) => return Ok(()),
+            Ok(n) => buf.extend_from_slice(&into[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Open a seq file on iterator link `link` and append all it has to `buf`,
+/// reading through `into` as `read_in_full_lengths()` does: the read is what
+/// runs the link's program, in this thread.
+fn read_iter_link(link: BorrowedFd<'_>, into: &mut [u8], buf: &mut Vec<u8>) -> std::io::Result<()> {
     // SAFETY: `link` is an open iterator link.
     let fd = unsafe { libbpf_sys::bpf_iter_create(link.as_raw_fd()) };
     if fd < 0 {
@@ -515,8 +553,7 @@ fn read_iter_link(link: BorrowedFd<'_>, buf: &mut Vec<u8>) -> std::io::Result<()
     }
     // SAFETY: a non-negative return is a descriptor created for us to own.
     let mut seq = unsafe { std::fs::File::from_raw_fd(fd) };
-    seq.read_to_end(buf)?;
-    Ok(())
+    read_in_full_lengths(&mut seq, into, buf)
 }
 
 /// The tgids the cgroup-members program wrote (`u32` each), appended to
@@ -873,9 +910,10 @@ impl TaskStacksIter {
         let mut tgids = Vec::new();
         let mut seen = HashSet::new();
         let mut bytes = Vec::new();
+        let mut into = vec![0u8; iter_read_len()];
         for link in &self.member_links {
             bytes.clear();
-            read_iter_link(link.as_fd(), &mut bytes)
+            read_iter_link(link.as_fd(), &mut into, &mut bytes)
                 .context("Failed to list a --cgroup target's processes")?;
             append_member_tgids(&bytes, &mut seen, &mut tgids);
         }
@@ -911,14 +949,16 @@ impl TaskStacksIter {
                 // as the next one's finds them, since a snapshot is the only
                 // thing that runs the program while it is being taken.
                 let mut stats = self.walk_stats();
+                // One buffer to read into, for every process of the snapshot.
+                let mut into = vec![0u8; iter_read_len()];
                 for tgid in tgids {
-                    if self.read_process(tgid, &mut buf, &mut stats)? {
+                    if self.read_process(tgid, &mut into, &mut buf, &mut stats)? {
                         // Cut short by a thread that exited under the walk:
                         // once more, for the threads behind it. The second
                         // walk can be cut too; one re-read is the bound, and
                         // the ones that were have a count of their own.
                         self.reread_processes.fetch_add(1, Ordering::Relaxed);
-                        if self.read_process(tgid, &mut buf, &mut stats)? {
+                        if self.read_process(tgid, &mut into, &mut buf, &mut stats)? {
                             self.still_short_processes.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -953,10 +993,12 @@ impl TaskStacksIter {
     /// never an error. A link to a process that has gone reads as empty.
     ///
     /// `stats` is the program's counters as the caller last saw them, and as
-    /// this read leaves them on return.
+    /// this read leaves them on return. `into` is the buffer the records are
+    /// read through, the caller's for the whole snapshot.
     fn read_process(
         &self,
         tgid: u32,
+        into: &mut [u8],
         buf: &mut Vec<u8>,
         stats: &mut Option<WalkStats>,
     ) -> Result<bool> {
@@ -965,7 +1007,7 @@ impl TaskStacksIter {
         link_info.task.pid = tgid;
         let link = create_iter_link(self.prog.as_fd(), &mut link_info)
             .context("Failed to scope a task-stacks iterator to a process")?;
-        read_iter_link(link.as_fd(), buf).context("Failed to read a task-stacks iterator")?;
+        read_iter_link(link.as_fd(), into, buf).context("Failed to read a task-stacks iterator")?;
         *stats = self.walk_stats();
         let (Some(before), Some(after)) = (before, *stats) else {
             return Ok(false);
@@ -1674,6 +1716,106 @@ mod tests {
             assert_eq!(walk, TaskWalk::Full);
             assert!(why.unwrap().contains("pid namespace"));
         }
+    }
+
+    /// The seq file of an iterator with one read session, as the kernel runs a
+    /// cgroup iterator's. A read with nothing left over from the one before
+    /// starts the session: the objects write their output whole, one after
+    /// another, the first whatever the length asked for and each of the others
+    /// only while what has been gathered is under that length. A session that
+    /// stopped with objects still to come cannot be started again, and the
+    /// read that would fails with EOPNOTSUPP. That rule and no more of the
+    /// kernel's read: its own buffer's limit is left out.
+    struct OneSession {
+        /// What each object writes, in the order the walk visits them.
+        objects: Vec<Vec<u8>>,
+        next: usize,
+        started: bool,
+        /// Gathered and not read yet.
+        left_over: Vec<u8>,
+        /// The length each read asked for.
+        asked: Vec<usize>,
+    }
+
+    impl OneSession {
+        fn over(objects: Vec<Vec<u8>>) -> OneSession {
+            OneSession {
+                objects,
+                next: 0,
+                started: false,
+                left_over: Vec::new(),
+                asked: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for OneSession {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.asked.push(out.len());
+            if self.left_over.is_empty() {
+                if self.started && self.next < self.objects.len() {
+                    return Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+                }
+                self.started = true;
+                while self.next < self.objects.len() {
+                    self.left_over.extend_from_slice(&self.objects[self.next]);
+                    self.next += 1;
+                    if self.left_over.len() >= out.len() {
+                        break;
+                    }
+                }
+            }
+            let n = self.left_over.len().min(out.len());
+            out[..n].copy_from_slice(&self.left_over[..n]);
+            self.left_over.drain(..n);
+            Ok(n)
+        }
+    }
+
+    /// A target with no process of its own, nine in the first cgroup below it
+    /// and one in the second: three objects, 36 bytes and then 4.
+    fn a_listing_over_three_cgroups() -> (Vec<Vec<u8>>, Vec<u8>) {
+        let tgids = |pids: std::ops::Range<u32>| -> Vec<u8> {
+            pids.flat_map(|pid| pid.to_ne_bytes()).collect()
+        };
+        let objects = vec![Vec::new(), tgids(100..109), tgids(200..201)];
+        let whole = objects.concat();
+        (objects, whole)
+    }
+
+    #[test]
+    fn a_listing_over_several_cgroups_is_read_whole_at_the_kernels_buffer_length() {
+        let (objects, whole) = a_listing_over_three_cgroups();
+        let mut seq = OneSession::over(objects);
+        let len = iter_read_len();
+        assert!(len >= 8 * 4096, "{len} is under eight pages");
+        let mut into = vec![0u8; len];
+        // Appended to what the vector holds already, which stays as it was.
+        let mut buf = vec![0xaa, 0xbb];
+        read_in_full_lengths(&mut seq, &mut into, &mut buf).expect("the listing reads whole");
+        assert_eq!(&buf[..2], [0xaa, 0xbb]);
+        assert_eq!(&buf[2..], whole);
+        // One read for the listing and one that finds its end, each of them
+        // asking for the full length.
+        assert_eq!(seq.asked, [len, len]);
+    }
+
+    #[test]
+    fn a_reader_that_asks_for_little_loses_a_listing_over_several_cgroups() {
+        // The control for the test above: the same listing, read in lengths of
+        // 32 bytes. The first read ends the session after the nine (36 bytes
+        // gathered, the second cgroup still to come), the second takes the
+        // four bytes left over, and the third has no session to start.
+        let (objects, whole) = a_listing_over_three_cgroups();
+        let mut seq = OneSession::over(objects);
+        let mut into = [0u8; 32];
+        let mut buf = Vec::new();
+        let err = read_in_full_lengths(&mut seq, &mut into, &mut buf)
+            .expect_err("a session cut short cannot be read to the end");
+        assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(seq.asked, [32, 32, 32]);
+        // What did come back is the nine and no more.
+        assert_eq!(buf, &whole[..36]);
     }
 
     #[test]

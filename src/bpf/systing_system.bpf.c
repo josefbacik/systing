@@ -9,6 +9,9 @@
 #endif
 
 #include "systing_shared.bpf.h"
+/* --include-task-context: the whole BPF side of the feature is this header
+ * (src/task_context/bpf); this file only calls task_context_read_current(). */
+#include "task_context_reader.bpf.h"
 
 /* Task state definitions (from task_struct->__state) */
 #define TASK_RUNNING		0x00000000
@@ -271,8 +274,15 @@ struct stack_event {
 	u32 cpu;
 	u32 user_stack_format;
 	struct task_info task;
-	u64 kernel_stack_length;
-	u64 user_stack_length;
+	/* Entry counts of at most MAX_STACK_DEPTH, so 32 bits each: the two
+	 * lengths used to be 64-bit and now share their first 8 bytes, which
+	 * frees the second 8 for the sampled thread's task_context id (see
+	 * task_context_reader.bpf.h; 0 = none, and always 0 without
+	 * --include-task-context). No other field moves and the record does
+	 * not grow. */
+	u32 kernel_stack_length;
+	u32 user_stack_length;
+	u64 task_context_id;
 	u64 kernel_stack[MAX_STACK_DEPTH];
 #ifdef SYSTING_PYSTACKS
 	struct pystacks_message py_msg_buffer;
@@ -1936,6 +1946,19 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 	event->ts = ts ? ts : bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
+
+	/*
+	 * The sampled thread's task_context id. Only running-stack events for
+	 * now (STACK_RUNNING: the CPU sampler's, and the ones the usdt, uprobe,
+	 * kprobe, tracepoint and raw tracepoint handlers emit; in each of them
+	 * the task is current). Sleep stacks are left out on purpose: they are
+	 * emitted from sched_switch. reserve_stack_event() cleared the record's
+	 * fixed part, this field in it, so every other stack event carries
+	 * 0 = none. The knob is rodata: with it off this arm is pruned at load
+	 * time and the maps it names are not created.
+	 */
+	if (task_context_config.enabled && type == STACK_RUNNING)
+		event->task_context_id = task_context_read_current(task);
 
 #ifdef SYSTING_PYSTACKS
 	event->py_msg_buffer.stack_len = 0;

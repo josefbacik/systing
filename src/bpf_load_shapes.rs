@@ -283,6 +283,41 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.collect_pystacks = true;
     });
 
+    // --include-task-context. On every other row the flag is off: none of
+    // its three programs is selected, none of its maps is created, and the
+    // one call site in the stack-emit path is rodata-dead - so those rows
+    // are also the proof that the feature costs a capture without the flag
+    // nothing at load. With the flag: the helper live in the CPU sampler and
+    // the three lifecycle programs, at the default capture; beside the Python
+    // walker (the emit path's two user-memory readers in one program, the
+    // widest stack frame that path can have); in the generic probe handlers,
+    // each of which emits a running stack through the same path; and with
+    // build-id frames, the emit path's other reservation size. Written for
+    // Linux 6.12 and newer: the kernels these rows load on.
+    add("task-context", &|c| c.include_task_context = true);
+    add("task-context-pystacks", &|c| {
+        c.include_task_context = true;
+        c.collect_pystacks = true;
+    });
+    add("task-context-trace-event", &|c| {
+        c.include_task_context = true;
+        c.trace_event = vec!["tracepoint:sched:sched_process_exit".to_string()];
+        c.pid = vec![std::process::id()];
+        c.collect_pystacks = true;
+    });
+    add("task-context-build-id", &|c| {
+        c.include_task_context = true;
+        c.collect_build_id = true;
+    });
+    // The same capture as the kernel's confidentiality mode leaves it: the
+    // helper returns at its first test and the three lifecycle programs at
+    // theirs. No kernel these rows run on is in that mode, so this row is
+    // the only load that walks those arms.
+    add("task-context-restricted", &|c| {
+        c.include_task_context = true;
+        c.task_context_force_restricted = true;
+    });
+
     // Memory lane: the continuous launcher's shape (default rss threshold,
     // fault/map sample rates 0 = every event), then each knob the launcher
     // or the on-demand lane can set.
@@ -819,6 +854,22 @@ R0 unbounded memory access\n\
         assert!(shapes.iter().any(|s| s.config.network
             && s.config.kernel_hooks == KernelHooks::Trampoline
             && s.legs == LegSelection::Host));
+        // --include-task-context: loaded alone, beside the Python walker and
+        // in the generic probe handlers; and off on every row that is not its
+        // own, so that the rest of the table loads the object a capture
+        // without the flag loads.
+        assert!(shapes
+            .iter()
+            .any(|s| s.config.include_task_context && !s.config.collect_pystacks));
+        assert!(shapes
+            .iter()
+            .any(|s| s.config.include_task_context && s.config.collect_pystacks));
+        assert!(shapes
+            .iter()
+            .any(|s| s.config.include_task_context && !s.config.trace_event.is_empty()));
+        assert!(shapes
+            .iter()
+            .all(|s| s.config.include_task_context == s.name.starts_with("task-context")));
     }
 
     #[test]

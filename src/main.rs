@@ -214,6 +214,9 @@ struct Command {
     /// With the task-stacks recorder, the interval between snapshots of the targeted threads, in milliseconds. With --duration the recorder takes ceil(duration / interval) snapshots, numbered from 1 (10 s at 100 ms: iterations 1-100)
     #[arg(long, default_value = "100", value_parser = clap::value_parser!(u64).range(1..))]
     task_stacks_interval_ms: u64,
+    /// Read each sampled thread's task_context: the named values a program sets on its threads with the task-context library (`crates/task-context`). Every running-stack sample then carries the id of the thread's current context (`stack_sample.task_context_id`) and the values of each id are stored once, in the `task_context` table. A process is found when its executable carries the library or names it as a direct dependency; one that loads it later (`dlopen`, a preloaded or indirect dependency) is not. Without this flag none of the feature's BPF programs or maps is loaded. Written for Linux 6.12 and newer
+    #[arg(long)]
+    include_task_context: bool,
     /// List all available recorders and their default states
     #[arg(long)]
     list_recorders: bool,
@@ -331,6 +334,9 @@ impl From<Command> for Config {
             tpu_metrics_interval: cmd.tpu_metrics_interval,
             task_stacks: cmd.task_stacks,
             task_stacks_interval_ms: cmd.task_stacks_interval_ms,
+            include_task_context: cmd.include_task_context,
+            task_context_force_restricted: false,
+            task_context_planted_recipes: Vec::new(),
             output_dir: cmd.output_dir,
             output: cmd.output,
             parquet_only: cmd.parquet_only,
@@ -696,6 +702,25 @@ mod tests {
         assert!(opts.task_stacks);
         assert!(opts.no_sched && opts.no_cpu_stack_traces);
         assert_eq!(opts.task_stacks_interval_ms, 250);
+    }
+
+    #[test]
+    fn task_context_is_off_by_default_and_on_with_its_flag_alone() {
+        let opts = opts_from(&[]);
+        assert!(!opts.include_task_context);
+
+        let opts = opts_from(&["--include-task-context"]);
+        assert!(opts.include_task_context);
+        assert!(
+            !opts.no_sched && !opts.no_cpu_stack_traces,
+            "the flag adds to a capture and takes nothing out of it"
+        );
+
+        // Not a recorder: choosing recorders neither turns it on nor off.
+        let opts = opts_from(&["--only-recorder", "cpu-stacks"]);
+        assert!(!opts.include_task_context);
+        let opts = opts_from(&["--only-recorder", "cpu-stacks", "--include-task-context"]);
+        assert!(opts.include_task_context);
     }
 
     #[test]
