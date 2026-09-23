@@ -853,6 +853,14 @@ pub fn get_required_bpf_programs(
         required.insert("systing_sched_process_exec");
     }
 
+    // --include-task-context: the three programs that keep a process's
+    // recipe from outliving its image. Without the flag nothing of the
+    // feature is loaded, and its maps are never created (see
+    // configure_bpf_skeleton).
+    if opts.include_task_context {
+        required.extend(crate::task_context::BPF_PROGRAMS);
+    }
+
     // Add programs from each enabled recorder
     for recorder in get_available_recorders() {
         if is_recorder_enabled(recorder.name, opts) {
@@ -1671,6 +1679,24 @@ pub struct Config {
     pub task_stacks: bool,
     /// Interval between task-stacks snapshots in milliseconds
     pub task_stacks_interval_ms: u64,
+    /// Read each sampled thread's task_context (`--include-task-context`):
+    /// the id of the thread's current context goes into every running-stack
+    /// sample and its named values into the `task_context` table. Off, none
+    /// of the feature's programs or maps is loaded. See [`crate::task_context`].
+    pub include_task_context: bool,
+    /// With [`Config::include_task_context`], run the feature as it runs
+    /// under the kernel's confidentiality mode whether or not that mode is
+    /// on: nothing of any process is read and no process is looked at. It
+    /// can only make the feature read less. Testing-only; no CLI flag.
+    pub task_context_force_restricted: bool,
+    /// With [`Config::include_task_context`], recipes written to the BPF
+    /// side's map exactly as given - none of discovery's validation - before
+    /// any program is attached: how a test shows that a recipe which is
+    /// wrong for its process reads nothing. Each is a process id and the
+    /// recipe's three words (the offset from the thread pointer as two's
+    /// complement, the region's base, the region's size). Testing-only; no
+    /// CLI flag.
+    pub task_context_planted_recipes: Vec<(u32, [u64; 3])>,
     /// Output directory for parquet files
     pub output_dir: PathBuf,
     /// Output path (format auto-detected from extension: .pb = Perfetto, .duckdb = DuckDB)
@@ -1749,6 +1775,9 @@ impl Default for Config {
             tpu_metrics_interval: 1000,
             task_stacks: false,
             task_stacks_interval_ms: 100,
+            include_task_context: false,
+            task_context_force_restricted: false,
+            task_context_planted_recipes: Vec::new(),
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
             parquet_only: false,
@@ -3612,7 +3641,22 @@ fn configure_bpf_skeleton(
             opts.no_interruptible_stack_traces as u32;
         rodata.tool_config.no_sched = opts.no_sched as u32;
         rodata.tool_config.no_irq = opts.no_irq as u32;
-        rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
+        let confidentiality_mode = detect_confidentiality_mode();
+        rodata.tool_config.confidentiality_mode = confidentiality_mode;
+        if opts.include_task_context {
+            // Frozen with the rest of .rodata, so with the flag off the one
+            // call site in the sampler's emit path is dead code to the
+            // verifier. In the kernel's confidentiality mode the feature
+            // stays loaded and reads nothing (see task_context::start); the
+            // testing-only knob can turn that on, never off.
+            rodata.task_context_config.enabled = 1;
+            rodata.task_context_config.restricted =
+                confidentiality_mode | u32::from(opts.task_context_force_restricted);
+            rodata.task_context_config.values_per_cpu_per_sec =
+                crate::task_context::DEFAULT_VALUES_PER_CPU_PER_SEC;
+            rodata.task_context_config.execs_per_cpu_per_sec =
+                crate::task_context::DEFAULT_EXECS_PER_CPU_PER_SEC;
+        }
         set_target_filter!(rodata, target_filter);
         if opts.no_stack_traces {
             rodata.tool_config.no_stack_traces = 1;
@@ -3707,6 +3751,17 @@ fn configure_bpf_skeleton(
             || name == "memory_vfio_inflight")
             && !(opts.memory && opts.memory_vfio && memory_legs.vfio_off.is_none())
         {
+            map.set_autocreate(false)
+                .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
+            continue;
+        }
+        // Nothing of --include-task-context exists without the flag. Its
+        // maps are referenced from the always-loaded sampler (its emit path
+        // calls task_context_read_current), but only behind the frozen
+        // task_context_config.enabled, so the verifier never reaches the
+        // reference: the shape memory_ringbufs already has under
+        // systing_perf_event_clock when the memory recorder is off.
+        if name.starts_with(crate::task_context::MAP_PREFIX) && !opts.include_task_context {
             map.set_autocreate(false)
                 .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
             continue;
@@ -5382,6 +5437,9 @@ struct ThreadHandles {
     /// Holds a `task_info_tx` clone, so it is stopped before the discovery
     /// thread is joined.
     task_stacks_thread: Option<crate::task_stacks_recorder::TaskStacksThread>,
+    /// `--include-task-context`: finished once the ring pollers are joined
+    /// (two of `ringbuf_threads` poll its rings).
+    task_context: Option<crate::task_context::Running>,
     task_info_tx: Sender<task_info>,
 }
 
@@ -5542,6 +5600,14 @@ fn run_tracing_loop(
     if let Some(thread) = handles.exec_handler_thread {
         let _p = stop_phase("join exec handler");
         thread.join().expect("Failed to join exec handler thread");
+    }
+    // Its two rings were polled by ringbuf_threads and went with them: that
+    // ends its discovery thread and leaves it the only owner of its table.
+    if let Some(task_context) = handles.task_context {
+        let _p = stop_phase("finish task_context");
+        if let Err(e) = task_context.finish() {
+            eprintln!("Warning: task_context: {e:#}");
+        }
     }
     shutdown_signal.store(true, Ordering::Relaxed);
     if let Some(thread) = handles.sysinfo_thread {
@@ -6050,12 +6116,50 @@ pub fn systing(
                 t_rings.elapsed()
             );
         }
-        let (rings, mut channels) =
+        let (mut rings, mut channels) =
             setup_ringbuffers(&skel, &opts, collect_pystacks, &ring_shards)?;
         // Take exec_event_rx/pysym_rx out before channels is moved into
         // spawn_recorder_threads
         let exec_event_rx = channels.exec_event_rx.take();
         let pysym_rx = channels.pysym_rx.take();
+
+        // --include-task-context: its two rings join the ones polled below,
+        // and the processes the capture was pointed at are looked at here,
+        // before any program is attached. Whether the feature reads at all
+        // is what configure_bpf_skeleton froze into the object.
+        let task_context = if opts.include_task_context {
+            let restricted = skel
+                .maps
+                .rodata_data
+                .as_deref()
+                .is_some_and(|rodata| rodata.task_context_config.restricted != 0);
+            let utids = recorder
+                .stack_recorder
+                .lock()
+                .unwrap()
+                .shared_utid_generator();
+            let started = crate::task_context::start(
+                crate::task_context::Maps {
+                    values_ring: &skel.maps.task_context_values,
+                    execs_ring: &skel.maps.task_context_execs,
+                    recipes: libbpf_rs::MapHandle::try_from(&skel.maps.task_context_recipes)
+                        .context("Failed to get handle to the task_context_recipes map")?,
+                    stats: libbpf_rs::MapHandle::try_from(&skel.maps.task_context_stats)
+                        .context("Failed to get handle to the task_context_stats map")?,
+                },
+                &sink,
+                utids,
+                crate::task_context::Options {
+                    restricted,
+                    pids: opts.pid.clone(),
+                    planted_recipes: opts.task_context_planted_recipes.clone(),
+                },
+            )?;
+            rings.extend(started.rings);
+            Some(started.running)
+        } else {
+            None
+        };
 
         // Create shutdown signal for receiver threads
         let shutdown_signal = Arc::new(AtomicBool::new(false));
@@ -6092,6 +6196,12 @@ pub fn systing(
         skel.attach().with_context(|| {
             "Failed to attach BPF programs to tracepoints. Check if tracepoints are enabled."
         })?;
+
+        // From here on an exec is announced to it, so this is when
+        // --include-task-context starts looking at processes.
+        if let Some(task_context) = &task_context {
+            task_context.attached();
+        }
 
         // Check for any probes that failed to attach and warn about them
         warn_failed_probe_attachments(&skel);
@@ -6575,6 +6685,7 @@ pub fn systing(
             task_info_tx,
             tpu_metrics_thread,
             task_stacks_thread,
+            task_context,
         };
 
         capture_end_ts = run_tracing_loop(
