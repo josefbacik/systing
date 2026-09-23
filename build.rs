@@ -375,6 +375,25 @@ fn main() {
             .expect("pystacks bpf dir exists")
             .display()
     );
+    // --include-task-context: the feature's BPF side is one header of its
+    // own, written against the ABI header the writer library ships. Only the
+    // main object includes it.
+    let task_context_bpf_arg = format!(
+        "-I{}",
+        Path::new("src/task_context/bpf")
+            .canonicalize()
+            .expect("src/task_context/bpf directory exists")
+            .display()
+    );
+    let task_context_abi_arg = format!(
+        "-I{}",
+        Path::new("crates/task-context/include")
+            .canonicalize()
+            .expect("crates/task-context/include directory exists")
+            .display()
+    );
+    println!("cargo:rerun-if-changed=src/task_context/bpf/task_context_reader.bpf.h");
+    println!("cargo:rerun-if-changed=crates/task-context/include/task_context.h");
     for src in SRC {
         let srcpath = Path::new(src);
         let fname = srcpath.file_name().unwrap().to_str().unwrap();
@@ -391,6 +410,8 @@ fn main() {
             OsStr::new("-DSYSTING_PYSTACKS"),
             OsStr::new(&pystacks_inc_arg),
             OsStr::new(&pystacks_bpf_arg),
+            OsStr::new(&task_context_bpf_arg),
+            OsStr::new(&task_context_abi_arg),
         ];
 
         if let Some(ref include_path) = multiarch_include {
