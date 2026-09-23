@@ -97,9 +97,7 @@ pub fn write(
                 s.seq.map(|v| v as i64),
                 s.trigger,
                 s.dumped_at_unix_ns,
-                s.sample_period as i64,
-                s.header_live_objects as i64,
-                s.header_live_bytes as i64
+                s.sample_period as i64
             ])?;
             for (sample, names) in s.samples.iter().zip(&symbolized.frames[si]) {
                 let ids: Vec<i64> = names
@@ -111,6 +109,7 @@ pub fn write(
                     .collect();
                 let next = stack_ids.len() as i64 + 1;
                 let stack_id = *stack_ids.entry(ids).or_insert(next);
+                let [est_lb, est_lo, est_ab, est_ao] = sample.estimates(s.sample_period);
                 sample_rows.append_row(params![
                     trace_id,
                     snapshot_id,
@@ -118,7 +117,11 @@ pub fn write(
                     sample.live_objects as i64,
                     sample.live_bytes as i64,
                     sample.alloc_objects as i64,
-                    sample.alloc_bytes as i64
+                    sample.alloc_bytes as i64,
+                    est_lo as i64,
+                    est_lb as i64,
+                    est_ao as i64,
+                    est_ab as i64
                 ])?;
                 written.samples += 1;
             }

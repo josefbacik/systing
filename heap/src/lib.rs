@@ -15,6 +15,7 @@ pub mod db;
 pub mod format;
 pub mod jemalloc;
 pub mod maps;
+pub mod perfetto;
 pub mod perfmap;
 pub mod retention;
 pub mod symbolize;
@@ -39,10 +40,6 @@ pub struct Snapshot {
     pub dumped_at_unix_ns: Option<i64>,
     /// Mean bytes between samples, as the dump states it.
     pub sample_period: u64,
-    /// The dump's header totals, as written: not always the sum of
-    /// `samples` (jemalloc 5.3 interval dumps disagree).
-    pub header_live_objects: u64,
-    pub header_live_bytes: u64,
     pub samples: Vec<Sample>,
     /// The process's memory map as of the dump, for symbolization.
     pub maps: Maps,
@@ -61,4 +58,61 @@ pub struct Sample {
     /// Cumulative since start; 0 unless the allocator tracked them.
     pub alloc_objects: u64,
     pub alloc_bytes: u64,
+}
+
+impl Sample {
+    /// Estimated (live bytes, live objects, alloc bytes, alloc objects) in
+    /// the process, from this stack's sampled counts at `sample_period`.
+    ///
+    /// jemalloc samples an allocation of `s` bytes with probability
+    /// `1 - exp(-s / sample_period)`, so each pair is divided by that
+    /// probability at the stack's mean object size, as jeprof does. This is
+    /// per stack: summing stacks first and scaling the sum under-counts small
+    /// objects badly (jemalloc's PROFILING_INTERNALS.md, "Aggregation must be
+    /// done after unbiasing samples"). jemalloc 5.3 writes each stack's pair
+    /// so that this per-stack step gives its own estimate.
+    pub fn estimates(&self, sample_period: u64) -> [u64; 4] {
+        let (live_bytes, live_objects) = unbias(self.live_bytes, self.live_objects, sample_period);
+        let (alloc_bytes, alloc_objects) =
+            unbias(self.alloc_bytes, self.alloc_objects, sample_period);
+        [live_bytes, live_objects, alloc_bytes, alloc_objects]
+    }
+}
+
+/// One (bytes, objects) pair, unbiased at its mean object size.
+fn unbias(bytes: u64, objects: u64, sample_period: u64) -> (u64, u64) {
+    if objects == 0 || sample_period == 0 {
+        return (bytes, objects);
+    }
+    let mean = bytes as f64 / objects as f64;
+    let scale = 1.0 / (1.0 - (-mean / sample_period as f64).exp());
+    (
+        (bytes as f64 * scale).round() as u64,
+        (objects as f64 * scale).round() as u64,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_objects_scale_up_far_more_than_large_ones() {
+        let sample = |bytes, objects| Sample {
+            addrs: vec![],
+            live_objects: objects,
+            live_bytes: bytes,
+            alloc_objects: 0,
+            alloc_bytes: 0,
+        };
+        // 256-byte objects at a 16 KiB period: each is sampled with
+        // probability about 1/64.5.
+        let [b, n, _, _] = sample(256, 1).estimates(16384);
+        assert_eq!((b, n), (16512, 65));
+        // 64 KiB objects are nearly always sampled.
+        let [b, _, _, _] = sample(65536, 1).estimates(16384);
+        assert_eq!(b, 66759);
+        // Nothing sampled stays nothing.
+        assert_eq!(sample(0, 0).estimates(16384), [0, 0, 0, 0]);
+    }
 }

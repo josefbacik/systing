@@ -72,15 +72,15 @@ fn a_dump_becomes_named_stacks_and_heap_rows() {
     }
     assert!(names[2].ends_with(&format!("<{f:#x}>")), "{}", names[2]);
 
-    let (upid, trigger, header_bytes, pname): (i64, String, i64, String) = conn
+    let (upid, trigger, period, pname): (i64, String, i64, String) = conn
         .query_row(
-            "SELECT s.upid, s.dump_trigger, s.header_live_bytes, p.name
+            "SELECT s.upid, s.dump_trigger, s.sample_period, p.name
              FROM heap_snapshot s JOIN process p USING (trace_id, upid)",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap();
-    assert_eq!((upid, trigger.as_str(), header_bytes), (1, "manual", 3000));
+    assert_eq!((upid, trigger.as_str(), period), (1, "manual", 524288));
     assert!(!pname.is_empty());
 
     let (alloc_objects, alloc_bytes): (i64, i64) = conn
@@ -205,4 +205,100 @@ fn library_python_frames_carry_the_module_like_pystacks() {
             format!("{module}:Cls.run (python) [mod.py]"),
         ]
     );
+}
+
+#[test]
+fn perfetto_output_splits_frames_and_reports_cumulative_counts() {
+    use perfetto_protos::trace::Trace;
+    use protobuf::Message;
+
+    // Two snapshots of one process: the stack holds 64 bytes, then 16.
+    let dir = tempfile::tempdir().unwrap();
+    let maps = "00020000-00021000 r-xp 00000000 00:00 0 \n";
+    for (seq, bytes) in [(0, 64), (1, 16)] {
+        let dump = format!(
+            "heap_v2/1\n  t*: 1: {bytes} [0: 0]\n@ 0x20008 0x20028\n  t*: 1: {bytes} [0: 0]\n\
+             \nMAPPED_LIBRARIES:\n{maps}"
+        );
+        std::fs::write(
+            dir.path().join(format!("jeprof.91.{seq}.i{seq}.heap")),
+            dump,
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        dir.path().join("perf-91.map"),
+        "20000 10 py::leak:/srv/app/work.py\n20020 10 py::Outer.run:/srv/app/work.py\n",
+    )
+    .unwrap();
+    let out = dir.path().join("heap.perfetto");
+    let st = std::process::Command::new(env!("CARGO_BIN_EXE_systing-heap"))
+        .arg(dir.path().join("jeprof"))
+        .args(["--keep-all", "-o"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let trace = Trace::parse_from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    let mut strings = std::collections::HashMap::new();
+    let mut frames = Vec::new();
+    let mut dumps = Vec::new();
+    let mut symbols = Vec::new();
+    for p in &trace.packet {
+        if p.has_profile_packet() {
+            let pp = p.profile_packet();
+            for s in &pp.strings {
+                strings.insert(s.iid(), String::from_utf8(s.str().to_vec()).unwrap());
+            }
+            frames.extend(pp.frames.iter().map(|f| (f.function_name_id(), f.rel_pc())));
+            dumps.extend(pp.process_dumps.iter().cloned());
+        }
+        if p.has_module_symbols() {
+            let m = p.module_symbols();
+            assert_eq!(m.build_id(), "systing-heap:[python]");
+            // No line from a trampoline: 0, so the UI still shows the file.
+            assert!(m
+                .address_symbols
+                .iter()
+                .all(|a| a.lines[0].line_number() == 0));
+            for a in &m.address_symbols {
+                symbols.push((
+                    m.path().to_string(),
+                    a.lines[0].source_file_name().to_string(),
+                ));
+            }
+        }
+    }
+    // Frames are named after the function alone, the source is a symbol,
+    // and each snapshot's packet defines the frames it uses again.
+    let names: Vec<&str> = frames.iter().map(|(id, _)| strings[id].as_str()).collect();
+    assert_eq!(names, vec!["Outer.run", "leak", "Outer.run", "leak"]);
+    assert_eq!(
+        symbols,
+        vec![
+            ("/[python]".to_string(), "/srv/app/work.py".to_string()),
+            ("/[python]".to_string(), "/srv/app/work.py".to_string())
+        ]
+    );
+    // Each snapshot carries its increase since the previous one; summed up
+    // to a snapshot, unreleased follows live and totals never fall.
+    assert_eq!(dumps.len(), 2);
+    let (a0, f0) = (
+        dumps[0].samples[0].self_allocated(),
+        dumps[0].samples[0].self_freed(),
+    );
+    let (a1, f1) = (
+        dumps[1].samples[0].self_allocated(),
+        dumps[1].samples[0].self_freed(),
+    );
+    assert!(a0 > 0 && f0 == 0, "{a0} {f0}");
+    assert_eq!(a1, 0, "live fell, so nothing more was allocated");
+    assert!(f1 > 0 && f1 < a0, "{f1} of {a0} freed");
+    assert_eq!(dumps[0].pid(), 91);
+    assert_eq!(dumps[0].heap_name(), "jemalloc");
 }

@@ -3500,6 +3500,8 @@ dependencies = [
  "clap",
  "duckdb",
  "libc",
+ "perfetto_protos",
+ "protobuf",
  "regex",
  "systing",
  "tempfile",

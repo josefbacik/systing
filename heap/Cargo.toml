@@ -30,7 +30,11 @@ blazesym = { git = "https://github.com/libbpf/blazesym.git", rev = "8705da0a8cec
 clap = { version = "4.5.20", features = ["derive"] }
 duckdb = "1.10504"
 libc = "0.2"
+# Same versions as systing's, for its Perfetto writer and frame parser.
+perfetto_protos = "0.48.1"
 regex = "1.11.1"
 systing = { path = "..", default-features = false }
 tempfile = "3.13"
 
+[dev-dependencies]
+protobuf = "3.7.1"

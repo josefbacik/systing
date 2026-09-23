@@ -172,7 +172,10 @@ pub fn parse(text: &str) -> Result<Snapshot> {
     if !rest.is_empty() {
         maps = Maps::parse(&rest.join("\n"));
     }
-    let [header_live_objects, header_live_bytes, ..] = totals.unwrap_or_default();
+    // The header's totals are read to keep the grammar, not kept: they are
+    // the sum of every stack's pair, and scaling a sum under-counts small
+    // objects (see Sample::estimates).
+    let _ = totals;
 
     Ok(Snapshot {
         format: Format::Jemalloc,
@@ -182,8 +185,6 @@ pub fn parse(text: &str) -> Result<Snapshot> {
         trigger: None,
         dumped_at_unix_ns: None,
         sample_period,
-        header_live_objects,
-        header_live_bytes,
         samples,
         maps,
         perf_map: None,
@@ -219,10 +220,6 @@ MAPPED_LIBRARIES:
     fn parses_header_stacks_and_maps() {
         let s = parse(DUMP).unwrap();
         assert_eq!(s.sample_period, 4096);
-        assert_eq!(
-            (s.header_live_objects, s.header_live_bytes),
-            (1270, 5112044)
-        );
         assert_eq!(s.samples.len(), 2);
         assert_eq!(
             s.samples[0].addrs,
@@ -247,7 +244,6 @@ MAPPED_LIBRARIES:
         let dump = "heap_v2/4096\n  t*: 2: 200 [0: 0]\n  t0: 1: 100 [0: 0] worker-1\n  \
                     t3: 1: 100 [0: 0] io pool 2\n@ 0x1\n  t*: 2: 200 [0: 0]\n  t0: 1: 100 [0: 0]\n";
         let s = parse(dump).unwrap();
-        assert_eq!(s.header_live_bytes, 200);
         assert_eq!(s.samples.len(), 1);
     }
 

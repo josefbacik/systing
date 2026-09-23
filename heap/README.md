@@ -47,6 +47,21 @@ All snapshots go under one trace id (`--trace-id`, default `heap`).
 
 Run it one-shot, from cron or a loop, as often as you want the database refreshed.
 
+## Perfetto output
+
+Give `-o` a Perfetto extension (`.pb`, `.perfetto`, `.pftrace` or `.perfetto-trace`) and the snapshots are written as native heap profiles, the format Perfetto's own heap profiler (heapprofd) writes, instead of a DuckDB database:
+
+```bash
+systing-heap -o heap.perfetto /data/heap/jeprof --keep-all
+```
+
+Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process gets a heap-profile track with a marker per snapshot, and clicking a marker shows its flamegraph.
+
+- **Frames are split like task stacks'.** A frame is named after the function alone, its module is the frame's mapping, and the source file and line are its symbols (Python frames: the file and line 0, since a trampoline names a function and its file but not a line). Python frames' mapping is `[python]`. Mappings carry a `systing-heap:<module>` build id, which Perfetto needs to attach the symbols; it is not an ELF build id.
+- **The numbers are estimates.** Each stack's sampled counts are unbiased before anything is added up (see Sampling and unbiasing), the same `est_*` values the DuckDB tables hold.
+- **Each snapshot holds its increase since the previous one,** and Perfetto adds them up, so the flamegraph at a marker shows the state at that snapshot. "Unreleased" is the live estimate. "Total allocated" is jemalloc's cumulative total when it ran with `prof_accum:true`; otherwise it is the smallest total consistent with the live counts seen, which is a lower bound.
+- **Retention works the same.** With a prefix input and no `--keep-all` there is one snapshot per process, so one marker.
+
 ## One snapshot per process
 
 Users usually care about the current state, so with a prefix input the tool keeps one snapshot per process and removes the rest.
@@ -129,6 +144,36 @@ Things to know:
 - **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps. Without it, Python frames show as `unknown ([anon:exec])` and the tool warns. It prints which map named each process's frames, and a map is consulted only for addresses the dump's own memory map puts in anonymous executable memory, so a stale map cannot name data. A refused candidate falls through to the next. A map is read only if it is a regular file (symlinks are not followed) of at most 256 MiB, and one in a world-writable directory such as `/tmp` only if you or root own it, as perf requires: otherwise another user could name your frames.
 - **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran about 40% slower. Code that spends its time in C pays far less. The hook itself runs only for sampled allocations.
 
+## Sampling and unbiasing
+
+jemalloc does not record every allocation.
+It samples: on average one allocation per `sample_period` bytes allocated (`2^lg_prof_sample`, 512 KiB by default), so an allocation of `s` bytes is recorded with probability `1 - exp(-s / sample_period)`.
+Large allocations are nearly always recorded; small ones rarely.
+At a 16 KiB period a 64 KiB buffer is recorded 98% of the time and a 256-byte object about once in 64.
+
+So a dump's counts are samples, not totals, and each stack's counts must be scaled back up to estimate what the process really holds.
+`systing-heap` does this for every row, the way jeprof does:
+
+```
+factor = 1 / (1 - exp(-(bytes / objects) / sample_period))
+est_bytes   = bytes   * factor
+est_objects = objects * factor
+```
+
+`bytes / objects` is the stack's mean object size, so small objects get a large factor and large ones a factor near 1.
+jemalloc 5.3 writes each stack's counts so that this per-stack step gives jemalloc's own estimate for that stack, even when the stack mixes object sizes.
+
+**Scale first, then add up.**
+The factor depends on the object size, so it must be applied to each stack on its own, and only the scaled values added together, across stacks, snapshots or machines.
+Adding the raw counts first and scaling the sum under-counts small objects badly, as jemalloc's own notes explain ([PROFILING_INTERNALS.md, "Aggregation must be done after unbiasing samples"](https://github.com/jemalloc/jemalloc/blob/dev/doc_internal/PROFILING_INTERNALS.md#aggregation-must-be-done-after-unbiasing-samples)).
+This is why the tables store the estimate of every row (`est_*`) and not the dump's header totals, which are exactly such a sum.
+
+**How close it gets.**
+For a Python program holding 97.1 MB (jemalloc's own count, with sampling off) in a mix of small, medium and large objects, the sum of `est_live_bytes` came to 86 to 102 MB over three runs at the default period, and to within 1 to 2% at a 16 KiB period.
+The sampled counts alone came to 3% and 6% of the real heap.
+A finer period gives a closer estimate, but sampling itself costs memory: jemalloc keeps each sampled object in a larger block, so the process's real heap grew from 97 MB to 159 MB at the 16 KiB period.
+`heap/tests/estimates.rs` checks this end to end.
+
 ## Tables
 
 `heap_snapshot` has one row per snapshot file.
@@ -143,10 +188,6 @@ Things to know:
 | `dump_trigger` | `interval` (every `lg_prof_interval` bytes), `manual` (`mallctl("prof.dump")`), `gdump` (new high-water mark), `final` (at exit) |
 | `dumped_at_unix_ns` | The file's modification time when read, wall-clock; a copy that does not keep times moves it |
 | `sample_period` | Mean bytes between samples (`2^lg_prof_sample`) |
-| `header_live_objects`, `header_live_bytes` | The dump's header totals, as written |
-
-The header totals are in the same form as `heap_sample`'s counts (below), so they are not the snapshot's estimated total either.
-That total is the sum of the scaled rows.
 
 `heap_sample` has one row per distinct allocation stack in a snapshot.
 
@@ -154,14 +195,9 @@ That total is the sum of the scaled rows.
 |---|---|
 | `snapshot_id` | `heap_snapshot.id` |
 | `stack_id` | `stack.id` |
-| `live_objects`, `live_bytes` | Allocated from this stack and not yet freed |
-| `alloc_objects`, `alloc_bytes` | Cumulative since start; 0 unless jemalloc ran with `prof_accum:true` |
-
-Counts are stored as jemalloc wrote them, and those are **not estimates of the true totals**: they are the inputs to jeprof's per-stack scaling.
-jemalloc 5.3 writes the values that jeprof's formula turns into its estimate, and older versions write the raw sampled counts, so both need the same step.
-Scale each row by `1 / (1 - exp(-(bytes / objects) / sample_period))`, both `live_*` and `alloc_*`.
-The factor depends on the objects' size, so unscaled rows rank stacks wrongly.
-In the example below, the 256-byte list nodes read about 64 times too small, and 64 KiB buffers about 2% too small.
+| `est_live_objects`, `est_live_bytes` | **Estimated** objects and bytes allocated from this stack and not yet freed, in the whole process. Use these. |
+| `est_alloc_objects`, `est_alloc_bytes` | Estimated cumulative allocations since start; 0 unless jemalloc ran with `prof_accum:true` |
+| `live_objects`, `live_bytes`, `alloc_objects`, `alloc_bytes` | The sampled counts as jemalloc wrote them, before unbiasing. Kept for reference; never add them up as totals |
 
 Pids are the writing process's own, in its pid namespace.
 Two containers whose main process is pid 1 share one `process` row when their dumps are read into one database, and heap rows carry no host or container of their own; `source_path` says where each came from.
@@ -169,43 +205,38 @@ A DuckDB merge keeps these tables; a schema-24 reader's merge, or an export to p
 
 ## Queries
 
-Scale the rows once, in a view, and query that:
+A snapshot's estimated live heap:
 
 ```sql
-CREATE OR REPLACE TEMP VIEW heap_est AS
-SELECT h.*, s.upid, s.seq,
-  h.live_bytes   / (1 - exp(-(h.live_bytes::DOUBLE / h.live_objects) / s.sample_period)) AS est_live_bytes,
-  h.live_objects / (1 - exp(-(h.live_bytes::DOUBLE / h.live_objects) / s.sample_period)) AS est_live_objects
-FROM heap_sample h
-JOIN heap_snapshot s ON s.trace_id = h.trace_id AND s.id = h.snapshot_id
-WHERE h.live_objects > 0;
+SELECT snapshot_id, sum(est_live_bytes) AS est_live_bytes
+FROM heap_sample GROUP BY snapshot_id ORDER BY snapshot_id;
 ```
 
 Estimated live bytes by the function that allocated, per snapshot: the innermost frame of each stack that is in the program's own binary (`myprogram` here):
 
 ```sql
 WITH own AS (
-  SELECT e.snapshot_id, e.est_live_bytes, arg_max(fr.name, u.idx) AS fn
-  FROM heap_est e
-  JOIN stack s ON s.trace_id = e.trace_id AND s.id = e.stack_id,
+  SELECT h.snapshot_id, h.est_live_bytes, arg_max(fr.name, u.idx) AS fn
+  FROM heap_sample h
+  JOIN stack s ON s.trace_id = h.trace_id AND s.id = h.stack_id,
        unnest(s.frame_ids) WITH ORDINALITY AS u(fid, idx)
   JOIN frame fr ON fr.trace_id = s.trace_id AND fr.id = u.fid
   WHERE fr.name LIKE '%(myprogram%'
-  GROUP BY e.trace_id, e.snapshot_id, e.stack_id, e.est_live_bytes
+  GROUP BY h.trace_id, h.snapshot_id, h.stack_id, h.est_live_bytes
 )
-SELECT snapshot_id, fn, round(sum(est_live_bytes)) AS est_live_bytes
+SELECT snapshot_id, fn, sum(est_live_bytes) AS est_live_bytes
 FROM own GROUP BY ALL ORDER BY snapshot_id, est_live_bytes DESC;
 ```
 
 Whole stacks, largest first, in the final snapshot:
 
 ```sql
-SELECT e.est_live_bytes, sf.frame_names
-FROM heap_est e
-JOIN heap_snapshot hs ON hs.trace_id = e.trace_id AND hs.id = e.snapshot_id
-JOIN stack_frames sf ON sf.trace_id = e.trace_id AND sf.id = e.stack_id
+SELECT h.est_live_bytes, sf.frame_names
+FROM heap_sample h
+JOIN heap_snapshot hs ON hs.trace_id = h.trace_id AND hs.id = h.snapshot_id
+JOIN stack_frames sf ON sf.trace_id = h.trace_id AND sf.id = h.stack_id
 WHERE hs.dump_trigger = 'final'
-ORDER BY e.est_live_bytes DESC;
+ORDER BY h.est_live_bytes DESC;
 ```
 
 Growth between each process's first and last snapshot, by stack.
@@ -213,13 +244,17 @@ Stack ids compare only within one process (frames carry absolute addresses, whic
 With a prefix input and no `--keep-all` there is one snapshot per process, so read with `--keep-all` for this.
 
 ```sql
-WITH ends AS (
+WITH rows AS (
+  SELECT h.*, s.upid, s.seq FROM heap_sample h
+  JOIN heap_snapshot s ON s.trace_id = h.trace_id AND s.id = h.snapshot_id
+),
+ends AS (
   SELECT upid, min(seq) AS first_seq, max(seq) AS last_seq FROM heap_snapshot GROUP BY upid
 )
-SELECT e.upid, e.stack_id,
-       coalesce(sum(e.est_live_bytes) FILTER (WHERE e.seq = ends.last_seq), 0)
-     - coalesce(sum(e.est_live_bytes) FILTER (WHERE e.seq = ends.first_seq), 0) AS growth
-FROM heap_est e JOIN ends USING (upid)
+SELECT r.upid, r.stack_id,
+       coalesce(sum(r.est_live_bytes) FILTER (WHERE r.seq = ends.last_seq), 0)
+     - coalesce(sum(r.est_live_bytes) FILTER (WHERE r.seq = ends.first_seq), 0) AS growth
+FROM rows r JOIN ends USING (upid)
 GROUP BY ALL ORDER BY growth DESC;
 ```
 
@@ -236,6 +271,6 @@ heap/examples/jemalloc/run.sh /tmp/snaps     # writes jeprof.<pid>.<seq>.<kind>.
 systing-heap -o /tmp/heap.duckdb /tmp/snaps
 ```
 
-In the result, once scaled (`heap_est` above), `leak_buffers` grows by about 2 MiB a round and reaches about 16 MiB in the final snapshot.
+In the result (`est_live_bytes`), `leak_buffers` grows by about 2 MiB a round and reaches about 16 MiB in the final snapshot.
 `build_list` grows to about 3 MB before the program frees the list, `cache_fill` stays about 1 MiB, and `churn` does not appear, since it frees everything it allocates.
 Unscaled, `build_list` reads about 45 KB: its 256-byte objects are the ones sampling misses most.

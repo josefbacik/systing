@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use systing_heap::perfmap::{self, PerfMap};
-use systing_heap::{db, jemalloc, retention, symbolize, Format, Snapshot};
+use systing_heap::{db, jemalloc, perfetto, retention, symbolize, Format, Snapshot};
 
 /// Parse allocator heap snapshots (jemalloc prof dumps), symbolize their
 /// stacks, and write them into a systing DuckDB database.
@@ -25,7 +25,9 @@ struct Cli {
     #[arg(required = true)]
     inputs: Vec<PathBuf>,
 
-    /// The DuckDB database to write. It is replaced on every run.
+    /// The output, replaced on every run: a DuckDB database, or a Perfetto
+    /// trace of native heap profiles when it ends in .pb, .perfetto, .pftrace
+    /// or .perfetto-trace (open it at ui.perfetto.dev).
     #[arg(short, long)]
     output: PathBuf,
 
@@ -130,8 +132,13 @@ fn main() -> Result<()> {
         .map(|p| p.to_string_lossy())
         .collect::<Vec<_>>()
         .join(",");
-    let written = write_replacing(&cli.output, |tmp| {
-        db::write(tmp, &cli.trace_id, &source, &snapshots, &symbolized)
+    let as_perfetto = perfetto::is_perfetto_output(&cli.output);
+    let written = write_replacing(&cli.output, !as_perfetto, |tmp| {
+        if as_perfetto {
+            perfetto::write(tmp, &snapshots, &symbolized)
+        } else {
+            db::write(tmp, &cli.trace_id, &source, &snapshots, &symbolized)
+        }
     })?;
     println!(
         "{}: {} snapshot(s), {} sample(s), {} stack(s), {} frame(s); {}/{} addresses symbolized, {} Python function(s) from perf maps",
@@ -192,7 +199,11 @@ fn attach_perf_maps(snapshots: &mut [Snapshot], dir: Option<&Path>) {
 /// Write a new database in a private, randomly named directory beside `out`
 /// and rename it over `out`, so a failed run leaves the previous database
 /// whole and no one else can plant a file or symlink at the temporary path.
-fn write_replacing<T>(out: &Path, write: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+fn write_replacing<T>(
+    out: &Path,
+    duckdb: bool,
+    write: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
     let parent = match out.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -210,7 +221,9 @@ fn write_replacing<T>(out: &Path, write: impl FnOnce(&Path) -> Result<T>) -> Res
     let result = write(&tmp)?;
     // A write-ahead log left by a crashed writer of the old database would
     // be replayed against the new one.
-    let _ = std::fs::remove_file(wal_path(out));
+    if duckdb {
+        let _ = std::fs::remove_file(wal_path(out));
+    }
     std::fs::rename(&tmp, out)
         .with_context(|| format!("renaming {} to {}", tmp.display(), out.display()))?;
     // Make the rename durable before any dump is deleted: after a power

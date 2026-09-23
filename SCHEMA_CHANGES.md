@@ -455,34 +455,34 @@ recorder's, so the usual stack queries and flamegraphs work on them.
 
 ### New tables
 - `heap_snapshot` — one row per snapshot file (id, format, source_path, upid,
-  seq, dump_trigger, dumped_at_unix_ns, sample_period, header_live_objects,
-  header_live_bytes). `format` is `jemalloc` for now. `upid` is the process
-  the file name names (a `process` row per pid, `name` from the dump's first
-  mapped file), NULL for a file renamed without its pid. That pid is the one
-  the writing process saw, in its own pid namespace (1 in many containers),
-  and it is the row's only process identity: two containers' dumps read into
-  one database share a `process` row, and a heap trace does not join a
-  capture of the same host by pid. `seq` and `dump_trigger` (`interval`,
-  `manual`, `gdump`, `final`) come from the file name. `dumped_at_unix_ns` is
-  the file's mtime when it was read, wall-clock (the trace tables' `ts` are
-  boot-monotonic): a copy that does not keep times moves it.
-  `sample_period` (mean bytes between samples) is from the header.
-  `header_live_*` are the header's totals as written, in the same form as
-  `heap_sample`'s counts (below): neither they nor a plain sum of
-  `heap_sample` is the snapshot's estimated total, which is the sum of the
-  rows once each is scaled.
+  seq, dump_trigger, dumped_at_unix_ns, sample_period). `format` is
+  `jemalloc` for now. `upid` is the process the file name names (a `process`
+  row per pid, `name` from the dump's first mapped file), NULL for a file
+  renamed without its pid. That pid is the one the writing process saw, in
+  its own pid namespace (1 in many containers), and it is the row's only
+  process identity: two containers' dumps read into one database share a
+  `process` row, and a heap trace does not join a capture of the same host by
+  pid. `seq` and `dump_trigger` (`interval`, `manual`, `gdump`, `final`) come
+  from the file name. `dumped_at_unix_ns` is the file's mtime when it was
+  read, wall-clock (the trace tables' `ts` are boot-monotonic): a copy that
+  does not keep times moves it. `sample_period` (mean bytes between samples)
+  is from the header. The header's own totals are not kept: they are a sum of
+  every stack's sampled counts, and a sum cannot be unbiased (below).
 - `heap_sample` — one row per distinct allocation stack in a snapshot
   (snapshot_id, stack_id, live_objects, live_bytes, alloc_objects,
-  alloc_bytes). Counts are as jemalloc wrote them, which are jeprof's
-  **inputs**, not estimates of the true totals: jemalloc 5.3 writes, per
-  stack, the values that jeprof's own per-stack scaling turns into its
-  estimate (`prof_do_unbias`), and older versions write the raw sampled
-  counts. Both need the same step: scale each row by
-  `1 / (1 - exp(-(bytes / objects) / sample_period))`, both `live_*` and
-  `alloc_*`. The factor depends on object size, so unscaled rows rank stacks
-  wrongly: about 1.02× for 64 KiB objects at a 16 KiB period, about 64× for
-  256-byte ones. `alloc_*` are cumulative since start and 0 unless the
-  allocator tracked them (jemalloc `prof_accum`).
+  alloc_bytes, est_live_objects, est_live_bytes, est_alloc_objects,
+  est_alloc_bytes). `est_*` are the estimates for the whole process; sum
+  these. jemalloc samples an allocation of `s` bytes with probability
+  `1 - exp(-s / sample_period)`, so each row is scaled by
+  `1 / (1 - exp(-(bytes / objects) / sample_period))` at its own mean object
+  size, as jeprof does, for both the live and the alloc pair. jemalloc 5.3
+  writes each stack's pair so that this step gives its own estimate. Scaling
+  must come before any sum: summing stacks first under-counts small objects
+  badly (jemalloc's PROFILING_INTERNALS.md, "Aggregation must be done after
+  unbiasing samples"). `live_*` / `alloc_*` are the counts as written, before
+  unbiasing, kept for reference: summed, they come to a few percent of the
+  real heap. `alloc_*` are cumulative since start and 0 unless the allocator
+  tracked them (jemalloc `prof_accum`).
 
 Python frames (named from a perf map, with perf trampolines) are
 function-level: `module:qualname (python) [file.py]` like pystacks' for
