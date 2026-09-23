@@ -22,6 +22,11 @@ name: bpf-load-shapes
 # scripts/ci/vmtest-task-context-e2e.sh decides by the lines the cases and the
 # tracer print, so a green row means every case ran to its end and the reader's own
 # counters say what it read and what it refused on that kernel.
+#
+# The same cases also run on native arm64, with no guest: the runner's own CPUs and
+# its own kernel (the arm64 job at the end). That is the only place the writer
+# library's ordering test meets weakly ordered hardware, and the only place the
+# reader's aarch64 thread-pointer and DTV reads are exercised.
 
 on:
   push:
@@ -231,5 +236,88 @@ jobs:
             task-context-e2e-${{ matrix.kernel.id }}.log
             task-context-e2e-${{ matrix.kernel.id }}.log.raw
             task-context-e2e-${{ matrix.kernel.id }}.log.counters
+          if-no-files-found: ignore
+          retention-days: 7
+
+  task-context-arm64:
+    name: task_context on native arm64
+    # GitHub's arm64 runner: Arm CPUs and the runner image's own kernel, not one
+    # of the pinned kernels above, and no guest. The image's kernel is whatever
+    # GitHub ships (6.14 at the time of writing); the job prints it.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2
+      - name: Install clang 21 (the release build's BPF compiler)
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh
+          sudo bash /tmp/llvm.sh 21
+          clang-21 --version
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+      - name: Download the pre-built DuckDB library the crate pins (arm64)
+        run: |
+          LIBDUCKDB_VERSION="$(scripts/libduckdb-version.sh)"
+          echo "libduckdb v${LIBDUCKDB_VERSION} (the DuckDB version Cargo.lock pins)"
+          wget -nv "https://github.com/duckdb/duckdb/releases/download/v${LIBDUCKDB_VERSION}/libduckdb-linux-arm64.zip" -O /tmp/libduckdb.zip
+          unzip /tmp/libduckdb.zip -d ${{ github.workspace }}/libduckdb
+      - name: Say what this machine is
+        run: |
+          uname -a
+          grep -m1 -i 'model name\|CPU part' /proc/cpuinfo || true
+          nproc
+          ls -l /sys/kernel/btf/vmlinux
+          cc --version | head -n 1
+      - name: Test the writer library on real arm64 cores
+        # `CI` is set: a case that cannot run (no compiler, no static C library)
+        # fails instead of skipping. Includes the two-thread ordering test, which
+        # cannot fail on x86-64.
+        run: cargo test -p task-context -- --nocapture
+      - name: Build the task_context_record test binary
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo test --test task_context_record --no-run --no-default-features --message-format=json > /tmp/build-task-context.json
+          BIN="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "task_context_record") | .executable' /tmp/build-task-context.json | tail -1)"
+          test -x "$BIN"
+          mkdir -p gate
+          cp "$BIN" gate/task_context_record
+          cp libduckdb/libduckdb.so gate/
+          ls -l gate
+      - name: Run the task_context end-to-end cases as root
+        # The script decides by what the cases and the tracer print, as in the
+        # guests; run outside a guest it mounts nothing and the cases use /tmp.
+        run: |
+          chmod +x gate/task_context_record scripts/ci/vmtest-task-context-e2e.sh
+          OUT="$GITHUB_WORKSPACE/task-context-e2e-arm64.log"
+          set +e
+          sudo -E bash "$GITHUB_WORKSPACE/scripts/ci/vmtest-task-context-e2e.sh" \
+            "$GITHUB_WORKSPACE/gate/task_context_record" "$GITHUB_WORKSPACE/gate" "$GITHUB_WORKSPACE" "$OUT"
+          echo "the script exited $? (informational: the file it wrote decides)"
+          set -e
+          echo "::group::guest output (arm64)"
+          cat "$OUT" || cat "$OUT.raw" || true
+          echo "::endgroup::"
+          grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: task-context-e2e-arm64
+          path: |
+            task-context-e2e-arm64.log
+            task-context-e2e-arm64.log.raw
+            task-context-e2e-arm64.log.counters
           if-no-files-found: ignore
           retention-days: 7
