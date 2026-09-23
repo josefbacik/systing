@@ -169,10 +169,10 @@ fn attach_perf_maps(snapshots: &mut [Snapshot], dir: Option<&Path>) {
         };
         s.perf_map = cache
             .entry(path)
-            .or_insert_with_key(|path| match std::fs::read_to_string(path) {
-                Ok(text) => Some(Arc::new(PerfMap::parse(&text))),
+            .or_insert_with_key(|path| match perfmap::read(path) {
+                Ok(map) => Some(Arc::new(map)),
                 Err(e) => {
-                    eprintln!("warning: reading {}: {e}", path.display());
+                    eprintln!("warning: not using {}: {e}", path.display());
                     None
                 }
             })

@@ -4,7 +4,14 @@
 //! `<start hex> <size hex> py::<qualname>:<file>`, so the trampoline frames in
 //! a heap snapshot's stacks name the Python functions they ran.
 
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+/// The largest perf map read: far beyond any real process's (one short
+/// line per Python function), small enough that a planted file cannot
+/// exhaust memory.
+pub const MAX_BYTES: u64 = 256 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -77,7 +84,8 @@ impl Entry {
 }
 
 /// Where to look for `perf-<pid>.map`, in order: `dir` (--perf-map-dir),
-/// beside the snapshot, then /tmp where the process wrote it.
+/// beside the snapshot, then /tmp where the process wrote it. Only names a
+/// candidate; [`read`] decides whether it may be used.
 pub fn find(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Option<PathBuf> {
     let name = format!("perf-{pid}.map");
     let beside = snapshot.parent().map(|p| p.join(&name));
@@ -88,7 +96,55 @@ pub fn find(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Option<PathBuf> {
     ]
     .into_iter()
     .flatten()
-    .find(|p| p.is_file())
+    .find(|p| p.symlink_metadata().is_ok())
+}
+
+/// Read a perf map found by [`find`]. Anyone can write /tmp, so the file is
+/// opened without following a symlink and must be a regular file, checked on
+/// the open handle, of at most [`MAX_BYTES`]. One in a world-writable
+/// directory must also be owned by this user or root, as perf requires, or
+/// another user could name our frames.
+pub fn read(path: &Path) -> std::io::Result<PerfMap> {
+    use std::io::{Error, ErrorKind};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if meta.len() > MAX_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("larger than {MAX_BYTES} bytes"),
+        ));
+    }
+    let world_writable_dir = path
+        .parent()
+        .and_then(|d| {
+            std::fs::metadata(if d.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                d
+            })
+            .ok()
+        })
+        .is_some_and(|d| d.mode() & 0o002 != 0);
+    // SAFETY: geteuid cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if world_writable_dir && meta.uid() != euid && meta.uid() != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "owned by uid {} in a world-writable directory; copy it beside the snapshot if you trust it",
+                meta.uid()
+            ),
+        ));
+    }
+    let mut text = String::new();
+    (&file).take(MAX_BYTES).read_to_string(&mut text)?;
+    Ok(PerfMap::parse(&text))
 }
 
 #[cfg(test)]
@@ -132,6 +188,22 @@ garbage line
         let m = PerfMap::parse(MAP);
         assert!(m.lookup(0x7f75cb8c7508).is_none());
         assert!(m.lookup(0x10).is_none());
+    }
+
+    #[test]
+    fn read_refuses_symlinks_and_non_files() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real.map");
+        std::fs::write(&real, MAP).unwrap();
+        assert_eq!(read(&real).unwrap(), PerfMap::parse(MAP));
+        let link = d.path().join("perf-1.map");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read(&link).is_err(), "a symlink must not be followed");
+        assert!(read(d.path()).is_err(), "a directory is not a map");
+        assert!(
+            read(Path::new("/dev/null")).is_err(),
+            "a device is not a map"
+        );
     }
 
     #[test]

@@ -125,7 +125,7 @@ Things to know:
 
 - **Turn trampolines on early.** Trampolines only wrap functions called after they are on, so a frame already running (the module that calls `install()`) has none. `PYTHONPERFSUPPORT=1` turns them on at startup. The hook applies only to allocations sampled after `install()`.
 - **Function granularity.** A trampoline is per function, so Python frames name the function and file (full path in `frame_file`), not the line.
-- **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps. Without it, Python frames show as `unknown ([anon])` and the tool warns.
+- **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps. Without it, Python frames show as `unknown ([anon])` and the tool warns. A map is read only if it is a regular file (symlinks are not followed) of at most 256 MiB, and one in a world-writable directory such as `/tmp` only if you or root own it, as perf requires: otherwise another user could name your frames.
 - **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran about 40% slower. Code that spends its time in C pays far less. The hook itself runs only for sampled allocations.
 
 ## Tables
