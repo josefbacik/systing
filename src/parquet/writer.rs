@@ -35,8 +35,8 @@ use crate::trace::{
     NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
     ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord, SliceRecord,
     SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord,
-    TaskStackEventRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord,
-    TpuOpRecord, TrackRecord, WakeupNewRecord,
+    TaskContextRecord, TaskStackEventRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord,
+    TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -149,6 +149,7 @@ pub struct StreamingParquetWriter {
     memory_thp: Vec<MemoryThpRecord>,
     memory_vmstat: Vec<MemoryVmstatRecord>,
     task_stack_events: Vec<TaskStackEventRecord>,
+    task_contexts: Vec<TaskContextRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
     cpu_infos: Vec<CpuInfoRecord>,
@@ -202,6 +203,7 @@ pub struct StreamingParquetWriter {
     memory_thp_writer: Option<TableWriter>,
     memory_vmstat_writer: Option<TableWriter>,
     task_stack_event_writer: Option<TableWriter>,
+    task_context_writer: Option<TableWriter>,
     clock_snapshot_writer: Option<TableWriter>,
     sysinfo_writer: Option<TableWriter>,
     cpu_info_writer: Option<TableWriter>,
@@ -288,6 +290,7 @@ impl StreamingParquetWriter {
             memory_thp: Vec::new(),
             memory_vmstat: Vec::new(),
             task_stack_events: Vec::new(),
+            task_contexts: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
             cpu_infos: Vec::new(),
@@ -329,6 +332,7 @@ impl StreamingParquetWriter {
             memory_thp_writer: None,
             memory_vmstat_writer: None,
             task_stack_event_writer: None,
+            task_context_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
             cpu_info_writer: None,
@@ -1200,6 +1204,24 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    fn flush_task_contexts(&mut self) -> Result<()> {
+        if self.task_contexts.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::task_context_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.task_context_writer,
+            &self.sink,
+            "task_context",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_task_context_batch(&self.task_contexts, &schema)?;
+        writer.write(&batch)?;
+        self.task_contexts.clear();
+        Ok(())
+    }
+
     fn flush_memory_vmstat(&mut self) -> Result<()> {
         if self.memory_vmstat.is_empty() {
             return Ok(());
@@ -1345,6 +1367,7 @@ impl StreamingParquetWriter {
         close_writer!(self.memory_thp_writer);
         close_writer!(self.memory_vmstat_writer);
         close_writer!(self.task_stack_event_writer);
+        close_writer!(self.task_context_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
         close_writer!(self.cpu_info_writer);
@@ -1852,6 +1875,17 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_task_context(&mut self, record: TaskContextRecord) -> Result<()> {
+        // A low-volume table (one row per name per new context id, rate
+        // limited at the source): no batch-sized reservation up front.
+        self.task_contexts.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.task_contexts, self.batch_size) {
+            self.flush_task_contexts()?;
+        }
+        Ok(())
+    }
+
     fn add_memory_vmstat(&mut self, record: MemoryVmstatRecord) -> Result<()> {
         Self::reserve_if_empty(&mut self.memory_vmstat, self.batch_size);
         self.memory_vmstat.push(record);
@@ -1948,6 +1982,7 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_memory_thp()?;
         self.flush_memory_vmstat()?;
         self.flush_task_stack_events()?;
+        self.flush_task_contexts()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
         self.flush_cpu_infos()?;
@@ -2497,6 +2532,7 @@ fn build_stack_sample_batch(
     let mut cpu_builder = Int32Builder::with_capacity(records.len());
     let mut stack_id_builder = Int64Builder::with_capacity(records.len());
     let mut stack_event_type_builder = Int8Builder::with_capacity(records.len());
+    let mut task_context_id_builder = UInt64Builder::with_capacity(records.len());
 
     for record in records {
         ts_builder.append_value(record.ts);
@@ -2504,6 +2540,7 @@ fn build_stack_sample_batch(
         cpu_builder.append_option(record.cpu);
         stack_id_builder.append_value(record.stack_id);
         stack_event_type_builder.append_value(record.stack_event_type);
+        task_context_id_builder.append_option(record.task_context_id);
     }
 
     Ok(RecordBatch::try_new(
@@ -2514,6 +2551,7 @@ fn build_stack_sample_batch(
             Arc::new(cpu_builder.finish()),
             Arc::new(stack_id_builder.finish()),
             Arc::new(stack_event_type_builder.finish()),
+            Arc::new(task_context_id_builder.finish()),
         ],
     )?)
 }
@@ -3251,6 +3289,38 @@ fn build_task_stack_event_batch(
             Arc::new(runtime_delta_ns.finish()),
             Arc::new(state.finish()),
             Arc::new(stack_id.finish()),
+        ],
+    )?)
+}
+
+fn build_task_context_batch(
+    records: &[TaskContextRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let n = records.len();
+    let mut utid = Int64Builder::with_capacity(n);
+    let mut id = UInt64Builder::with_capacity(n);
+    let mut ts = Int64Builder::with_capacity(n);
+    let mut name = StringBuilder::with_capacity(n, n * 16);
+    let mut value_u64 = UInt64Builder::with_capacity(n);
+    let mut value_str = StringBuilder::with_capacity(n, n * 32);
+    for r in records {
+        utid.append_value(r.utid);
+        id.append_value(r.id);
+        ts.append_value(r.ts);
+        name.append_value(&r.name);
+        value_u64.append_option(r.value_u64);
+        value_str.append_option(r.value_str.as_deref());
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(utid.finish()),
+            Arc::new(id.finish()),
+            Arc::new(ts.finish()),
+            Arc::new(name.finish()),
+            Arc::new(value_u64.finish()),
+            Arc::new(value_str.finish()),
         ],
     )?)
 }

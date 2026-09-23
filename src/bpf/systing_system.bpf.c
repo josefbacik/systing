@@ -271,8 +271,15 @@ struct stack_event {
 	u32 cpu;
 	u32 user_stack_format;
 	struct task_info task;
-	u64 kernel_stack_length;
-	u64 user_stack_length;
+	/* Entry counts of at most MAX_STACK_DEPTH, so 32 bits each: the two
+	 * lengths used to be 64-bit and now share their first 8 bytes, which
+	 * frees the second 8 for the sampled thread's task_context id (see
+	 * task_context_reader.bpf.h; 0 = none, and always 0 without
+	 * --include-task-context). No other field moves and the record does
+	 * not grow. */
+	u32 kernel_stack_length;
+	u32 user_stack_length;
+	u64 task_context_id;
 	u64 kernel_stack[MAX_STACK_DEPTH];
 #ifdef SYSTING_PYSTACKS
 	struct pystacks_message py_msg_buffer;
