@@ -264,6 +264,23 @@ fn contexts(dir: &Path) -> Contexts {
     contexts
 }
 
+/// Every `utid` the `thread` table has.
+fn thread_utids(dir: &Path) -> BTreeSet<i64> {
+    let path = dir.join("thread.parquet");
+    assert!(path.exists(), "thread.parquet not found");
+    let mut utids = BTreeSet::new();
+    for batch in batches(&path) {
+        let utid = batch
+            .column_by_name("utid")
+            .expect("thread.utid")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("utid is Int64");
+        utids.extend((0..batch.num_rows()).map(|row| utid.value(row)));
+    }
+    utids
+}
+
 // ---------------------------------------------------------------------------
 // Capturing
 // ---------------------------------------------------------------------------
@@ -371,6 +388,15 @@ fn check_example_trace(dir: &Path, how: &str) {
                 ids[0]
             );
         }
+    }
+
+    // Every row belongs to a thread the trace knows: no orphan utid.
+    let known = thread_utids(dir);
+    for (utid, id) in contexts.keys() {
+        assert!(
+            known.contains(utid),
+            "[{how}] task_context has utid {utid} (id {id:#x}), which the thread table does not have"
+        );
     }
 
     // Every id a sample carries has its values: none was dropped on the way

@@ -303,8 +303,11 @@ static __always_inline u64 task_context_thread_pointer(struct task_struct *task)
  * now: the last one the thread's values travelled under - but only if it is
  * THIS block's. A word's top bits are the index its block was given when it
  * was handed to its thread, and they never change while the thread holds it;
- * an entry left under the same tid by an earlier thread whose exit was not
- * seen has another block's index, and is not carried.
+ * an entry left under the same tid by an earlier thread of the SAME process
+ * whose exit was not seen has another block's index, and is not carried.
+ * (Each process numbers its own blocks, so across processes an index can
+ * repeat: there it is the exit program's unconditional delete that keeps an
+ * old entry from meeting a new thread.)
  */
 static __always_inline u64 task_context_last_or_none(const u64 *last, u64 word)
 {
