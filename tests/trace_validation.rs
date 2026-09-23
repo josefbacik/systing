@@ -5716,6 +5716,173 @@ fn test_e2e_task_stacks_scoped_walks_record_what_the_full_walk_does() {
     );
 }
 
+/// A `--cgroup` target with cgroups below it, which is how a container runtime
+/// lays a workload out: a cgroup for the whole of it and one below for each
+/// container. The recorder lists such a target's processes with one read of a
+/// cgroup iterator that walks the target and every cgroup below it, and that
+/// iterator has a single read session: the kernel ends it as soon as what it
+/// has gathered reaches the length the reader asked for, and a session that
+/// ended before the last cgroup cannot be picked up again. A reader that asks
+/// for little therefore loses the listing of any target whose first cgroups
+/// hold a few processes and that has a cgroup after them, and every snapshot
+/// of such a capture walks every thread on the host instead. The target here
+/// is a cgroup with two below it, nine processes in the first and one in the
+/// second, none in the target itself. The listing has to come back whole at
+/// every snapshot, so that not one of them takes the other walk, and the
+/// process in the second cgroup has to be in the recording.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_task_stacks_scoped_walk_lists_the_cgroups_below_the_target() {
+    use std::process::{Command, Stdio};
+
+    // A process asleep in a cgroup, put there by writing its pid to the
+    // cgroup's `cgroup.procs`. Killed and reaped when the guard drops, on the
+    // test's panic path too, so that the cgroup it is in can go.
+    struct Sleeper(std::process::Child);
+
+    impl Sleeper {
+        fn spawn_in(cgroup: &Path) -> Sleeper {
+            let sleeper = Sleeper(
+                Command::new("sleep")
+                    .arg("600")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("Failed to spawn a sleeper"),
+            );
+            let procs = cgroup.join("cgroup.procs");
+            std::fs::write(&procs, sleeper.pid().to_string()).unwrap_or_else(|e| {
+                panic!(
+                    "Failed to move pid {} into {}: {e}",
+                    sleeper.pid(),
+                    procs.display()
+                )
+            });
+            sleeper
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let Some(cgroup_root) = systing::cgroup::cgroup2_root() else {
+        eprintln!("skipping: no cgroup v2 unified hierarchy on this system");
+        return;
+    };
+    let base = match current_cgroup_v2_path() {
+        Some(p) if p != "/" => cgroup_root.join(p.trim_start_matches('/')),
+        _ => cgroup_root,
+    };
+    let target = base.join(format!("systing-tsm-{}", std::process::id()));
+    let (first, second) = (target.join("first"), target.join("second"));
+    let mut fixture = CgroupFixture { dirs: Vec::new() };
+    match fixture.create(&target) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            eprintln!(
+                "skipping: cannot create a cgroup under {} ({e})",
+                base.display()
+            );
+            return;
+        }
+        Err(e) => panic!("Failed to create cgroup {}: {e}", target.display()),
+    }
+    // In this order: the kernel lists a cgroup's children oldest first, so the
+    // nine are listed before the cgroup that comes after them.
+    for below in [&first, &second] {
+        fixture
+            .create(below)
+            .unwrap_or_else(|e| panic!("Failed to create cgroup {}: {e}", below.display()));
+    }
+    // After the fixture, so dropped before it: the cgroups empty, then go.
+    let in_first: Vec<Sleeper> = (0..9).map(|_| Sleeper::spawn_in(&first)).collect();
+    let in_second = Sleeper::spawn_in(&second);
+
+    // Four seconds of a snapshot every 250 ms.
+    let target_path = target.to_str().expect("a cgroup path in UTF-8").to_string();
+    let (stderr, out_dir) = task_stacks_capture(&["--cgroup", &target_path], 250, 4, false);
+
+    if !stderr.contains("task-stacks: walking the --cgroup targets' processes alone") {
+        // A host the scoped walk does not run on says why at start, and only
+        // a reason known before anything is loaded counts: a kernel that
+        // refuses the iterator ends up on the other walk too.
+        let why = task_stacks_full_walk_reason(&stderr).unwrap_or_else(|| {
+            panic!("a capture with targets that walks every thread must say why:\n{stderr}")
+        });
+        assert!(
+            [
+                TASK_STACKS_NOT_ROOT_PID_NS,
+                TASK_STACKS_START_TIME_CGROUPS,
+                TASK_STACKS_NO_CSS_TASK_KFUNC,
+                TASK_STACKS_THREADED_SUBTREE,
+            ]
+            .contains(&why),
+            "the capture walked every thread on the host for a reason no healthy host gives \
+             ({why:?}):\n{stderr}"
+        );
+        eprintln!("skipping: this host took the walk over every thread ({why})");
+        return;
+    }
+    // Both the line a capture prints the first time a snapshot takes the other
+    // walk and the count of them in its closing line say this.
+    assert!(
+        !stderr.contains("walked every thread on the host instead"),
+        "the listing of a target with cgroups below it did not come back whole, and a snapshot \
+         walked every thread on the host instead:\n{stderr}"
+    );
+
+    let events = out_dir.path().join("task_stack_event.parquet");
+    let threads = out_dir.path().join("thread.parquet");
+    assert!(
+        events.exists() && threads.exists(),
+        "no task_stack_event.parquet / thread.parquet in {}",
+        out_dir.path().display()
+    );
+    let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+    let recorded = |pid: u32| -> i64 {
+        conn.query_row(
+            &format!(
+                "SELECT CAST(COUNT(*) AS BIGINT) \
+                 FROM read_parquet('{}') e JOIN read_parquet('{}') t ON t.utid = e.utid \
+                 WHERE t.tid = {pid}",
+                events.display(),
+                threads.display()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to count a sleeper's events")
+    };
+    for (below, sleeper) in in_first
+        .iter()
+        .map(|sleeper| ("first", sleeper))
+        .chain(std::iter::once(("second", &in_second)))
+    {
+        assert!(
+            recorded(sleeper.pid()) > 0,
+            "the sleeper {} in the {below} cgroup below the target is not in the recording",
+            sleeper.pid()
+        );
+    }
+    eprintln!(
+        "the listing came back whole: {} processes in two cgroups below the target, all recorded",
+        in_first.len() + 1
+    );
+}
+
 /// A scoped walk of a process that retires threads all the time. The kernel
 /// ends the walk of one process early when the thread it has just handed over
 /// exits before it advances; the recorder reads a process whose walk came up
