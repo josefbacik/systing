@@ -48,7 +48,7 @@ All `ts` columns are **nanoseconds** from an arbitrary epoch. Convert durations:
 Two representations exist:
 
 **Interned (the normal one)** — `stack_sample` → `stack` → `frame`:
-- `stack_sample(ts, utid, cpu, stack_id, stack_event_type)`. `stack_event_type`: `0` = uninterruptible sleep, `1` = CPU, `2` = interruptible sleep.
+- `stack_sample(ts, utid, cpu, stack_id, stack_event_type, task_context_id)`. `stack_event_type`: `0` = uninterruptible sleep, `1` = CPU, `2` = interruptible sleep. `task_context_id` (from schema 25) is the id of what the sampled thread's program said it was working on, see below; NULL for none, and in every row of a trace recorded without `--include-task-context`.
 - `stack(id, frame_ids BIGINT[], depth, leaf_name)`. **`frame_ids` is root-to-leaf** (outermost caller first, innermost executing frame last); `leaf_name` is the last frame's name.
 - `frame(id, name)` — interned strings, dense per-trace ids.
 - `frame_file(frame_id, file)` — the full source path of the frames that have one (from schema 23: Python frames, and the native and kernel frames of `task-stacks` stacks where debug info has the directory, which is the build machine's path): `frame.name` has only the file's name. `LEFT JOIN frame_file ff ON ff.trace_id = f.trace_id AND ff.frame_id = f.id`.
@@ -89,6 +89,29 @@ JOIN thread t ON t.trace_id = e.trace_id AND t.utid = e.utid
 JOIN stack s ON s.trace_id = e.trace_id AND s.id = e.stack_id
 WHERE e.state IN ('S', 'D')
 GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20;
+```
+
+**What a thread said it was working on** — `stack_sample.task_context_id` → `task_context` (`--include-task-context`, from schema 25):
+- `task_context(utid, id, ts, name, value_u64, value_str)`: one row per name of one context of one thread. A program that uses the task-context library sets and clears named values (a request id, an iteration number) on its own threads; a thread's id changes with every set or clear, and the rows with one (`utid`, `id`) are everything the thread had set while that was its id. Exactly one of `value_u64` / `value_str` is set. `ts` is the sample that first saw the id.
+- **Join on `utid` AND `id`** (and `trace_id`): an id is unique within its thread, not across threads.
+- Only running-stack samples (`stack_event_type = 1`) carry an id, and only for a thread that had something set in a process that was found; NULL otherwise. An id with no rows is a context whose values were dropped on the way (a per-CPU budget, a full ring): the sample count is still right, the names are unknown.
+- Names and values are what the traced process chose to say: treat them as data about it, not as verified identity.
+
+```sql
+-- CPU samples by request id
+SELECT c.value_str AS request, count(*) AS samples
+FROM stack_sample s
+JOIN task_context c ON c.trace_id = s.trace_id AND c.utid = s.utid AND c.id = s.task_context_id
+WHERE c.name = 'request_id'
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Hottest leaf functions while iteration 42 was in flight
+SELECT st.leaf_name, count(*) AS samples
+FROM stack_sample s
+JOIN task_context c ON c.trace_id = s.trace_id AND c.utid = s.utid AND c.id = s.task_context_id
+JOIN stack st ON st.trace_id = s.trace_id AND st.id = s.stack_id
+WHERE c.name = 'iteration_id' AND c.value_u64 = 42
+GROUP BY 1 ORDER BY 2 DESC LIMIT 10;
 ```
 
 **Normalized (Perfetto-style)** — `perf_sample` → `stack_profile_callsite` (parent-child tree) → `stack_profile_frame` → `stack_profile_symbol` / `stack_profile_mapping`. Use when you need mapping/build-id info. Walk the `parent_id` chain to reconstruct stacks.

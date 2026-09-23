@@ -2,7 +2,9 @@
 
 Attach a few named values to the calling thread — a request id, an iteration
 number — so that a tracer can read them from outside the process and store
-them beside each sample it takes of that thread.
+them beside each sample it takes of that thread. New to it? See the
+[quick start](https://github.com/josefbacik/systing/blob/main/docs/TASK_CONTEXT.md),
+which also covers collecting the data with systing.
 
 ```c
 #include "task_context.h"
