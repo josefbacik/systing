@@ -29,10 +29,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{FileExt, MetadataExt};
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-use object::elf::{FileHeader64, DT_NEEDED, PT_LOAD, SHT_NOBITS};
+use object::elf::{FileHeader64, DT_NEEDED, PN_XNUM, PT_LOAD, SHN_XINDEX, SHT_DYNAMIC, SHT_NOBITS};
 use object::read::elf::{Dyn, FileHeader, ProgramHeader, SectionHeader, SectionTable};
 use object::read::{ReadCache, ReadRef};
 use object::Endianness;
@@ -80,6 +79,14 @@ const USER_ADDR_MAX: u64 = 0x00ff_ffff_ffff_ffff;
 /// Distinct files whose ELF facts are remembered; past this the table
 /// starts again.
 const ELF_CACHE_MAX: usize = 1 << 16;
+
+/// The longest a file may say its info section and its dynamic section are
+/// for this reader to read them. A file states its own sizes, a sparse file
+/// can state any, and the cache a file is read through allocates what it is
+/// told: a size past these is refused unread. (The record is 104 bytes; a
+/// dynamic section of a megabyte is 65,536 entries.)
+const INFO_SECTION_MAX: u64 = 4096;
+const DYNAMIC_SECTION_MAX: u64 = 1 << 20;
 
 /// One process's recipe, as the BPF side takes it: the layout of
 /// `struct task_context_recipe` in `task_context_reader.bpf.h`.
@@ -339,6 +346,14 @@ fn needs_library<'data, R: ReadRef<'data>>(
     endian: Endianness,
     data: R,
 ) -> bool {
+    // A dynamic section that says it is longer than any real one is not
+    // read: such a file does not name the library as far as this goes.
+    let too_long = sections.iter().any(|section| {
+        section.sh_type(endian) == SHT_DYNAMIC && section.sh_size(endian) > DYNAMIC_SECTION_MAX
+    });
+    if too_long {
+        return false;
+    }
     let Ok(Some((entries, link))) = sections.dynamic(endian, data) else {
         return false;
     };
@@ -364,9 +379,20 @@ fn needs_library<'data, R: ReadRef<'data>>(
 /// Only the file header, the program headers, the section header table and
 /// the two small sections of interest are read. In particular no symbol
 /// table is, so a large unstripped executable costs what a small one does.
+/// Every length followed is one this reader bounds itself: the header's own
+/// 16-bit counts, and `INFO_SECTION_MAX` / `DYNAMIC_SECTION_MAX`.
 pub(crate) fn elf_facts<'data, R: ReadRef<'data>>(data: R) -> Option<ElfFacts> {
     let header = FileHeader64::<Endianness>::parse(data).ok()?;
     let endian = header.endian().ok()?;
+    // Extended numbering keeps a count too large for the header's 16 bits
+    // in section 0 instead, where a file can state billions of headers. No
+    // program this looks for needs it: such a file is not of interest.
+    if header.e_phnum(endian) == PN_XNUM
+        || header.e_shstrndx(endian) == SHN_XINDEX
+        || (header.e_shnum(endian) == 0 && header.e_shoff(endian) != 0)
+    {
+        return None;
+    }
     let (first_load_address, first_load_offset) = header
         .program_headers(endian, data)
         .ok()?
@@ -381,8 +407,11 @@ pub(crate) fn elf_facts<'data, R: ReadRef<'data>>(data: R) -> Option<ElfFacts> {
     let mut record_refused = false;
     if let Some((_, section)) = sections.section_by_name(endian, INFO_SECTION.as_bytes()) {
         // The constant fields are in the file's data image, so a section
-        // that occupies no file space is not the library's.
-        let bytes = if section.sh_type(endian) == SHT_NOBITS {
+        // that occupies no file space is not the library's; nor is one
+        // that says it is longer than this reader will read.
+        let unreadable =
+            section.sh_type(endian) == SHT_NOBITS || section.sh_size(endian) > INFO_SECTION_MAX;
+        let bytes = if unreadable {
             None
         } else {
             section.data(endian, data).ok()
@@ -473,24 +502,19 @@ fn exe_mapping<'a>(
     lowest_mapping(maps, |mapping| mapping.name == exe_path)
 }
 
-/// Open the file behind a mapping: through the process's own map first (it
-/// is that file whatever the process's mount namespace, and whether or not
-/// the file still has a name), then by path.
+/// Open the file behind a mapping through the process's own map: the entry
+/// of `/proc/<pid>/map_files` is that file whatever the process's mount
+/// namespace, and whether or not the file still has a name. Never by the
+/// path the map prints: a path is the traced process's to choose, it means
+/// something else in another namespace, and an open acts (a device node, a
+/// FIFO) before anything can be checked. A process whose entry cannot be
+/// opened counts as gone, and its next exec is looked at again.
 fn open_mapped_file(pid: u32, mapping: &MemoryMapping) -> Option<fs::File> {
     let by_range = format!(
         "/proc/{pid}/map_files/{:x}-{:x}",
         mapping.start, mapping.end
     );
-    if let Ok(file) = fs::File::open(by_range) {
-        return Some(file);
-    }
-    let name = mapping
-        .name
-        .strip_suffix(" (deleted)")
-        .unwrap_or(&mapping.name);
-    fs::File::open(format!("/proc/{pid}/root{name}"))
-        .or_else(|_| fs::File::open(Path::new(name)))
-        .ok()
+    fs::File::open(by_range).ok()
 }
 
 /// Discovery's state: what each distinct file said, and the counters.
@@ -989,6 +1013,12 @@ mod tests {
     /// `LOAD_ADDRESS`, optionally the record's section (holding `record`)
     /// and optionally one DT_NEEDED entry naming `needed`.
     fn small_elf(record: Option<&[u8]>, needed: Option<&str>) -> Vec<u8> {
+        small_elf_padded(record, needed, 0)
+    }
+
+    /// The same, with `padding` empty entries in its dynamic section after
+    /// the one that names `needed`.
+    fn small_elf_padded(record: Option<&[u8]>, needed: Option<&str>, padding: usize) -> Vec<u8> {
         use object::elf;
         let machine = if cfg!(target_arch = "aarch64") {
             elf::EM_AARCH64
@@ -1014,8 +1044,10 @@ mod tests {
             dynamic.extend_from_slice(&u64::from(elf::DT_NEEDED).to_le_bytes());
             dynamic.extend_from_slice(&1u64.to_le_bytes());
         }
-        dynamic.extend_from_slice(&u64::from(elf::DT_NULL).to_le_bytes());
-        dynamic.extend_from_slice(&0u64.to_le_bytes());
+        for _ in 0..=padding {
+            dynamic.extend_from_slice(&u64::from(elf::DT_NULL).to_le_bytes());
+            dynamic.extend_from_slice(&0u64.to_le_bytes());
+        }
         file.extend_from_slice(&dynamic);
         let names_at = file.len() as u64;
         let names = b"\0task_context_info\0.dynstr\0.dynamic\0.shstrtab\0";
@@ -1182,6 +1214,54 @@ mod tests {
         assert!(!elf_facts(&none[..]).unwrap().needs_library);
 
         assert!(elf_facts(&b"not an ELF file"[..]).is_none());
+    }
+
+    /// A file states its own sizes. What starts as a good record, in a
+    /// section that says it is longer than any record, is refused unread; a
+    /// dynamic section past the bound is not searched, though its first
+    /// entry names the library.
+    #[test]
+    fn a_size_the_file_states_is_followed_only_up_to_this_readers_bound() {
+        if cfg!(target_endian = "big") {
+            return;
+        }
+        let mut long = record_in_file().to_vec();
+        long.resize(INFO_SECTION_MAX as usize, 0);
+        let facts = elf_facts(&small_elf(Some(&long), None)[..]).unwrap();
+        assert!(facts.record_address.is_some(), "at the bound it is read");
+        long.push(0);
+        let facts = elf_facts(&small_elf(Some(&long), None)[..]).unwrap();
+        assert_eq!((facts.record_address, facts.record_refused), (None, true));
+
+        // With the entry that names the library and the one that ends the
+        // section, this many empty entries make exactly the bound.
+        let at_the_bound = DYNAMIC_SECTION_MAX as usize / 16 - 2;
+        let name = Some("libtask_context.so.1");
+        let searched = small_elf_padded(None, name, at_the_bound);
+        assert!(elf_facts(&searched[..]).unwrap().needs_library);
+        let too_long = small_elf_padded(None, name, at_the_bound + 1);
+        assert!(!elf_facts(&too_long[..]).unwrap().needs_library);
+    }
+
+    /// Extended numbering moves a count out of the header into section 0,
+    /// where it can be any size. A file that uses it, for its segments, its
+    /// sections or its section names, is not looked into at all.
+    #[test]
+    fn a_file_with_extended_numbering_is_not_a_file_of_interest() {
+        if cfg!(target_endian = "big") {
+            return;
+        }
+        let good = small_elf(Some(&record_in_file()), None);
+        assert!(elf_facts(&good[..]).is_some());
+        for (at, value) in [
+            (56, 0xffffu16), // e_phnum = PN_XNUM
+            (60, 0),         // e_shnum = 0 with a section table
+            (62, 0xffff),    // e_shstrndx = SHN_XINDEX
+        ] {
+            let mut file = good.clone();
+            file[at..at + 2].copy_from_slice(&value.to_le_bytes());
+            assert!(elf_facts(&file[..]).is_none(), "header field at {at}");
+        }
     }
 
     #[test]
