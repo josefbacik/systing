@@ -338,7 +338,8 @@ cargo build --release -p systing-heap
 systing-heap -o heap.duckdb /data/heap/jeprof   # jemalloc's prof_prefix: latest snapshot per process, older dumps deleted
 ```
 
-See [`heap/README.md`](heap/README.md) for producing snapshots, the tables, and queries.
+To set a service up to write snapshots (native stacks for any service, Python frames for Python services) and collect them, see [`docs/HEAP_SNAPSHOTS.md`](docs/HEAP_SNAPSHOTS.md).
+For the tool's options, the tables, and queries, see [`heap/README.md`](heap/README.md).
 
 ### Debugging and Verbosity
 

@@ -8,6 +8,8 @@ It is not a recording of malloc and free calls; systing's `memory-alloc` recorde
 The tool parses each snapshot, symbolizes its stacks, and writes them into the same `frame` and `stack` tables every systing recorder uses, plus two heap tables.
 The database opens in `systing-analyze` and merges with other traces like any capture.
 
+To set a service up to write snapshots, see [`docs/HEAP_SNAPSHOTS.md`](../docs/HEAP_SNAPSHOTS.md).
+
 ## Formats
 
 The format is chosen by file extension.
