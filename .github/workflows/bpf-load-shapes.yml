@@ -10,6 +10,17 @@ name: bpf-load-shapes
 # The verdict travels in a file the guest writes into the shared workspace, not in
 # the VM tool's exit code: a Container-Optimized OS kernel has no virtio console,
 # so vng cannot read the guest's exit code there and returns 255 either way.
+#
+# Each guest job then boots its kernel a second time and runs the task_context
+# end-to-end cases (tests/task_context_record.rs) as root: a program that uses the
+# task-context library is traced - started by the tracer and already running, with
+# the library linked in and as a shared object - and the trace must carry what it
+# set; under the confidentiality mode, and under a recipe planted on a process it is
+# wrong for, it must carry nothing. Those cases are `#[ignore]`d for an unprivileged
+# `cargo test` and return early without a C compiler;
+# scripts/ci/vmtest-task-context-e2e.sh decides by the lines the cases and the
+# tracer print, so a green row means every case ran to its end and the reader's own
+# counters say what it read and what it refused on that kernel.
 
 on:
   push:
@@ -65,6 +76,28 @@ jobs:
           mkdir -p gate
           cp "$BIN" gate/bpf_load_shapes
           cp libduckdb/libduckdb.so gate/
+          ls -l gate
+      - name: Build the task_context_record test binary (its end-to-end cases run the tracer in-process)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo test --test task_context_record --no-run --no-default-features --message-format=json > /tmp/build-task-context.json
+          BIN="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "task_context_record") | .executable' /tmp/build-task-context.json | tail -1)"
+          test -x "$BIN"
+          cp "$BIN" gate/task_context_record
+          # A debug build carries most of its size in debug sections nothing in the guest
+          # reads; drop them from the shipped COPY only, so the artifact stays small.
+          strip --strip-debug gate/task_context_record
+          # The cases compile the library's own example from the directory cargo baked
+          # into the test binary (CARGO_MANIFEST_DIR). Record it, so the guest job can
+          # refuse to run against any other checkout.
+          pwd > gate/manifest-dir.txt
+          cat gate/manifest-dir.txt
           ls -l gate
       - uses: actions/upload-artifact@v4
         with:
@@ -154,10 +187,48 @@ jobs:
           cat "$OUT" || true
           echo "::endgroup::"
           grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      - name: Boot the kernel again and run the task_context end-to-end cases
+        run: |
+          chmod +x gate/task_context_record scripts/ci/vmtest-task-context-e2e.sh
+          # The cases compile the library's example from the directory baked into the test
+          # binary when the build job compiled it. The guest sees this job's checkout at the
+          # same path; refuse to run if that is not the path the binary knows.
+          SRC_DIR="$(cat gate/manifest-dir.txt)"
+          if [ "$SRC_DIR" != "$GITHUB_WORKSPACE" ]; then
+            echo "the build job compiled in $SRC_DIR; this job's checkout is $GITHUB_WORKSPACE"
+            exit 1
+          fi
+          test -f "$GITHUB_WORKSPACE/crates/task-context/src/task_context.c"
+          mkdir -p guest-tmp
+          OUT="$GITHUB_WORKSPACE/task-context-e2e-${{ matrix.kernel.id }}.log"
+          KVM_FLAG=""
+          [ -w /dev/kvm ] || KVM_FLAG="--disable-kvm"
+          set +e
+          timeout 1800 vng --run "kernels/${{ matrix.kernel.id }}/kernel" $KVM_FLAG --force-9p --cpus 4 --memory 8G \
+            --rwdir "$GITHUB_WORKSPACE" --rwdir "/tmp=$GITHUB_WORKSPACE/guest-tmp" \
+            --append oops=panic --append virtme_root_user=1 --verbose \
+            -- bash "$GITHUB_WORKSPACE/scripts/ci/vmtest-task-context-e2e.sh" \
+                 "$GITHUB_WORKSPACE/gate/task_context_record" "$GITHUB_WORKSPACE/gate" "$GITHUB_WORKSPACE" "$OUT"
+          echo "vng exited $? (informational, as above: the guest-written file decides)"
+          set -e
+          echo "::group::guest output (${{ matrix.kernel.id }})"
+          cat "$OUT" || cat "$OUT.raw" || true
+          echo "::endgroup::"
+          grep -q '^VNG-TEST-EXIT:0$' "$OUT"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: load-shapes-${{ matrix.kernel.id }}
           path: load-shapes-${{ matrix.kernel.id }}.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: task-context-e2e-${{ matrix.kernel.id }}
+          path: |
+            task-context-e2e-${{ matrix.kernel.id }}.log
+            task-context-e2e-${{ matrix.kernel.id }}.log.raw
+            task-context-e2e-${{ matrix.kernel.id }}.log.counters
           if-no-files-found: ignore
           retention-days: 7

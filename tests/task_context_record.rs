@@ -19,6 +19,12 @@
 //! phase 2   request_id cleared            iteration_id = 1000 n + 2
 //! ```
 //!
+//! In those two tests the tracer starts the program, so the process is found
+//! at its exec. A third starts the program first and the capture afterwards:
+//! a process that is already running is found by the look at the start of
+//! the capture, over every process when the capture names none and at the
+//! named process when it names one.
+//!
 //! Two more tests hold what must NOT happen: a recipe that is wrong for its
 //! process (planted over a busy process that does not use the library) reads
 //! nothing, and under the kernel's confidentiality mode (forced here) a
@@ -30,13 +36,18 @@
 //! ```
 //! ./scripts/run-integration-tests.sh task_context_record
 //! ```
+//! CI runs them as root in the load-shape workflow's guests
+//! (`scripts/ci/vmtest-task-context-e2e.sh`), which reads the lines the tests
+//! and the tracer print: every test ends by printing one, and none is
+//! printed by a test that returned early.
 
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, Int64Array, StringArray, UInt64Array};
@@ -46,10 +57,18 @@ use systing::traced_command::spawn_traced_child;
 use systing::{systing, Config};
 use tempfile::TempDir;
 
-/// How long every thread of the example stays on a CPU after each phase.
-const BUSY_MS: &str = "400";
+/// How long every thread of the example stays on a CPU after each phase, in
+/// milliseconds, unless `BUSY_MS_VAR` says otherwise.
+const DEFAULT_BUSY_MS: &str = "400";
+/// Overrides `DEFAULT_BUSY_MS`: an emulated machine may need longer phases
+/// for the same number of samples. What is asserted does not change with it.
+const BUSY_MS_VAR: &str = "TASK_CONTEXT_TEST_BUSY_MS";
+/// The phase length of a program started BEFORE its capture: its first phase
+/// must outlast loading the programs and the capture on the slowest machine.
+/// The test ends the program itself.
+const ALREADY_RUNNING_BUSY_MS: &str = "1800000";
 /// The least number of samples that must carry each expected context. A
-/// thread spins for `BUSY_MS` in each; a handful is far below what any
+/// thread spins for the phase length in each; a handful is far below what any
 /// sampling rate gives and far above zero.
 const MIN_SAMPLES_PER_CONTEXT: usize = 5;
 /// Tells `busy_helper_without_the_library` how long to spin.
@@ -309,11 +328,16 @@ fn record_command(command: &[String], configure: impl FnOnce(&mut Config)) -> Te
     dir
 }
 
+/// The phase length the example is run with, in milliseconds.
+fn busy_ms() -> String {
+    std::env::var(BUSY_MS_VAR).unwrap_or_else(|_| DEFAULT_BUSY_MS.to_string())
+}
+
 fn example_command(program: &Path) -> Vec<String> {
     vec![
         program.to_str().expect("a utf-8 path").to_string(),
         "--busy-ms".to_string(),
-        BUSY_MS.to_string(),
+        busy_ms(),
     ]
 }
 
@@ -331,10 +355,12 @@ fn expected_phases(who: u64) -> [BTreeMap<String, Value>; 3] {
     ]
 }
 
-/// The whole read: every thread's three contexts are in the table with the
-/// values the program set, under one `utid` each; every sample that carries
-/// an id finds its values; and each expected context was sampled.
-fn check_example_trace(dir: &Path, how: &str) {
+/// The whole read: every thread's contexts of its first `phases_run` phases
+/// are in the table with the values the program set, under one `utid` each;
+/// every sample that carries an id finds its values; and each expected
+/// context was sampled. `phases_run` is 3 for a program that ran to its end
+/// under the capture and 1 for one the capture met in its first phase.
+fn check_example_trace(dir: &Path, how: &str, phases_run: usize) {
     let samples = samples(dir);
     let contexts = contexts(dir);
     assert!(!samples.is_empty(), "[{how}] the capture has no samples");
@@ -365,7 +391,7 @@ fn check_example_trace(dir: &Path, how: &str) {
             threads.insert(utid),
             "[{how}] two threads of the example share utid {utid}"
         );
-        for (phase, wanted) in phases.iter().enumerate() {
+        for (phase, wanted) in phases.iter().enumerate().take(phases_run) {
             let ids: Vec<u64> = contexts
                 .iter()
                 .filter(|((owner, _), values)| *owner == utid && *values == wanted)
@@ -384,7 +410,7 @@ fn check_example_trace(dir: &Path, how: &str) {
             assert!(
                 carried >= MIN_SAMPLES_PER_CONTEXT,
                 "[{how}] thread {who} phase {phase}: {carried} samples carry id {:#x}; the thread \
-                 spun for {BUSY_MS} ms with it",
+                 stayed on a CPU with it and {MIN_SAMPLES_PER_CONTEXT} or more are wanted",
                 ids[0]
             );
         }
@@ -440,6 +466,10 @@ fn check_nothing_was_read(dir: &Path, how: &str) {
         contexts.is_empty(),
         "[{how}] the task_context table has rows: {contexts:?}"
     );
+    eprintln!(
+        "[{how}] {} samples, none with a context id, no task_context row",
+        samples.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +485,7 @@ fn a_program_with_the_library_linked_in_is_traced_with_its_contexts() {
     let build = TempDir::new().expect("a directory to build in");
     let program = build_linked_in(build.path());
     let trace = record_command(&example_command(&program), |_| {});
-    check_example_trace(trace.path(), "linked in");
+    check_example_trace(trace.path(), "linked in", 3);
 }
 
 #[test]
@@ -467,7 +497,82 @@ fn a_program_that_names_the_library_as_a_dependency_is_traced_with_its_contexts(
     let build = TempDir::new().expect("a directory to build in");
     let program = build_against_shared_object(build.path());
     let trace = record_command(&example_command(&program), |_| {});
-    check_example_trace(trace.path(), "shared object");
+    check_example_trace(trace.path(), "shared object", 3);
+}
+
+/// Ends the process when the test leaves, however it leaves.
+struct Ended(Child);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A program that was running BEFORE the capture started. No exec announces
+/// it: it is found by the look the capture takes when it starts - over every
+/// process of the host when the capture names none, and at the named process
+/// when it names one. The program is in its first phase throughout (that
+/// phase is made far longer than the capture), so that phase's context is
+/// what every one of its threads must be seen with.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn a_program_already_running_is_found_when_the_capture_starts() {
+    if !have_a_compiler() {
+        return;
+    }
+    let build = TempDir::new().expect("a directory to build in");
+    let program = build_linked_in(build.path());
+    for (how, by_pid) in [
+        ("already running, every process", false),
+        ("already running, by pid", true),
+    ] {
+        let mut example = Ended(
+            Command::new(&program)
+                .args(["--busy-ms", ALREADY_RUNNING_BUSY_MS])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("the example starts"),
+        );
+        // Each thread prints one line once its first phase's values stand,
+        // then stays on a CPU: three lines, and the program is ready. The
+        // reader is kept until the program is ended, so its output stays open.
+        let mut lines = BufReader::new(example.0.stdout.take().expect("the example's output"));
+        let mut reported = 0;
+        while reported < 3 {
+            let mut line = String::new();
+            let read = lines.read_line(&mut line).expect("the example's output");
+            assert!(
+                read > 0,
+                "[{how}] the example ended after {reported} of its 3 threads reported"
+            );
+            if line.starts_with("TCX1 ") {
+                reported += 1;
+            }
+        }
+        let dir = TempDir::new().expect("a directory for the trace");
+        let result = systing(
+            Config {
+                duration: 4,
+                pid: if by_pid {
+                    vec![example.0.id()]
+                } else {
+                    Vec::new()
+                },
+                include_task_context: true,
+                output_dir: dir.path().to_path_buf(),
+                output: dir.path().join("trace.pb"),
+                ..Config::default()
+            },
+            None,
+        );
+        drop(example);
+        drop(lines);
+        result.expect("the recording runs");
+        check_example_trace(dir.path(), how, 1);
+    }
 }
 
 /// The kernel's confidentiality mode, forced: the process uses the library
