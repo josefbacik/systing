@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -179,6 +179,7 @@ pub const DATA_TABLES: &[&str] = &[
     "memory_thp",
     "memory_vmstat",
     "task_stack_event",
+    "task_context",
     "clock_snapshot",
     "sysinfo",
     "cpu_info",
@@ -447,7 +448,11 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             utid BIGINT,
             cpu INTEGER,
             stack_id BIGINT,
-            stack_event_type TINYINT
+            stack_event_type TINYINT,
+            -- The sampled thread's task_context id (--include-task-context),
+            -- NULL when none: its values are the task_context rows with the
+            -- same utid and id.
+            task_context_id UBIGINT
         );
 
         -- Network interface metadata
@@ -685,6 +690,20 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             runtime_delta_ns BIGINT,
             state VARCHAR,
             stack_id BIGINT
+        );
+
+        -- --include-task-context: one named value of one task_context id
+        -- of one thread. A sample's context is the rows whose utid and id
+        -- equal the sample's utid and task_context_id; exactly one of
+        -- value_u64 / value_str is set.
+        CREATE TABLE IF NOT EXISTS task_context (
+            trace_id VARCHAR,
+            utid BIGINT,
+            id UBIGINT,
+            ts BIGINT,
+            name VARCHAR,
+            value_u64 UBIGINT,
+            value_str VARCHAR
         );
 
         -- /proc/vmstat counters (THP, compaction, direct reclaim families)
@@ -1187,7 +1206,7 @@ pub fn import_order_by(table_name: &str) -> Option<&'static str> {
     match table_name {
         "sched_slice" => Some("cpu, ts"),
         "thread_state" => Some("utid, ts"),
-        "stack_sample" | "task_stack_event" => Some("utid, ts"),
+        "stack_sample" | "task_stack_event" | "task_context" => Some("utid, ts"),
         "softirq_slice" | "irq_slice" => Some("cpu, ts"),
         "counter" => Some("track_id, ts"),
         _ => None,
@@ -1572,6 +1591,7 @@ fn import_tables(
     import_table("memory_thp", &paths.memory_thp)?;
     import_table("memory_vmstat", &paths.memory_vmstat)?;
     import_table("task_stack_event", &paths.task_stack_event)?;
+    import_table("task_context", &paths.task_context)?;
 
     // Clock snapshot
     import_table("clock_snapshot", &paths.clock_snapshot)?;
@@ -2118,6 +2138,7 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
     export_table("memory_thp", &paths.memory_thp)?;
     export_table("memory_vmstat", &paths.memory_vmstat)?;
     export_table("task_stack_event", &paths.task_stack_event)?;
+    export_table("task_context", &paths.task_context)?;
 
     // Clock snapshot
     export_table("clock_snapshot", &paths.clock_snapshot)?;
@@ -2912,6 +2933,111 @@ mod tests {
         assert!(
             err.contains("wchan") && !err.contains("thread_name"),
             "{err}"
+        );
+    }
+
+    /// A `stack_sample.parquet` written before `task_context_id` existed has
+    /// no such column. Every column it does have is known, so it is taken
+    /// whole, under strict_schema too, and BY NAME leaves the new column NULL
+    /// in each of its rows. A file written with `--include-task-context`
+    /// carries the id, all 64 bits of it, and the `task_context.parquet`
+    /// beside it lands in its own table.
+    #[test]
+    fn test_a_stack_sample_file_without_task_context_id_imports_with_nulls() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        let parquet = |name: &str, select: &str| -> String {
+            let path = temp_dir.path().join(name).to_string_lossy().into_owned();
+            conn.execute_batch(&format!("COPY ({select}) TO '{path}' (FORMAT PARQUET)"))
+                .unwrap();
+            format!("read_parquet('{path}')")
+        };
+        let strict = ImportOptions {
+            strict_schema: true,
+        };
+        let mut report = ImportReport::default();
+
+        let older = parquet(
+            "older.parquet",
+            "SELECT 10::BIGINT AS ts, 1::BIGINT AS utid, 0::INTEGER AS cpu, \
+                    7::BIGINT AS stack_id, 1::TINYINT AS stack_event_type",
+        );
+        let columns = import_column_list(&conn, "stack_sample", &older, strict, &mut report)
+            .unwrap()
+            .unwrap();
+        assert_eq!(columns, "*");
+        conn.execute_batch(&format!(
+            "INSERT INTO stack_sample BY NAME SELECT 'older' AS trace_id, {columns} FROM {older}"
+        ))
+        .unwrap();
+
+        // An id with its top bit set: the column is unsigned on purpose.
+        let newer = parquet(
+            "newer.parquet",
+            "SELECT 20::BIGINT AS ts, 1::BIGINT AS utid, 0::INTEGER AS cpu, \
+                    7::BIGINT AS stack_id, 1::TINYINT AS stack_event_type, \
+                    18446744073709551614::UBIGINT AS task_context_id",
+        );
+        let columns = import_column_list(&conn, "stack_sample", &newer, strict, &mut report)
+            .unwrap()
+            .unwrap();
+        assert_eq!(columns, "*");
+        conn.execute_batch(&format!(
+            "INSERT INTO stack_sample BY NAME SELECT 'newer' AS trace_id, {columns} FROM {newer}"
+        ))
+        .unwrap();
+
+        let values = parquet(
+            "task_context.parquet",
+            "SELECT 1::BIGINT AS utid, 18446744073709551614::UBIGINT AS id, 20::BIGINT AS ts, \
+                    'request_id' AS name, NULL::UBIGINT AS value_u64, 'abc-123' AS value_str",
+        );
+        let columns = import_column_list(&conn, "task_context", &values, strict, &mut report)
+            .unwrap()
+            .unwrap();
+        assert_eq!(columns, "*");
+        conn.execute_batch(&format!(
+            "INSERT INTO task_context BY NAME SELECT 'newer' AS trace_id, {columns} FROM {values}"
+        ))
+        .unwrap();
+        assert_eq!(report, ImportReport::default());
+
+        // The ids are read back as text so that the comparison is of all 64
+        // bits whatever integer type the driver would hand over.
+        let mut stmt = conn
+            .prepare("SELECT trace_id, task_context_id::VARCHAR FROM stack_sample ORDER BY ts")
+            .unwrap();
+        let samples: Vec<(String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            samples,
+            vec![
+                ("older".to_string(), None),
+                (
+                    "newer".to_string(),
+                    Some("18446744073709551614".to_string())
+                ),
+            ]
+        );
+
+        // The join a reader makes: a sample's values are the rows with its
+        // utid and its id.
+        let joined: (String, Option<String>) = conn
+            .query_row(
+                "SELECT c.name, c.value_str FROM stack_sample s \
+                 JOIN task_context c ON c.trace_id = s.trace_id AND c.utid = s.utid \
+                      AND c.id = s.task_context_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            joined,
+            ("request_id".to_string(), Some("abc-123".to_string()))
         );
     }
 

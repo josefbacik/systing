@@ -329,6 +329,10 @@ pub fn stack_schema() -> Arc<Schema> {
 /// - 0 = STACK_SLEEP_UNINTERRUPTIBLE: Captured when task went to uninterruptible sleep
 /// - 1 = STACK_RUNNING: Captured while task was running (CPU sampling, probes)
 /// - 2 = STACK_SLEEP_INTERRUPTIBLE: Captured when task went to interruptible sleep
+///
+/// `task_context_id` is the sampled thread's task_context id
+/// (`--include-task-context`), NULL when there was none; its values are the
+/// `task_context` rows with the same `utid` and `id`.
 pub fn stack_sample_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),
@@ -336,6 +340,7 @@ pub fn stack_sample_schema() -> Arc<Schema> {
         Field::new("cpu", DataType::Int32, true),
         Field::new("stack_id", DataType::Int64, false),
         Field::new("stack_event_type", DataType::Int8, false),
+        Field::new("task_context_id", DataType::UInt64, true),
     ]))
 }
 
@@ -572,6 +577,19 @@ pub fn task_stack_event_schema() -> Arc<Schema> {
         Field::new("runtime_delta_ns", DataType::Int64, false),
         Field::new("state", DataType::Utf8, false),
         Field::new("stack_id", DataType::Int64, true),
+    ]))
+}
+
+/// Schema for task_context.parquet: one named value of one task_context id of
+/// one thread. Exactly one of `value_u64` / `value_str` is set in a row.
+pub fn task_context_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("utid", DataType::Int64, false),
+        Field::new("id", DataType::UInt64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("value_u64", DataType::UInt64, true),
+        Field::new("value_str", DataType::Utf8, true),
     ]))
 }
 
