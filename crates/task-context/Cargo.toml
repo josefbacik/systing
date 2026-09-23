@@ -1,0 +1,23 @@
+[package]
+name = "task-context"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+description = "Attach a few named values (a request id, an iteration number) to the calling thread so that a tracer can read them from outside the process and store them beside each sample"
+repository = "https://github.com/josefbacik/systing"
+readme = "README.md"
+keywords = ["tracing", "profiling", "thread-local", "context"]
+categories = ["development-tools::profiling"]
+
+[lib]
+name = "task_context"
+
+[build-dependencies]
+# Compiles the one C file the library is: a thread-local with a fixed TLS
+# model and a load-time constructor are things stable Rust cannot express.
+cc = "1"
+
+[dev-dependencies]
+# ELF access in the tests only: the read core plus the ELF format.
+object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }

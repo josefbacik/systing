@@ -11,7 +11,24 @@ name: bpf-load-shapes
 # the VM tool's exit code: a Container-Optimized OS kernel has no virtio console,
 # so vng cannot read the guest's exit code there and returns 255 either way.
 #
-# Each guest job then boots its kernel a second time and runs the task-stacks
+# Each guest job then boots its kernel a second time and runs the task_context
+# end-to-end cases (tests/task_context_record.rs) as root: a program that uses the
+# task-context library is traced - started by the tracer and already running, with
+# the library linked in, as a shared object, and as a shared object whose slot is
+# found through the thread's DTV - and the trace must carry what it set; under the
+# confidentiality mode, and under a recipe planted on a process it is wrong for, it
+# must carry nothing. Those cases are `#[ignore]`d for an unprivileged
+# `cargo test` and return early without a C compiler;
+# scripts/ci/vmtest-task-context-e2e.sh decides by the lines the cases and the
+# tracer print, so a green row means every case ran to its end and the reader's own
+# counters say what it read and what it refused on that kernel.
+#
+# The same cases also run on native arm64, with no guest: the runner's own CPUs and
+# its own kernel (the arm64 job at the end). That is the only place the writer
+# library's ordering test meets weakly ordered hardware, and the only place the
+# reader's aarch64 thread-pointer and DTV reads are exercised.
+#
+# Each guest job also boots its kernel a third time and runs the task-stacks
 # end-to-end cases (`test_e2e_task_stacks_scoped_walk*`, tests/trace_validation.rs)
 # as root: the scoped walks by pid and by cgroup, the listing of the cgroups below
 # a target, and a process that retires threads. Those cases are `#[ignore]`d for an
@@ -73,6 +90,28 @@ jobs:
           mkdir -p gate
           cp "$BIN" gate/bpf_load_shapes
           cp libduckdb/libduckdb.so gate/
+          ls -l gate
+      - name: Build the task_context_record test binary (its end-to-end cases run the tracer in-process)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo test --test task_context_record --no-run --no-default-features --message-format=json > /tmp/build-task-context.json
+          BIN="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "task_context_record") | .executable' /tmp/build-task-context.json | tail -1)"
+          test -x "$BIN"
+          cp "$BIN" gate/task_context_record
+          # A debug build carries most of its size in debug sections nothing in the guest
+          # reads; drop them from the shipped COPY only, so the artifact stays small.
+          strip --strip-debug gate/task_context_record
+          # The cases compile the library's own example from the directory cargo baked
+          # into the test binary (CARGO_MANIFEST_DIR). Record it, so the guest job can
+          # refuse to run against any other checkout.
+          pwd > gate/manifest-dir.txt
+          cat gate/manifest-dir.txt
           ls -l gate
       - name: Build the trace_validation test binary and the systing binary its end-to-end cases start
         env:
@@ -187,6 +226,34 @@ jobs:
           cat "$OUT" || true
           echo "::endgroup::"
           grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      - name: Boot the kernel again and run the task_context end-to-end cases
+        run: |
+          chmod +x gate/task_context_record scripts/ci/vmtest-task-context-e2e.sh
+          # The cases compile the library's example from the directory baked into the test
+          # binary when the build job compiled it. The guest sees this job's checkout at the
+          # same path; refuse to run if that is not the path the binary knows.
+          SRC_DIR="$(cat gate/manifest-dir.txt)"
+          if [ "$SRC_DIR" != "$GITHUB_WORKSPACE" ]; then
+            echo "the build job compiled in $SRC_DIR; this job's checkout is $GITHUB_WORKSPACE"
+            exit 1
+          fi
+          test -f "$GITHUB_WORKSPACE/crates/task-context/src/task_context.c"
+          mkdir -p guest-tmp
+          OUT="$GITHUB_WORKSPACE/task-context-e2e-${{ matrix.kernel.id }}.log"
+          KVM_FLAG=""
+          [ -w /dev/kvm ] || KVM_FLAG="--disable-kvm"
+          set +e
+          timeout 1800 vng --run "kernels/${{ matrix.kernel.id }}/kernel" $KVM_FLAG --force-9p --cpus 4 --memory 8G \
+            --rwdir "$GITHUB_WORKSPACE" --rwdir "/tmp=$GITHUB_WORKSPACE/guest-tmp" \
+            --append oops=panic --append virtme_root_user=1 --verbose \
+            -- bash "$GITHUB_WORKSPACE/scripts/ci/vmtest-task-context-e2e.sh" \
+                 "$GITHUB_WORKSPACE/gate/task_context_record" "$GITHUB_WORKSPACE/gate" "$GITHUB_WORKSPACE" "$OUT"
+          echo "vng exited $? (informational, as above: the guest-written file decides)"
+          set -e
+          echo "::group::guest output (${{ matrix.kernel.id }})"
+          cat "$OUT" || cat "$OUT.raw" || true
+          echo "::endgroup::"
+          grep -q '^VNG-TEST-EXIT:0$' "$OUT"
       - name: Boot the kernel again and run the task-stacks end-to-end cases
         run: |
           chmod +x gate/trace_validation gate/systing scripts/ci/vmtest-task-stacks-e2e.sh
@@ -226,9 +293,102 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
+          name: task-context-e2e-${{ matrix.kernel.id }}
+          path: |
+            task-context-e2e-${{ matrix.kernel.id }}.log
+            task-context-e2e-${{ matrix.kernel.id }}.log.raw
+            task-context-e2e-${{ matrix.kernel.id }}.log.counters
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
           name: task-stacks-e2e-${{ matrix.kernel.id }}
           path: |
             task-stacks-e2e-${{ matrix.kernel.id }}.log
             task-stacks-e2e-${{ matrix.kernel.id }}.log.raw
+          if-no-files-found: ignore
+          retention-days: 7
+
+  task-context-arm64:
+    name: task_context on native arm64
+    # GitHub's arm64 runner: Arm CPUs and the runner image's own kernel, not one
+    # of the pinned kernels above, and no guest. The image's kernel is whatever
+    # GitHub ships (6.14 at the time of writing); the job prints it.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2
+      - name: Install clang 21 (the release build's BPF compiler)
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh
+          sudo bash /tmp/llvm.sh 21
+          clang-21 --version
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+      - name: Download the pre-built DuckDB library the crate pins (arm64)
+        run: |
+          LIBDUCKDB_VERSION="$(scripts/libduckdb-version.sh)"
+          echo "libduckdb v${LIBDUCKDB_VERSION} (the DuckDB version Cargo.lock pins)"
+          wget -nv "https://github.com/duckdb/duckdb/releases/download/v${LIBDUCKDB_VERSION}/libduckdb-linux-arm64.zip" -O /tmp/libduckdb.zip
+          unzip /tmp/libduckdb.zip -d ${{ github.workspace }}/libduckdb
+      - name: Say what this machine is
+        run: |
+          uname -a
+          grep -m1 -i 'model name\|CPU part' /proc/cpuinfo || true
+          nproc
+          ls -l /sys/kernel/btf/vmlinux
+          cc --version | head -n 1
+      - name: Test the writer library on real arm64 cores
+        # `CI` is set: a case that cannot run (no compiler, no static C library)
+        # fails instead of skipping. Includes the two-thread ordering test, which
+        # cannot fail on x86-64.
+        run: cargo test -p task-context -- --nocapture
+      - name: Build the task_context_record test binary
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo test --test task_context_record --no-run --no-default-features --message-format=json > /tmp/build-task-context.json
+          BIN="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "task_context_record") | .executable' /tmp/build-task-context.json | tail -1)"
+          test -x "$BIN"
+          mkdir -p gate
+          cp "$BIN" gate/task_context_record
+          cp libduckdb/libduckdb.so gate/
+          ls -l gate
+      - name: Run the task_context end-to-end cases as root
+        # The script decides by what the cases and the tracer print, as in the
+        # guests; run outside a guest it mounts nothing and the cases use /tmp.
+        run: |
+          chmod +x gate/task_context_record scripts/ci/vmtest-task-context-e2e.sh
+          OUT="$GITHUB_WORKSPACE/task-context-e2e-arm64.log"
+          set +e
+          sudo -E bash "$GITHUB_WORKSPACE/scripts/ci/vmtest-task-context-e2e.sh" \
+            "$GITHUB_WORKSPACE/gate/task_context_record" "$GITHUB_WORKSPACE/gate" "$GITHUB_WORKSPACE" "$OUT"
+          echo "the script exited $? (informational: the file it wrote decides)"
+          set -e
+          echo "::group::guest output (arm64)"
+          cat "$OUT" || cat "$OUT.raw" || true
+          echo "::endgroup::"
+          grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: task-context-e2e-arm64
+          path: |
+            task-context-e2e-arm64.log
+            task-context-e2e-arm64.log.raw
+            task-context-e2e-arm64.log.counters
           if-no-files-found: ignore
           retention-days: 7
