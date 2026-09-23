@@ -445,7 +445,7 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
-## Schema Version 25 (systing 1.22.0) — 2026-09-22
+## Schema Version 26 (systing 1.23.0) — 2026-09-23
 
 Heap snapshots: an allocator's own dump of the memory a process had live when
 it wrote the file (jemalloc `prof.dump`), read by the new `systing-heap` tool
@@ -489,10 +489,69 @@ Python frames (named from a perf map, with perf trampolines) are
 function-level: `module:qualname (python) [file.py]` like pystacks' for
 library code, with no line.
 
-The two tables are in `DATA_TABLES`, so a DuckDB merge by a schema-25 reader
-keeps them. A schema-24 reader merging a heap database leaves them out without
+The two tables are in `DATA_TABLES`, so a DuckDB merge by a schema-26 reader
+keeps them. A schema-25 reader merging a heap database leaves them out without
 a message, and they have no parquet files, so an export to parquet and back
 drops them too.
+
+## Schema Version 25 (systing 1.22.0) — 2026-09-23
+
+`--include-task-context`: a program that uses the task-context library
+(`crates/task-context`) attaches a few named values to each of its threads, and
+a capture with the flag records which of them a thread had set when it was
+sampled. The values are stored once per context, not once per sample: a sample
+carries the 8-byte id of its thread's context, and the `task_context` table
+holds what each id stood for.
+
+### Added columns
+- `stack_sample.task_context_id` (UBIGINT): the id of the sampled thread's
+  context, NULL for "none". Filled for running-stack samples
+  (`stack_event_type = 1`: the CPU sampler's, and the running stacks the probe
+  recorders emit) of a thread of a process that publishes the library's recipe
+  and has at least one name set, in a capture recorded with
+  `--include-task-context`. NULL for every other row: sleep stacks, a thread
+  that has set nothing or has cleared every name, a process that does not use
+  the library or was not found (see the README for what is looked for), a
+  counted miss, a capture without the flag. An id belongs to ONE thread: ids
+  are unique within a thread, not across threads or processes, so every join
+  is on (`utid`, id). The column is in every `stack_sample.parquet` this
+  version writes, all NULL without the flag. NULL in traces recorded before
+  schema 25.
+
+### New tables
+- `task_context` (utid BIGINT, id UBIGINT, ts BIGINT, name VARCHAR,
+  value_u64 UBIGINT, value_str VARCHAR): one row per name of one context of one
+  thread. The rows with one (`utid`, `id`) are everything the thread had set
+  while its context id was `id`, and a thread's id changes with every set or
+  clear. `ts` is the sample that first saw the id. Exactly one of `value_u64` /
+  `value_str` is set. A name is 1 to 31 characters of `[A-Za-z0-9_.:-]`, and a
+  name outside that class is dropped with its value; a string value is at most
+  256 bytes and has invalid UTF-8 and control characters replaced (U+FFFD)
+  before it is stored. Names and values are whatever the traced process chose
+  to set: data about that process, never an identity to trust. Written only by
+  a capture with the flag that read at least one context: `task_context.parquet`
+  does not exist otherwise, and the table is empty.
+
+  ```sql
+  SELECT s.ts, c.name, c.value_u64, c.value_str
+  FROM stack_sample s
+  JOIN task_context c
+    ON c.trace_id = s.trace_id AND c.utid = s.utid AND c.id = s.task_context_id;
+  ```
+
+  An id with no rows is a context whose values did not travel: they are sent
+  once, when a sample first sees the id, inside a per-CPU budget, and a full
+  ring or a spent budget drops the values and keeps the id (the capture's
+  `task_context samples:` line counts both).
+
+### Compatibility
+- A reader at this version imports an older `stack_sample.parquet` with the new
+  column NULL.
+- A reader older than this version that has the import guard (1.18.2 and
+  newer) imports a newer `stack_sample.parquet` without the column and warns
+  once, and never opens `task_context.parquet`, a table it does not know; a
+  reader older than 1.18.2 fails the import of a newer `stack_sample.parquet`
+  whole. So readers move to this version before writers do.
 
 ## Schema Version 24 (systing 1.21.0) — 2026-09-15
 

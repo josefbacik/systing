@@ -297,6 +297,10 @@ pub struct StackRecord {
 /// - `cpu`: CPU core number (optional)
 /// - `stack_id`: Reference to StackRecord.id
 /// - `stack_event_type`: Type of stack capture (0=STACK_SLEEP_UNINTERRUPTIBLE, 1=STACK_RUNNING, 2=STACK_SLEEP_INTERRUPTIBLE)
+/// - `task_context_id`: The sampled thread's task_context id at the sample
+///   (`--include-task-context`), `None` when the thread had none, the read
+///   missed, or the capture ran without the flag. Its values are the
+///   `task_context` rows with the same `utid` and `id`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StackSampleRecord {
     pub ts: i64,
@@ -304,6 +308,7 @@ pub struct StackSampleRecord {
     pub cpu: Option<i32>,
     pub stack_id: i64,
     pub stack_event_type: i8,
+    pub task_context_id: Option<u64>,
 }
 
 // Network metadata records
@@ -872,6 +877,27 @@ pub struct TaskStackEventRecord {
     pub stack_id: Option<i64>,
 }
 
+/// One named value of one task_context id of one thread
+/// (`--include-task-context`): what the thread had set under `name` while its
+/// context id was `id`. A thread's id changes with every set or clear, so the
+/// rows with one (`utid`, `id`) are the thread's whole context at that id, and
+/// a sample's context is the rows whose `utid` and `id` equal the sample's
+/// `utid` and `task_context_id`. Key on BOTH: ids are unique within a thread,
+/// not across threads or processes. `ts` is the sample that first saw the id.
+/// Exactly one of `value_u64` / `value_str` is set. Names and values are set
+/// by the traced process itself and are data, never identity: a name outside
+/// the library's own class is dropped, and a string has invalid UTF-8 and
+/// control characters replaced before it is stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskContextRecord {
+    pub utid: i64,
+    pub id: u64,
+    pub ts: i64,
+    pub name: String,
+    pub value_u64: Option<u64>,
+    pub value_str: Option<String>,
+}
+
 /// A `/proc/vmstat` counter sampled at the start and the end of the capture
 /// (the THP, compaction and direct-reclaim families), so `value_end -
 /// value_start` is the host-wide count over the capture: the fleet-general
@@ -922,6 +948,7 @@ pub struct ExtractedData {
     pub memory_thp: Vec<MemoryThpRecord>,
     pub memory_vmstat: Vec<MemoryVmstatRecord>,
     pub task_stack_events: Vec<TaskStackEventRecord>,
+    pub task_contexts: Vec<TaskContextRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
     pub cpu_infos: Vec<CpuInfoRecord>,

@@ -16,7 +16,7 @@
 //! down:
 //!
 //! - live bytes and objects are jeprof's estimates (the rows scaled as
-//!   `SCHEMA_CHANGES.md`, schema 25, says), not the counts as written;
+//!   `SCHEMA_CHANGES.md`, schema 26, says), not the counts as written;
 //! - "allocated" is jemalloc's cumulative count where it kept one
 //!   (`prof_accum`), otherwise the smallest total consistent with the live
 //!   counts seen so far (it grows by each rise in live bytes); "freed" is

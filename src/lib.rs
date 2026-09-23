@@ -63,6 +63,7 @@ pub mod stream;
 pub mod symbol_shorten;
 pub mod systing_core;
 pub mod target_filter;
+pub mod task_context;
 pub mod task_stacks_recorder;
 pub mod tpu;
 pub mod trace;

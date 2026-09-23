@@ -1198,6 +1198,14 @@ fn convert_stack_event_type(bpf_type: u32) -> i8 {
     }
 }
 
+/// The sample's task_context id as the trace stores it. The BPF side leaves
+/// 0 for "none" — the flag is off, the process publishes no recipe, or the
+/// thread has set nothing — and a real id is never 0.
+#[inline]
+fn convert_task_context_id(bpf_id: u64) -> Option<u64> {
+    (bpf_id != 0).then_some(bpf_id)
+}
+
 pub struct StackRecorder {
     pub(crate) ringbuf: RingBuffer<stack_event>,
     pub(crate) psr: Arc<StackWalkerRun>,
@@ -1327,6 +1335,13 @@ impl StackRecorder {
             guest_samples: 0,
             dropped_frameless: 0,
         }
+    }
+
+    /// The generator this recorder takes each sample's `utid` from, for a
+    /// writer whose rows must carry the same `utid` as the samples they
+    /// belong to (the `task_context` table).
+    pub fn shared_utid_generator(&self) -> Arc<UtidGenerator> {
+        Arc::clone(&self.utid_generator)
     }
 
     /// Enable build-id mode: user frames arrive as (build-id, file offset)
@@ -2477,6 +2492,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                     cpu: Some(event.cpu as i32),
                     stack_id,
                     stack_event_type: convert_stack_event_type(event.stack_event_type.0),
+                    task_context_id: convert_task_context_id(event.task_context_id),
                 };
 
                 if let Err(e) = collector.add_stack_sample(sample) {
@@ -3612,6 +3628,14 @@ mod tests {
         assert_eq!(convert_stack_event_type(127), 127);
         assert_eq!(convert_stack_event_type(128), i8::MAX);
         assert_eq!(convert_stack_event_type(u32::MAX), i8::MAX);
+    }
+
+    #[test]
+    fn test_convert_task_context_id() {
+        assert_eq!(convert_task_context_id(0), None);
+        assert_eq!(convert_task_context_id(2), Some(2));
+        // All 64 bits are the id: a thread index fills the top ones.
+        assert_eq!(convert_task_context_id(u64::MAX - 1), Some(u64::MAX - 1));
     }
 
     /// An address inside this test binary's text, guaranteed to be backed by

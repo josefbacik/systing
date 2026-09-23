@@ -854,9 +854,9 @@ mod tests {
              -- Storage order is root-first: main, middle, leaf_fn.
              INSERT INTO stack VALUES ('t', 7, [0, 1, 2], 3, 'main (workload) <0x3>');
              INSERT INTO stack VALUES ('t', 8, [3], 1, 'alloc_only (workload) <0x9>');
-             INSERT INTO stack_sample VALUES ('t', 1000, 1, 0, 7, 1);
-             INSERT INTO stack_sample VALUES ('t', 2000, 1, 0, 7, 1);
-             INSERT INTO stack_sample VALUES ('t', 3000, 1, 0, 7, 2);
+             INSERT INTO stack_sample VALUES ('t', 1000, 1, 0, 7, 1, NULL);
+             INSERT INTO stack_sample VALUES ('t', 2000, 1, 0, 7, 1, NULL);
+             INSERT INTO stack_sample VALUES ('t', 3000, 1, 0, 7, 2, NULL);
              -- Stack 8 is referenced only by the memory recorder.
              INSERT INTO memory_alloc VALUES ('t', 1, 1500, 2, 'malloc', 0, 64, NULL, 8);",
         )
@@ -933,7 +933,7 @@ mod tests {
             "INSERT INTO frame VALUES ('a', 0, 'f0'), ('b', 0, 'f0');
              INSERT INTO stack VALUES ('a', 1, [0], 1, 'f0'), ('b', 1, [0], 1, 'f0');
              INSERT INTO thread (trace_id, utid, tid, name, upid) VALUES ('a', 1, 1, NULL, NULL), ('b', 1, 1, NULL, NULL);
-             INSERT INTO stack_sample VALUES ('a', 1, 1, 0, 1, 1), ('b', 1, 1, 0, 1, 1);",
+             INSERT INTO stack_sample VALUES ('a', 1, 1, 0, 1, 1, NULL), ('b', 1, 1, 0, 1, 1, NULL);",
         )
         .unwrap();
         drop(conn);
@@ -973,7 +973,7 @@ mod tests {
             "INSERT INTO frame VALUES ('t', 0, 'f0');
              INSERT INTO stack VALUES ('t', 1, [0], 1, 'f0');
              INSERT INTO thread (trace_id, utid, tid, name, upid) VALUES ('t', 1, 1, NULL, NULL);
-             INSERT INTO stack_sample VALUES ('t', 1, 1, 0, 1, 1);",
+             INSERT INTO stack_sample VALUES ('t', 1, 1, 0, 1, 1, NULL);",
         )
         .unwrap();
         drop(conn);
@@ -1104,7 +1104,7 @@ mod tests {
              -- Leaf-first python storage despite the v1.11.0 stamp.
              INSERT INTO stack VALUES ('t', 7, [0, 1, 2], 3, 'py_leaf (python) [app.py:9]');
              INSERT INTO thread (trace_id, utid, tid, name, upid) VALUES ('t', 1, 101, NULL, NULL);
-             INSERT INTO stack_sample VALUES ('t', 1000, 1, 0, 7, 1);",
+             INSERT INTO stack_sample VALUES ('t', 1000, 1, 0, 7, 1, NULL);",
         )
         .unwrap();
         drop(conn);
@@ -1135,7 +1135,7 @@ mod tests {
              INSERT INTO frame VALUES ('t', 2, 'native_leaf (app) <0x1>');
              INSERT INTO stack VALUES ('t', 7, [0, 1, 2], 3, 'native_leaf (app) <0x1>');
              INSERT INTO thread (trace_id, utid, tid, name, upid) VALUES ('t', 1, 101, NULL, NULL);
-             INSERT INTO stack_sample VALUES ('t', 1000, 1, 0, 7, 1);",
+             INSERT INTO stack_sample VALUES ('t', 1000, 1, 0, 7, 1, NULL);",
         )
         .unwrap();
         drop(conn);
@@ -1172,7 +1172,7 @@ mod tests {
              -- Storage: [py leaf, py root, native root, native leaf].
              INSERT INTO stack VALUES ('t', 7, [0, 1, 2, 3], 4, 'py_leaf (python) [app.py:9]');
              INSERT INTO thread (trace_id, utid, tid, name, upid) VALUES ('t', 1, 101, NULL, NULL);
-             INSERT INTO stack_sample VALUES ('t', 1000, 1, 0, 7, 1);",
+             INSERT INTO stack_sample VALUES ('t', 1000, 1, 0, 7, 1, NULL);",
         )
         .unwrap();
         drop(conn);
@@ -1210,7 +1210,7 @@ mod tests {
              -- Storage (uniform root-first): py root, py leaf, native root, native leaf.
              INSERT INTO stack VALUES ('t', 7, [0, 1, 2, 3], 4, 'native_leaf (app) <0x1>');
              INSERT INTO thread (trace_id, utid, tid, name, upid) VALUES ('t', 1, 101, NULL, NULL);
-             INSERT INTO stack_sample VALUES ('t', 1000, 1, 0, 7, 1);",
+             INSERT INTO stack_sample VALUES ('t', 1000, 1, 0, 7, 1, NULL);",
         )
         .unwrap();
         drop(conn);

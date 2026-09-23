@@ -208,7 +208,7 @@ One sampled 256-byte object at a 16 KiB period reads 16,512 bytes, give or take 
 
 Pids are the writing process's own, in its pid namespace.
 Two containers whose main process is pid 1 share one `process` row when their dumps are read into one database, and heap rows carry no host or container of their own; `source_path` says where each came from.
-A DuckDB merge keeps these tables; a schema-24 reader's merge, or an export to parquet and back, drops them without a message.
+A DuckDB merge keeps these tables; a schema-25 reader's merge, or an export to parquet and back, drops them without a message.
 
 ## Queries
 
