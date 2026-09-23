@@ -140,15 +140,20 @@ def keep_perf_map_across_fork(strict=False):
                 forking[0] = os.getpid()
 
             def add_parent_map():
-                path = f"/tmp/perf-{forking[0]}.map"
+                # /tmp is shared: open without following a link, check that
+                # handle is a regular file of ours (CPython writes the map as
+                # the effective uid), and copy through the same handle.
+                flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
                 try:
-                    st = os.lstat(path)
+                    fd = os.open(f"/tmp/perf-{forking[0]}.map", flags)
                 except OSError:
                     return
-                # /tmp is shared: only a regular file of ours, which the
-                # sticky bit keeps anyone else from replacing.
-                if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
-                    copy(path.encode())
+                try:
+                    st = os.fstat(fd)
+                    if stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid():
+                        copy(f"/proc/self/fd/{fd}".encode())
+                finally:
+                    os.close(fd)
 
             os.register_at_fork(before=note_parent, after_in_child=add_parent_map)
             _copy_on_fork = True
