@@ -6974,6 +6974,44 @@ pub fn systing(
     Ok(exit_code)
 }
 
+/// libbpf's print output while a load probe loads an object. The print
+/// callback is a plain function pointer, so the buffer is process-global, and
+/// one probe at a time owns it, whichever object it loads ([`bpf_load_probe`],
+/// [`crate::task_stacks_recorder::TaskStacksIter::load_probe`]).
+static PROBE_CAPTURE: Mutex<String> = Mutex::new(String::new());
+static PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+fn probe_capture_print(_level: libbpf_rs::PrintLevel, msg: String) {
+    if let Ok(mut buf) = PROBE_CAPTURE.lock() {
+        buf.push_str(&msg);
+    }
+}
+
+/// Serializes the load probes of one process, so two tests in one binary
+/// cannot interleave their captures: held from a probe's first act to its
+/// report.
+pub(crate) fn probe_lock() -> std::sync::MutexGuard<'static, ()> {
+    PROBE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Run `load` with libbpf's print output captured, and return what it
+/// returned beside the text. libbpf's print callback is replaced for the
+/// duration and restored afterwards. The buffer is the probes' own, so the
+/// caller shows the [`probe_lock`] it holds.
+pub(crate) fn capture_libbpf_print<T>(
+    _probe: &std::sync::MutexGuard<'static, ()>,
+    load: impl FnOnce() -> T,
+) -> (T, String) {
+    PROBE_CAPTURE.lock().unwrap().clear();
+    let previous = libbpf_rs::set_print(Some((libbpf_rs::PrintLevel::Debug, probe_capture_print)));
+    let out = load();
+    libbpf_rs::set_print(previous);
+    let log = std::mem::take(&mut *PROBE_CAPTURE.lock().unwrap());
+    (out, log)
+}
+
 /// Load-only probe of the BPF object at one configuration: open the skeleton,
 /// configure it exactly as [`systing`] does for `opts` (rodata, map sizes,
 /// the autoload set), load it into the kernel, and attach nothing. The report
@@ -7014,22 +7052,9 @@ pub fn bpf_load_probe(
     legs: crate::bpf_load_shapes::LegSelection,
     log_level: &dyn Fn(&str) -> u32,
 ) -> Result<crate::bpf_load_shapes::LoadReport> {
-    use crate::bpf_load_shapes::{LegSelection, LoadReport, ProgramLoad};
-    use libbpf_rs::PrintLevel;
-    use std::collections::BTreeSet;
+    use crate::bpf_load_shapes::{LegSelection, LoadReport};
 
-    // The libbpf print callback is a plain function pointer, so the capture
-    // buffer is process-global, and one probe at a time owns it.
-    static CAPTURE: Mutex<String> = Mutex::new(String::new());
-    static PROBE: Mutex<()> = Mutex::new(());
-    fn capture_print(_level: PrintLevel, msg: String) {
-        if let Ok(mut buf) = CAPTURE.lock() {
-            buf.push_str(&msg);
-        }
-    }
-    let _probe = PROBE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let probe = probe_lock();
 
     let cgroup_filter = resolve_cgroup_filter(opts)?;
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
@@ -7160,58 +7185,20 @@ pub fn bpf_load_probe(
         }
     }
 
-    CAPTURE.lock().unwrap().clear();
-    let previous = libbpf_rs::set_print(Some((PrintLevel::Debug, capture_print)));
-    let load_result = open_skel.load();
-    libbpf_rs::set_print(previous);
-    let log = std::mem::take(&mut *CAPTURE.lock().unwrap());
+    let (load_result, log) = capture_libbpf_print(&probe, || open_skel.load());
 
     // Instruction counts are read from the LOADED object: subprogram calls
     // are appended to each caller at load, and the verifier log indexes that
     // final program, not the one the open object holds.
-    let (loaded, error, insn_counts): (bool, Option<String>, HashMap<String, usize>) =
-        match load_result {
-            Ok(skel) => {
-                let counts = skel
-                    .object()
-                    .progs()
-                    .map(|p| (p.name().to_string_lossy().into_owned(), p.insn_cnt()))
-                    .collect();
-                (true, None, counts)
-            }
-            Err(e) => (false, Some(format!("{e:#}")), HashMap::new()),
-        };
-    let sections = crate::bpf_load_shapes::split_prog_load_logs(&log);
-    let mut programs = Vec::new();
-    for name in autoloaded {
-        let visited: BTreeSet<u32> = sections
-            .get(name.as_str())
-            .map(|s| crate::bpf_load_shapes::visited_insns(s))
-            .unwrap_or_default();
-        let verifier_log = sections.get(name.as_str()).cloned();
-        let insn_total = insn_counts.get(&name).copied().unwrap_or(0);
-        programs.push(ProgramLoad {
-            name,
-            autoload: true,
-            insn_total,
-            visited,
-            verifier_log,
-        });
-    }
-    for name in skipped {
-        programs.push(ProgramLoad {
-            name,
-            autoload: false,
-            insn_total: 0,
-            visited: BTreeSet::new(),
-            verifier_log: None,
-        });
-    }
-    Ok(LoadReport {
-        loaded,
-        error,
-        programs,
-    })
+    let outcome: std::result::Result<HashMap<String, usize>, String> = match load_result {
+        Ok(skel) => Ok(skel
+            .object()
+            .progs()
+            .map(|p| (p.name().to_string_lossy().into_owned(), p.insn_cnt()))
+            .collect()),
+        Err(e) => Err(format!("{e:#}")),
+    };
+    Ok(LoadReport::from_load(autoloaded, skipped, &log, outcome))
 }
 
 #[cfg(test)]
