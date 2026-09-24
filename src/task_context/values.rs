@@ -42,7 +42,7 @@ const TYPE_STRING: u8 = 2;
 const SEQ_BUSY: u64 = 1;
 
 /// `struct task_context_value_event` in `task_context_reader.bpf.h`: ts,
-/// tgid, tid, id, cpu, reserved, then the block.
+/// tgid, tid, id, cpu, image, then the block.
 pub(crate) const RECORD_HEAD: usize = 32;
 pub(crate) const RECORD_SIZE: usize = RECORD_HEAD + BLOCK_SIZE;
 
@@ -69,7 +69,8 @@ pub struct ValueCounters {
     pub bad_blocks: u64,
     /// A slot whose mask bit and type disagree, or of an unknown type.
     pub bad_slots: u64,
-    /// A name of length 0 or over 31, or with a byte outside the class.
+    /// A name of length 0 or over 31, with a byte outside the class, or one
+    /// the record already has.
     pub bad_names: u64,
     /// String values in which at least one byte was replaced.
     pub replaced_values: u64,
@@ -107,13 +108,16 @@ pub(crate) enum Value {
     Str(String),
 }
 
-/// A record after the walk: whose it is and the values that passed. (The
-/// head also carries the process id, at bytes 8..12; rows are keyed by the
-/// thread, so it is not kept.)
+/// A record after the walk: whose it is and the values that passed. (Rows are
+/// keyed by the thread; the process id and `image`, which the head also
+/// carries, are kept only to tell a record sent twice from another thread's or
+/// another image's.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedRecord {
     pub ts: u64,
+    pub tgid: u32,
     pub tid: u32,
+    pub image: u32,
     pub id: u64,
     pub values: Vec<(String, Value)>,
 }
@@ -182,8 +186,10 @@ pub(crate) fn parse_record(data: &[u8], counters: &mut ValueCounters) -> Option<
         return None;
     }
     let ts = u64_at(data, 0);
+    let tgid = u32_at(data, 8);
     let tid = u32_at(data, 12);
     let id = u64_at(data, 16);
+    let image = u32_at(data, 28);
     let block = &data[RECORD_HEAD..RECORD_SIZE];
 
     // The BPF side checked all of this before it sent the record; a record
@@ -218,6 +224,12 @@ pub(crate) fn parse_record(data: &[u8], counters: &mut ValueCounters) -> Option<
             counters.bad_names += 1;
             continue;
         };
+        // The library never sets a name twice; a block that does was not
+        // written by it, and the table's rows are one per name.
+        if values.iter().any(|(kept, _)| *kept == name) {
+            counters.bad_names += 1;
+            continue;
+        }
         let value = if kind == TYPE_U64 {
             Value::U64(u64_at(slot, SLOT_VALUE_AT))
         } else {
@@ -233,7 +245,9 @@ pub(crate) fn parse_record(data: &[u8], counters: &mut ValueCounters) -> Option<
     }
     Some(ParsedRecord {
         ts,
+        tgid,
         tid,
+        image,
         id,
         values,
     })
@@ -244,12 +258,16 @@ pub(crate) fn parse_record(data: &[u8], counters: &mut ValueCounters) -> Option<
 pub(crate) struct ValuesSink<C: RecordCollector> {
     writer: C,
     utids: Arc<UtidGenerator>,
-    /// tid -> the id whose values were last written for it. A thread's ids
-    /// never repeat except for the newest one sent again (the BPF side
-    /// sends a record again when it could not note that it had), so this
-    /// keeps (utid, id, name) unique in the table. It is cleared when it
-    /// reaches `LAST_WRITTEN_MAX` threads; one repeat may then get through.
-    last_written: HashMap<u32, u64>,
+    /// (tgid, tid) -> the id whose values were last written for it, and the
+    /// image it was read in. A thread's ids never repeat except for the
+    /// newest one sent again (the BPF side sends a record again when it could
+    /// not note that it had), so this drops exactly those. The process is
+    /// part of the key, and the image of the value, because a thread id the
+    /// kernel reuses for a thread of another process, or an exec, starts
+    /// again at the same first id, and that record must not be taken for a
+    /// repeat. It is cleared when it reaches `LAST_WRITTEN_MAX` threads; one
+    /// repeat may then get through.
+    last_written: HashMap<(u32, u32), (u64, u32)>,
     counters: ValueCounters,
 }
 
@@ -268,14 +286,16 @@ impl<C: RecordCollector> ValuesSink<C> {
         let Some(record) = parse_record(data, &mut self.counters) else {
             return;
         };
-        if self.last_written.get(&record.tid) == Some(&record.id) {
+        let thread = (record.tgid, record.tid);
+        let written = (record.id, record.image);
+        if self.last_written.get(&thread) == Some(&written) {
             self.counters.duplicate_records += 1;
             return;
         }
         if self.last_written.len() >= LAST_WRITTEN_MAX {
             self.last_written.clear();
         }
-        self.last_written.insert(record.tid, record.id);
+        self.last_written.insert(thread, written);
 
         let utid = self.utids.get_or_create_utid(record.tid as i32);
         for (name, value) in record.values {
@@ -372,7 +392,10 @@ mod tests {
         );
         let mut counters = ValueCounters::default();
         let record = parse_record(&data, &mut counters).unwrap();
-        assert_eq!((record.ts, record.tid, record.id), (1_000, 101, ID));
+        assert_eq!(
+            (record.ts, record.tgid, record.tid, record.id),
+            (1_000, 100, 101, ID)
+        );
         assert_eq!(
             record.values,
             vec![
@@ -479,6 +502,24 @@ mod tests {
     }
 
     #[test]
+    fn a_name_the_record_already_has_is_refused_and_counted() {
+        let mut data = empty_record(1, 2, ID);
+        set_slot(&mut data, 0, TYPE_U64, b"same", &1u64.to_ne_bytes());
+        set_slot(&mut data, 1, TYPE_STRING, b"same", b"second");
+        set_slot(&mut data, 2, TYPE_U64, b"other", &3u64.to_ne_bytes());
+        let mut counters = ValueCounters::default();
+        let record = parse_record(&data, &mut counters).unwrap();
+        assert_eq!(
+            record.values,
+            vec![
+                ("same".to_string(), Value::U64(1)),
+                ("other".to_string(), Value::U64(3)),
+            ]
+        );
+        assert_eq!(counters.bad_names, 1);
+    }
+
+    #[test]
     fn what_a_trace_must_not_carry_is_replaced() {
         let (text, replaced) = sanitize(b"plain text, 100%");
         assert_eq!((text.as_str(), replaced), ("plain text, 100%", false));
@@ -544,6 +585,73 @@ mod tests {
             (3, 3, 1)
         );
         assert_eq!(sink.finish().unwrap(), counters);
+    }
+
+    /// A thread id the kernel hands to a thread of another process, or a new
+    /// image of the same one, starts at the same first id: its record is not a
+    /// repeat of the earlier one.
+    #[test]
+    fn a_reused_thread_id_in_another_process_is_not_a_repeat() {
+        let utids = Arc::new(UtidGenerator::new());
+        let mut sink = ValuesSink::new(InMemoryCollector::new(), utids);
+        let mut old = empty_record(100, 101, ID);
+        set_slot(&mut old, 0, TYPE_STRING, b"request_id", b"first process");
+        let mut reused = empty_record(200, 101, ID);
+        set_slot(
+            &mut reused,
+            0,
+            TYPE_STRING,
+            b"request_id",
+            b"second process",
+        );
+        sink.handle(&old);
+        sink.handle(&reused);
+        // The repeat of each is still one.
+        sink.handle(&reused);
+        sink.handle(&old);
+
+        let values: Vec<_> = sink
+            .writer()
+            .data()
+            .task_contexts
+            .iter()
+            .map(|row| row.value_str.clone().unwrap())
+            .collect();
+        assert_eq!(values, vec!["first process", "second process"]);
+        assert_eq!(sink.counters().duplicate_records, 2);
+    }
+
+    /// An exec keeps the process id and the thread id, and the new image
+    /// numbers its ids from the start: only the image tells its first record
+    /// from a repeat of the old image's.
+    #[test]
+    fn a_new_image_of_the_same_thread_is_not_a_repeat() {
+        let utids = Arc::new(UtidGenerator::new());
+        let mut sink = ValuesSink::new(InMemoryCollector::new(), utids);
+        let record = |image: u32, value: &[u8]| {
+            let mut data = empty_record(100, 100, ID);
+            data[28..32].copy_from_slice(&image.to_ne_bytes());
+            set_slot(&mut data, 0, TYPE_STRING, b"request_id", value);
+            data
+        };
+        let (before, after) = (
+            record(0xa000, b"before exec"),
+            record(0xb000, b"after exec"),
+        );
+        sink.handle(&before);
+        sink.handle(&after);
+        // A record sent twice is still one.
+        sink.handle(&after);
+
+        let values: Vec<_> = sink
+            .writer()
+            .data()
+            .task_contexts
+            .iter()
+            .map(|row| row.value_str.clone().unwrap())
+            .collect();
+        assert_eq!(values, vec!["before exec", "after exec"]);
+        assert_eq!(sink.counters().duplicate_records, 1);
     }
 
     /// What leaves the tracer is per slot: a slot that is set, and of a string

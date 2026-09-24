@@ -198,7 +198,13 @@ struct task_context_value_event {
 	u32 tid;
 	u64 id;
 	u32 cpu;
-	u32 reserved;
+	/* The low 32 bits of the address of the task's mm_struct. A process
+	 * numbers its threads' ids from the start in every image, so after an
+	 * exec the same process id, thread id and id can come again for other
+	 * values; the new image's mm exists before the old one is freed, so the
+	 * two differ. User space uses it, with the ids, only to tell a record
+	 * sent twice from one that is not. */
+	u32 image;
 	u8 block[sizeof(struct task_context_block_v1)];
 };
 
@@ -575,7 +581,7 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	rec->tid = tid;
 	rec->id = s1;
 	rec->cpu = bpf_get_smp_processor_id();
-	rec->reserved = 0;
+	rec->image = (u32)(unsigned long)BPF_CORE_READ(task, mm);
 	bpf_ringbuf_submit(rec, 0);
 
 	if (bpf_map_update_elem(&task_context_last_id, &tid, &s1, BPF_ANY))
