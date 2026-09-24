@@ -292,7 +292,8 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   `bpf_iter_css_task_new` in the kernel's BTF), with the start-time `--cgroup`
   matching, with a `--cgroup` target inside a threaded subtree (cgroup v2's
   threaded mode, where a thread need not be in its process's cgroup), from a
-  pid namespace other than the host's, or past 1024 target processes, a
+  pid namespace other than the host's, or past 1024 target processes (with
+  `--pid`, the children a target forked that have since gone do not count), a
   snapshot walks every thread on the host as it always has and records the
   same threads; the walk in use is printed at start. Setting
   `SYSTING_TASK_STACKS_FULL_WALK` to any non-empty value (`=1` will do) forces
@@ -303,7 +304,9 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   kernel cut: a thread that exits ahead of a walk's position lowers its visits
   the same way, so a process that retires threads steadily reads short, and
   short again, even when nothing was missed. The two figures are upper bounds
-  on the walks that lost a thread.
+  on the walks that lost a thread. When any record did not fit the kernel's
+  buffer and was unwound again at the next read, the line ends with how many:
+  each is a thread walked twice within one snapshot, a cost and not a loss.
 - The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
   with the stack by `stack_id` into `stack` like every other recorder's. With
   Python frames collected, the `thread` table also gets the name the process

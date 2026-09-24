@@ -9,12 +9,14 @@
 //! targets walks every thread on the host; one with `--pid` or `--cgroup`
 //! targets walks their threads alone where the host allows it, a link per
 //! target process ([`TaskWalk`]), and every thread on the host where it does
-//! not, recording the same threads either way. A thread that has
-//! used no CPU time and sits in the same non-runnable state as at its last
-//! record cannot have changed its stack: for it the program skips the walk and
-//! writes a bare header flagged unchanged. The stacks are symbolized with the
-//! stack recorder's at the end of the capture. In Python-only mode a thread
-//! without Python frames is left out.
+//! not. Either walk records the same threads, but for a process whose every
+//! thread has exited and which waits to be reaped: the kernel's listing of a
+//! `--cgroup` target leaves it out, and the walk over every thread meets it.
+//! A thread that has used no CPU time and sits in the same non-runnable state
+//! as at its last record cannot have changed its stack: for it the program
+//! skips the walk and writes a bare header flagged unchanged. The stacks are
+//! symbolized with the stack recorder's at the end of the capture. In
+//! Python-only mode a thread without Python frames is left out.
 //!
 //! A thread's records become events. A full record opens one, from the start
 //! of its iteration; an unchanged record extends the thread's open event by
@@ -468,10 +470,37 @@ fn choose_walk(filter: &TargetFilter, facts: &WalkFacts) -> (TaskWalk, Option<&'
 /// placed in the target whose process sits beside it would never be walked,
 /// where the walk over every thread matches it by its own cgroup. A type that
 /// cannot be read is taken for a domain's, in which every thread of a process
-/// is where its process is.
+/// is where its process is. Only a member of such a subtree counts, the type
+/// `threaded`: the subtree's own root (`domain threaded`) and a cgroup that can
+/// hold no process (`domain invalid`) are listed by process like any domain.
 fn in_threaded_subtree(dir: BorrowedFd<'_>) -> bool {
     std::fs::read_to_string(format!("/proc/self/fd/{}/cgroup.type", dir.as_raw_fd()))
         .is_ok_and(|kind| kind.trim() == "threaded")
+}
+
+/// Why the kernel cannot be asked to list the `--cgroup` targets whose
+/// directories are `dirs`, where it cannot. `threaded` is
+/// [`in_threaded_subtree`], a parameter so that a test can stand in for it.
+fn why_not_listed(
+    dirs: &[BorrowedFd<'_>],
+    threaded: impl Fn(BorrowedFd<'_>) -> bool,
+) -> Option<&'static str> {
+    if dirs.is_empty() {
+        return Some("there is no --cgroup directory to list");
+    }
+    // A link's parameters say "no descriptor" with a 0, and a link made with
+    // none walks the whole hierarchy.
+    if dirs.iter().any(|dir| dir.as_raw_fd() == 0) {
+        return Some(
+            "a --cgroup directory is open as descriptor 0, which the kernel takes for none",
+        );
+    }
+    if dirs.iter().any(|dir| threaded(*dir)) {
+        return Some(
+            "a --cgroup target is in a threaded subtree, where a thread need not be in its process's cgroup",
+        );
+    }
+    None
 }
 
 /// Create an iterator link of `prog` with `link_info`'s parameters: what
@@ -515,9 +544,21 @@ fn create_iter_link(
 /// before that buffer would.
 fn iter_read_len() -> usize {
     // SAFETY: sysconf reads a constant of the running system.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    // A page size the system does not give is taken for the smallest there is.
-    usize::try_from(page).unwrap_or(4096).max(4096) * 8
+    read_len_for_page(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+}
+
+/// The largest page the kernels this runs on are built with.
+const LARGEST_PAGE: usize = 64 * 1024;
+
+/// [`iter_read_len()`] on a system whose page size reads as `page`. A size the
+/// system does not give, or one under the smallest there is, is taken for the
+/// largest: a read that asks for more than the kernel's buffer costs the memory
+/// it reads into, and one that asks for less is what cuts a listing short.
+fn read_len_for_page(page: libc::c_long) -> usize {
+    match usize::try_from(page) {
+        Ok(page) if page >= 4096 => page * 8,
+        _ => LARGEST_PAGE * 8,
+    }
 }
 
 /// Append all `seq` has to `buf`, reading into `into` and asking for the whole
@@ -546,6 +587,12 @@ fn read_in_full_lengths(
 /// reading through `into` as `read_in_full_lengths()` does: the read is what
 /// runs the link's program, in this thread.
 fn read_iter_link(link: BorrowedFd<'_>, into: &mut [u8], buf: &mut Vec<u8>) -> std::io::Result<()> {
+    debug_assert!(
+        into.len() >= iter_read_len(),
+        "a buffer of {} bytes is short of the {} an iterator is read through",
+        into.len(),
+        iter_read_len()
+    );
     // SAFETY: `link` is an open iterator link.
     let fd = unsafe { libbpf_sys::bpf_iter_create(link.as_raw_fd()) };
     if fd < 0 {
@@ -566,6 +613,97 @@ fn append_member_tgids(bytes: &[u8], seen: &mut HashSet<u32>, tgids: &mut Vec<u3
             tgids.push(tgid);
         }
     }
+}
+
+/// Whether a process with this pid exists in systing's own pid namespace, the
+/// one the walk by pid counts its targets in. One that has exited and waits to
+/// be reaped still does. Signal 0 answers for any task's id, a thread's
+/// included: a number that has come round to another process's thread keeps a
+/// key it should lose, never the other way.
+fn process_exists(pid: u32) -> bool {
+    match libc::pid_t::try_from(pid) {
+        // Signal 0 to pid 0 would look systing's own process group up.
+        Ok(0) | Err(_) => false,
+        Ok(pid) => {
+            // SAFETY: signal 0 delivers nothing: the call only looks the pid up.
+            let found = unsafe { libc::kill(pid, 0) } == 0;
+            found || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+    }
+}
+
+/// The keys of a BPF map with `u32` keys, in the order the kernel steps
+/// through them. An error ends the keys and is kept in `err`.
+struct MapKeys<'a> {
+    map: BorrowedFd<'a>,
+    last: Option<u32>,
+    err: Option<std::io::Error>,
+}
+
+impl<'a> MapKeys<'a> {
+    fn of(map: BorrowedFd<'a>) -> Self {
+        MapKeys {
+            map,
+            last: None,
+            err: None,
+        }
+    }
+}
+
+impl Iterator for MapKeys<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        let mut next = 0u32;
+        // SAFETY: the map's keys are u32, `last` and `next` are one each, and
+        // a null key asks for the first.
+        let ret = unsafe {
+            libbpf_sys::bpf_map_get_next_key(
+                self.map.as_raw_fd(),
+                self.last
+                    .as_ref()
+                    .map_or(std::ptr::null(), |key| key as *const u32 as *const c_void),
+                &mut next as *mut u32 as *mut c_void,
+            )
+        };
+        if ret < 0 {
+            if ret != -libc::ENOENT {
+                self.err = Some(std::io::Error::from_raw_os_error(-ret));
+            }
+            return None;
+        }
+        self.last = Some(next);
+        Some(next)
+    }
+}
+
+/// The `pids` map's keys split for a snapshot: the processes to walk, each
+/// once and no more than one past what a snapshot walks one at a time, and the
+/// keys met on the way whose process `exists` says has gone. The fork hook adds
+/// a key for every child a target has and nothing takes one out, so without
+/// the second list the children that came and went would count against the
+/// first for the rest of the capture.
+fn live_targets(
+    keys: impl IntoIterator<Item = u32>,
+    exists: impl Fn(u32) -> bool,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut seen = HashSet::new();
+    let (mut live, mut gone) = (Vec::new(), Vec::new());
+    for key in keys {
+        // The map grows under the walk; a key met twice is walked once.
+        if !seen.insert(key) {
+            continue;
+        }
+        if !exists(key) {
+            gone.push(key);
+            continue;
+        }
+        live.push(key);
+        if live.len() > SCOPED_WALK_MAX_PROCESSES {
+            break;
+        }
+    }
+    (live, gone)
 }
 
 /// What [`TaskStacksIter::load_object`] keeps of the object it loaded.
@@ -619,17 +757,10 @@ impl TaskStacksIter {
         cgroup_dirs: &[BorrowedFd<'_>],
     ) -> Result<Self> {
         let (mut walk, mut why_full) = choose_walk(filter, &WalkFacts::of_this_host(filter));
-        if walk == TaskWalk::ByCgroup && cgroup_dirs.is_empty() {
-            (walk, why_full) = (
-                TaskWalk::Full,
-                Some("there is no --cgroup directory to list"),
-            );
-        }
-        if walk == TaskWalk::ByCgroup && cgroup_dirs.iter().any(|dir| in_threaded_subtree(*dir)) {
-            (walk, why_full) = (
-                TaskWalk::Full,
-                Some("a --cgroup target is in a threaded subtree, where a thread need not be in its process's cgroup"),
-            );
+        if walk == TaskWalk::ByCgroup {
+            if let Some(why) = why_not_listed(cgroup_dirs, in_threaded_subtree) {
+                (walk, why_full) = (TaskWalk::Full, Some(why));
+            }
         }
         let loaded = if walk == TaskWalk::ByCgroup {
             // The members program is one more thing a kernel can refuse, and
@@ -864,44 +995,27 @@ impl TaskStacksIter {
     }
 
     /// The `--pid` targets now: the keys of the `pids` map, the processes the
-    /// targets have forked since the capture began among them.
+    /// targets have forked since the capture began among them. Those that have
+    /// gone since leave the map here, the only place that takes a key out.
     fn target_pids(&self) -> Result<Vec<u32>> {
-        let mut tgids = Vec::new();
-        let mut seen = HashSet::new();
-        let mut key = 0u32;
-        let mut have_key = false;
-        loop {
-            let mut next = 0u32;
-            // SAFETY: the map's keys are u32, `key` and `next` are one each,
-            // and a null key asks for the first.
-            let ret = unsafe {
-                libbpf_sys::bpf_map_get_next_key(
-                    self.pids.as_raw_fd(),
-                    if have_key {
-                        &key as *const u32 as *const c_void
-                    } else {
-                        std::ptr::null()
-                    },
-                    &mut next as *mut u32 as *mut c_void,
-                )
-            };
-            if ret == -libc::ENOENT {
-                return Ok(tgids);
-            }
-            if ret < 0 {
-                return Err(std::io::Error::from_raw_os_error(-ret))
-                    .context("Failed to read the --pid targets");
-            }
-            // The map grows under the walk; a key met twice is walked once.
-            if seen.insert(next) {
-                tgids.push(next);
-            }
-            if tgids.len() > SCOPED_WALK_MAX_PROCESSES {
-                return Ok(tgids);
-            }
-            key = next;
-            have_key = true;
+        let mut keys = MapKeys::of(self.pids.as_fd());
+        let (live, gone) = live_targets(&mut keys, process_exists);
+        if let Some(e) = keys.err {
+            return Err(e).context("Failed to read the --pid targets");
         }
+        // Once the keys have been stepped through, not under it: the kernel
+        // cannot step on from a key that has been taken out, and starts over.
+        for pid in gone {
+            // SAFETY: the map's keys are u32 and `pid` is one. The return is
+            // left unread: a key something else took out first is as good.
+            unsafe {
+                libbpf_sys::bpf_map_delete_elem(
+                    self.pids.as_raw_fd(),
+                    &pid as *const u32 as *const c_void,
+                );
+            }
+        }
+        Ok(live)
     }
 
     /// The processes in the `--cgroup` targets now, the cgroups below them
@@ -1069,6 +1183,36 @@ pub struct WalkStats {
 const _: () = assert!(
     std::mem::size_of::<WalkStats>() == std::mem::size_of::<skel::types::task_stacks_walk_stats>()
 );
+
+/// What the capture's closing line adds to its counts, each part only when
+/// there is something to say: the snapshots of a scoped capture that took the
+/// full walk, the walks of a process read again and those of them short the
+/// second time too, and the records that did not fit the kernel's buffer and
+/// were unwound again at the next read. New parts go last: what reads the
+/// line finds the earlier ones where they were.
+fn closing_asides(full_walks: u64, reread: u64, still_short: u64, unsent: u64) -> String {
+    let mut asides = String::new();
+    match full_walks {
+        0 => {}
+        n => asides.push_str(&format!(
+            "; {n} snapshots walked every thread on the host instead"
+        )),
+    }
+    match reread {
+        0 => {}
+        n => asides.push_str(&format!(
+            "; {n} walks of a process came up short and were read again, \
+             {still_short} of them short the second time too"
+        )),
+    }
+    match unsent {
+        0 => {}
+        n => asides.push_str(&format!(
+            "; {n} records did not fit the kernel's buffer and were unwound again"
+        )),
+    }
+    asides
+}
 
 /// One entry per thread out of a snapshot of scoped walks, which can hand a
 /// thread over more than once: the second walk of a process read twice meets
@@ -1312,26 +1456,17 @@ impl TaskStacksThread {
                 // What the walks cost: the tasks the program was handed
                 // against those it had records to write for.
                 if let Some(stats) = iter.walk_stats() {
-                    let mut asides = String::new();
-                    match iter.full_walk_snapshots() {
-                        0 => {}
-                        n => asides.push_str(&format!(
-                            "; {n} snapshots walked every thread on the host instead"
-                        )),
-                    }
-                    match iter.reread_processes() {
-                        0 => {}
-                        n => asides.push_str(&format!(
-                            "; {n} walks of a process came up short and were read again, \
-                             {} of them short the second time too",
-                            iter.still_short_processes()
-                        )),
-                    }
                     eprintln!(
-                        "task-stacks: walked {} and visited {} tasks for {} targeted{asides}",
+                        "task-stacks: walked {} and visited {} tasks for {} targeted{}",
                         iter.walk().describe(),
                         stats.visited,
-                        stats.targeted
+                        stats.targeted,
+                        closing_asides(
+                            iter.full_walk_snapshots(),
+                            iter.reread_processes(),
+                            iter.still_short_processes(),
+                            stats.unsent
+                        )
                     );
                 }
             })?;
@@ -1834,6 +1969,126 @@ mod tests {
         append_member_tgids(&10u32.to_ne_bytes(), &mut seen, &mut tgids);
         append_member_tgids(&40u32.to_ne_bytes(), &mut seen, &mut tgids);
         assert_eq!(tgids, [30, 10, 20, 40]);
+    }
+
+    #[test]
+    fn a_page_size_the_system_does_not_give_is_taken_for_the_largest() {
+        assert_eq!(read_len_for_page(4096), 8 * 4096);
+        assert_eq!(read_len_for_page(65536), 8 * 65536);
+        // sysconf's error, and a size under the smallest there is.
+        assert_eq!(read_len_for_page(-1), 8 * LARGEST_PAGE);
+        assert_eq!(read_len_for_page(512), 8 * LARGEST_PAGE);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is short of the")]
+    fn an_iterator_is_not_read_through_a_short_buffer() {
+        // The length is checked before the link is touched: any descriptor does.
+        let any = std::fs::File::open("/dev/null").expect("Failed to open /dev/null");
+        let _ = read_iter_link(any.as_fd(), &mut [0u8; 32], &mut Vec::new());
+    }
+
+    #[test]
+    fn processes_that_have_gone_leave_the_targets_and_do_not_count() {
+        let (live, gone) = live_targets([7u32, 100, 101, 8, 102, 7], |pid| pid < 100);
+        assert_eq!(live, [7, 8]);
+        assert_eq!(gone, [100, 101, 102]);
+
+        // More keys than a snapshot walks one at a time, three of them alive.
+        let cap = SCOPED_WALK_MAX_PROCESSES as u32;
+        let keys = (1..=cap + 3).chain([cap + 10, cap + 11, cap + 12]);
+        let (live, gone) = live_targets(keys, |pid| pid > cap + 3);
+        assert_eq!(live, [cap + 10, cap + 11, cap + 12]);
+        assert_eq!(gone.len(), SCOPED_WALK_MAX_PROCESSES + 3);
+    }
+
+    #[test]
+    fn more_live_targets_than_a_snapshot_walks_end_the_listing_there() {
+        let cap = SCOPED_WALK_MAX_PROCESSES as u32;
+        let asked = std::cell::Cell::new(0u32);
+        let (live, gone) = live_targets(1..=cap + 500, |_| {
+            asked.set(asked.get() + 1);
+            true
+        });
+        assert_eq!(live.len(), SCOPED_WALK_MAX_PROCESSES + 1);
+        assert!(gone.is_empty());
+        // Nothing past the one too many is looked up.
+        assert_eq!(asked.get(), cap + 1);
+    }
+
+    #[test]
+    fn a_process_exists_until_it_is_reaped() {
+        assert!(process_exists(std::process::id()));
+        assert!(!process_exists(0));
+        assert!(!process_exists(u32::MAX));
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("Failed to spawn true");
+        let pid = child.id();
+        // Running, or exited and waiting to be reaped: it is there.
+        let before_the_wait = process_exists(pid);
+        child.wait().expect("Failed to wait for true");
+        assert!(before_the_wait);
+        assert!(!process_exists(pid));
+    }
+
+    #[test]
+    fn only_a_member_of_a_threaded_subtree_counts_as_in_one() {
+        let dir = tempfile::tempdir().expect("Failed to create a temporary directory");
+        let kind_file = dir.path().join("cgroup.type");
+        let open = || std::fs::File::open(dir.path()).expect("Failed to open the directory");
+        // No type to read: a domain's.
+        assert!(!in_threaded_subtree(open().as_fd()));
+        for (kind, threaded) in [
+            ("threaded\n", true),
+            ("domain\n", false),
+            ("domain threaded\n", false),
+            ("domain invalid\n", false),
+        ] {
+            std::fs::write(&kind_file, kind).expect("Failed to write cgroup.type");
+            assert_eq!(in_threaded_subtree(open().as_fd()), threaded, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_cgroup_listing_is_refused_for_what_its_directories_cannot_give() {
+        let dir = tempfile::tempdir().expect("Failed to create a temporary directory");
+        let opened = std::fs::File::open(dir.path()).expect("Failed to open the directory");
+        assert_ne!(
+            opened.as_raw_fd(),
+            0,
+            "this test needs its standard input open"
+        );
+        let no = |_: BorrowedFd<'_>| false;
+        assert_eq!(why_not_listed(&[opened.as_fd()], no), None);
+        assert_eq!(
+            why_not_listed(&[], no),
+            Some("there is no --cgroup directory to list")
+        );
+        // SAFETY: descriptor 0 is the test process's standard input, open for
+        // its life; it is compared here, never read.
+        let zero = unsafe { BorrowedFd::borrow_raw(0) };
+        assert!(why_not_listed(&[opened.as_fd(), zero], no)
+            .is_some_and(|why| why.contains("descriptor 0")));
+        assert!(why_not_listed(&[opened.as_fd()], |_| true)
+            .is_some_and(|why| why.contains("threaded subtree")));
+    }
+
+    #[test]
+    fn the_closing_line_adds_only_what_there_is_to_say() {
+        assert_eq!(closing_asides(0, 0, 0, 0), "");
+        assert_eq!(
+            closing_asides(0, 0, 0, 3),
+            "; 3 records did not fit the kernel's buffer and were unwound again"
+        );
+        assert_eq!(
+            closing_asides(2, 5, 1, 3),
+            "; 2 snapshots walked every thread on the host instead\
+             ; 5 walks of a process came up short and were read again, \
+             1 of them short the second time too\
+             ; 3 records did not fit the kernel's buffer and were unwound again"
+        );
     }
 
     #[test]
