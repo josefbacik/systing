@@ -379,15 +379,25 @@ TCX_INLINE tcx_u64 task_context_seq_next(tcx_u64 s)
  * A string is kept only after bytes that are not valid UTF-8, and the
  * control ranges U+0000-U+001F and U+007F-U+009F, have been replaced.
  *
- * ORDERING, WHAT IS AND IS NOT SHOWN.  For a reader inside the writer's own
- * thread only compiler order matters, and the fence provides it.  For a
- * reader on another CPU the argument above follows from the C11 memory
- * model and mirrors the kernel's own seqcount; on x86-64 stores are not
- * reordered with stores, so the question is about weakly ordered machines
- * such as aarch64.  No test has yet demonstrated it on such hardware, and an
- * emulator cannot: the library's test suite is to carry a two-thread test
- * (one thread setting two values in a loop, one reading word / slots / word
- * and counting torn pairs) meant to run on real aarch64 cores.
+ * ORDERING.  A reader inside the writer's own thread needs only compiler
+ * order, and the writer's fence provides it: the tracer's reader is always
+ * one, since it reads the task that is running on its own CPU.  A reader on
+ * ANOTHER CPU must also order its own reads, as the kernel's
+ * read_seqcount_begin() and read_seqcount_retry() do:
+ *
+ *	s1 = __atomic_load_n(&b->seq, __ATOMIC_ACQUIRE);
+ *	... copy the header and the slots ...
+ *	__atomic_thread_fence(__ATOMIC_ACQUIRE);
+ *	s2 = __atomic_load_n(&b->seq, __ATOMIC_RELAXED);
+ *
+ * Without the acquire on the first read the copy may be satisfied before it,
+ * and without the fence the second read may pass the copy, so a torn copy
+ * can meet two equal words.  On x86-64 loads are not reordered with loads and
+ * neither can happen; on a weakly ordered machine such as aarch64 the pair
+ * of words only means something when they are read this way.  The library's
+ * test suite has a two-thread test that reads like this (one thread setting
+ * a wide value in a loop, one reading word / value / word) and CI runs it on
+ * native aarch64 cores.
  */
 
 /* ---------------------------------------------------------------------- */

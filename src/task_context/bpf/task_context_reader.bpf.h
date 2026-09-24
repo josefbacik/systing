@@ -50,6 +50,20 @@
  * tp_btf programs). The feature is written for 6.12 and newer, the kernels
  * its load test runs on; every helper and field it uses is present at 6.6.
  *
+ * WHY NO DYNPTR. Dynptrs were looked at for reading a process's memory and
+ * left out, for two reasons of kernel version. The route that would let BPF
+ * find a thread-local by itself, without user space reading the process's
+ * ELF file (task work and the file dynptr, as presented at LPC 2025), needs
+ * mainline 6.18 and 6.19; here user space finds the recipe, so BPF makes two
+ * plain reads (the thread pointer, then the block) and nothing newer than
+ * 6.6 is needed. The user-memory dynptr kfuncs (bpf_copy_from_user_task_dynptr
+ * and its kin, mainline 6.16 on) could only size the value record, which
+ * saves ring bytes when a thread's context changes and no more: a trace
+ * holds the same ids and values either way. They would need a second arm for
+ * the older kernels, and a load test that runs on 6.12 only would never put
+ * that arm before the verifier. So every kernel gets the fixed-width copy.
+ * A later change can add the kfunc arm where BTF has them.
+ *
  * With the feature off (task_context_config.enabled == 0, the default) user
  * space does not load the three programs or create the maps below, and the
  * one call site is dead code the verifier prunes.
@@ -89,7 +103,9 @@ enum task_context_reason {
 	TASK_CONTEXT_R_NEW_ID, /* id read, a value record sent */
 	TASK_CONTEXT_R_RESTRICTED, /* confidentiality mode: nothing read */
 	TASK_CONTEXT_R_NOT_CURRENT, /* the task is not the current task */
-	TASK_CONTEXT_R_NO_USER_CONTEXT, /* a kernel thread */
+	TASK_CONTEXT_R_NO_USER_CONTEXT, /* a task with no user code to read: a
+					 * kernel or io worker thread, an exiting
+					 * thread, a vfork child */
 	TASK_CONTEXT_R_UNSUPPORTED_ARCH,
 	TASK_CONTEXT_R_TP_IMPLAUSIBLE, /* thread pointer, DTV or slot address */
 	TASK_CONTEXT_R_SLOT_READ_FAILED, /* the slot, or a DTV word on the way */
@@ -198,7 +214,13 @@ struct task_context_value_event {
 	u32 tid;
 	u64 id;
 	u32 cpu;
-	u32 reserved;
+	/* The low 32 bits of the address of the task's mm_struct. A process
+	 * numbers its threads' ids from the start in every image, so after an
+	 * exec the same process id, thread id and id can come again for other
+	 * values; the new image's mm exists before the old one is freed, so the
+	 * two differ. User space uses it, with the ids, only to tell a record
+	 * sent twice from one that is not. */
+	u32 image;
 	u8 block[sizeof(struct task_context_block_v1)];
 };
 
@@ -224,19 +246,24 @@ struct {
 } task_context_execs SEC(".maps");
 
 /*
- * Tasks that never run user code: kernel threads, and the workers the kernel
- * makes INSIDE a process (io_uring's, vhost's). The latter share the process's
- * memory, its tgid and so its recipe, and start life with their creator's
- * thread pointer, so a read for one of them would land on the creator's
- * block: another thread's, from another CPU. They are refused like kernel
- * threads. (task_struct.flags bits, the same values at 6.6, 6.12 and 6.18.)
+ * Tasks that run no user code, or none any more: kernel threads, the workers
+ * the kernel makes INSIDE a process (io_uring's, vhost's), and a thread that
+ * is exiting. The workers share the process's memory, its tgid and so its
+ * recipe, and start life with their creator's thread pointer, so a read for
+ * one of them would land on the creator's block: another thread's, from
+ * another CPU. An exiting thread has already had its last-id entry deleted by
+ * the exit program below, PF_EXITING being set before that program runs, and
+ * a sample that made a new one would leave it there for good. All are
+ * refused like kernel threads. (task_struct.flags bits, the same values at
+ * 6.6, 6.12 and 6.18.)
  */
+#define TASK_CONTEXT_PF_EXITING 0x00000004
 #define TASK_CONTEXT_PF_IO_WORKER 0x00000010
 #define TASK_CONTEXT_PF_USER_WORKER 0x00004000
 #define TASK_CONTEXT_PF_KTHREAD 0x00200000
-#define TASK_CONTEXT_PF_NO_USER_CODE                              \
-	(TASK_CONTEXT_PF_KTHREAD | TASK_CONTEXT_PF_IO_WORKER |    \
-	 TASK_CONTEXT_PF_USER_WORKER)
+#define TASK_CONTEXT_PF_NO_USER_CODE                                        \
+	(TASK_CONTEXT_PF_KTHREAD | TASK_CONTEXT_PF_IO_WORKER |              \
+	 TASK_CONTEXT_PF_USER_WORKER | TASK_CONTEXT_PF_EXITING)
 
 /* The lowest address a slot, a block or a thread pointer may have, and the
  * highest a user address can have on the architecture (56 bits with 5-level
@@ -450,6 +477,18 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	if (!recipe)
 		return 0;
 
+	/* A vfork child (CLONE_VFORK, which posix_spawn uses too) runs on its
+	 * parent's thread pointer over its parent's memory until it execs or
+	 * exits, so a recipe would take it to the parent's block. The fork
+	 * program gives it none, but user space can find it before that: the
+	 * look at the start of a capture reads the parent's memory for it. The
+	 * kernel sets vfork_done for exactly that span. Counted, so that the
+	 * refusal is visible, only for a process that has a recipe. */
+	if (BPF_CORE_READ(task, vfork_done)) {
+		task_context_count(TASK_CONTEXT_R_NO_USER_CONTEXT);
+		return 0;
+	}
+
 	/* 2. The 8-byte slot: at thread pointer + tp_offset, or where the DTV
 	 * walk ends (which counts and returns 0 when there is nothing to read). */
 	tp = task_context_thread_pointer(task);
@@ -575,7 +614,7 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	rec->tid = tid;
 	rec->id = s1;
 	rec->cpu = bpf_get_smp_processor_id();
-	rec->reserved = 0;
+	rec->image = (u32)(unsigned long)BPF_CORE_READ(task, mm);
 	bpf_ringbuf_submit(rec, 0);
 
 	if (bpf_map_update_elem(&task_context_last_id, &tid, &s1, BPF_ANY))
@@ -645,7 +684,11 @@ int BPF_PROG(task_context_exec, struct task_struct *task, pid_t old_pid,
  * fork of a PROCESS: the child's one thread inherits the slot, the block and
  * the region at the same addresses, so the parent's recipe holds in the child
  * until it execs. A new THREAD shares the tgid and needs nothing: its slot
- * starts NULL.
+ * starts NULL. A child that shares its parent's memory (vfork, posix_spawn)
+ * is given nothing: it runs on the parent's thread pointer, so the recipe
+ * would make it read the parent's block, and its samples would carry the
+ * parent's context until it execs. (The reader refuses a vfork child too,
+ * for a recipe user space wrote for it.)
  */
 SEC("tp_btf/sched_process_fork")
 int BPF_PROG(task_context_fork, struct task_struct *parent,
@@ -656,6 +699,8 @@ int BPF_PROG(task_context_fork, struct task_struct *parent,
 	u32 child_tgid = child->tgid;
 
 	if (!task_context_active() || parent_tgid == child_tgid)
+		return 0;
+	if (parent->mm == child->mm)
 		return 0;
 	recipe = bpf_map_lookup_elem(&task_context_recipes, &parent_tgid);
 	if (!recipe)

@@ -514,7 +514,10 @@ holds what each id stood for.
   the library or was not found (see the README for what is looked for), a
   counted miss, a capture without the flag. An id belongs to ONE thread: ids
   are unique within a thread, not across threads or processes, so every join
-  is on (`utid`, id). The column is in every `stack_sample.parquet` this
+  is on (`utid`, id). (A thread id the kernel hands to a thread of another
+  process during one capture keeps the first thread's `utid`, as everywhere in
+  the schema, so the two threads can have an id, and rows, in common; the
+  rows' `ts` tells them apart.) The column is in every `stack_sample.parquet` this
   version writes, all NULL without the flag. NULL in traces recorded before
   schema 25.
 
@@ -525,12 +528,14 @@ holds what each id stood for.
   while its context id was `id`, and a thread's id changes with every set or
   clear. `ts` is the sample that first saw the id. Exactly one of `value_u64` /
   `value_str` is set. A name is 1 to 31 characters of `[A-Za-z0-9_.:-]`, and a
-  name outside that class is dropped with its value; a string value is at most
-  256 bytes and has invalid UTF-8 and control characters replaced (U+FFFD)
-  before it is stored. Names and values are whatever the traced process chose
-  to set: data about that process, never an identity to trust. Written only by
-  a capture with the flag that read at least one context: `task_context.parquet`
-  does not exist otherwise, and the table is empty.
+  name outside that class is dropped with its value, and so is a name a record
+  already has; a string value is at most 256 bytes as the program set it, and
+  has invalid UTF-8 and control characters replaced (U+FFFD) before it is
+  stored (a replaced byte can grow to three, so a stored value is at most 768
+  bytes). Names and values are whatever the traced process chose to set: data
+  about that process, never an identity to trust. Written only by a capture
+  with the flag that read at least one context: `task_context.parquet` does not
+  exist otherwise, and the table is empty.
 
   ```sql
   SELECT s.ts, c.name, c.value_u64, c.value_str

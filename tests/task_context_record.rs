@@ -28,10 +28,12 @@
 //! the capture, over every process when the capture names none and at the
 //! named process when it names one.
 //!
-//! Two more tests hold what must NOT happen: a recipe that is wrong for its
+//! Three more tests hold what must NOT happen: a recipe that is wrong for its
 //! process (planted over a busy process that does not use the library) reads
-//! nothing, and under the kernel's confidentiality mode (forced here) a
-//! process that does use the library leaves no id and no value in the trace.
+//! nothing, under the kernel's confidentiality mode (forced here) a process
+//! that does use the library leaves no id and no value in the trace, and a
+//! child that shares its parent's memory (vfork) does not carry the parent's
+//! context.
 //!
 //! These need root, a kernel that loads the tracer's BPF object (6.12 or
 //! newer is what the object is load-tested on) and a C compiler (`cc`, or
@@ -611,6 +613,117 @@ fn nothing_is_read_in_confidentiality_mode() {
         config.task_context_force_restricted = true;
     });
     check_nothing_was_read(trace.path(), "confidentiality mode");
+}
+
+/// A program that sets a context, spins, then vforks a child that spins too
+/// and exits. A vfork child runs on its parent's thread pointer over its
+/// parent's memory, so a recipe copied to it would make it read the parent's
+/// block. The child touches nothing of the library.
+const VFORK_PROGRAM: &str = r#"
+#define _GNU_SOURCE
+#include "task_context.h"
+
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+static long now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static void spin(long ms)
+{
+	long end = now_ms() + ms;
+
+	while (now_ms() < end)
+		;
+}
+
+int main(int argc, char **argv)
+{
+	long ms = argc > 1 ? atol(argv[1]) : 400;
+	pid_t child;
+
+	if (set_task_context("request_id", "the parent") != 0)
+		return 2;
+	spin(ms);
+	child = vfork();
+	if (child == 0) {
+		spin(ms);
+		_exit(0);
+	}
+	waitpid(child, NULL, 0);
+	return 0;
+}
+"#;
+
+fn build_vfork_program(dir: &Path) -> PathBuf {
+    let source = dir.join("tcx_vfork.c");
+    std::fs::write(&source, VFORK_PROGRAM).expect("the program's source is written");
+    let program = dir.join("tcx_vfork");
+    compile(
+        &[],
+        &[&library_dir().join("src/task_context.c"), &source],
+        &program,
+    )
+    .expect("the vfork program builds with the library linked in");
+    program
+}
+
+/// The parent's samples carry its context; the child, which shares its
+/// memory until it exits, has none of its own and must carry none.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn a_vfork_child_does_not_carry_its_parents_context() {
+    if !have_a_compiler() {
+        return;
+    }
+    let build = TempDir::new().expect("a directory to build in");
+    let program = build_vfork_program(build.path());
+    let trace = record_command(
+        &[
+            program.to_str().expect("a utf-8 path").to_string(),
+            busy_ms(),
+        ],
+        |_| {},
+    );
+
+    // utid -> (samples, samples with an id)
+    let mut threads: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
+    for sample in samples(trace.path()) {
+        let counts = threads.entry(sample.utid).or_default();
+        counts.0 += 1;
+        counts.1 += usize::from(sample.id.is_some());
+    }
+    let carrying: Vec<_> = threads.iter().filter(|(_, counts)| counts.1 > 0).collect();
+    assert_eq!(
+        carrying.len(),
+        1,
+        "only the parent has a context to carry; samples and samples with an id by utid: {threads:?}"
+    );
+    let parent_ids = carrying[0].1 .1;
+    assert!(
+        parent_ids >= MIN_SAMPLES_PER_CONTEXT,
+        "the parent's samples carry its context: {threads:?}"
+    );
+    let child_samples: usize = threads
+        .iter()
+        .filter(|(_, counts)| counts.1 == 0 && counts.0 >= MIN_SAMPLES_PER_CONTEXT)
+        .map(|(_, counts)| counts.0)
+        .sum();
+    assert!(
+        child_samples > 0,
+        "the child was sampled while it ran: {threads:?}"
+    );
+    eprintln!(
+        "[vfork child] {child_samples} samples of the child, none with a context id; \
+         {parent_ids} of the parent's carry one"
+    );
 }
 
 /// Not a real test: a process that stays on a CPU and does NOT use the
