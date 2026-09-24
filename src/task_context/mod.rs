@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use libbpf_rs::{MapCore, MapFlags, MapHandle, RingBuffer, RingBufferBuilder};
@@ -85,9 +85,10 @@ pub const REASONS: [&str; 20] = [
 const ATTACH_PASS_BUDGET: Duration = Duration::from_secs(2);
 /// An exec is announced before the loader has mapped the program's
 /// libraries and before the writer library's constructor has run, so a
-/// process that links the library is looked at again after these waits.
+/// process that links the library is looked at again after these waits, one
+/// per look that found nothing yet.
 const EXEC_RETRY_MS: [u64; 3] = [10, 30, 60];
-/// How often the processes still waiting after that are looked at again.
+/// How long a process still waiting after that goes between looks.
 const LOOK_AGAIN_EVERY: Duration = Duration::from_secs(1);
 /// Exec notices waiting for the discovery thread; one more is dropped and
 /// counted.
@@ -153,56 +154,87 @@ pub struct Started<'a> {
 }
 
 /// Processes that link the library and had not published a recipe when they
-/// were last looked at. Bounded both ways: in how many it holds and in how
-/// often each is looked at, so that a process which never publishes is not
-/// read for ever.
+/// were last looked at, each with the time of its next look. Bounded both
+/// ways: in how many it holds and in how often each is looked at, so that a
+/// process which never publishes is not read for ever. A process is looked at
+/// when ITS time comes, never because something else happened: on a host that
+/// execs all the time, the list is not scanned once per exec.
 #[derive(Debug, Default)]
 struct LookAgain {
-    /// (process, looks so far)
-    waiting: Vec<(u32, u32)>,
+    /// (process, looks so far, when it is next looked at)
+    waiting: Vec<(u32, u32, Instant)>,
 }
 
 impl LookAgain {
     const MAX_WAITING: usize = 256;
     const MAX_LOOKS: u32 = 30;
 
-    /// Returns false, and takes nothing, when the list is full.
-    fn add(&mut self, pid: u32) -> bool {
-        if self.waiting.iter().any(|(waiting, _)| *waiting == pid) {
+    /// How long a process waits for its next look once `looks` looks in a
+    /// row have found nothing yet.
+    fn wait_after(looks: u32) -> Duration {
+        EXEC_RETRY_MS
+            .get(looks as usize)
+            .map_or(LOOK_AGAIN_EVERY, |ms| Duration::from_millis(*ms))
+    }
+
+    /// Wait for `pid`; a process already waiting has a new image, so its
+    /// schedule starts again. Returns false, and takes nothing, when the
+    /// list is full.
+    fn add(&mut self, pid: u32, now: Instant) -> bool {
+        let entry = (pid, 0, now + Self::wait_after(0));
+        if let Some(waiting) = self
+            .waiting
+            .iter_mut()
+            .find(|(waiting, ..)| *waiting == pid)
+        {
+            *waiting = entry;
             return true;
         }
         if self.waiting.len() >= Self::MAX_WAITING {
             return false;
         }
-        self.waiting.push((pid, 0));
+        self.waiting.push(entry);
         true
     }
 
-    /// Look at every waiting process once. A process leaves the list when
-    /// it publishes (`publish` is called), when it turns out not to link the
-    /// library after all, when it is refused or gone, or when it has been
-    /// looked at `MAX_LOOKS` times; the last are counted and returned.
+    /// When the next look is due, if any process is waiting.
+    fn next_due(&self) -> Option<Instant> {
+        self.waiting.iter().map(|(_, _, due)| *due).min()
+    }
+
+    /// Look at every waiting process whose time has come. A process leaves
+    /// the list when it publishes (`publish` is called), when it turns out
+    /// not to link the library after all, when it is refused or gone, or when
+    /// it has been looked at `MAX_LOOKS` times; the last are counted and
+    /// returned.
     fn tick(
         &mut self,
+        now: Instant,
         mut look: impl FnMut(u32) -> Finding,
         mut publish: impl FnMut(u32, Recipe),
     ) -> u64 {
         let mut gave_up = 0;
-        self.waiting.retain_mut(|(pid, looks)| match look(*pid) {
-            Finding::Published(recipe) => {
-                publish(*pid, recipe);
-                false
+        self.waiting.retain_mut(|(pid, looks, due)| {
+            if *due > now {
+                return true;
             }
-            Finding::NotYet => {
-                *looks += 1;
-                if *looks >= Self::MAX_LOOKS {
-                    gave_up += 1;
+            match look(*pid) {
+                Finding::Published(recipe) => {
+                    publish(*pid, recipe);
                     false
-                } else {
-                    true
                 }
+                Finding::NotYet => {
+                    *looks += 1;
+                    if *looks >= Self::MAX_LOOKS {
+                        gave_up += 1;
+                        false
+                    } else {
+                        *due = now + Self::wait_after(*looks);
+                        true
+                    }
+                }
+                Finding::NotLinked | Finding::Refused(_) | Finding::Gone => false,
             }
-            Finding::NotLinked | Finding::Refused(_) | Finding::Gone => false,
         });
         gave_up
     }
@@ -221,26 +253,21 @@ fn publish(recipes: &MapHandle, counters: &mut DiscoveryCounters, pid: u32, reci
 /// A process has a new image. The BPF side dropped its recipe at the exec;
 /// this looks at the new image, and whatever it finds, a recipe this thread
 /// may have written for the OLD image in the meantime does not survive it.
+/// It never waits: a process whose library is not initialised yet is looked
+/// at again on the schedule of [`LookAgain`], so that a burst of execs cannot
+/// hold up every other process behind their waits.
 fn handle_exec(
     discovery: &mut Discovery,
     recipes: &MapHandle,
     look_again: &mut LookAgain,
     pid: u32,
 ) {
-    let mut finding = discovery.look(pid);
-    for wait in EXEC_RETRY_MS {
-        if finding != Finding::NotYet {
-            break;
-        }
-        thread::sleep(Duration::from_millis(wait));
-        finding = discovery.look(pid);
-    }
-    match finding {
+    match discovery.look(pid) {
         Finding::Published(recipe) => publish(recipes, &mut discovery.counters, pid, recipe),
         other => {
             // Absent is the common case; the error says nothing new.
             let _ = recipes.delete(&pid.to_ne_bytes());
-            if other == Finding::NotYet && !look_again.add(pid) {
+            if other == Finding::NotYet && !look_again.add(pid, Instant::now()) {
                 discovery.counters.gave_up += 1;
             }
         }
@@ -265,7 +292,7 @@ fn look_at_targets(
                 if again {
                     let _ = recipes.delete(&pid.to_ne_bytes());
                 }
-                if other == Finding::NotYet && !look_again.add(pid) {
+                if other == Finding::NotYet && !look_again.add(pid, Instant::now()) {
                     discovery.counters.gave_up += 1;
                 }
             }
@@ -291,8 +318,9 @@ struct DiscoveryJob {
 /// The discovery thread. It waits until the caller says the programs are
 /// attached (from then on an exec is announced), looks at the capture's
 /// targets once more, or at every process when there are none, then serves
-/// exec notices as they come and the waiting processes once a second. It
-/// ends when the ring that feeds it is dropped.
+/// exec notices as they come and each waiting process when its time comes.
+/// It ends when the ring that feeds it is dropped and the notices already
+/// queued are served.
 fn discovery_thread(
     job: DiscoveryJob,
     attached: Receiver<()>,
@@ -319,7 +347,7 @@ fn discovery_thread(
             publish(&recipes, &mut discovery.counters, *pid, *recipe);
         }
         for pid in &pass.not_yet {
-            if !look_again.add(*pid) {
+            if !look_again.add(*pid, Instant::now()) {
                 discovery.counters.gave_up += 1;
             }
         }
@@ -349,7 +377,10 @@ fn discovery_thread(
         }
     }
     loop {
-        match execs.recv_timeout(LOOK_AGAIN_EVERY) {
+        let wait = look_again.next_due().map_or(LOOK_AGAIN_EVERY, |due| {
+            due.saturating_duration_since(Instant::now())
+        });
+        match execs.recv_timeout(wait) {
             Ok(pid) => handle_exec(&mut discovery, &recipes, &mut look_again, pid),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -357,6 +388,7 @@ fn discovery_thread(
         if !look_again.waiting.is_empty() {
             let mut found = Vec::new();
             let gave_up = look_again.tick(
+                Instant::now(),
                 |pid| discovery.look(pid),
                 |pid, recipe| found.push((pid, recipe)),
             );
@@ -616,17 +648,24 @@ mod tests {
         );
     }
 
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
     #[test]
     fn a_process_that_never_publishes_is_not_looked_at_for_ever() {
+        let mut now = Instant::now();
         let mut list = LookAgain::default();
-        assert!(list.add(7));
-        assert!(list.add(7), "the same process twice is one entry");
+        assert!(list.add(7, now));
+        assert!(list.add(7, now), "the same process twice is one entry");
         assert_eq!(list.waiting.len(), 1);
 
         let mut looks = 0;
         let mut gave_up = 0;
         for _ in 0..LookAgain::MAX_LOOKS + 5 {
+            now += LOOK_AGAIN_EVERY;
             gave_up += list.tick(
+                now,
                 |_| {
                     looks += 1;
                     Finding::NotYet
@@ -641,12 +680,14 @@ mod tests {
 
     #[test]
     fn a_waiting_process_leaves_the_list_when_it_publishes_or_stops_mattering() {
+        let now = Instant::now();
         let mut list = LookAgain::default();
         for pid in [1, 2, 3, 4, 5] {
-            assert!(list.add(pid));
+            assert!(list.add(pid, now));
         }
         let mut published = Vec::new();
         let gave_up = list.tick(
+            now + LOOK_AGAIN_EVERY,
             |pid| match pid {
                 1 => Finding::Published(RECIPE),
                 2 => Finding::NotLinked,
@@ -658,18 +699,97 @@ mod tests {
         );
         assert_eq!(gave_up, 0);
         assert_eq!(published, vec![(1, RECIPE)]);
-        assert_eq!(list.waiting, vec![(5, 1)]);
+        let left: Vec<_> = list
+            .waiting
+            .iter()
+            .map(|(pid, looks, _)| (*pid, *looks))
+            .collect();
+        assert_eq!(left, vec![(5, 1)]);
     }
 
     #[test]
     fn the_list_takes_no_more_than_its_bound() {
+        let now = Instant::now();
         let mut list = LookAgain::default();
         for pid in 0..LookAgain::MAX_WAITING as u32 {
-            assert!(list.add(pid));
+            assert!(list.add(pid, now));
         }
-        assert!(!list.add(u32::MAX));
-        assert!(list.add(0), "a process already waiting is not a new entry");
+        assert!(!list.add(u32::MAX, now));
+        assert!(
+            list.add(0, now),
+            "a process already waiting is not a new entry"
+        );
         assert_eq!(list.waiting.len(), LookAgain::MAX_WAITING);
+    }
+
+    /// The waits are the exec retries, then one a second, each counted from
+    /// the scan that found nothing (not from the end of a slow look).
+    #[test]
+    fn a_process_is_looked_at_when_its_time_comes() {
+        let start = Instant::now();
+        let mut list = LookAgain::default();
+        assert_eq!(list.next_due(), None);
+        list.add(7, start);
+
+        let mut at = Vec::new();
+        while let Some(due) = list.next_due() {
+            list.tick(due, |_| Finding::NotYet, |_, _| unreachable!());
+            at.push(due - start);
+            if at.len() == 5 {
+                break;
+            }
+        }
+        assert_eq!(at, vec![ms(10), ms(40), ms(100), ms(1100), ms(2100)]);
+    }
+
+    /// The scan is not made once per exec: on a host that execs all the time
+    /// `tick` runs after every notice, and a process must not use up its looks
+    /// at the pace of the notices.
+    #[test]
+    fn a_burst_of_calls_looks_at_a_waiting_process_once_and_only_when_due() {
+        let start = Instant::now();
+        let mut list = LookAgain::default();
+        list.add(7, start);
+
+        let mut looks = 0;
+        let mut tick = |list: &mut LookAgain, now| {
+            list.tick(
+                now,
+                |_| {
+                    looks += 1;
+                    Finding::NotYet
+                },
+                |_, _| unreachable!(),
+            )
+        };
+        for _ in 0..1000 {
+            tick(&mut list, start + ms(9));
+        }
+        for _ in 0..1000 {
+            tick(&mut list, start + ms(10));
+        }
+        assert_eq!(looks, 1);
+        assert_eq!(list.waiting[0].1, 1);
+    }
+
+    #[test]
+    fn a_new_image_starts_the_waiting_process_schedule_again() {
+        let start = Instant::now();
+        let mut list = LookAgain::default();
+        list.add(7, start);
+        for _ in 0..3 {
+            let due = list.next_due().unwrap();
+            list.tick(due, |_| Finding::NotYet, |_, _| unreachable!());
+        }
+        assert_eq!(list.waiting[0].1, 3);
+
+        let exec = start + ms(500);
+        assert!(list.add(7, exec));
+        assert_eq!(list.waiting.len(), 1);
+        assert_eq!(
+            (list.waiting[0].1, list.next_due()),
+            (0, Some(exec + ms(10)))
+        );
     }
 
     #[test]
