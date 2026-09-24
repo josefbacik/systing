@@ -531,27 +531,187 @@ mod tests {
         }
     }
 
+    /// Blocks are given back to one pool that every test in this process
+    /// shares, and the tests run in parallel: another may take the block
+    /// between the two threads. So the pair is tried again until the second
+    /// thread is given the very block the first one returned, which is the
+    /// case this test is about; a run that never sees it fails.
     #[test]
     fn a_returned_block_comes_back_empty_under_a_new_index() {
-        let first = thread::spawn(|| {
-            set_str("left_behind", "by the first owner").unwrap();
-            describe_self()
-        })
-        .join()
-        .unwrap();
-        let second = thread::spawn(|| {
-            set_u64("fresh", 1).unwrap();
-            let me = describe_self();
-            let mask: u32 = read(me.block + BLOCK_MASK_AT);
-            (me, mask, slot_of(me.block, "left_behind"))
-        })
-        .join()
-        .unwrap();
+        for _ in 0..100 {
+            let first = thread::spawn(|| {
+                set_str("left_behind", "by the first owner").unwrap();
+                describe_self()
+            })
+            .join()
+            .unwrap();
+            let (me, mask, stale) = thread::spawn(|| {
+                set_u64("fresh", 1).unwrap();
+                let me = describe_self();
+                let mask: u32 = read(me.block + BLOCK_MASK_AT);
+                (me, mask, slot_of(me.block, "left_behind"))
+            })
+            .join()
+            .unwrap();
+            if me.block != first.block {
+                continue;
+            }
+            assert_ne!(index_of(me.id), index_of(first.id));
+            assert_eq!(mask.count_ones(), 1);
+            assert!(stale.is_none());
+            return;
+        }
+        panic!("no thread was given the block another had just returned");
+    }
 
-        let (me, mask, stale) = second;
-        assert_ne!(index_of(me.id), index_of(first.id));
-        assert_eq!(mask.count_ones(), 1);
-        assert!(stale.is_none());
+    /// The wrapper turns some bad input away before the C library sees it,
+    /// so these calls go to the C functions themselves, which check on their
+    /// own: a caller in C has no wrapper. A refusal takes no block.
+    #[test]
+    fn the_c_functions_check_lengths_themselves() {
+        use std::ffi::CString;
+        on_a_fresh_thread(|| {
+            let text = |bytes: usize| CString::new("x".repeat(bytes)).unwrap();
+            let name = text(1);
+            let (empty, longest, too_long) = (text(0), text(NAME_MAX - 1), text(NAME_MAX));
+            let (fits, over) = (text(VALUE_MAX), text(VALUE_MAX + 1));
+            let null = core::ptr::null();
+            // SAFETY: every pointer is a NUL-terminated string that outlives
+            // its call, or the null pointer the functions turn away.
+            unsafe {
+                for name in [empty.as_ptr(), too_long.as_ptr(), null] {
+                    assert_eq!(
+                        check(set_task_context_u64(name, 1)),
+                        Err(Error::InvalidName)
+                    );
+                    assert_eq!(
+                        check(set_task_context_str(name, fits.as_ptr())),
+                        Err(Error::InvalidName)
+                    );
+                    assert_eq!(check(clear_task_context(name)), Err(Error::InvalidName));
+                }
+                assert_eq!(
+                    check(set_task_context_str(name.as_ptr(), over.as_ptr())),
+                    Err(Error::TooLong)
+                );
+                assert_eq!(
+                    check(set_task_context_str(name.as_ptr(), null)),
+                    Err(Error::InvalidValue)
+                );
+                assert_eq!(describe_self().block, 0, "no refusal took a block");
+
+                // The longest name and the longest value that are allowed.
+                check(set_task_context_str(longest.as_ptr(), fits.as_ptr())).unwrap();
+            }
+            let block = describe_self().block;
+            let slot = slot_address(block, slot_of(block, &"x".repeat(NAME_MAX - 1)).unwrap());
+            assert_eq!(read::<u16>(slot + SLOT_VALUE_LEN_AT) as usize, VALUE_MAX);
+        });
+    }
+
+    /// A signal handler that arrives inside an update and sets a value would
+    /// write over that update's half-made state, so the library refuses it.
+    /// The refusal is what a call meets while the sequence word is odd, and
+    /// the test puts the word there itself: a real signal could not be made
+    /// to arrive at that instant.
+    #[test]
+    fn a_call_inside_the_threads_own_update_is_refused() {
+        on_a_fresh_thread(|| {
+            set_u64("k", 1).unwrap();
+            let me = describe_self();
+            // SAFETY: the word is 8-byte aligned inside this thread's block.
+            let word = unsafe { AtomicU64::from_ptr((me.block + BLOCK_SEQ_AT) as *mut u64) };
+            word.fetch_or(1, Ordering::Relaxed);
+            let refused = info().busy_refused_count;
+
+            assert_eq!(set_u64("k", 2), Err(Error::Busy));
+            assert_eq!(set_str("other", "value"), Err(Error::Busy));
+            assert_eq!(clear("k"), Err(Error::Busy));
+            assert_eq!(
+                current_id(),
+                me.id,
+                "the id the interrupted update began from"
+            );
+            assert!(info().busy_refused_count >= refused + 3);
+            assert!(slot_of(me.block, "other").is_none());
+
+            word.fetch_and(!1, Ordering::Relaxed);
+            set_u64("k", 2).unwrap();
+            assert_ne!(current_id(), me.id);
+        });
+    }
+
+    extern "C" {
+        fn fork() -> c_int;
+        fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+        fn _exit(code: c_int) -> !;
+    }
+
+    /// Fork in a process with other threads, as the test runner is: the child
+    /// has this one thread, and does nothing but set values and `_exit`.
+    /// Returns the child's exit code, or fails the test if it did not exit.
+    fn in_a_forked_child(body: impl FnOnce() -> c_int) -> c_int {
+        // SAFETY: the child calls only what `body` calls, which allocates
+        // nothing and takes no lock, and ends in `_exit`.
+        let pid = unsafe { fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { _exit(body()) }
+        }
+        let mut status = 0;
+        // SAFETY: `status` is a valid, writable int.
+        assert_eq!(unsafe { waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(
+            status & 0x7f,
+            0,
+            "the child did not exit: status {status:#x}"
+        );
+        (status >> 8) & 0xff
+    }
+
+    #[test]
+    fn a_forked_child_keeps_its_values_and_changes_them_alone() {
+        on_a_fresh_thread(|| {
+            set_u64("kept", 5).unwrap();
+            let before = describe_self();
+            let code = in_a_forked_child(|| {
+                let me = describe_self();
+                let mut code = 0;
+                if me.block != before.block || me.id != before.id {
+                    code |= 1;
+                }
+                if set_u64("child", 1).is_err() {
+                    code |= 2;
+                }
+                if current_id() == before.id {
+                    code |= 4;
+                }
+                code
+            });
+            assert_eq!(code, 0, "what the child found wrong, by bit");
+            // The child's block was its own copy.
+            assert_eq!(current_id(), before.id);
+            assert!(slot_of(before.block, "child").is_none());
+        });
+    }
+
+    #[test]
+    fn a_thread_that_first_sets_in_a_forked_child_gets_a_block_there() {
+        on_a_fresh_thread(|| {
+            assert_eq!(describe_self().block, 0);
+            let code = in_a_forked_child(|| {
+                let mut code = 0;
+                if set_u64("first", 1).is_err() {
+                    code |= 1;
+                }
+                if describe_self().block == 0 || current_id() == 0 {
+                    code |= 2;
+                }
+                code
+            });
+            assert_eq!(code, 0, "what the child found wrong, by bit");
+            assert_eq!(describe_self().block, 0, "the parent's thread took nothing");
+        });
     }
 
     /// One thread rewrites ONE value over and over: a string wider than any
@@ -623,7 +783,7 @@ mod tests {
             );
         }
         writer.join().unwrap();
-        // Not a claim about how many: only that the loop looked at all.
-        let _ = kept;
+        // A loop that kept nothing has shown nothing.
+        assert!(kept > 0, "no read of a stable value was ever made");
     }
 }
