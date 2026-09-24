@@ -27,6 +27,14 @@ name: bpf-load-shapes
 # its own kernel (the arm64 job at the end). That is the only place the writer
 # library's ordering test meets weakly ordered hardware, and the only place the
 # reader's aarch64 thread-pointer and DTV reads are exercised.
+#
+# Each guest job also boots its kernel a third time and runs the task-stacks
+# end-to-end cases (`test_e2e_task_stacks_scoped_walk*`, tests/trace_validation.rs)
+# as root: the scoped walks by pid and by cgroup, the listing of the cgroups below
+# a target, and a process that retires threads. Those cases are `#[ignore]`d for an
+# unprivileged `cargo test` and return early where they cannot do their work;
+# scripts/ci/vmtest-task-stacks-e2e.sh turns every such early return into a failure,
+# so a green row means the walks ran on that kernel.
 
 on:
   push:
@@ -104,6 +112,31 @@ jobs:
           # refuse to run against any other checkout.
           pwd > gate/manifest-dir.txt
           cat gate/manifest-dir.txt
+          ls -l gate
+      - name: Build the trace_validation test binary and the systing binary its end-to-end cases start
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo test --test trace_validation --no-run --no-default-features --message-format=json > /tmp/build-e2e.json
+          BIN="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "trace_validation") | .executable' /tmp/build-e2e.json | tail -1)"
+          SYSTING="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "bin") | select(.target.name == "systing") | .executable' /tmp/build-e2e.json | tail -1)"
+          test -x "$BIN"
+          test -x "$SYSTING"
+          cp "$BIN" gate/trace_validation
+          cp "$SYSTING" gate/systing
+          # Debug builds carry most of their size in debug sections nothing in the guest
+          # reads; drop them from the shipped COPIES only, so the artifact stays small.
+          strip --strip-debug gate/trace_validation gate/systing
+          # The task-stacks cases start `systing` by the absolute path cargo baked into
+          # the test binary (CARGO_BIN_EXE_systing). Record its directory, so the guest
+          # job can put it back where the test binary looks for it.
+          dirname "$SYSTING" > gate/bin-dir.txt
+          cat gate/bin-dir.txt
           ls -l gate
       - uses: actions/upload-artifact@v4
         with:
@@ -221,6 +254,35 @@ jobs:
           cat "$OUT" || cat "$OUT.raw" || true
           echo "::endgroup::"
           grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      - name: Boot the kernel again and run the task-stacks end-to-end cases
+        run: |
+          chmod +x gate/trace_validation gate/systing scripts/ci/vmtest-task-stacks-e2e.sh
+          # The cases start `systing` by the absolute path baked into the test binary
+          # when the build job compiled it: put it back there. The guest sees the
+          # workspace at the same path, read-write.
+          BIN_DIR="$(cat gate/bin-dir.txt)"
+          case "$BIN_DIR" in
+            "$GITHUB_WORKSPACE"/*) ;;
+            *) echo "the build job's binary sat in $BIN_DIR, outside this job's workspace $GITHUB_WORKSPACE"; exit 1 ;;
+          esac
+          mkdir -p "$BIN_DIR" guest-tmp
+          cp gate/systing "$BIN_DIR/"
+          ls -l "$BIN_DIR"
+          OUT="$GITHUB_WORKSPACE/task-stacks-e2e-${{ matrix.kernel.id }}.log"
+          KVM_FLAG=""
+          [ -w /dev/kvm ] || KVM_FLAG="--disable-kvm"
+          set +e
+          timeout 1800 vng --run "kernels/${{ matrix.kernel.id }}/kernel" $KVM_FLAG --force-9p --cpus 4 --memory 8G \
+            --rwdir "$GITHUB_WORKSPACE" --rwdir "/tmp=$GITHUB_WORKSPACE/guest-tmp" \
+            --append oops=panic --append virtme_root_user=1 --verbose \
+            -- bash "$GITHUB_WORKSPACE/scripts/ci/vmtest-task-stacks-e2e.sh" \
+                 "$GITHUB_WORKSPACE/gate/trace_validation" "$GITHUB_WORKSPACE/gate" "$OUT"
+          echo "vng exited $? (informational, as above: the guest-written file decides)"
+          set -e
+          echo "::group::guest output (${{ matrix.kernel.id }})"
+          cat "$OUT" || cat "$OUT.raw" || true
+          echo "::endgroup::"
+          grep -q '^VNG-TEST-EXIT:0$' "$OUT"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -236,6 +298,15 @@ jobs:
             task-context-e2e-${{ matrix.kernel.id }}.log
             task-context-e2e-${{ matrix.kernel.id }}.log.raw
             task-context-e2e-${{ matrix.kernel.id }}.log.counters
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: task-stacks-e2e-${{ matrix.kernel.id }}
+          path: |
+            task-stacks-e2e-${{ matrix.kernel.id }}.log
+            task-stacks-e2e-${{ matrix.kernel.id }}.log.raw
           if-no-files-found: ignore
           retention-days: 7
 
