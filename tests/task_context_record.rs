@@ -28,6 +28,15 @@
 //! the capture, over every process when the capture names none and at the
 //! named process when it names one.
 //!
+//! Two more read the same programs through the task-stacks recorder, with the
+//! CPU sampler off so that only its iterator can have read a context: each
+//! `task_stack_event` of a thread carries the id of the context it had, and
+//! the values of the id are in the `task_context` table, sent by the iterator
+//! alone (for the three builds, so that the DTV walk is read through
+//! `bpf_copy_from_user_task` as well as the fixed distance from the thread
+//! pointer; and once more in the confidentiality mode, when the iterator reads
+//! nothing).
+//!
 //! Three more tests hold what must NOT happen: a recipe that is wrong for its
 //! process (planted over a busy process that does not use the library) reads
 //! nothing, under the kernel's confidentiality mode (forced here) a process
@@ -182,7 +191,8 @@ fn build_against_shared_object(dir: &Path, dtv: bool) -> PathBuf {
 // Reading a trace back
 // ---------------------------------------------------------------------------
 
-/// One row of `stack_sample`: the thread, and the context id it carries.
+/// One row of `stack_sample` or of `task_stack_event`: the thread, and the
+/// context id it carries.
 struct Sample {
     utid: i64,
     id: Option<u64>,
@@ -207,19 +217,28 @@ fn batches(path: &Path) -> impl Iterator<Item = arrow::record_batch::RecordBatch
 }
 
 fn samples(dir: &Path) -> Vec<Sample> {
-    let path = dir.join("stack_sample.parquet");
-    assert!(path.exists(), "stack_sample.parquet not found");
+    ids_in(dir, "stack_sample.parquet")
+}
+
+/// The task-stacks recorder's events.
+fn events(dir: &Path) -> Vec<Sample> {
+    ids_in(dir, "task_stack_event.parquet")
+}
+
+fn ids_in(dir: &Path, file: &str) -> Vec<Sample> {
+    let path = dir.join(file);
+    assert!(path.exists(), "{file} not found");
     let mut rows = Vec::new();
     for batch in batches(&path) {
         let utid = batch
             .column_by_name("utid")
-            .expect("stack_sample.utid")
+            .unwrap_or_else(|| panic!("{file}.utid"))
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("utid is Int64");
         let id = batch
             .column_by_name("task_context_id")
-            .expect("every trace this build writes has stack_sample.task_context_id")
+            .unwrap_or_else(|| panic!("every trace this build writes has {file}'s task_context_id"))
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("task_context_id is UInt64");
@@ -367,6 +386,47 @@ fn expected_phases(who: u64) -> [BTreeMap<String, Value>; 3] {
     ]
 }
 
+/// Thread `who` of the example: its `utid`, and the id of each of its first
+/// `phases_run` contexts, from the `task_context` table alone. Each context is
+/// in the table once, with the values the program set, under one `utid`.
+fn thread_contexts(contexts: &Contexts, how: &str, who: u64, phases_run: usize) -> (i64, Vec<u64>) {
+    let phases = expected_phases(who);
+    // The thread is the one utid that has the first phase's context.
+    let owners: Vec<i64> = contexts
+        .iter()
+        .filter(|(_, values)| **values == phases[0])
+        .map(|((utid, _), _)| *utid)
+        .collect();
+    assert_eq!(
+        owners.len(),
+        1,
+        "[{how}] thread {who}: its first context {:?} is in the table {} times",
+        phases[0],
+        owners.len()
+    );
+    let utid = owners[0];
+    let ids = phases
+        .iter()
+        .enumerate()
+        .take(phases_run)
+        .map(|(phase, wanted)| {
+            let ids: Vec<u64> = contexts
+                .iter()
+                .filter(|((owner, _), values)| *owner == utid && *values == wanted)
+                .map(|((_, id), _)| *id)
+                .collect();
+            assert_eq!(
+                ids.len(),
+                1,
+                "[{how}] thread {who} phase {phase}: {wanted:?} is in the table {} times under utid {utid}",
+                ids.len()
+            );
+            ids[0]
+        })
+        .collect();
+    (utid, ids)
+}
+
 /// The whole read: every thread's contexts of its first `phases_run` phases
 /// are in the table with the values the program set, under one `utid` each;
 /// every sample that carries an id finds its values; and each expected
@@ -384,46 +444,20 @@ fn check_example_trace(dir: &Path, how: &str, phases_run: usize) {
 
     let mut threads = BTreeSet::new();
     for who in 0..3u64 {
-        let phases = expected_phases(who);
-        // The thread is the one utid that has the first phase's context.
-        let owners: Vec<i64> = contexts
-            .iter()
-            .filter(|(_, values)| **values == phases[0])
-            .map(|((utid, _), _)| *utid)
-            .collect();
-        assert_eq!(
-            owners.len(),
-            1,
-            "[{how}] thread {who}: its first context {:?} is in the table {} times",
-            phases[0],
-            owners.len()
-        );
-        let utid = owners[0];
+        let (utid, ids) = thread_contexts(&contexts, how, who, phases_run);
         assert!(
             threads.insert(utid),
             "[{how}] two threads of the example share utid {utid}"
         );
-        for (phase, wanted) in phases.iter().enumerate().take(phases_run) {
-            let ids: Vec<u64> = contexts
-                .iter()
-                .filter(|((owner, _), values)| *owner == utid && *values == wanted)
-                .map(|((_, id), _)| *id)
-                .collect();
-            assert_eq!(
-                ids.len(),
-                1,
-                "[{how}] thread {who} phase {phase}: {wanted:?} is in the table {} times under utid {utid}",
-                ids.len()
-            );
+        for (phase, id) in ids.iter().enumerate() {
             let carried = samples
                 .iter()
-                .filter(|sample| sample.utid == utid && sample.id == Some(ids[0]))
+                .filter(|sample| sample.utid == utid && sample.id == Some(*id))
                 .count();
             assert!(
                 carried >= MIN_SAMPLES_PER_CONTEXT,
-                "[{how}] thread {who} phase {phase}: {carried} samples carry id {:#x}; the thread \
-                 stayed on a CPU with it and {MIN_SAMPLES_PER_CONTEXT} or more are wanted",
-                ids[0]
+                "[{how}] thread {who} phase {phase}: {carried} samples carry id {id:#x}; the thread \
+                 stayed on a CPU with it and {MIN_SAMPLES_PER_CONTEXT} or more are wanted"
             );
         }
     }
@@ -723,6 +757,147 @@ fn a_vfork_child_does_not_carry_its_parents_context() {
     eprintln!(
         "[vfork child] {child_samples} samples of the child, none with a context id; \
          {parent_ids} of the parent's carry one"
+    );
+}
+
+/// The task-stacks recorder beside the tracer, and nothing else that reads a
+/// context: the CPU sampler and the sleep stacks are off, so every value in
+/// the `task_context` table was sent by the recorder's iterator.
+fn record_task_stacks(program: &Path, restricted: bool) -> TempDir {
+    record_command(&example_command(program), |config| {
+        config.task_stacks = true;
+        config.task_stacks_interval_ms = 50;
+        config.no_cpu_stack_traces = true;
+        config.no_sleep_stack_traces = true;
+        config.no_interruptible_stack_traces = true;
+        config.task_context_force_restricted = restricted;
+        config.parquet_only = true;
+    })
+}
+
+/// The least number of `task_stack_event`s that must carry each expected
+/// context: a thread that stays on a CPU for a phase is recorded at every
+/// iteration, and the iteration is 50 ms against a phase of 400.
+const MIN_EVENTS_PER_CONTEXT: usize = 2;
+
+/// Each thread's events carry the id of its context, and the id's values are
+/// in the table.
+fn check_task_stacks_trace(dir: &Path, how: &str) {
+    let events = events(dir);
+    let contexts = contexts(dir);
+    assert!(
+        !events.is_empty(),
+        "[{how}] the capture has no task_stack_event"
+    );
+    assert!(
+        !contexts.is_empty(),
+        "[{how}] the task_context table is empty: with the CPU sampler off only the task-stacks \
+         iterator can have sent a value (the `task_context discovery:` and `task_context samples:` \
+         lines above say whether the process was found and what was read)"
+    );
+
+    let mut threads = BTreeSet::new();
+    for who in 0..3u64 {
+        let (utid, ids) = thread_contexts(&contexts, how, who, 3);
+        assert!(
+            threads.insert(utid),
+            "[{how}] two threads of the example share utid {utid}"
+        );
+        for (phase, id) in ids.iter().enumerate() {
+            let carried = events
+                .iter()
+                .filter(|event| event.utid == utid && event.id == Some(*id))
+                .count();
+            assert!(
+                carried >= MIN_EVENTS_PER_CONTEXT,
+                "[{how}] thread {who} phase {phase}: {carried} events carry id {id:#x}; the thread \
+                 stayed on a CPU with it and {MIN_EVENTS_PER_CONTEXT} or more are wanted"
+            );
+        }
+    }
+
+    let known = thread_utids(dir);
+    let mut with_id = 0usize;
+    for event in &events {
+        assert!(
+            known.contains(&event.utid),
+            "[{how}] an event of utid {}, which the thread table does not have",
+            event.utid
+        );
+        if let Some(id) = event.id {
+            with_id += 1;
+            assert!(
+                contexts.contains_key(&(event.utid, id)),
+                "[{how}] an event of utid {} carries id {id:#x}, which the task_context table does not have",
+                event.utid
+            );
+            assert_ne!(id, 0, "[{how}] 0 means no context and is stored as NULL");
+        }
+    }
+    eprintln!(
+        "[task stacks: {how}] {} events, {with_id} with a context id, {} contexts of {} threads",
+        events.len(),
+        contexts.len(),
+        threads.len()
+    );
+}
+
+/// The iterator reads other tasks' memory, from another CPU, with the
+/// sleepable copy: the fixed distance from the thread pointer, and the DTV
+/// walk, which reads a handful of words more.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn a_task_stack_event_carries_its_threads_context() {
+    if !have_a_compiler() {
+        return;
+    }
+    let build = TempDir::new().expect("a directory to build in");
+    let linked_in = build_linked_in(build.path());
+    let trace = record_task_stacks(&linked_in, false);
+    check_task_stacks_trace(trace.path(), "linked in");
+
+    let shared = TempDir::new().expect("a directory to build in");
+    let program = build_against_shared_object(shared.path(), false);
+    let trace = record_task_stacks(&program, false);
+    check_task_stacks_trace(trace.path(), "shared object");
+
+    let dtv = TempDir::new().expect("a directory to build in");
+    let program = build_against_shared_object(dtv.path(), true);
+    let trace = record_task_stacks(&program, false);
+    check_task_stacks_trace(trace.path(), "shared object, dtv");
+}
+
+/// The kernel's confidentiality mode, forced: the iterator reads nothing of
+/// any process either.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn a_task_stack_event_carries_no_context_in_confidentiality_mode() {
+    if !have_a_compiler() {
+        return;
+    }
+    let build = TempDir::new().expect("a directory to build in");
+    let program = build_linked_in(build.path());
+    let trace = record_task_stacks(&program, true);
+    let events = events(trace.path());
+    assert!(
+        !events.is_empty(),
+        "[task stacks: confidentiality mode] the capture has no task_stack_event, so it shows nothing"
+    );
+    let carrying = events.iter().filter(|event| event.id.is_some()).count();
+    assert_eq!(
+        carrying,
+        0,
+        "[task stacks: confidentiality mode] {carrying} of {} events carry a context id",
+        events.len()
+    );
+    let contexts = contexts(trace.path());
+    assert!(
+        contexts.is_empty(),
+        "[task stacks: confidentiality mode] the task_context table has rows: {contexts:?}"
+    );
+    eprintln!(
+        "[task stacks: confidentiality mode] {} events, none with a context id, no task_context row",
+        events.len()
     );
 }
 

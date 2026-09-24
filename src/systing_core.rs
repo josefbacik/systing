@@ -1681,7 +1681,8 @@ pub struct Config {
     pub task_stacks_interval_ms: u64,
     /// Read each sampled thread's task_context (`--include-task-context`):
     /// the id of the thread's current context goes into every running-stack
-    /// sample and its named values into the `task_context` table. Off, none
+    /// sample (and, with the task-stacks recorder, into every event of it)
+    /// and its named values into the `task_context` table. Off, none
     /// of the feature's programs or maps is loaded. See [`crate::task_context`].
     pub include_task_context: bool,
     /// With [`Config::include_task_context`], run the feature as it runs
@@ -4379,6 +4380,19 @@ fn shared_pystacks_maps<'a>(
     }
 }
 
+/// The main object's task_context maps, for the task-stacks object to reuse
+/// (`--include-task-context`).
+fn shared_task_context_maps<'a>(
+    skel: &'a SystingSystemSkel,
+) -> crate::task_stacks_recorder::SharedTaskContextMaps<'a> {
+    crate::task_stacks_recorder::SharedTaskContextMaps {
+        recipes: skel.maps.task_context_recipes.as_fd(),
+        last_id: skel.maps.task_context_last_id.as_fd(),
+        stats: skel.maps.task_context_stats.as_fd(),
+        values: skel.maps.task_context_values.as_fd(),
+    }
+}
+
 /// Resolve the `--cgroup` targets for whichever mode the running kernel gets.
 ///
 /// Kernel mode opens each target directory and reads its id and nothing more
@@ -6311,10 +6325,25 @@ pub fn systing(
                 .iter()
                 .map(|target| target.dir.as_fd())
                 .collect();
+            // With --include-task-context the iterator reads its threads'
+            // contexts too, into the main object's maps and onto its ring;
+            // it reads nothing where the main object does not (restricted).
+            let task_context_maps = shared_task_context_maps(&skel);
+            let task_context = opts.include_task_context.then(|| {
+                let restricted = skel
+                    .maps
+                    .rodata_data
+                    .is_some_and(|rodata| rodata.task_context_config.restricted != 0);
+                (
+                    &task_context_maps,
+                    crate::task_stacks_recorder::TaskContextMode { restricted },
+                )
+            });
             Some(crate::task_stacks_recorder::TaskStacksIter::load(
                 &target_filter,
                 &target_filter_maps(&skel),
                 &shared_pystacks_maps(&skel),
+                task_context,
                 task_stack_mode,
                 &cgroup_dirs,
             )?)

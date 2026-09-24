@@ -10,13 +10,17 @@
  * and calls task_context_read_current(); nothing else of the feature is in
  * systing_system.bpf.c.
  *
- * WHO CAN CALL IT. Any handler that records something about the CURRENT
- * thread: the helper is one inline function taking the task, and every
- * recorder's handlers in systing_system.bpf.c are one translation unit with
- * it. The first caller is the path that emits a running stack. A separately
- * built object (the task-stacks recorder's) would include this file as well
- * and share the maps by reusing their descriptors at load; none does yet, and
- * that recorder samples OTHER threads, which the helper refuses by design.
+ * WHO CAN CALL IT. Two callers, in two objects. Any handler that records
+ * something about the CURRENT thread calls task_context_read_current(): one
+ * inline function taking the task, and every recorder's handlers in
+ * systing_system.bpf.c are one translation unit with it. The first caller is
+ * the path that emits a running stack. The task-stacks recorder's object
+ * (src/bpf/task_stacks.bpf.c, built with STROBELIGHT_SLEEPABLE_BPF) includes
+ * this file as well and calls task_context_read_task() for the thread its
+ * iterator was handed, which is not the current task: it shares the recipes,
+ * the last-id table, the counters and the values ring below by reusing their
+ * descriptors at load (src/task_stacks_recorder.rs), and has none of the
+ * programs. Each of the two helpers refuses what the other is for.
  *
  * HOW IT WORKS. User space (src/task_context/discovery.rs) finds each process
  * that links the writer library, validates the record the library publishes
@@ -31,14 +35,18 @@
  * themselves travel once per id, on a ring of their own.
  *
  * WHAT IT NEVER DOES. It never reads kernel memory at an address a process
- * supplied: every copy of a process's bytes is bpf_probe_read_user(), and
- * every kernel read is a field of the kernel's own task struct, or of the
- * signal struct it points to, at an offset CO-RE relocates (a task's ids and
- * flags, its thread pointer in the sample path, its process's count of live
- * threads in the exit hook). It never reads another task's memory: the
- * subject is the current task or the call is a counted miss. It never blocks,
- * retries in place or faults a page in. It never submits a record it did not
- * fill completely under a good return: a reserved record is either whole or
+ * supplied: every copy of a process's bytes is bpf_probe_read_user() of the
+ * current task or, in the task-stacks object, bpf_copy_from_user_task() of the
+ * task its iterator was handed, and every kernel read is a field of the
+ * kernel's own task struct, or of the signal struct it points to, at an
+ * offset CO-RE relocates (a task's ids and flags, its thread pointer in the
+ * sample path, its process's count of live threads in the exit hook). The
+ * main object never reads another task's memory: the subject is the current
+ * task or the call is a counted miss. It never blocks, retries in place or
+ * faults a page in - the task-stacks object apart, whose sleepable iterator
+ * copies another task's memory with a helper that may sleep and fault a page
+ * in, as its stack unwinder does. It never submits a record it did not fill
+ * completely under a good return: a reserved record is either whole or
  * discarded. Every miss in a process that published a recipe is counted under
  * its own reason and the sample then carries no id (or, when it interrupted
  * the thread's own update, the id the thread's values last travelled under);
@@ -78,6 +86,19 @@
 
 #include "systing_shared.bpf.h"
 #include "task_context.h"
+
+/*
+ * The task-stacks recorder's object includes this file to read the context of
+ * OTHER tasks, from a sleepable iterator. Its build defines
+ * STROBELIGHT_SLEEPABLE_BPF (build.rs, for pystacks) and this file takes the
+ * same define as the sign of that object. There, a process's memory is copied
+ * with bpf_copy_from_user_task(), the three programs, the exec ring and the
+ * sampler's budgets are not compiled in, and task_context_read_task() stands
+ * in for task_context_read_current().
+ */
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+#define TASK_CONTEXT_OTHER_TASKS 1
+#endif
 
 /*
  * The feature's own read-only configuration, set by user space before load
@@ -185,6 +206,7 @@ struct {
 	__uint(max_entries, TASK_CONTEXT_R_MAX);
 } task_context_stats SEC(".maps");
 
+#ifndef TASK_CONTEXT_OTHER_TASKS
 /* Per-CPU one-second budgets: slot 0 value records, slot 1 exec notices. */
 struct task_context_budget {
 	u64 window_start_ns;
@@ -200,6 +222,7 @@ struct {
 
 #define TASK_CONTEXT_BUDGET_VALUES 0
 #define TASK_CONTEXT_BUDGET_EXECS 1
+#endif /* !TASK_CONTEXT_OTHER_TASKS */
 
 /*
  * A thread's values, sent when a sample first sees a new id for it. `block`
@@ -234,6 +257,25 @@ struct {
 	__uint(max_entries, 4 * 1024 * 1024);
 } task_context_values SEC(".maps");
 
+#ifdef TASK_CONTEXT_OTHER_TASKS
+/*
+ * The record under construction, per CPU: a copy of another task's block can
+ * fault a page in and so sleep, and a ring reservation held across that would
+ * keep every later record on the ring from being read until it came back. The
+ * block is copied here, checked, and only then sent with one
+ * bpf_ringbuf_output(). The one reader of the iterator's links at a time, and
+ * a sleepable program that cannot migrate, are what make one slot a CPU do
+ * (task_stacks_scratch, in task_stacks.bpf.c, rests on the same two facts).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct task_context_value_event);
+} task_context_scratch SEC(".maps");
+#endif
+
+#ifndef TASK_CONTEXT_OTHER_TASKS
 /* "This process has a new image: look at it again." */
 struct task_context_exec_event {
 	u32 pid;
@@ -244,6 +286,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 64 * 1024);
 } task_context_execs SEC(".maps");
+#endif /* !TASK_CONTEXT_OTHER_TASKS */
 
 /*
  * Tasks that run no user code, or none any more: kernel threads, the workers
@@ -294,6 +337,55 @@ static __always_inline bool task_context_user_range_ok(u64 addr, u64 len)
 	       addr <= TASK_CONTEXT_USER_ADDR_MAX - len;
 }
 
+/*
+ * A copy of `size` bytes of `task`'s memory at user address `addr`; non-zero
+ * on failure, in which case the destination has been zeroed. The main object
+ * only ever reads the CURRENT task, from a context that cannot sleep, and so
+ * with the helper that never faults a page in. The task-stacks iterator reads
+ * OTHER tasks, sleepably, with bpf_copy_from_user_task(), which does (the
+ * helper its stack unwinder copies frames with).
+ */
+static __always_inline long task_context_copy(struct task_struct *task,
+					      void *dst, u32 size, u64 addr)
+{
+#ifdef TASK_CONTEXT_OTHER_TASKS
+	return bpf_copy_from_user_task(dst, size, (const void *)addr, task, 0);
+#else
+	return bpf_probe_read_user(dst, size, (const void *)addr);
+#endif
+}
+
+#ifdef TASK_CONTEXT_OTHER_TASKS
+/*
+ * A word only this file's atomics write, for the barrier below.
+ */
+u64 task_context_fence;
+
+/*
+ * The ordering the ABI asks of a reader on ANOTHER CPU (task_context.h,
+ * "ORDERING"): an acquire on the first read of the sequence word, and an
+ * acquire fence before the second. The task-stacks iterator runs on whatever
+ * CPU its reader thread is on, never inside the thread it reads, and on a
+ * weakly ordered machine such as aarch64 a copy may otherwise be satisfied
+ * before the word or after the word that is meant to close it. A BPF atomic
+ * that returns the old value is fully ordered, as Linux's atomic_fetch_add()
+ * is, so a fetch-and-add of 0 is a full barrier (a fetch whose result is not
+ * used would be compiled to a bare add, which is not one). On x86-64 it costs
+ * one locked instruction.
+ */
+static __always_inline void task_context_full_barrier(void)
+{
+	u64 old = __sync_fetch_and_add(&task_context_fence, 0);
+
+	barrier_var(old);
+}
+#else
+static __always_inline void task_context_full_barrier(void)
+{
+}
+#endif
+
+#ifndef TASK_CONTEXT_OTHER_TASKS
 /* One unit of this CPU's budget `which` for the current second, or false. */
 static __always_inline bool task_context_take(u32 which, u64 now, u32 limit)
 {
@@ -312,6 +404,7 @@ static __always_inline bool task_context_take(u32 which, u64 now, u32 limit)
 	b->used += 1;
 	return true;
 }
+#endif /* !TASK_CONTEXT_OTHER_TASKS */
 
 /*
  * The thread pointer the kernel keeps for a task. Like the ids and flags the
@@ -343,12 +436,12 @@ static __always_inline u64 task_context_thread_pointer(struct task_struct *task)
  * a fixed offset into that block. A DTV that does not reach the module yet, or
  * holds no block for it, belongs to a thread that never touched the library's
  * thread-local (the loader allocates it on first touch): no context, the same
- * answer as a NULL slot. Every read is one 8-byte bpf_probe_read_user() of
- * the current task's memory, its return tested before its destination is
- * looked at.
+ * answer as a NULL slot. Every read is one 8-byte task_context_copy() of the
+ * task's memory, its return tested before its destination is looked at.
  */
 static __always_inline u64
-task_context_dtv_slot(u64 tp, const struct task_context_recipe *recipe)
+task_context_dtv_slot(struct task_struct *task, u64 tp,
+		      const struct task_context_recipe *recipe)
 {
 #ifdef TASK_CONTEXT_TCB_DTV_OFFSET
 	u64 modid = recipe->dtv_modid, dtv = 0, length = 0, block = 0, slot;
@@ -360,8 +453,8 @@ task_context_dtv_slot(u64 tp, const struct task_context_recipe *recipe)
 		task_context_count(TASK_CONTEXT_R_TP_IMPLAUSIBLE);
 		return 0;
 	}
-	if (bpf_probe_read_user(&dtv, sizeof(dtv),
-				(void *)(tp + TASK_CONTEXT_TCB_DTV_OFFSET))) {
+	if (task_context_copy(task, &dtv, sizeof(dtv),
+			      tp + TASK_CONTEXT_TCB_DTV_OFFSET)) {
 		task_context_count(TASK_CONTEXT_R_SLOT_READ_FAILED);
 		return 0;
 	}
@@ -372,8 +465,8 @@ task_context_dtv_slot(u64 tp, const struct task_context_recipe *recipe)
 		task_context_count(TASK_CONTEXT_R_TP_IMPLAUSIBLE);
 		return 0;
 	}
-	if (bpf_probe_read_user(&length, sizeof(length),
-				(void *)(dtv - TASK_CONTEXT_DTV_ENTRY_SIZE))) {
+	if (task_context_copy(task, &length, sizeof(length),
+			      dtv - TASK_CONTEXT_DTV_ENTRY_SIZE)) {
 		task_context_count(TASK_CONTEXT_R_SLOT_READ_FAILED);
 		return 0;
 	}
@@ -381,8 +474,8 @@ task_context_dtv_slot(u64 tp, const struct task_context_recipe *recipe)
 		task_context_count(TASK_CONTEXT_R_UNSET);
 		return 0;
 	}
-	if (bpf_probe_read_user(&block, sizeof(block),
-				(void *)(dtv + modid * TASK_CONTEXT_DTV_ENTRY_SIZE))) {
+	if (task_context_copy(task, &block, sizeof(block),
+			      dtv + modid * TASK_CONTEXT_DTV_ENTRY_SIZE)) {
 		task_context_count(TASK_CONTEXT_R_SLOT_READ_FAILED);
 		return 0;
 	}
@@ -428,54 +521,45 @@ static __always_inline u64 task_context_last_or_none(const u64 *last, u64 word)
 }
 
 /*
- * The context id of the CURRENT thread for one sample, or 0 for "none".
- * `task` must be the current task (a handler whose sample describes another
- * task must not call this: the check below turns that into a counted miss).
- *
- * The steps are the ABI's reader rule, in its order and with its numbers.
+ * Steps 0 and 1 of the ABI's reader rule for `task`: whether to read anything
+ * of it at all, and the recipe to read it by. NULL for a call that reads
+ * nothing, after counting why where that is a miss: the confidentiality mode,
+ * an architecture with no reader, (in the main object) a task that is not the
+ * current one, a task that runs no user code, a vfork child. A process that
+ * published no recipe is the common case and is deliberately not counted: one
+ * lookup and out.
  */
-static __always_inline u64 task_context_read_current(struct task_struct *task)
+static __always_inline const struct task_context_recipe *
+task_context_recipe_of(struct task_struct *task)
 {
-	struct task_context_value_event *rec;
-	struct task_context_recipe *recipe;
-	u64 tp, slot_addr, block = 0, offset, s1, s2 = 0, copied = 0, now;
-	u64 *last;
-	u32 tgid, tid;
-	struct {
-		u32 magic;
-		u16 version;
-		u16 hdr_size;
-		u64 seq;
-		u32 set_mask;
-		u32 reserved0;
-	} head = { 0 };
+	const struct task_context_recipe *recipe;
+	u32 tgid = task->tgid;
 
 	if (task_context_config.restricted) {
 		task_context_count(TASK_CONTEXT_R_RESTRICTED);
-		return 0;
+		return NULL;
 	}
 
 #if !defined(__x86_64__) && !defined(__aarch64__)
 	task_context_count(TASK_CONTEXT_R_UNSUPPORTED_ARCH);
-	return 0;
+	return NULL;
 #endif
 
-	tgid = task->tgid;
-	tid = task->pid;
-	if ((u32)bpf_get_current_pid_tgid() != tid) {
+#ifndef TASK_CONTEXT_OTHER_TASKS
+	if ((u32)bpf_get_current_pid_tgid() != task->pid) {
 		task_context_count(TASK_CONTEXT_R_NOT_CURRENT);
-		return 0;
+		return NULL;
 	}
+#endif
 	if (task->flags & TASK_CONTEXT_PF_NO_USER_CODE) {
 		task_context_count(TASK_CONTEXT_R_NO_USER_CONTEXT);
-		return 0;
+		return NULL;
 	}
 
-	/* 1. No published recipe for the process: read nothing. The common
-	 * case, and deliberately not counted: one lookup and out. */
+	/* 1. No published recipe for the process: read nothing. */
 	recipe = bpf_map_lookup_elem(&task_context_recipes, &tgid);
 	if (!recipe)
-		return 0;
+		return NULL;
 
 	/* A vfork child (CLONE_VFORK, which posix_spawn uses too) runs on its
 	 * parent's thread pointer over its parent's memory until it execs or
@@ -486,36 +570,68 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	 * refusal is visible, only for a process that has a recipe. */
 	if (BPF_CORE_READ(task, vfork_done)) {
 		task_context_count(TASK_CONTEXT_R_NO_USER_CONTEXT);
-		return 0;
+		return NULL;
 	}
+	return recipe;
+}
+
+/*
+ * Steps 2 to 5 of the ABI's reader rule for `task`, whose recipe is `recipe`:
+ * the part both readers share. Where the thread's block is, whether its
+ * header checks out, and what its sequence word says. Returns true when the
+ * thread has a NEW id, whose values are to be sent: *id is that id and
+ * *block_out the address of the block it was read from. Returns false when
+ * there is nothing to send, with *id the id the sample carries (0 for
+ * "none"), every reason for a 0 counted. Every copy is task_context_copy(),
+ * of the current task's memory in the main object and of another task's in
+ * the task-stacks object; the range checks the rule demands of a reader of
+ * ANOTHER task's memory are made in both.
+ */
+static __always_inline bool
+task_context_look(struct task_struct *task,
+		  const struct task_context_recipe *recipe, u32 tid, u64 *id,
+		  u64 *block_out)
+{
+	u64 tp, slot_addr, block = 0, offset, s1;
+	u64 *last;
+	struct {
+		u32 magic;
+		u16 version;
+		u16 hdr_size;
+		u64 seq;
+		u32 set_mask;
+		u32 reserved0;
+	} head = { 0 };
+
+	*id = 0;
 
 	/* 2. The 8-byte slot: at thread pointer + tp_offset, or where the DTV
 	 * walk ends (which counts and returns 0 when there is nothing to read). */
 	tp = task_context_thread_pointer(task);
 	if (!task_context_user_range_ok(tp, 0)) {
 		task_context_count(TASK_CONTEXT_R_TP_IMPLAUSIBLE);
-		return 0;
+		return false;
 	}
 	if (recipe->dtv_modid) {
-		slot_addr = task_context_dtv_slot(tp, recipe);
+		slot_addr = task_context_dtv_slot(task, tp, recipe);
 		if (!slot_addr)
-			return 0;
+			return false;
 	} else {
 		slot_addr = tp + (u64)recipe->tp_offset;
 	}
 	if (!task_context_user_range_ok(slot_addr, sizeof(block))) {
 		task_context_count(TASK_CONTEXT_R_TP_IMPLAUSIBLE);
-		return 0;
+		return false;
 	}
 	/* 0. The return is tested before one byte of the destination is
 	 * looked at: the helper zeroes the destination when it fails. */
-	if (bpf_probe_read_user(&block, sizeof(block), (void *)slot_addr)) {
+	if (task_context_copy(task, &block, sizeof(block), slot_addr)) {
 		task_context_count(TASK_CONTEXT_R_SLOT_READ_FAILED);
-		return 0;
+		return false;
 	}
 	if (!block) {
 		task_context_count(TASK_CONTEXT_R_UNSET);
-		return 0;
+		return false;
 	}
 	/* The block must lie inside the region the library published, at a
 	 * whole number of strides from its base - the test the rule demands
@@ -524,27 +640,30 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	if (block < recipe->region_base ||
 	    recipe->region_size < sizeof(struct task_context_block_v1)) {
 		task_context_count(TASK_CONTEXT_R_OUT_OF_RANGE);
-		return 0;
+		return false;
 	}
 	offset = block - recipe->region_base;
 	if (offset > recipe->region_size - sizeof(struct task_context_block_v1) ||
 	    offset % TASK_CONTEXT_BLOCK_STRIDE) {
 		task_context_count(TASK_CONTEXT_R_OUT_OF_RANGE);
-		return 0;
+		return false;
 	}
 
 	/* 3. The first 24 bytes of the block: the 16 the rule names and the
 	 * set mask beside them. Zero is never a valid word. */
-	if (bpf_probe_read_user(&head, sizeof(head), (void *)block)) {
+	if (task_context_copy(task, &head, sizeof(head), block)) {
 		task_context_count(TASK_CONTEXT_R_BLOCK_READ_FAILED);
-		return 0;
+		return false;
 	}
+	/* Nothing after the first read of the word may be satisfied before it
+	 * (a no-op in the main object, which reads on the writer's own CPU). */
+	task_context_full_barrier();
 	if (head.magic != TASK_CONTEXT_BLOCK_MAGIC ||
 	    head.version != TASK_CONTEXT_ABI_VERSION ||
 	    head.hdr_size != __builtin_offsetof(struct task_context_block_v1, slots) ||
 	    head.seq == 0) {
 		task_context_count(TASK_CONTEXT_R_BAD_HEADER);
-		return 0;
+		return false;
 	}
 
 	/* 4. An odd word: the thread's own update is in progress (the only
@@ -556,7 +675,8 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	last = bpf_map_lookup_elem(&task_context_last_id, &tid);
 	if (s1 & TASK_CONTEXT_SEQ_BUSY) {
 		task_context_count(TASK_CONTEXT_R_IN_PROGRESS);
-		return task_context_last_or_none(last, s1);
+		*id = task_context_last_or_none(last, s1);
+		return false;
 	}
 
 	/* The thread has a block and has cleared every name: no context, so
@@ -565,14 +685,47 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	 * thread that writes both, so the two belong together.) */
 	if (!head.set_mask) {
 		task_context_count(TASK_CONTEXT_R_EMPTY);
-		return 0;
+		return false;
 	}
 
 	/* 5. Nothing changed since the values last travelled. */
 	if (last && *last == s1) {
 		task_context_count(TASK_CONTEXT_R_SAME_ID);
-		return s1;
+		*id = s1;
+		return false;
 	}
+
+	*id = s1;
+	*block_out = block;
+	return true;
+}
+
+#ifndef TASK_CONTEXT_OTHER_TASKS
+/*
+ * The context id of the CURRENT thread for one sample, or 0 for "none".
+ * `task` must be the current task (a handler whose sample describes another
+ * task must not call this: the check in task_context_recipe_of() turns that
+ * into a counted miss).
+ *
+ * The steps are the ABI's reader rule, in its order and with its numbers.
+ */
+static __always_inline u64 task_context_read_current(struct task_struct *task)
+{
+	struct task_context_value_event *rec;
+	const struct task_context_recipe *recipe;
+	u64 block = 0, s1 = 0, s2 = 0, copied = 0, now;
+	u64 *last;
+	u32 tgid = task->tgid;
+	u32 tid = task->pid;
+
+	/* 0, 1 */
+	recipe = task_context_recipe_of(task);
+	if (!recipe)
+		return 0;
+
+	/* 2 to 5 */
+	if (!task_context_look(task, recipe, tid, &s1, &block))
+		return s1;
 
 	/* 6. A new id: its values travel once, within this CPU's budget.
 	 * Past the budget, or with the ring full, the sample still carries
@@ -593,9 +746,9 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	 * record; then the word again. A record is submitted only when both
 	 * copies succeeded and all three words agree - otherwise it is
 	 * discarded, so no byte of an earlier record can ride out in it. */
-	if (bpf_probe_read_user(rec->block, sizeof(rec->block), (void *)block) ||
-	    bpf_probe_read_user(&s2, sizeof(s2),
-				(void *)(block + __builtin_offsetof(struct task_context_block_v1, seq)))) {
+	if (task_context_copy(task, rec->block, sizeof(rec->block), block) ||
+	    task_context_copy(task, &s2, sizeof(s2),
+			      block + __builtin_offsetof(struct task_context_block_v1, seq))) {
 		bpf_ringbuf_discard(rec, 0);
 		task_context_count(TASK_CONTEXT_R_BLOCK_READ_FAILED);
 		return s1;
@@ -607,6 +760,7 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	if (copied != s1 || s2 != s1) {
 		bpf_ringbuf_discard(rec, 0);
 		task_context_count(TASK_CONTEXT_R_TORN);
+		last = bpf_map_lookup_elem(&task_context_last_id, &tid);
 		return task_context_last_or_none(last, s1);
 	}
 	rec->ts = now;
@@ -624,7 +778,93 @@ static __always_inline u64 task_context_read_current(struct task_struct *task)
 	task_context_count(TASK_CONTEXT_R_NEW_ID);
 	return s1;
 }
+#endif /* !TASK_CONTEXT_OTHER_TASKS */
 
+#ifdef TASK_CONTEXT_OTHER_TASKS
+/*
+ * The context id of `task`, a thread the task-stacks iterator was handed (it
+ * is not the current task), or 0 for "none". The steps are the ones of
+ * task_context_read_current(), with what being another task's reader changes:
+ *
+ *  - Every copy is of another task's memory, and may sleep to fault a page in.
+ *    So the block is copied into this CPU's scratch record and checked there,
+ *    and only then sent, whole, with one bpf_ringbuf_output(): a ring
+ *    reservation held across a copy that sleeps would keep every later record
+ *    on the ring from being read.
+ *  - The reader runs on whichever CPU the iterator's reader thread is on,
+ *    never inside the thread it reads, so the ABI's ordering for a reader on
+ *    another CPU is followed (task_context_full_barrier()).
+ *  - There is no per-CPU budget. The sampler's exists because a sample can
+ *    come at any rate from any CPU; what this sends is bounded by the
+ *    iterator's own pace, at most one record per thread per iteration and
+ *    only for a thread whose id has changed, and by the ring, which counts
+ *    what it cannot take (RING_FULL) and keeps the id.
+ */
+static __always_inline u64 task_context_read_task(struct task_struct *task)
+{
+	struct task_context_value_event *rec;
+	const struct task_context_recipe *recipe;
+	u64 block = 0, s1 = 0, s2 = 0, copied = 0;
+	u64 *last;
+	u32 tid = task->pid;
+	u32 key = 0;
+
+	/* 0, 1 */
+	recipe = task_context_recipe_of(task);
+	if (!recipe)
+		return 0;
+
+	/* 2 to 5 */
+	if (!task_context_look(task, recipe, tid, &s1, &block))
+		return s1;
+
+	/* 6. A new id: its values travel once. */
+	rec = bpf_map_lookup_elem(&task_context_scratch, &key);
+	if (!rec)
+		return s1;
+	if (task_context_copy(task, rec->block, sizeof(rec->block), block)) {
+		task_context_count(TASK_CONTEXT_R_BLOCK_READ_FAILED);
+		return s1;
+	}
+	/* The second read of the word may not pass the copy. */
+	task_context_full_barrier();
+	if (task_context_copy(task, &s2, sizeof(s2),
+			      block + __builtin_offsetof(struct task_context_block_v1, seq))) {
+		task_context_count(TASK_CONTEXT_R_BLOCK_READ_FAILED);
+		return s1;
+	}
+	__builtin_memcpy(&copied,
+			 &rec->block[__builtin_offsetof(struct task_context_block_v1, seq)],
+			 sizeof(copied));
+	/* 7. Unequal: torn; the copy is dropped, the last id stands. */
+	if (copied != s1 || s2 != s1) {
+		task_context_count(TASK_CONTEXT_R_TORN);
+		last = bpf_map_lookup_elem(&task_context_last_id, &tid);
+		return task_context_last_or_none(last, s1);
+	}
+	/* Every field is written, and the struct has no padding: the whole
+	 * scratch record goes out, so no byte of an earlier one can ride in it. */
+	rec->ts = bpf_ktime_get_boot_ns();
+	rec->tgid = task->tgid;
+	rec->tid = tid;
+	rec->id = s1;
+	rec->cpu = bpf_get_smp_processor_id();
+	rec->image = (u32)(unsigned long)BPF_CORE_READ(task, mm);
+	if (bpf_ringbuf_output(&task_context_values, rec, sizeof(*rec), 0)) {
+		task_context_count(TASK_CONTEXT_R_RING_FULL);
+		return s1;
+	}
+
+	if (bpf_map_update_elem(&task_context_last_id, &tid, &s1, BPF_ANY))
+		task_context_count(TASK_CONTEXT_R_CACHE_REFUSED);
+
+	/* 8. The event carries s1, and the values sent are the values of s1. */
+	task_context_count(TASK_CONTEXT_R_NEW_ID);
+	return s1;
+}
+#endif /* TASK_CONTEXT_OTHER_TASKS */
+
+#ifndef TASK_CONTEXT_OTHER_TASKS
 /*
  * The three programs below run only with the feature on, and do nothing in
  * the tracer's confidentiality mode: no recipe exists then, so there is none
@@ -734,5 +974,7 @@ int BPF_PROG(task_context_exit, struct task_struct *task)
 		bpf_map_delete_elem(&task_context_recipes, &tgid);
 	return 0;
 }
+
+#endif /* !TASK_CONTEXT_OTHER_TASKS */
 
 #endif /* __TASK_CONTEXT_READER_BPF_H */

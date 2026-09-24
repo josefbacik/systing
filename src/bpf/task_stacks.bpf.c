@@ -9,7 +9,9 @@
  * kernel_stack_len kernel frames, user_stack_len user frames (u64 each, leaf
  * first) and py_len bytes of struct pystacks_message. A thread that has not run
  * since its last record, and is in the same non-runnable state as then, gets
- * the header alone, flagged TASK_STACKS_UNCHANGED.
+ * the header alone, flagged TASK_STACKS_UNCHANGED. The header also carries the
+ * thread's task_context id (--include-task-context), read for a full record
+ * only: a thread that has not run cannot have changed its context.
  *
  * Why this is its own BPF object rather than a program in systing_system.bpf.o:
  *  - STROBELIGHT_SLEEPABLE_BPF selects the sleepable bodies of the pystacks
@@ -42,6 +44,14 @@
 
 #include "systing_shared.bpf.h"
 #include "task_stack_unwinder.bpf.h"
+
+/*
+ * --include-task-context: the reader of a thread's task_context, compiled for
+ * another task's memory (the header says how). Its maps are the main
+ * object's, reused at load when the capture asks for the feature and not
+ * created when it does not (TaskStacksIter::load_object).
+ */
+#include "task_context_reader.bpf.h"
 
 #define TASK_STACKS_MAX_DEPTH 127
 
@@ -92,6 +102,7 @@ struct task_stacks_event {
 	u32 user_stack_len;	/* frames that follow the kernel frames */
 	u32 py_len;		/* bytes of pystacks_message after the frames */
 	u32 pad;
+	u64 task_context_id;	/* the thread's task_context id; 0 = none */
 };
 
 /* Exposes the record type to the generated skeleton. */
@@ -319,6 +330,26 @@ __noinline int task_stacks_read_python(pid_t tid)
 	       len * sizeof(struct stack_walker_frame);
 }
 
+/*
+ * Thread `tid`'s task_context id, or 0 for none (--include-task-context; the
+ * reader is task_context_read_task() in task_context_reader.bpf.h, which
+ * counts every miss under its reason). Sends the values of a new id on the
+ * main object's values ring, as the sampler does.
+ */
+__noinline u64 task_stacks_read_context(pid_t tid)
+{
+	struct task_struct *task;
+	u64 id;
+
+	if (!task_context_config.enabled)
+		return 0;
+	if (get_task(tid, &task))
+		return 0;
+	id = task_context_read_task(task);
+	put_task(task);
+	return id;
+}
+
 SEC("iter.s/task")
 int systing_task_stacks(struct bpf_iter__task *ctx)
 {
@@ -369,6 +400,7 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	bpf_probe_read_kernel_str(e->task.comm, sizeof(e->task.comm), task->comm);
 	e->flags = 0;
 	e->pad = 0;
+	e->task_context_id = 0;
 
 	/* Before the status, not after: see status_delta(). A uniprocessor
 	 * kernel has no on_cpu, nor a CPU for the thread to be on but ours. */
@@ -400,6 +432,8 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 		ulen = task_stacks_read_user(tid);
 	if (task_stacks_config.collect_python)
 		py_len = task_stacks_read_python(tid);
+	if (task_context_config.enabled)
+		e->task_context_id = task_stacks_read_context(tid);
 
 	klen = bounded(klen, TASK_STACKS_MAX_DEPTH);
 	ulen = bounded(ulen, TASK_STACKS_MAX_DEPTH);

@@ -3264,6 +3264,7 @@ fn build_task_stack_event_batch(
     let mut runtime_delta_ns = Int64Builder::with_capacity(n);
     let mut state = StringBuilder::with_capacity(n, n);
     let mut stack_id = Int64Builder::with_capacity(n);
+    let mut task_context_id = UInt64Builder::with_capacity(n);
     for r in records {
         ts.append_value(r.ts);
         dur.append_value(r.dur);
@@ -3275,6 +3276,7 @@ fn build_task_stack_event_batch(
         runtime_delta_ns.append_value(r.runtime_delta_ns);
         state.append_value(&r.state);
         stack_id.append_option(r.stack_id);
+        task_context_id.append_option(r.task_context_id);
     }
     Ok(RecordBatch::try_new(
         schema.clone(),
@@ -3289,6 +3291,7 @@ fn build_task_stack_event_batch(
             Arc::new(runtime_delta_ns.finish()),
             Arc::new(state.finish()),
             Arc::new(stack_id.finish()),
+            Arc::new(task_context_id.finish()),
         ],
     )?)
 }

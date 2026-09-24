@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use duckdb::Connection;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::parquet_paths::ParquetPaths;
 use crate::trace::ManifestRecord;
@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 26;
+pub const SCHEMA_VERSION: u32 = 27;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -193,6 +193,66 @@ pub const DATA_TABLES: &[&str] = &[
     "tpu_device",
     "tpu_op",
     "tpu_metric",
+];
+
+/// Where one table's parquet file is in a [`ParquetPaths`].
+pub type ParquetFileOf = fn(&ParquetPaths) -> &PathBuf;
+
+/// The tables a parquet directory holds, each with the DuckDB table it is
+/// imported into and where its file is. The one list the importers and the
+/// exporter read, so a table added to it reaches all of them: `systing-util
+/// convert` once kept a list of its own and silently dropped the tables added
+/// to the library's after it. `stack` is the one entry that is not a table of
+/// the same name: its file is interned into `frame` and `stack` by
+/// [`import_stack_from_parquet`].
+pub const PARQUET_TABLES: &[(&str, ParquetFileOf)] = &[
+    ("process", |p| &p.process),
+    ("thread", |p| &p.thread),
+    ("sched_slice", |p| &p.sched_slice),
+    ("thread_state", |p| &p.thread_state),
+    ("irq_slice", |p| &p.irq_slice),
+    ("softirq_slice", |p| &p.softirq_slice),
+    ("wakeup_new", |p| &p.wakeup_new),
+    ("sched_migrate", |p| &p.sched_migrate),
+    ("process_exit", |p| &p.process_exit),
+    ("counter_track", |p| &p.counter_track),
+    ("counter", |p| &p.counter),
+    ("slice", |p| &p.slice),
+    ("track", |p| &p.track),
+    ("args", |p| &p.args),
+    ("instant", |p| &p.instant),
+    ("instant_args", |p| &p.instant_args),
+    ("stack", |p| &p.stack),
+    ("stack_sample", |p| &p.stack_sample),
+    // The legacy stack tables, for Perfetto .pb extraction.
+    ("stack_profile_symbol", |p| &p.symbol),
+    ("stack_profile_mapping", |p| &p.stack_mapping),
+    ("stack_profile_frame", |p| &p.frame),
+    ("stack_profile_callsite", |p| &p.callsite),
+    ("perf_sample", |p| &p.perf_sample),
+    ("network_interface", |p| &p.network_interface),
+    ("socket_connection", |p| &p.socket_connection),
+    ("network_syscall", |p| &p.network_syscall),
+    ("network_packet", |p| &p.network_packet),
+    ("network_socket", |p| &p.network_socket),
+    ("network_poll", |p| &p.network_poll),
+    ("network_dns", |p| &p.network_dns),
+    ("memory_rss", |p| &p.memory_rss),
+    ("memory_map", |p| &p.memory_map),
+    ("memory_fault", |p| &p.memory_fault),
+    ("memory_alloc", |p| &p.memory_alloc),
+    ("memory_vfio", |p| &p.memory_vfio),
+    ("memory_iommu", |p| &p.memory_iommu),
+    ("memory_thp", |p| &p.memory_thp),
+    ("memory_vmstat", |p| &p.memory_vmstat),
+    ("task_stack_event", |p| &p.task_stack_event),
+    ("task_context", |p| &p.task_context),
+    ("clock_snapshot", |p| &p.clock_snapshot),
+    ("sysinfo", |p| &p.sysinfo),
+    ("cpu_info", |p| &p.cpu_info),
+    ("tpu_device", |p| &p.tpu_device),
+    ("tpu_op", |p| &p.tpu_op),
+    ("tpu_metric", |p| &p.tpu_metric),
 ];
 
 /// Create DuckDB schema with all tables.
@@ -696,13 +756,17 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             stime_delta_ns BIGINT,
             runtime_delta_ns BIGINT,
             state VARCHAR,
-            stack_id BIGINT
+            stack_id BIGINT,
+            -- --include-task-context: the thread's task_context id as the
+            -- record that opened the event found it, NULL when none; its
+            -- values are the task_context rows with the same utid and id.
+            task_context_id UBIGINT
         );
 
         -- --include-task-context: one named value of one task_context id
-        -- of one thread. A sample's context is the rows whose utid and id
-        -- equal the sample's utid and task_context_id; exactly one of
-        -- value_u64 / value_str is set.
+        -- of one thread. A sample's (or a task_stack_event's) context is the
+        -- rows whose utid and id equal its utid and task_context_id; exactly
+        -- one of value_u64 / value_str is set.
         CREATE TABLE IF NOT EXISTS task_context (
             trace_id VARCHAR,
             utid BIGINT,
@@ -1583,71 +1647,9 @@ fn import_tables(
         Ok(())
     };
 
-    // Import core tables
-    import_table("process", &paths.process)?;
-    import_table("thread", &paths.thread)?;
-    import_table("sched_slice", &paths.sched_slice)?;
-    import_table("thread_state", &paths.thread_state)?;
-
-    // IRQ/softirq tables
-    import_table("irq_slice", &paths.irq_slice)?;
-    import_table("softirq_slice", &paths.softirq_slice)?;
-    import_table("wakeup_new", &paths.wakeup_new)?;
-    import_table("sched_migrate", &paths.sched_migrate)?;
-    import_table("process_exit", &paths.process_exit)?;
-
-    // Counter tables
-    import_table("counter_track", &paths.counter_track)?;
-    import_table("counter", &paths.counter)?;
-
-    // Event tables
-    import_table("slice", &paths.slice)?;
-    import_table("track", &paths.track)?;
-    import_table("args", &paths.args)?;
-    import_table("instant", &paths.instant)?;
-    import_table("instant_args", &paths.instant_args)?;
-
-    // Stack tables (query-friendly format)
-    import_table("stack", &paths.stack)?;
-    import_table("stack_sample", &paths.stack_sample)?;
-
-    // Legacy stack profile tables (for Perfetto .pb extraction compatibility)
-    import_table("stack_profile_symbol", &paths.symbol)?;
-    import_table("stack_profile_mapping", &paths.stack_mapping)?;
-    import_table("stack_profile_frame", &paths.frame)?;
-    import_table("stack_profile_callsite", &paths.callsite)?;
-    import_table("perf_sample", &paths.perf_sample)?;
-
-    // Network tables
-    import_table("network_interface", &paths.network_interface)?;
-    import_table("socket_connection", &paths.socket_connection)?;
-    import_table("network_syscall", &paths.network_syscall)?;
-    import_table("network_packet", &paths.network_packet)?;
-    import_table("network_socket", &paths.network_socket)?;
-    import_table("network_poll", &paths.network_poll)?;
-    import_table("network_dns", &paths.network_dns)?;
-    import_table("memory_rss", &paths.memory_rss)?;
-    import_table("memory_map", &paths.memory_map)?;
-    import_table("memory_fault", &paths.memory_fault)?;
-    import_table("memory_alloc", &paths.memory_alloc)?;
-    import_table("memory_vfio", &paths.memory_vfio)?;
-    import_table("memory_iommu", &paths.memory_iommu)?;
-    import_table("memory_thp", &paths.memory_thp)?;
-    import_table("memory_vmstat", &paths.memory_vmstat)?;
-    import_table("task_stack_event", &paths.task_stack_event)?;
-    import_table("task_context", &paths.task_context)?;
-
-    // Clock snapshot
-    import_table("clock_snapshot", &paths.clock_snapshot)?;
-
-    // System info
-    import_table("sysinfo", &paths.sysinfo)?;
-    import_table("cpu_info", &paths.cpu_info)?;
-
-    // TPU tables
-    import_table("tpu_device", &paths.tpu_device)?;
-    import_table("tpu_op", &paths.tpu_op)?;
-    import_table("tpu_metric", &paths.tpu_metric)?;
+    for (table_name, path) in PARQUET_TABLES {
+        import_table(table_name, path(paths))?;
+    }
 
     Ok(())
 }
@@ -2085,30 +2087,6 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
         Ok(())
     };
 
-    // Export all tables
-    export_table("process", &paths.process)?;
-    export_table("thread", &paths.thread)?;
-    export_table("sched_slice", &paths.sched_slice)?;
-    export_table("thread_state", &paths.thread_state)?;
-
-    // IRQ/softirq tables
-    export_table("irq_slice", &paths.irq_slice)?;
-    export_table("softirq_slice", &paths.softirq_slice)?;
-    export_table("wakeup_new", &paths.wakeup_new)?;
-    export_table("sched_migrate", &paths.sched_migrate)?;
-    export_table("process_exit", &paths.process_exit)?;
-
-    // Counter tables
-    export_table("counter_track", &paths.counter_track)?;
-    export_table("counter", &paths.counter)?;
-
-    // Event tables
-    export_table("slice", &paths.slice)?;
-    export_table("track", &paths.track)?;
-    export_table("args", &paths.args)?;
-    export_table("instant", &paths.instant)?;
-    export_table("instant_args", &paths.instant_args)?;
-
     // Stack tables: denormalize frame_ids back to frame_names so the parquet
     // matches what the streaming writer would have produced.
     {
@@ -2156,45 +2134,12 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
             })?;
         }
     }
-    export_table("stack_sample", &paths.stack_sample)?;
-
-    // Legacy stack profile tables (for Perfetto .pb extraction compatibility)
-    export_table("stack_profile_symbol", &paths.symbol)?;
-    export_table("stack_profile_mapping", &paths.stack_mapping)?;
-    export_table("stack_profile_frame", &paths.frame)?;
-    export_table("stack_profile_callsite", &paths.callsite)?;
-    export_table("perf_sample", &paths.perf_sample)?;
-
-    // Network tables
-    export_table("network_interface", &paths.network_interface)?;
-    export_table("socket_connection", &paths.socket_connection)?;
-    export_table("network_syscall", &paths.network_syscall)?;
-    export_table("network_packet", &paths.network_packet)?;
-    export_table("network_socket", &paths.network_socket)?;
-    export_table("network_poll", &paths.network_poll)?;
-    export_table("network_dns", &paths.network_dns)?;
-    export_table("memory_rss", &paths.memory_rss)?;
-    export_table("memory_map", &paths.memory_map)?;
-    export_table("memory_fault", &paths.memory_fault)?;
-    export_table("memory_alloc", &paths.memory_alloc)?;
-    export_table("memory_vfio", &paths.memory_vfio)?;
-    export_table("memory_iommu", &paths.memory_iommu)?;
-    export_table("memory_thp", &paths.memory_thp)?;
-    export_table("memory_vmstat", &paths.memory_vmstat)?;
-    export_table("task_stack_event", &paths.task_stack_event)?;
-    export_table("task_context", &paths.task_context)?;
-
-    // Clock snapshot
-    export_table("clock_snapshot", &paths.clock_snapshot)?;
-
-    // System info
-    export_table("sysinfo", &paths.sysinfo)?;
-    export_table("cpu_info", &paths.cpu_info)?;
-
-    // TPU tables
-    export_table("tpu_device", &paths.tpu_device)?;
-    export_table("tpu_op", &paths.tpu_op)?;
-    export_table("tpu_metric", &paths.tpu_metric)?;
+    // Every other table: one file each. `stack` was written above.
+    for (table_name, path) in PARQUET_TABLES {
+        if *table_name != "stack" {
+            export_table(table_name, path(&paths))?;
+        }
+    }
 
     Ok(())
 }
@@ -2977,6 +2922,79 @@ mod tests {
         assert!(
             err.contains("wchan") && !err.contains("thread_name"),
             "{err}"
+        );
+    }
+
+    /// A `task_stack_event.parquet` written before schema 27 has no
+    /// `task_context_id`: it imports whole, under strict_schema too, with the
+    /// column NULL. One written with `--include-task-context` carries the id,
+    /// all 64 bits of it, and the event joins to its values on (`utid`, id).
+    #[test]
+    fn test_a_task_stack_event_file_without_task_context_id_imports_with_nulls() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        let parquet = |name: &str, select: &str| -> String {
+            let path = temp_dir.path().join(name).to_string_lossy().into_owned();
+            conn.execute_batch(&format!("COPY ({select}) TO '{path}' (FORMAT PARQUET)"))
+                .unwrap();
+            format!("read_parquet('{path}')")
+        };
+        let strict = ImportOptions {
+            strict_schema: true,
+        };
+        let mut report = ImportReport::default();
+        let event = "10::BIGINT AS ts, 5::BIGINT AS dur, 1::BIGINT AS utid, \
+                     1::BIGINT AS start_iteration, 1::BIGINT AS end_iteration, \
+                     0::BIGINT AS utime_delta_ns, 0::BIGINT AS stime_delta_ns, \
+                     0::BIGINT AS runtime_delta_ns, 'S' AS state, 7::BIGINT AS stack_id";
+
+        let older = parquet("older.parquet", &format!("SELECT {event}"));
+        let newer = parquet(
+            "newer.parquet",
+            &format!("SELECT {event}, 18446744073709551614::UBIGINT AS task_context_id"),
+        );
+        for (trace, file) in [("older", &older), ("newer", &newer)] {
+            let columns = import_column_list(&conn, "task_stack_event", file, strict, &mut report)
+                .unwrap()
+                .unwrap();
+            assert_eq!(columns, "*");
+            conn.execute_batch(&format!(
+                "INSERT INTO task_stack_event BY NAME SELECT '{trace}' AS trace_id, {columns} FROM {file}"
+            ))
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO task_context VALUES \
+             ('newer', 1, 18446744073709551614, 10, 'request_id', NULL, 'abc-123')",
+        )
+        .unwrap();
+        assert_eq!(report, ImportReport::default());
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.trace_id, e.task_context_id::VARCHAR, c.value_str \
+                 FROM task_stack_event e \
+                 LEFT JOIN task_context c ON c.trace_id = e.trace_id AND c.utid = e.utid \
+                      AND c.id = e.task_context_id \
+                 ORDER BY e.trace_id DESC",
+            )
+            .unwrap();
+        let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("older".to_string(), None, None),
+                (
+                    "newer".to_string(),
+                    Some("18446744073709551614".to_string()),
+                    Some("abc-123".to_string())
+                ),
+            ]
         );
     }
 
@@ -4034,6 +4052,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// Every parquet file a directory can hold is imported and exported, and
+    /// into a table the schema has: a file added to `ParquetPaths` without a
+    /// line in `PARQUET_TABLES` would be known and never read.
+    #[test]
+    fn test_parquet_tables_cover_every_parquet_path() {
+        let paths = ParquetPaths::new(Path::new("/trace"));
+        let listed: Vec<&PathBuf> = PARQUET_TABLES
+            .iter()
+            .map(|(_, path)| path(&paths))
+            .collect();
+        for path in paths.all_paths() {
+            // The manifest is read by its own statements.
+            if path == &paths.manifest {
+                continue;
+            }
+            assert!(
+                listed.contains(&path),
+                "{} has no entry in PARQUET_TABLES",
+                path.display()
+            );
+        }
+        for (table, _) in PARQUET_TABLES {
+            assert!(
+                DATA_TABLES.contains(table),
+                "PARQUET_TABLES entry '{table}' is not a table of the schema"
+            );
+        }
     }
 
     #[test]

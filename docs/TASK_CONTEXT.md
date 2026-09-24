@@ -92,7 +92,9 @@ sudo systing --include-task-context -d 10 --output trace.duckdb
 
 ## 3. Read the results
 
-Each CPU sample has a `task_context_id`. The values behind an id are in the
+Each CPU sample has a `task_context_id`, and so does each event of the
+task-stacks recorder (`--add-recorder task-stacks`) in `task_stack_event`. The
+values behind an id are in the
 `task_context` table, joined on trace, thread and id. Open the trace with the
 DuckDB CLI and group samples by a value, for example by request:
 
@@ -110,7 +112,8 @@ its process was not found, or the read missed.
 
 ## Not covered yet
 
-Sleeping stacks and the other recorders' events carry no context, and the
+Sleeping stacks and the events of the other recorders carry no context (the
+task-stacks recorder's do, see above), and the
 Perfetto view does not show it; use the tables. When the kernel is in lockdown
 confidentiality mode, nothing is read. Details are in the
 [Task Context section of the README](../README.md#task-context) and in the

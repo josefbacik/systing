@@ -39,8 +39,8 @@ SRC="$3"
 OUT="$4"
 RAW="$OUT.raw"
 # The cases this run must have: see the list of `need_line` calls below.
-CASES=7
-CAPTURES=9
+CASES=9
+CAPTURES=13
 
 export LD_LIBRARY_PATH="$LIBDUCKDB_DIR"
 {
@@ -122,6 +122,13 @@ want_count() {
     need_line "\[a small region\] $read_nothing"
     need_line "\[all of user memory\] $read_nothing"
     need_line "\[vfork child\] [0-9]+ samples of the child, none with a context id; [0-9]+ of the parent's carry one"
+    # The task-stacks recorder's cases, with the CPU sampler off: what they read, the
+    # recorder's iterator read, from another task's memory.
+    events_whole='[0-9]+ events, [0-9]+ with a context id, [0-9]+ contexts of 3 threads'
+    need_line "\[task stacks: linked in\] $events_whole"
+    need_line "\[task stacks: shared object\] $events_whole"
+    need_line "\[task stacks: shared object, dtv\] $events_whole"
+    need_line "\[task stacks: confidentiality mode\] [0-9]+ events, none with a context id, no task_context row"
 
     # The reader's own counters, one line a capture.
     counters="$OUT.counters"
@@ -130,10 +137,10 @@ want_count() {
     cat "$counters"
     refusal='(unset|out_of_range|slot_read_failed|tp_implausible|block_read_failed|bad_header)=[1-9]'
     want_count "$(grep -c '' "$counters")" "$CAPTURES" "captures printed their counters"
-    want_count "$(grep -c -E 'new_id=[1-9]' "$counters")" 6 \
-        "captures read a context (the three started programs, the running program twice, the vfork parent)"
-    want_count "$(grep -E 'restricted=[1-9]' "$counters" | grep -c -v -E '(new|same)_id=')" 1 \
-        "capture counted the confidentiality mode's refusals and read nothing"
+    want_count "$(grep -c -E 'new_id=[1-9]' "$counters")" 9 \
+        "captures read a context (the three started programs, the running program twice, the vfork parent, the three started programs again through the task-stacks recorder)"
+    want_count "$(grep -E 'restricted=[1-9]' "$counters" | grep -c -v -E '(new|same)_id=')" 2 \
+        "captures counted the confidentiality mode's refusals and read nothing (the sampler's, the task-stacks recorder's)"
     want_count "$(grep -v -E '(new_id|same_id|restricted)=' "$counters" | grep -c -E "$refusal")" 2 \
         "captures counted a refusal of the recipe planted on them and read nothing"
 

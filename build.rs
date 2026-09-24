@@ -269,12 +269,32 @@ fn build_task_stacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &
             .display()
     );
 
+    // The task_context reader (`#include "task_context_reader.bpf.h"`) and the
+    // ABI header it includes: the same files the main object reads, here
+    // compiled to read other tasks' contexts (see the reader's header).
+    let task_context_bpf_arg = format!(
+        "-I{}",
+        Path::new("src/task_context/bpf")
+            .canonicalize()
+            .expect("src/task_context/bpf directory exists")
+            .display()
+    );
+    let task_context_abi_arg = format!(
+        "-I{}",
+        Path::new("crates/task-context/include")
+            .canonicalize()
+            .expect("crates/task-context/include directory exists")
+            .display()
+    );
+
     let obj_path = out_dir.join("task_stacks.bpf.o");
     let mut object_args = vec![
         OsStr::new(&out_dir_include_arg),
         OsStr::new(&bpf_include_arg),
         OsStr::new(&pystacks_include_arg),
         OsStr::new(&pystacks_src_arg),
+        OsStr::new(&task_context_bpf_arg),
+        OsStr::new(&task_context_abi_arg),
         OsStr::new(arch_define),
         OsStr::new("-DSTROBELIGHT_SLEEPABLE_BPF"),
     ];
@@ -292,6 +312,8 @@ fn build_task_stacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &
     // The pystacks sources it includes are watched by build_pystacks_bpf.
     println!("cargo:rerun-if-changed={src}");
     println!("cargo:rerun-if-changed=src/bpf/task_stack_unwinder.bpf.h");
+    println!("cargo:rerun-if-changed=src/task_context/bpf/task_context_reader.bpf.h");
+    println!("cargo:rerun-if-changed=crates/task-context/include/task_context.h");
 }
 
 /// Detect the target architecture and return the corresponding clang define

@@ -1202,7 +1202,7 @@ fn convert_stack_event_type(bpf_type: u32) -> i8 {
 /// 0 for "none" — the flag is off, the process publishes no recipe, or the
 /// thread has set nothing — and a real id is never 0.
 #[inline]
-fn convert_task_context_id(bpf_id: u64) -> Option<u64> {
+pub(crate) fn convert_task_context_id(bpf_id: u64) -> Option<u64> {
     (bpf_id != 0).then_some(bpf_id)
 }
 

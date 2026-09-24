@@ -49,7 +49,7 @@ use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::pystacks::thread_names::ThreadNames;
 use crate::record::RecordCollector;
 use crate::session_recorder::{get_clock_value, SessionRecorder};
-use crate::stack_recorder::{Stack, StackInterner};
+use crate::stack_recorder::{convert_task_context_id, Stack, StackInterner};
 use crate::systing_core::types::pystacks_message;
 use crate::systing_core::{task_info, TaskSightings};
 use crate::target_filter::{set_target_filter, TargetFilter, TargetFilterMaps};
@@ -183,6 +183,43 @@ impl SharedPystacksMaps<'_> {
     }
 }
 
+/// The main object's task_context maps, which the task-stacks object reuses
+/// when the capture has `--include-task-context`: the recipes user space
+/// wrote (so it reads the processes the main object's sampler reads), the
+/// last-id table (so a thread's values travel once, whichever of the two reads
+/// it first), the reasons' counters and the ring the value records go out on
+/// (so they reach the one sink). The object's own scratch record is not shared.
+pub struct SharedTaskContextMaps<'a> {
+    pub recipes: BorrowedFd<'a>,
+    pub last_id: BorrowedFd<'a>,
+    pub stats: BorrowedFd<'a>,
+    pub values: BorrowedFd<'a>,
+}
+
+impl SharedTaskContextMaps<'_> {
+    fn reuse_in(&self, m: &mut skel::OpenTaskStacksMaps<'_>) -> Result<()> {
+        for (map, fd) in [
+            (&mut m.task_context_recipes, self.recipes),
+            (&mut m.task_context_last_id, self.last_id),
+            (&mut m.task_context_stats, self.stats),
+            (&mut m.task_context_values, self.values),
+        ] {
+            map.reuse_fd(fd)
+                .with_context(|| format!("Failed to reuse the {:?} map", map.name()))?;
+        }
+        Ok(())
+    }
+}
+
+/// How the task-stacks object reads task_context: it does, for a capture with
+/// `--include-task-context`, and `restricted` is the main object's
+/// confidentiality mode (`task_context_config.restricted`), under which it
+/// reads nothing of any process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskContextMode {
+    pub restricted: bool,
+}
+
 fn tid(task: &task_info) -> u32 {
     task.tgidpid as u32
 }
@@ -228,6 +265,9 @@ pub struct TaskSample {
     pub runtime_delta: u64,
     /// `__state | exit_state`.
     pub state: u32,
+    /// The thread's task_context id (`--include-task-context`); `None` for
+    /// none, and always for an unchanged record, which reads none.
+    pub task_context_id: Option<u64>,
     /// Leaf first, as the kernel and the unwinder deliver them.
     pub kernel_stack: Vec<u64>,
     pub user_stack: Vec<u64>,
@@ -333,6 +373,7 @@ fn parse_records(buf: &[u8]) -> Result<Vec<TaskSample>> {
             stime_delta: e.stime_delta,
             runtime_delta: e.runtime_delta,
             state: e.state,
+            task_context_id: convert_task_context_id(e.task_context_id),
             kernel_stack,
             user_stack,
             py_msg,
@@ -753,6 +794,7 @@ impl TaskStacksIter {
         filter: &TargetFilter,
         maps: &TargetFilterMaps<'_>,
         pystacks_maps: &SharedPystacksMaps<'_>,
+        task_context: Option<(&SharedTaskContextMaps<'_>, TaskContextMode)>,
         mode: TaskStackFrames,
         cgroup_dirs: &[BorrowedFd<'_>],
     ) -> Result<Self> {
@@ -765,16 +807,16 @@ impl TaskStacksIter {
         let loaded = if walk == TaskWalk::ByCgroup {
             // The members program is one more thing a kernel can refuse, and
             // nothing a capture should fail for: without it, the full walk.
-            match Self::load_object(filter, maps, pystacks_maps, mode, cgroup_dirs) {
+            match Self::load_object(filter, maps, pystacks_maps, task_context, mode, cgroup_dirs) {
                 Ok(loaded) => loaded,
                 Err(e) => {
                     eprintln!("task-stacks: could not load the cgroup-members iterator: {e:#}");
                     (walk, why_full) = (TaskWalk::Full, Some("the kernel refused the iterator"));
-                    Self::load_object(filter, maps, pystacks_maps, mode, &[])?
+                    Self::load_object(filter, maps, pystacks_maps, task_context, mode, &[])?
                 }
             }
         } else {
-            Self::load_object(filter, maps, pystacks_maps, mode, &[])?
+            Self::load_object(filter, maps, pystacks_maps, task_context, mode, &[])?
         };
         // One line on which walk a capture with targets runs with: the first
         // thing to read when its snapshots cost more, or see less, than hoped.
@@ -809,7 +851,8 @@ impl TaskStacksIter {
         filter: &TargetFilter,
         mode: TaskStackFrames,
         members: bool,
-    ) {
+        task_context: Option<TaskContextMode>,
+    ) -> Result<()> {
         let rodata = open_skel
             .maps
             .rodata_data
@@ -819,6 +862,14 @@ impl TaskStacksIter {
         rodata.task_stacks_config.collect_kernel = mode.native() as u32;
         rodata.task_stacks_config.collect_user = mode.native() as u32;
         rodata.task_stacks_config.collect_python = mode.python() as u32;
+        // --include-task-context. Frozen with the rest of .rodata, so with
+        // the flag off the one call site is dead code to the verifier and the
+        // feature's maps (the main object's, in a capture) are not created,
+        // as in the main object.
+        if let Some(task_context) = task_context {
+            rodata.task_context_config.enabled = 1;
+            rodata.task_context_config.restricted = task_context.restricted as u32;
+        }
 
         // pystacks' own configuration, as the main object's (see
         // PystacksMaps::configure_bss): only the registered Python pids.
@@ -842,6 +893,25 @@ impl TaskStacksIter {
                 .systing_task_stacks_members
                 .set_autoload(true);
         }
+
+        if task_context.is_none() {
+            let m = &mut open_skel.maps;
+            for map in [
+                &mut m.task_context_recipes,
+                &mut m.task_context_last_id,
+                &mut m.task_context_stats,
+                &mut m.task_context_values,
+                &mut m.task_context_scratch,
+            ] {
+                map.set_autocreate(false).with_context(|| {
+                    format!(
+                        "Failed to disable autocreate for '{}'",
+                        map.name().to_string_lossy()
+                    )
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Open, configure, load and attach the object; with `member_dirs`, the
@@ -851,6 +921,7 @@ impl TaskStacksIter {
         filter: &TargetFilter,
         maps: &TargetFilterMaps<'_>,
         pystacks_maps: &SharedPystacksMaps<'_>,
+        task_context: Option<(&SharedTaskContextMaps<'_>, TaskContextMode)>,
         mode: TaskStackFrames,
         member_dirs: &[BorrowedFd<'_>],
     ) -> Result<LoadedObject> {
@@ -858,7 +929,13 @@ impl TaskStacksIter {
         let mut open_skel = skel::TaskStacksSkelBuilder::default()
             .open(&mut storage)
             .context("Failed to open the task-stacks BPF object")?;
-        Self::configure(&mut open_skel, filter, mode, !member_dirs.is_empty());
+        Self::configure(
+            &mut open_skel,
+            filter,
+            mode,
+            !member_dirs.is_empty(),
+            task_context.map(|(_, task_context_mode)| task_context_mode),
+        )?;
 
         let m = &mut open_skel.maps;
         maps.reuse_in(
@@ -871,6 +948,11 @@ impl TaskStacksIter {
         pystacks_maps
             .reuse_in(m)
             .context("Failed to share the pystacks maps with the task-stacks iterator")?;
+        if let Some((task_context_maps, _)) = task_context {
+            task_context_maps
+                .reuse_in(m)
+                .context("Failed to share the task_context maps with the task-stacks iterator")?;
+        }
 
         let skel = open_skel.load().context(
             "Failed to load the task-stacks BPF iterator: it needs Linux 6.2 or newer \
@@ -940,6 +1022,7 @@ impl TaskStacksIter {
         filter: &TargetFilter,
         mode: TaskStackFrames,
         members: bool,
+        task_context: Option<TaskContextMode>,
         log_level: &dyn Fn(&str) -> u32,
     ) -> Result<crate::bpf_load_shapes::LoadReport> {
         let probe = crate::systing_core::probe_lock();
@@ -949,7 +1032,7 @@ impl TaskStacksIter {
         let mut open_skel = skel::TaskStacksSkelBuilder::default()
             .open(&mut storage)
             .context("Failed to open the task-stacks BPF object")?;
-        Self::configure(&mut open_skel, filter, mode, members);
+        Self::configure(&mut open_skel, filter, mode, members, task_context)?;
 
         let mut autoloaded: Vec<String> = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
@@ -1400,6 +1483,7 @@ impl TaskStacksThread {
                                         runtime_delta: sample.runtime_delta,
                                         state: sample.state,
                                         stack,
+                                        task_context_id: sample.task_context_id,
                                     }))
                                 })
                                 .collect(),
@@ -1490,6 +1574,7 @@ pub struct TaskEntry {
     pub runtime_delta: u64,
     pub state: u32,
     pub stack: Option<Stack>,
+    pub task_context_id: Option<u64>,
 }
 
 /// What an iteration has to say about one thread.
@@ -1517,6 +1602,7 @@ struct TaskEvent {
     runtime_delta: u64,
     state: u32,
     stack_id: Option<i64>,
+    task_context_id: Option<u64>,
 }
 
 /// Collects the snapshots for the trace.
@@ -1588,6 +1674,7 @@ impl TaskStacksRecorder {
                         runtime_delta: entry.runtime_delta,
                         state: entry.state,
                         stack_id,
+                        task_context_id: entry.task_context_id,
                     });
                 }
             }
@@ -1628,6 +1715,7 @@ impl TaskStacksRecorder {
                 runtime_delta_ns: event.runtime_delta as i64,
                 state: state_name(event.state).to_string(),
                 stack_id: event.stack_id,
+                task_context_id: event.task_context_id,
             })?;
         }
         Ok(())
@@ -1658,10 +1746,24 @@ mod tests {
         user: &[u64],
         py: &[u8],
     ) -> Vec<u8> {
+        record_bytes_in_context(t, flags, deltas, 0, kernel, user, py)
+    }
+
+    /// [`record_bytes`] for a thread that has a task_context id (0: none).
+    fn record_bytes_in_context(
+        t: &task_info,
+        flags: u32,
+        deltas: (u64, u64),
+        task_context_id: u64,
+        kernel: &[u64],
+        user: &[u64],
+        py: &[u8],
+    ) -> Vec<u8> {
         let mut e = task_stacks_event::default();
         e.task.tgidpid = t.tgidpid;
         e.task.cgid = t.cgid;
         e.task.comm = t.comm;
+        e.task_context_id = task_context_id;
         e.utime_delta = deltas.0;
         e.stime_delta = deltas.1;
         e.runtime_delta = deltas.0 + deltas.1;
@@ -1679,6 +1781,14 @@ mod tests {
     }
 
     fn changed(t: task_info, stack: Option<Stack>) -> SnapshotEntry {
+        changed_in_context(t, stack, None)
+    }
+
+    fn changed_in_context(
+        t: task_info,
+        stack: Option<Stack>,
+        task_context_id: Option<u64>,
+    ) -> SnapshotEntry {
         SnapshotEntry::Changed(TaskEntry {
             task: t,
             utime_delta: 0,
@@ -1686,6 +1796,7 @@ mod tests {
             runtime_delta: 0,
             state: 0,
             stack,
+            task_context_id,
         })
     }
 
@@ -2194,7 +2305,7 @@ mod tests {
 
     #[test]
     fn record_header_has_no_padding() {
-        assert_eq!(std::mem::size_of::<task_stacks_event>(), 80);
+        assert_eq!(std::mem::size_of::<task_stacks_event>(), 88);
     }
 
     #[test]
@@ -2328,6 +2439,7 @@ mod tests {
                 runtime_delta: 345,
                 state: 0x2,
                 stack: stack(),
+                task_context_id: Some(0x2a),
             })],
         );
         // The same stack again: interned once. No stack: no id.
@@ -2348,11 +2460,63 @@ mod tests {
                 runtime_delta_ns: 345,
                 state: "D".to_string(),
                 stack_id: Some(TASK_STACKS_STACK_ID_OFFSET),
+                task_context_id: Some(0x2a),
             }
         );
         assert_eq!(events[1].stack_id, Some(TASK_STACKS_STACK_ID_OFFSET));
         assert_eq!(events[2].stack_id, None);
         assert_eq!(recorder.take_interner().total(), 1);
+    }
+
+    #[test]
+    fn an_event_keeps_the_context_it_opened_with_until_a_full_record_replaces_it() {
+        let t = task(10, 10, "main");
+        let stack = || Some(Stack::new(&[0xffff_ffff_8100_0000], &[0x401000], &[]));
+        let (mut recorder, _) = recorder();
+        recorder.record_snapshot(1, 1_000, vec![changed_in_context(t, stack(), Some(2))]);
+        // A thread that has not run cannot have changed its context: the
+        // event runs on under the id it opened with.
+        recorder.record_snapshot(2, 2_000, vec![unchanged(t)]);
+        // One that has run, back on the same stack under another context, is
+        // a new event with the new id.
+        recorder.record_snapshot(3, 3_000, vec![changed_in_context(t, stack(), Some(4))]);
+        // And with none set, an event with none.
+        recorder.record_snapshot(4, 4_000, vec![changed_in_context(t, stack(), None)]);
+
+        let events = written(&recorder, 5_000);
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.start_iteration, e.end_iteration, e.task_context_id))
+                .collect::<Vec<_>>(),
+            [(1, 2, Some(2)), (3, 3, Some(4)), (4, 4, None)]
+        );
+    }
+
+    #[test]
+    fn parse_records_reads_the_task_context_id_and_zero_is_none() {
+        let with = task(100, 100, "with");
+        let without = task(100, 101, "without");
+        let mut buf =
+            record_bytes_in_context(&with, 0, (0, 0), 0x0100_0000_0000_0002, &[], &[], &[]);
+        buf.extend(record_bytes(&without, 0, (0, 0), &[], &[], &[]));
+        // An unchanged record reads no context.
+        buf.extend(record_bytes(
+            &task(100, 102, "idle"),
+            FLAG_UNCHANGED,
+            (0, 0),
+            &[],
+            &[],
+            &[],
+        ));
+        let samples = parse_records(&buf).unwrap();
+        assert_eq!(
+            samples
+                .iter()
+                .map(|s| s.task_context_id)
+                .collect::<Vec<_>>(),
+            [Some(0x0100_0000_0000_0002), None, None]
+        );
     }
 
     #[test]

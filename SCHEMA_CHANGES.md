@@ -445,6 +445,45 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 27 (systing 1.24.0) — 2026-09-24
+
+The task-stacks recorder carries a thread's task_context. With
+`--include-task-context` and `--add-recorder task-stacks` together, an event
+records the id of its thread's context, the way a running-stack sample has since
+schema 25, and the values of the id are the same `task_context` rows.
+
+### Added columns
+- `task_stack_event.task_context_id` (UBIGINT): the id of the thread's context
+  as the record that opened the event found it, NULL for "none". The recorder
+  reads it for a full record only: a thread it finds not to have run since its
+  last record cannot have changed its context, so the event runs on under the
+  id it opened with. NULL when the thread has set nothing or has cleared every
+  name, when its process does not use the library or was not found (see the
+  README for what is looked for), for a counted miss, and in every row of a
+  capture without `--include-task-context`. Ids are unique within a thread,
+  not across threads or processes, so the join is on (`utid`, id), as for
+  `stack_sample`. The column is in every `task_stack_event.parquet` this version
+  writes, all NULL without the flag. NULL in traces recorded before schema 27.
+
+  ```sql
+  SELECT e.ts, e.dur, c.name, c.value_u64, c.value_str
+  FROM task_stack_event e
+  JOIN task_context c
+    ON c.trace_id = e.trace_id AND c.utid = e.utid AND c.id = e.task_context_id;
+  ```
+
+  As for a sample, an id with no rows is a context whose values did not travel
+  (a full ring, or a copy that failed); a thread that then stays blocked is not
+  read again until it next runs, so its event keeps an id without rows.
+
+### Compatibility
+- A reader at this version imports an older `task_stack_event.parquet` with the
+  new column NULL.
+- A reader older than this version that has the import guard (1.18.2 and
+  newer) imports a newer `task_stack_event.parquet` without the column and warns
+  once; a reader older than 1.18.2 fails the import of it whole. So readers move
+  to this version before writers do.
+
 ## Schema Version 26 (systing 1.23.0) — 2026-09-23
 
 Heap snapshots: an allocator's own dump of the memory a process had live when

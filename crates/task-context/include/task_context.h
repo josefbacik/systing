@@ -380,8 +380,11 @@ TCX_INLINE tcx_u64 task_context_seq_next(tcx_u64 s)
  * control ranges U+0000-U+001F and U+007F-U+009F, have been replaced.
  *
  * ORDERING.  A reader inside the writer's own thread needs only compiler
- * order, and the writer's fence provides it: the tracer's reader is always
- * one, since it reads the task that is running on its own CPU.  A reader on
+ * order, and the writer's fence provides it: the tracer's sampler is one,
+ * since it reads the task that is running on its own CPU.  The tracer's other
+ * reader, the task-stacks recorder's iterator, runs on whichever CPU its own
+ * thread is on and reads another thread's block from there, with a full
+ * barrier where the rule below asks for an acquire.  A reader on
  * ANOTHER CPU must also order its own reads, as the kernel's
  * read_seqcount_begin() and read_seqcount_retry() do:
  *

@@ -3604,51 +3604,16 @@ fn run_convert(
         Ok(())
     };
 
-    import_table("process", |p| &p.process)?;
-    import_table("thread", |p| &p.thread)?;
-    import_table("sched_slice", |p| &p.sched_slice)?;
-    import_table("thread_state", |p| &p.thread_state)?;
-    import_table("irq_slice", |p| &p.irq_slice)?;
-    import_table("softirq_slice", |p| &p.softirq_slice)?;
-    import_table("wakeup_new", |p| &p.wakeup_new)?;
-    import_table("sched_migrate", |p| &p.sched_migrate)?;
-    import_table("process_exit", |p| &p.process_exit)?;
-    import_table("counter_track", |p| &p.counter_track)?;
-    import_table("counter", |p| &p.counter)?;
-    import_table("slice", |p| &p.slice)?;
-    import_table("track", |p| &p.track)?;
-    import_table("args", |p| &p.args)?;
-    // Instant events (packet events, etc.)
-    import_table("instant", |p| &p.instant)?;
-    import_table("instant_args", |p| &p.instant_args)?;
-    // Stack trace tables
-    import_table("stack_profile_symbol", |p| &p.symbol)?;
-    import_table("stack_profile_mapping", |p| &p.stack_mapping)?;
-    import_table("stack_profile_frame", |p| &p.frame)?;
-    import_table("stack_profile_callsite", |p| &p.callsite)?;
-    import_table("perf_sample", |p| &p.perf_sample)?;
-    // New query-friendly stack tables. stack.parquet carries frame_names
-    // (denormalized) which is interned into frame + stack.frame_ids on import.
-    // Only the parquet-directory inputs (needs_trace_id_injection) produce a
-    // stack.parquet; .pb extraction uses the legacy stack_profile_* tables.
-    // (Imported above, ahead of the per-table loop, behind the same guard as
-    // every other table.)
-    import_table("stack_sample", |p| &p.stack_sample)?;
-    // Network interface metadata
-    import_table("network_interface", |p| &p.network_interface)?;
-    // Socket connection metadata
-    import_table("socket_connection", |p| &p.socket_connection)?;
-    // New network tables
-    import_table("network_syscall", |p| &p.network_syscall)?;
-    import_table("network_packet", |p| &p.network_packet)?;
-    import_table("network_socket", |p| &p.network_socket)?;
-    import_table("network_poll", |p| &p.network_poll)?;
-    // Clock snapshot data
-    import_table("clock_snapshot", |p| &p.clock_snapshot)?;
-    // System info
-    import_table("sysinfo", |p| &p.sysinfo)?;
-    // Per-CPU frequency limits
-    import_table("cpu_info", |p| &p.cpu_info)?;
+    // Every table a parquet directory holds, from the library's list, so a
+    // table added there is imported here too. stack.parquet (the
+    // parquet-directory inputs only; .pb extraction uses the legacy
+    // stack_profile_* tables) was imported above, ahead of this loop, behind
+    // the same guard as every other table.
+    for (table_name, get_path) in systing::duckdb::PARQUET_TABLES {
+        if *table_name != "stack" {
+            import_table(table_name, *get_path)?;
+        }
+    }
 
     conn.execute_batch("COMMIT")?;
 
