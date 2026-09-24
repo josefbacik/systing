@@ -40,6 +40,15 @@ static pthread_mutex_t install_lock = PTHREAD_MUTEX_INITIALIZER;
  */
 static pthread_mutex_t unwind_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t fork_handlers_once = PTHREAD_ONCE_INIT;
+/*
+ * The thread that holds unwind_lock across a fork. Other libraries' fork
+ * handlers run inside that window on that thread, and one that allocates can
+ * be sampled: that thread must not wait on the lock it holds. (A thread
+ * handle, not a __thread flag: in a dlopen'd library a __thread variable's
+ * first use on a thread can allocate.)
+ */
+static pthread_t forking_thread;
+static _Atomic int forking;
 static mallctl_fn mallctl_p;
 static prof_backtrace_hook_t jemalloc_default;
 static unw_backtrace_fn unw_backtrace_p;
@@ -54,7 +63,12 @@ static void libunwind_backtrace(void **vec, unsigned *len, unsigned max_len)
 	 * outermost frame.
 	 */
 	/* jemalloc holds none of its locks here and never calls this
-	 * reentrantly, so waiting on unwind_lock cannot deadlock. */
+	 * reentrantly; the one thread that may already hold unwind_lock is
+	 * the one forking, which records no stack instead. */
+	if (forking && pthread_equal(forking_thread, pthread_self())) {
+		*len = 0;
+		return;
+	}
 	pthread_mutex_lock(&unwind_lock);
 	int n = unw_backtrace_p(vec, (int)max_len);
 	pthread_mutex_unlock(&unwind_lock);
@@ -95,15 +109,20 @@ static int set_hook(prof_backtrace_hook_t hook)
 static void before_fork(void)
 {
 	pthread_mutex_lock(&unwind_lock);
+	forking_thread = pthread_self();
+	forking = 1;
 }
 
 static void after_fork_parent(void)
 {
+	forking = 0;
 	pthread_mutex_unlock(&unwind_lock);
 }
 
 static void after_fork_child(void)
 {
+	/* The child's thread is the one that forked, with the same handle. */
+	forking = 0;
 	pthread_mutex_unlock(&unwind_lock);
 	/* The child's only thread is the one that forked: an install that
 	 * another thread had in progress never finishes there. install_lock is

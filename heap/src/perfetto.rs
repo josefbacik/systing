@@ -385,7 +385,13 @@ fn write_packets(
                 alloc_count: next.alloc_count - prev.alloc_count,
                 free_count: next.free_count - prev.free_count,
             };
-            if delta.allocated + delta.freed + delta.alloc_count + delta.free_count > 0 {
+            if [
+                delta.allocated,
+                delta.freed,
+                delta.alloc_count,
+                delta.free_count,
+            ] != [0; 4]
+            {
                 changed.push((callstack, delta));
             }
         }

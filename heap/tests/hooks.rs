@@ -331,3 +331,77 @@ fn a_forked_worker_names_the_frames_it_inherited() {
         ]
     );
 }
+
+// A library whose fork handlers allocate, registered before install(): its
+// handlers run while the forking thread holds the hook's unwind lock.
+const ALLOCATING_ATFORK_C: &str = r#"
+#include <pthread.h>
+#include <stdlib.h>
+static void *volatile keep;
+static void allocate(void) { free(keep); keep = malloc(4096); }
+__attribute__((constructor)) static void init(void) { pthread_atfork(allocate, allocate, allocate); }
+"#;
+
+const ALLOCATING_ATFORK_APP: &str = r#"
+import ctypes, os, sys
+ctypes.CDLL(sys.argv[1])
+import systing_heap_hooks
+systing_heap_hooks.install(backtrace="libunwind", strict=True)
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+os.waitpid(pid, 0)
+"#;
+
+#[test]
+fn a_fork_with_allocating_fork_handlers_does_not_hang() {
+    let Some(env) = setup() else { return };
+    if !common::have_libunwind() {
+        common::skip("needs libunwind.so.8");
+        return;
+    }
+    let dir = env.dir.path();
+    let lib = dir.join("liballocating_atfork.so");
+    let src = dir.join("allocating_atfork.c");
+    std::fs::write(&src, ALLOCATING_ATFORK_C).unwrap();
+    let built = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args(["-O2", "-fPIC", "-shared", "-o"])
+        .arg(&lib)
+        .arg(&src)
+        .arg("-lpthread")
+        .status()
+        .unwrap();
+    assert!(built.success());
+    std::fs::write(dir.join("atfork_app.py"), ALLOCATING_ATFORK_APP).unwrap();
+    let dumps = dir.join("atfork-dumps");
+    std::fs::create_dir(&dumps).unwrap();
+    // Every allocation sampled, so the handlers' allocations reach the hook.
+    let mut child = Command::new(&env.python)
+        .arg(dir.join("atfork_app.py"))
+        .arg(&lib)
+        .env("LD_PRELOAD", &env.jemalloc)
+        .env(
+            "MALLOC_CONF",
+            format!(
+                "prof:true,lg_prof_sample:0,prof_prefix:{}/jeprof",
+                dumps.display()
+            ),
+        )
+        .env("SYSTING_HEAP_HOOKS_LIB", &env.lib)
+        .env("PYTHONPATH", HOOKS)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the fork hung: a fork handler's sampled allocation waited on the unwind lock");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
