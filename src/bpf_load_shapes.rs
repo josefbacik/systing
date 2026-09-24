@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::systing_core::{Config, KernelHooks};
 use crate::target_filter::TargetFilter;
-use crate::task_stacks_recorder::TaskStackFrames;
+use crate::task_stacks_recorder::{TaskContextMode, TaskStackFrames};
 
 /// One program's outcome in a load probe.
 #[derive(Debug, Clone)]
@@ -527,6 +527,10 @@ pub struct TaskStacksLoadShape {
     /// Select the cgroup-members program, as a `--cgroup` capture does where
     /// the kernel lists a cgroup's processes.
     pub members: bool,
+    /// `--include-task-context`: the iterator reads each thread's context
+    /// too. A row of its own for the frames it is combined with, since the
+    /// verifier prunes by this constant like the others.
+    pub task_context: Option<TaskContextMode>,
 }
 
 /// The configurations of the task-stacks object that ship. The filter rows
@@ -555,6 +559,11 @@ pub fn task_stacks_shape_table() -> Vec<TaskStacksLoadShape> {
         filter,
         mode,
         members,
+        task_context: None,
+    };
+    let with_task_context = |shape: TaskStacksLoadShape| TaskStacksLoadShape {
+        task_context: Some(TaskContextMode { restricted: false }),
+        ..shape
     };
     vec![
         // No targets: the walk over every thread, each frames mode.
@@ -617,6 +626,22 @@ pub fn task_stacks_shape_table() -> Vec<TaskStacksLoadShape> {
             TaskStackFrames::Native,
             true,
         ),
+        // `--include-task-context` beside `--add-recorder task-stacks`: the
+        // reader of other tasks' contexts, with the smallest walk and with
+        // the largest (Python frames too, whose walk takes most of the
+        // verifier's budget).
+        with_task_context(row(
+            "task-stacks-task-context-native",
+            no_targets,
+            TaskStackFrames::Native,
+            false,
+        )),
+        with_task_context(row(
+            "task-stacks-task-context-all",
+            no_targets,
+            TaskStackFrames::All,
+            false,
+        )),
     ]
 }
 
@@ -915,6 +940,16 @@ R0 unbounded memory access\n\
                 && members[0].filter.filter_cgroup
                 && members[0].filter.cgroup_match_kernel
         );
+        // The task_context reader is verified in the two frames modes that
+        // bound its neighbours' size.
+        for mode in [TaskStackFrames::Native, TaskStackFrames::All] {
+            assert!(
+                shapes
+                    .iter()
+                    .any(|s| s.task_context.is_some() && s.mode == mode),
+                "no {mode:?} row with task_context"
+            );
+        }
     }
 
     #[test]

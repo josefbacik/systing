@@ -565,6 +565,10 @@ pub fn memory_thp_schema() -> Arc<Schema> {
 }
 
 /// Schema for task_stack_event.parquet
+///
+/// `task_context_id` is the thread's task_context id at the record that opened
+/// the event (`--include-task-context`), NULL when there was none; its values
+/// are the `task_context` rows with the same `utid` and `id`.
 pub fn task_stack_event_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),
@@ -577,6 +581,7 @@ pub fn task_stack_event_schema() -> Arc<Schema> {
         Field::new("runtime_delta_ns", DataType::Int64, false),
         Field::new("state", DataType::Utf8, false),
         Field::new("stack_id", DataType::Int64, true),
+        Field::new("task_context_id", DataType::UInt64, true),
     ]))
 }
 

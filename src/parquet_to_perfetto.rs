@@ -4376,6 +4376,11 @@ mod tests {
                 constant(0),
                 Arc::new(events.iter().map(|_| Some("S")).collect::<StringArray>()),
                 Arc::new(events.iter().map(|e| e.3).collect::<Int64Array>()),
+                // The task_context id: not drawn.
+                Arc::new(arrow::array::UInt64Array::from(vec![
+                    None::<u64>;
+                    events.len()
+                ])),
             ],
         )?;
         let file = File::create(dir.join("task_stack_event.parquet"))?;

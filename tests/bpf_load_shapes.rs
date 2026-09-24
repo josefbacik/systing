@@ -232,8 +232,14 @@ fn every_shape_loads() {
     let mut task_stacks_reports: Vec<(String, LoadReport)> = Vec::new();
     for shape in &task_stacks_shapes {
         let started = std::time::Instant::now();
-        let report = TaskStacksIter::load_probe(&shape.filter, shape.mode, shape.members, &|_| 0)
-            .unwrap_or_else(|e| panic!("[{}] probe failed before load: {e:#}", shape.name));
+        let report = TaskStacksIter::load_probe(
+            &shape.filter,
+            shape.mode,
+            shape.members,
+            shape.task_context,
+            &|_| 0,
+        )
+        .unwrap_or_else(|e| panic!("[{}] probe failed before load: {e:#}", shape.name));
         let selected = report.programs.iter().filter(|p| p.autoload).count();
         eprintln!(
             "[{}] loaded={} programs selected={} in {:.1?}",

@@ -17,7 +17,10 @@ name: bpf-load-shapes
 # the library linked in, as a shared object, and as a shared object whose slot is
 # found through the thread's DTV - and the trace must carry what it set; under the
 # confidentiality mode, and under a recipe planted on a process it is wrong for, it
-# must carry nothing. Those cases are `#[ignore]`d for an unprivileged
+# must carry nothing. The same three programs are traced once more through the
+# task-stacks recorder with the CPU sampler off (`task_stack_event.task_context_id`),
+# so that its iterator, which reads other threads' memory from another CPU, is the
+# only reader of the values; and in the confidentiality mode it reads nothing. Those cases are `#[ignore]`d for an unprivileged
 # `cargo test` and return early without a C compiler;
 # scripts/ci/vmtest-task-context-e2e.sh decides by the lines the cases and the
 # tracer print, so a green row means every case ran to its end and the reader's own

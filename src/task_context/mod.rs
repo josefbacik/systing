@@ -5,7 +5,9 @@
 //! side (`bpf/task_context_reader.bpf.h`) reads, for every running-stack
 //! sample, the 8-byte id of the sampled thread's current context and stores
 //! it in the sample; the values themselves travel once per id on a ring of
-//! their own. This module is everything else, and none of it runs without
+//! their own. The task-stacks recorder's iterator reads the same for each
+//! full record of the threads it walks, with the same maps and the same ring
+//! (`task_stacks_recorder::SharedTaskContextMaps`). This module is everything else, and none of it runs without
 //! the flag:
 //!
 //! - [`discovery`] finds the processes that publish a recipe, validates it

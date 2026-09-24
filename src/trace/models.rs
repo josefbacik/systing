@@ -861,8 +861,11 @@ pub struct MemoryThpRecord {
 /// `state` is the kernel's one-letter task state (`thread_state.state` is the
 /// raw integer); `stack_id` is the thread's stack as the iteration's walk found it
 /// (kernel, native user and Python frames as the capture's mode collects them),
-/// `None` when it had no frames. The thread's names, the kernel's and its
-/// Python process's, are on `thread`: join it on `utid`.
+/// `None` when it had no frames. `task_context_id` is the thread's
+/// task_context id as that walk found it (`--include-task-context`), `None`
+/// when it had none; its values are the `task_context` rows with the same
+/// `utid` and `id`. The thread's names, the kernel's and its Python
+/// process's, are on `thread`: join it on `utid`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TaskStackEventRecord {
     pub ts: i64,
@@ -875,6 +878,7 @@ pub struct TaskStackEventRecord {
     pub runtime_delta_ns: i64,
     pub state: String,
     pub stack_id: Option<i64>,
+    pub task_context_id: Option<u64>,
 }
 
 /// One named value of one task_context id of one thread

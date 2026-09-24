@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 26;
+pub const SCHEMA_VERSION: u32 = 27;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -756,13 +756,17 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             stime_delta_ns BIGINT,
             runtime_delta_ns BIGINT,
             state VARCHAR,
-            stack_id BIGINT
+            stack_id BIGINT,
+            -- --include-task-context: the thread's task_context id as the
+            -- record that opened the event found it, NULL when none; its
+            -- values are the task_context rows with the same utid and id.
+            task_context_id UBIGINT
         );
 
         -- --include-task-context: one named value of one task_context id
-        -- of one thread. A sample's context is the rows whose utid and id
-        -- equal the sample's utid and task_context_id; exactly one of
-        -- value_u64 / value_str is set.
+        -- of one thread. A sample's (or a task_stack_event's) context is the
+        -- rows whose utid and id equal its utid and task_context_id; exactly
+        -- one of value_u64 / value_str is set.
         CREATE TABLE IF NOT EXISTS task_context (
             trace_id VARCHAR,
             utid BIGINT,
@@ -2918,6 +2922,79 @@ mod tests {
         assert!(
             err.contains("wchan") && !err.contains("thread_name"),
             "{err}"
+        );
+    }
+
+    /// A `task_stack_event.parquet` written before schema 27 has no
+    /// `task_context_id`: it imports whole, under strict_schema too, with the
+    /// column NULL. One written with `--include-task-context` carries the id,
+    /// all 64 bits of it, and the event joins to its values on (`utid`, id).
+    #[test]
+    fn test_a_task_stack_event_file_without_task_context_id_imports_with_nulls() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        let parquet = |name: &str, select: &str| -> String {
+            let path = temp_dir.path().join(name).to_string_lossy().into_owned();
+            conn.execute_batch(&format!("COPY ({select}) TO '{path}' (FORMAT PARQUET)"))
+                .unwrap();
+            format!("read_parquet('{path}')")
+        };
+        let strict = ImportOptions {
+            strict_schema: true,
+        };
+        let mut report = ImportReport::default();
+        let event = "10::BIGINT AS ts, 5::BIGINT AS dur, 1::BIGINT AS utid, \
+                     1::BIGINT AS start_iteration, 1::BIGINT AS end_iteration, \
+                     0::BIGINT AS utime_delta_ns, 0::BIGINT AS stime_delta_ns, \
+                     0::BIGINT AS runtime_delta_ns, 'S' AS state, 7::BIGINT AS stack_id";
+
+        let older = parquet("older.parquet", &format!("SELECT {event}"));
+        let newer = parquet(
+            "newer.parquet",
+            &format!("SELECT {event}, 18446744073709551614::UBIGINT AS task_context_id"),
+        );
+        for (trace, file) in [("older", &older), ("newer", &newer)] {
+            let columns = import_column_list(&conn, "task_stack_event", file, strict, &mut report)
+                .unwrap()
+                .unwrap();
+            assert_eq!(columns, "*");
+            conn.execute_batch(&format!(
+                "INSERT INTO task_stack_event BY NAME SELECT '{trace}' AS trace_id, {columns} FROM {file}"
+            ))
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO task_context VALUES \
+             ('newer', 1, 18446744073709551614, 10, 'request_id', NULL, 'abc-123')",
+        )
+        .unwrap();
+        assert_eq!(report, ImportReport::default());
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.trace_id, e.task_context_id::VARCHAR, c.value_str \
+                 FROM task_stack_event e \
+                 LEFT JOIN task_context c ON c.trace_id = e.trace_id AND c.utid = e.utid \
+                      AND c.id = e.task_context_id \
+                 ORDER BY e.trace_id DESC",
+            )
+            .unwrap();
+        let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("older".to_string(), None, None),
+                (
+                    "newer".to_string(),
+                    Some("18446744073709551614".to_string()),
+                    Some("abc-123".to_string())
+                ),
+            ]
         );
     }
 

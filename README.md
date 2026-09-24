@@ -309,6 +309,8 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   each is a thread walked twice within one snapshot, a cost and not a loss.
 - The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
   with the stack by `stack_id` into `stack` like every other recorder's. With
+  `--include-task-context` each row also has the id of its thread's task context
+  (`task_context_id`, schema 27; see [Task context](#task-context)). With
   Python frames collected, the `thread` table also gets the name the process
   gave each thread (`thread.py_name`: `threading.Thread(name=...)`), read out
   of the interpreter: Python 3.13 and 3.14 for now.
@@ -336,8 +338,9 @@ its events until the capture ends, so it cannot be used with `--continuous`.
 A program can say what each of its threads is working on, a request id or an
 iteration number, with the task-context library (`crates/task-context`; its
 README has the calls). `--include-task-context` records it: every
-running-stack sample then carries the id of its thread's context, and the
-`task_context` table holds the names and values each id stood for. To add it to
+running-stack sample then carries the id of its thread's context (and so does
+every task-stacks event, with that recorder), and the `task_context` table holds
+the names and values each id stood for. To add it to
 an app and collect it, see the [Task context quick start](docs/TASK_CONTEXT.md).
 
 ```bash
@@ -363,6 +366,21 @@ GROUP BY 1 ORDER BY 2 DESC;
 - Which samples: the running stacks (`stack_event_type = 1`), the CPU
   sampler's and the ones the probe recorders emit. Sleep stacks and the other
   recorders' events do not carry an id yet.
+- With `--add-recorder task-stacks` as well, each `task_stack_event` carries
+  `task_context_id` too (schema 27), the id its thread had when the recorder's
+  iterator read it, and the same `task_context` rows hold its values. The
+  iterator reads the thread's memory from outside it, from another CPU, and
+  reads a thread that ran since its last record; one it found not to have run
+  keeps the id its event opened with. Join on (`utid`, id) as above:
+
+  ```sql
+  SELECT e.ts, e.dur, c.value_str AS request, s.leaf_name
+  FROM task_stack_event e
+  JOIN task_context c
+    ON c.trace_id = e.trace_id AND c.utid = e.utid AND c.id = e.task_context_id
+  JOIN stack s ON s.trace_id = e.trace_id AND s.id = e.stack_id
+  WHERE c.name = 'request_id';
+  ```
 - Which processes: one whose executable carries the library (linked in), or
   names it as a dependency of its own (`libtask_context*.so`). A process is
   looked at when the capture starts (the targets, or every process on the host
