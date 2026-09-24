@@ -39,8 +39,8 @@ SRC="$3"
 OUT="$4"
 RAW="$OUT.raw"
 # The cases this run must have: see the list of `need_line` calls below.
-CASES=6
-CAPTURES=8
+CASES=7
+CAPTURES=9
 
 export LD_LIBRARY_PATH="$LIBDUCKDB_DIR"
 {
@@ -121,6 +121,7 @@ want_count() {
     need_line "\[confidentiality mode\] $read_nothing"
     need_line "\[a small region\] $read_nothing"
     need_line "\[all of user memory\] $read_nothing"
+    need_line "\[vfork child\] [0-9]+ samples of the child, none with a context id; [0-9]+ of the parent's carry one"
 
     # The reader's own counters, one line a capture.
     counters="$OUT.counters"
@@ -129,8 +130,8 @@ want_count() {
     cat "$counters"
     refusal='(unset|out_of_range|slot_read_failed|tp_implausible|block_read_failed|bad_header)=[1-9]'
     want_count "$(grep -c '' "$counters")" "$CAPTURES" "captures printed their counters"
-    want_count "$(grep -c -E 'new_id=[1-9]' "$counters")" 5 \
-        "captures read a context (the three started programs, the running program twice)"
+    want_count "$(grep -c -E 'new_id=[1-9]' "$counters")" 6 \
+        "captures read a context (the three started programs, the running program twice, the vfork parent)"
     want_count "$(grep -E 'restricted=[1-9]' "$counters" | grep -c -v -E '(new|same)_id=')" 1 \
         "capture counted the confidentiality mode's refusals and read nothing"
     want_count "$(grep -v -E '(new_id|same_id|restricted)=' "$counters" | grep -c -E "$refusal")" 2 \
