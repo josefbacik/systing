@@ -50,6 +50,20 @@
  * tp_btf programs). The feature is written for 6.12 and newer, the kernels
  * its load test runs on; every helper and field it uses is present at 6.6.
  *
+ * WHY NO DYNPTR. Dynptrs were looked at for reading a process's memory and
+ * left out, for two reasons of kernel version. The route that would let BPF
+ * find a thread-local by itself, without user space reading the process's
+ * ELF file (task work and the file dynptr, as presented at LPC 2025), needs
+ * mainline 6.18 and 6.19; here user space finds the recipe, so BPF makes two
+ * plain reads (the thread pointer, then the block) and nothing newer than
+ * 6.6 is needed. The user-memory dynptr kfuncs (bpf_copy_from_user_task_dynptr
+ * and its kin, mainline 6.16 on) could only size the value record, which
+ * saves ring bytes when a thread's context changes and no more: a trace
+ * holds the same ids and values either way. They would need a second arm for
+ * the older kernels, and a load test that runs on 6.12 only would never put
+ * that arm before the verifier. So every kernel gets the fixed-width copy.
+ * A later change can add the kfunc arm where BTF has them.
+ *
  * With the feature off (task_context_config.enabled == 0, the default) user
  * space does not load the three programs or create the maps below, and the
  * one call site is dead code the verifier prunes.

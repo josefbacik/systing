@@ -138,9 +138,14 @@ that publishes second publishes nothing, and every call it serves returns
 no `dlopen` and `dlsym`, or does not export the record of the first copy, the
 check cannot see it and does not refuse.
 
-Loading the library with `dlopen` after the program has started is outside
-what this version's example and tests cover; the header's "Limits" section
-says what the two common C libraries do with it.
+A library loaded with `dlopen` after the program has started works within the
+limits the header's "Limits" section gives for the two common C libraries. The
+tests load a `-DTASK_CONTEXT_DTV` build that way, with the default TLS dialect
+and, on x86-64, with TLS descriptors, and check that its record is published
+by the time `dlopen` returns and that setting a value works in the loading
+thread and in another. The tracer only looks at a library that is linked in or
+a dependency at start (see the top-level README), so a library loaded later is
+not read.
 
 ## Limits
 
