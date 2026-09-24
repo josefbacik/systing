@@ -2723,14 +2723,14 @@ fn task_stacks_title(
 /// (the location and the address as far as they are known; the kernel's module
 /// is `[kernel]`), `function (python) [file:line]` for a Python frame.
 #[derive(Debug, PartialEq, Eq)]
-struct FrameParts<'a> {
-    function: &'a str,
+pub struct FrameParts<'a> {
+    pub function: &'a str,
     /// `python`, `kernel` or `native`.
-    language: &'static str,
-    module: Option<&'a str>,
-    file: Option<&'a str>,
-    line: Option<i64>,
-    address: Option<&'a str>,
+    pub language: &'static str,
+    pub module: Option<&'a str>,
+    pub file: Option<&'a str>,
+    pub line: Option<i64>,
+    pub address: Option<&'a str>,
 }
 
 impl FrameParts<'_> {
@@ -2762,7 +2762,9 @@ impl FrameParts<'_> {
     }
 }
 
-fn parse_frame(frame: &str) -> FrameParts<'_> {
+/// Split a frame name into its parts. Public so other writers
+/// (`systing-heap`'s Perfetto output) split frames as task stacks do.
+pub fn parse_frame(frame: &str) -> FrameParts<'_> {
     // `file:line`, or a file alone.
     fn location(location: &str) -> (Option<&str>, Option<i64>) {
         match location.rsplit_once(':') {

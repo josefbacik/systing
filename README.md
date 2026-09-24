@@ -424,6 +424,19 @@ the same ids, as decimal numbers, are the `id` column. `tests/task_context_recor
 runs this, for the library linked in and as a shared object, and checks the
 rows (`./scripts/run-integration-tests.sh task_context_record`).
 
+### Heap Snapshots
+
+`systing-heap` reads heap snapshots that an allocator wrote itself (jemalloc profile dumps for now) into a systing DuckDB database.
+A snapshot shows the memory a process had allocated when it wrote the file, by allocation stack; it is not a recording of malloc calls (that is the `memory-alloc` recorder).
+
+```bash
+cargo build --release -p systing-heap
+systing-heap -o heap.duckdb /data/heap/jeprof   # jemalloc's prof_prefix: latest snapshot per process, older dumps deleted
+```
+
+To set a service up to write snapshots (native stacks for any service, Python frames for Python services) and collect them, see [`docs/HEAP_SNAPSHOTS.md`](docs/HEAP_SNAPSHOTS.md).
+For the tool's options, the tables, and queries, see [`heap/README.md`](heap/README.md).
+
 ### Debugging and Verbosity
 
 Use multiple `-v` flags to control verbosity levels:

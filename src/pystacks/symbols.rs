@@ -278,8 +278,9 @@ fn get_symbol_name(sym: &PystacksSymbol) -> String {
 
 /// Extract a module name from a file path.
 /// Looks for known directory markers (site-packages, lib/python*, etc.)
-/// and constructs a dotted module path from the remainder.
-fn get_module_name_from_filename(path: &str) -> String {
+/// and constructs a dotted module path from the remainder. Public so
+/// offline symbolizers (`systing-heap`) name Python frames the same way.
+pub fn get_module_name_from_filename(path: &str) -> String {
     const KEYWORDS: &[&str] = &["site-packages/", "dist-packages/", "lib/python"];
 
     let mut max_boundary = None;

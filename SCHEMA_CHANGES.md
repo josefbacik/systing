@@ -445,6 +445,55 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 26 (systing 1.23.0) — 2026-09-23
+
+Heap snapshots: an allocator's own dump of the memory a process had live when
+it wrote the file (jemalloc `prof.dump`), read by the new `systing-heap` tool
+(`heap/`), not by a recorder. This is not `memory_alloc`, which records
+individual malloc/free calls. Stacks go into `frame` / `stack` like every
+recorder's, so the usual stack queries and flamegraphs work on them.
+
+### New tables
+- `heap_snapshot` — one row per snapshot file (id, format, source_path, upid,
+  seq, dump_trigger, dumped_at_unix_ns, sample_period). `format` is
+  `jemalloc` for now. `upid` is the process the file name names (a `process`
+  row per pid, `name` from the dump's first mapped file), NULL for a file
+  renamed without its pid. That pid is the one the writing process saw, in
+  its own pid namespace (1 in many containers), and it is the row's only
+  process identity: two containers' dumps read into one database share a
+  `process` row, and a heap trace does not join a capture of the same host by
+  pid. `seq` and `dump_trigger` (`interval`, `manual`, `gdump`, `final`) come
+  from the file name. `dumped_at_unix_ns` is the file's mtime when it was
+  read, wall-clock (the trace tables' `ts` are boot-monotonic): a copy that
+  does not keep times moves it. `sample_period` (mean bytes between samples)
+  is from the header. The header's own totals are not kept: they are a sum of
+  every stack's sampled counts, and a sum cannot be unbiased (below).
+- `heap_sample` — one row per distinct allocation stack in a snapshot
+  (snapshot_id, stack_id, live_objects, live_bytes, alloc_objects,
+  alloc_bytes, est_live_objects, est_live_bytes, est_alloc_objects,
+  est_alloc_bytes). `est_*` are the estimates for the whole process; sum
+  these. jemalloc samples an allocation of `s` bytes with probability
+  `1 - exp(-s / sample_period)`, so each row is scaled by
+  `1 / (1 - exp(-(bytes / objects) / sample_period))` at its own mean object
+  size, as jeprof does, for both the live and the alloc pair. jemalloc 5.3
+  writes each stack's pair so that this step gives its own estimate. Scaling
+  must come before any sum: summing stacks first under-counts small objects
+  badly (jemalloc's PROFILING_INTERNALS.md, "Aggregation must be done after
+  unbiasing samples"). `live_*` / `alloc_*` are the counts as written, before
+  unbiasing, kept for reference: summed, they under-count, by how much
+  depending on object size (3% and 6% of the real heap for the test's
+  mostly small objects). `alloc_*` are cumulative since start and 0 unless
+  the allocator tracked them (jemalloc `prof_accum`).
+
+Python frames (named from a perf map, with perf trampolines) are
+function-level: `module:qualname (python) [file.py]` like pystacks' for
+library code, with no line.
+
+The two tables are in `DATA_TABLES`, so a DuckDB merge by a schema-26 reader
+keeps them. A schema-25 reader merging a heap database leaves them out without
+a message, and they have no parquet files, so an export to parquet and back
+drops them too.
+
 ## Schema Version 25 (systing 1.22.0) — 2026-09-23
 
 `--include-task-context`: a program that uses the task-context library

@@ -134,7 +134,12 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 25;
+pub const SCHEMA_VERSION: u32 = 26;
+
+/// The systing version that writes `_traces.systing_version`. A constant so
+/// the tools built on the library (`systing-heap`) record the same version
+/// the library's own importer does.
+pub const SYSTING_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -180,6 +185,8 @@ pub const DATA_TABLES: &[&str] = &[
     "memory_vmstat",
     "task_stack_event",
     "task_context",
+    "heap_snapshot",
+    "heap_sample",
     "clock_snapshot",
     "sysinfo",
     "cpu_info",
@@ -704,6 +711,43 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             name VARCHAR,
             value_u64 UBIGINT,
             value_str VARCHAR
+        );
+
+        -- Heap snapshots read by systing-heap: an allocator's own dump of the
+        -- memory a process had live when it wrote the file (jemalloc
+        -- prof.dump, later pprof and tcmalloc), not a stream of malloc calls
+        -- (that is memory_alloc). One row per snapshot file, ids dense per
+        -- trace in the order the files were read.
+        CREATE TABLE IF NOT EXISTS heap_snapshot (
+            trace_id VARCHAR,
+            id BIGINT,
+            format VARCHAR, -- 'jemalloc'
+            source_path VARCHAR,
+            upid BIGINT, -- process.upid; NULL when the file name has no pid
+            seq BIGINT, -- the allocator's dump sequence number, NULL if none
+            dump_trigger VARCHAR, -- jemalloc: 'interval', 'manual', 'gdump', 'final'
+            dumped_at_unix_ns BIGINT, -- the file's mtime when read (wall clock)
+            sample_period BIGINT -- mean bytes between samples, as the dump states it
+        );
+
+        -- One row per distinct allocation stack in a snapshot. live_* and
+        -- alloc_* are the sampled counts as jemalloc wrote them; est_* are
+        -- the estimates for the whole process, each row unbiased at its own
+        -- mean object size (see SCHEMA_CHANGES.md, schema 26). Sum est_*,
+        -- never the sampled counts. alloc_* are cumulative since start and 0
+        -- unless the allocator tracked them (prof_accum).
+        CREATE TABLE IF NOT EXISTS heap_sample (
+            trace_id VARCHAR,
+            snapshot_id BIGINT,
+            stack_id BIGINT,
+            live_objects BIGINT,
+            live_bytes BIGINT,
+            alloc_objects BIGINT,
+            alloc_bytes BIGINT,
+            est_live_objects BIGINT,
+            est_live_bytes BIGINT,
+            est_alloc_objects BIGINT,
+            est_alloc_bytes BIGINT
         );
 
         -- /proc/vmstat counters (THP, compaction, direct reclaim families)

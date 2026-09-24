@@ -3492,6 +3492,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "systing-heap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blazesym",
+ "clap",
+ "duckdb",
+ "libc",
+ "perfetto_protos",
+ "protobuf",
+ "regex",
+ "systing",
+ "tempfile",
+]
+
+[[package]]
 name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/gopclntab", "crates/task-context"]
+members = [".", "crates/gopclntab", "crates/task-context", "heap"]
 
 [package]
 name = "systing"
