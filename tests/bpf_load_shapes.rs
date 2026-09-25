@@ -232,11 +232,12 @@ fn every_shape_loads() {
     let mut task_stacks_reports: Vec<(String, LoadReport)> = Vec::new();
     for shape in &task_stacks_shapes {
         let started = std::time::Instant::now();
-        let report = TaskStacksIter::load_probe(
+        let (report, configured) = TaskStacksIter::load_probe(
             &shape.filter,
             shape.mode,
             shape.members,
             shape.task_context,
+            shape.remote_reads,
             &|_| 0,
         )
         .unwrap_or_else(|e| panic!("[{}] probe failed before load: {e:#}", shape.name));
@@ -248,6 +249,29 @@ fn every_shape_loads() {
             selected,
             started.elapsed()
         );
+        // A row of the shape that reads nothing of another task says what it
+        // loaded with, read back from the configured object and not from the
+        // row: every leg that needs those reads is off whatever the row asked
+        // for, and the user stack is still collected.
+        if !shape.remote_reads {
+            eprintln!(
+                "[{}] loaded with remote_user_reads={} collect_user={} collect_python={} \
+                 task_context={}",
+                shape.name,
+                configured.remote_user_reads,
+                configured.collect_user,
+                configured.collect_python,
+                configured.task_context
+            );
+            assert!(
+                !configured.remote_user_reads
+                    && configured.collect_user
+                    && !configured.collect_python
+                    && !configured.task_context,
+                "[{}] a row without other tasks' memory loaded with {configured:?}",
+                shape.name
+            );
+        }
         // The probe leaves the cgroup-members program out for one reason
         // only, decided before it loads anything. Say so where it happens,
         // so that a selection finding below explains itself.

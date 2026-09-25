@@ -61,6 +61,15 @@ const volatile struct {
 	u32 collect_kernel;
 	u32 collect_user;
 	u32 collect_python;
+	/* May this object read another task's user memory: a user stack past
+	 * its first frame, a thread's Python frames, its task context. 0 unless
+	 * userspace sets it, and userspace sets it only where that is known to
+	 * be safe (see remote_reads() in task_stacks_recorder.rs). With it 0 the
+	 * unwinder and its bpf_find_vma() lookup on arm64 are dead code to the
+	 * verifier and are not loaded, and the Python walk and the task-context
+	 * reader are never reached; the kernel drops them too where it drops
+	 * global functions that nothing calls (6.8 and later). */
+	u32 remote_user_reads;
 } task_stacks_config = {0};
 
 /*
@@ -272,6 +281,11 @@ static __always_inline u32 bounded(u32 n, u32 max)
  * Thread `tid`'s user stack into the scratch, by frame pointers (see
  * task_stack_unwinder.bpf.h: bpf_get_task_stack() reads a user stack only for
  * the current task). Returns the number of frames.
+ *
+ * Where the object may not read another task's memory (remote_user_reads is
+ * 0) the stack is its first frame alone: what the unwinder itself stores
+ * before its first read, and what it returns for a thread whose walk stops
+ * at once.
  */
 __noinline int task_stacks_read_user(pid_t tid)
 {
@@ -283,7 +297,18 @@ __noinline int task_stacks_read_user(pid_t tid)
 		return 0;
 	if (get_task(tid, &task))
 		return 0;
-	n = unwind_user_stack_task(task, s->user_stack, TASK_STACKS_MAX_DEPTH);
+	if (task_stacks_config.remote_user_reads) {
+		n = unwind_user_stack_task(task, s->user_stack,
+					   TASK_STACKS_MAX_DEPTH);
+	} else {
+		/* Where the thread was interrupted, from its saved registers.
+		 * Nothing of the task's own memory is read, and on arm64 the
+		 * lookup that guards such a read is not called. */
+		struct pt_regs *regs = (struct pt_regs *)bpf_task_pt_regs(task);
+
+		s->user_stack[0] = PT_REGS_IP(regs);
+		n = 1;
+	}
 	put_task(task);
 	return n;
 }
@@ -306,7 +331,8 @@ __noinline int task_stacks_read_python(pid_t tid)
 	int ret = 0;
 	u64 len;
 
-	if (!task_stacks_config.collect_python)
+	if (!task_stacks_config.collect_python ||
+	    !task_stacks_config.remote_user_reads)
 		return 0;
 	if (get_task(tid, &task))
 		return 0;
@@ -341,7 +367,8 @@ __noinline u64 task_stacks_read_context(pid_t tid)
 	struct task_struct *task;
 	u64 id;
 
-	if (!task_context_config.enabled)
+	if (!task_context_config.enabled ||
+	    !task_stacks_config.remote_user_reads)
 		return 0;
 	if (get_task(tid, &task))
 		return 0;
@@ -430,9 +457,12 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	}
 	if (task_stacks_config.collect_user && !is_kernel_thread(task))
 		ulen = task_stacks_read_user(tid);
-	if (task_stacks_config.collect_python)
+	/* Both read another task's memory and nothing else: off with it. */
+	if (task_stacks_config.collect_python &&
+	    task_stacks_config.remote_user_reads)
 		py_len = task_stacks_read_python(tid);
-	if (task_context_config.enabled)
+	if (task_context_config.enabled &&
+	    task_stacks_config.remote_user_reads)
 		e->task_context_id = task_stacks_read_context(tid);
 
 	klen = bounded(klen, TASK_STACKS_MAX_DEPTH);

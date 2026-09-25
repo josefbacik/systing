@@ -505,6 +505,136 @@ fn choose_walk(filter: &TargetFilter, facts: &WalkFacts) -> (TaskWalk, Option<&'
     (TaskWalk::ByCgroup, None)
 }
 
+/// The first patch release of each stable line that carries the fix making a
+/// `bpf_find_vma` lookup on another task's address space safe (CVE-2026-93137).
+/// A line that is not listed has no fixed release this table knows of.
+const FIND_VMA_FIXED_FROM: &[(u32, u32, u32)] = &[
+    (6, 1, 188),
+    (6, 6, 157),
+    (6, 12, 110),
+    (6, 18, 52),
+    (7, 2, 6),
+];
+
+/// The leading `MAJOR.MINOR.PATCH` of a kernel release string, or `None`.
+///
+/// Deliberately strict, because the caller fails closed on `None`: three
+/// decimal numbers at the very start, no sign, no leading zero, each fitting
+/// `u32`; after the third number the string ends or continues with one of
+/// `-`, `+`, `.`, `_`, `~`. A control character anywhere in the string makes it
+/// unparseable, so a truncated or corrupted buffer never reads as a release.
+fn leading_release_triple(release: &str) -> Option<(u32, u32, u32)> {
+    if release.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let mut rest = release;
+    let mut out = [0u32; 3];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let (number, tail) = rest.split_at(digits);
+        if number.len() > 1 && number.starts_with('0') {
+            return None;
+        }
+        *slot = number.parse().ok()?;
+        rest = tail;
+        if i < 2 {
+            rest = rest.strip_prefix('.')?;
+        }
+    }
+    match rest.chars().next() {
+        None | Some('-' | '+' | '.' | '_' | '~') => Some((out[0], out[1], out[2])),
+        Some(_) => None,
+    }
+}
+
+/// Whether a kernel with this release string carries the fix, judged from the
+/// release number alone.
+///
+/// `true` only when the string's leading triple names a listed stable line at
+/// or past that line's first fixed patch release. Everything else is `false`:
+/// a string that does not parse, a line that is not listed, a patch below the
+/// line's figure. What follows the triple never changes the verdict, in
+/// either direction: a vendor build that backports the fix under an older
+/// number reads unfixed, and a vendor suffix on a fixed number does not close
+/// it again. The fix changes a helper's body and leaves no new symbol to
+/// probe for, so the release number is the only thing there is to read.
+fn find_vma_fixed(release: &str) -> bool {
+    let Some((major, minor, patch)) = leading_release_triple(release) else {
+        return false;
+    };
+    FIND_VMA_FIXED_FROM
+        .iter()
+        .any(|&(m, n, first_fixed)| m == major && n == minor && patch >= first_fixed)
+}
+
+/// What decides whether the iterator may read another task's user memory,
+/// spelled out so a test can ask about hosts it does not run on.
+#[derive(Clone, Debug)]
+struct RemoteReadFacts {
+    /// The object was built for aarch64: the one architecture whose unwinder
+    /// looks the next frame's mapping up (`bpf_find_vma`) before it reads it.
+    aarch64: bool,
+    /// The running kernel's release string (`uname -r`).
+    kernel_release: String,
+}
+
+impl RemoteReadFacts {
+    fn of_this_host() -> Self {
+        RemoteReadFacts {
+            aarch64: cfg!(target_arch = "aarch64"),
+            kernel_release: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map(|s| s.trim_end_matches('\n').to_string())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Whether a capture on a host like `facts` reads other tasks' user memory,
+/// and when it does not, why. On aarch64 the lookup the unwinder makes on
+/// another task's address space is a use-after-free below the releases
+/// [`find_vma_fixed`] lists, and it is also what keeps the frame reads off
+/// device memory there: so where the lookup cannot be made, nothing of
+/// another task's memory is read by this object at all. A release string
+/// that cannot be placed reads as not fixed. Nothing opens this from the
+/// outside: no option and no environment variable.
+fn remote_reads(facts: &RemoteReadFacts) -> (bool, Option<String>) {
+    if !facts.aarch64 || find_vma_fixed(&facts.kernel_release) {
+        return (true, None);
+    }
+    (
+        false,
+        Some(format!(
+            "kernel {:?} is not known to carry the fix that makes bpf_find_vma safe on another \
+             task (6.1.188, 6.6.157, 6.12.110, 6.18.52 or 7.2.6 and later on those lines)",
+            facts.kernel_release
+        )),
+    )
+}
+
+/// What a capture that collects `frames` records where `remote` says whether
+/// other tasks' memory may be read: the reason it cannot start, if it cannot.
+/// Python frames alone are about the Python threads and record no thread that
+/// has none, so without the reads such a capture would hold nothing and look
+/// like a host with no Python thread. The other modes still record every
+/// targeted thread, with its kernel frames, its first user frame, its CPU
+/// time and its state.
+fn why_not_recordable(
+    frames: TaskStackFrames,
+    remote: bool,
+    why_not: Option<&str>,
+) -> Option<String> {
+    if remote || frames != TaskStackFrames::Python {
+        return None;
+    }
+    Some(format!(
+        "task-stacks: Python frames alone cannot be recorded here: {}; ask for native or all",
+        why_not.unwrap_or("other tasks' memory is not read")
+    ))
+}
+
 /// Whether `dir`, a `--cgroup` target's directory, is a member of a threaded
 /// subtree (cgroup v2's threaded mode). There a thread and its process can sit
 /// in different cgroups, and the kernel lists a cgroup by process: a thread
@@ -783,6 +913,21 @@ pub struct TaskStacksIter {
     reread_processes: AtomicU64,
     /// Of those, the ones whose second walk came up short too.
     still_short_processes: AtomicU64,
+    /// Whether this capture reads other tasks' user memory ([`remote_reads`]):
+    /// with it off a user stack is its first frame alone, and there are no
+    /// Python frames and no task context.
+    remote_reads: bool,
+}
+
+/// What [`TaskStacksIter::configure`] left in the opened object's rodata, read
+/// back before the load: what a load probe's row loaded with, as a read of the
+/// object and not the row's own input handed back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfiguredLegs {
+    pub collect_user: bool,
+    pub collect_python: bool,
+    pub remote_user_reads: bool,
+    pub task_context: bool,
 }
 
 impl TaskStacksIter {
@@ -798,6 +943,16 @@ impl TaskStacksIter {
         mode: TaskStackFrames,
         cgroup_dirs: &[BorrowedFd<'_>],
     ) -> Result<Self> {
+        // Decided once, here, before anything is opened: every program and
+        // every link of this capture follows from it.
+        let (remote, why_not) = remote_reads(&RemoteReadFacts::of_this_host());
+        if let Some(refusal) = why_not_recordable(mode, remote, why_not.as_deref()) {
+            bail!("{refusal}");
+        }
+        // With the reads off neither the task-context reader nor the Python
+        // walker is configured into this object: the same paths as a capture
+        // that asked for neither.
+        let task_context = if remote { task_context } else { None };
         let (mut walk, mut why_full) = choose_walk(filter, &WalkFacts::of_this_host(filter));
         if walk == TaskWalk::ByCgroup {
             if let Some(why) = why_not_listed(cgroup_dirs, in_threaded_subtree) {
@@ -807,16 +962,24 @@ impl TaskStacksIter {
         let loaded = if walk == TaskWalk::ByCgroup {
             // The members program is one more thing a kernel can refuse, and
             // nothing a capture should fail for: without it, the full walk.
-            match Self::load_object(filter, maps, pystacks_maps, task_context, mode, cgroup_dirs) {
+            match Self::load_object(
+                filter,
+                maps,
+                pystacks_maps,
+                task_context,
+                mode,
+                cgroup_dirs,
+                remote,
+            ) {
                 Ok(loaded) => loaded,
                 Err(e) => {
                     eprintln!("task-stacks: could not load the cgroup-members iterator: {e:#}");
                     (walk, why_full) = (TaskWalk::Full, Some("the kernel refused the iterator"));
-                    Self::load_object(filter, maps, pystacks_maps, task_context, mode, &[])?
+                    Self::load_object(filter, maps, pystacks_maps, task_context, mode, &[], remote)?
                 }
             }
         } else {
-            Self::load_object(filter, maps, pystacks_maps, task_context, mode, &[])?
+            Self::load_object(filter, maps, pystacks_maps, task_context, mode, &[], remote)?
         };
         // One line on which walk a capture with targets runs with: the first
         // thing to read when its snapshots cost more, or see less, than hoped.
@@ -824,6 +987,13 @@ impl TaskStacksIter {
             Some(why) => eprintln!("task-stacks: walking {}: {why}", walk.describe()),
             None if walk != TaskWalk::Full => eprintln!("task-stacks: walking {}", walk.describe()),
             None => {}
+        }
+        // And one on what its stacks hold, where that is less than was asked.
+        if let Some(why_not) = &why_not {
+            eprintln!(
+                "task-stacks: not reading other tasks' memory: {why_not}; user stacks are their \
+                 first frame alone; Python frames and task context are off"
+            );
         }
         Ok(Self {
             link: loaded.link,
@@ -838,21 +1008,28 @@ impl TaskStacksIter {
             full_walk_snapshots: AtomicU64::new(0),
             reread_processes: AtomicU64::new(0),
             still_short_processes: AtomicU64::new(0),
+            remote_reads: remote,
         })
     }
 
     /// Configure the opened object for a capture targeted as `filter` that
     /// collects the stacks `mode` names; with `members`, select the
-    /// cgroup-members program too. What a capture loads and what a load
-    /// probe loads are configured here and nowhere else, so the two cannot
-    /// drift apart.
+    /// cgroup-members program too. `remote` is whether the object may read
+    /// other tasks' user memory ([`remote_reads`]): without it the Python
+    /// walker and the task-context reader are configured as for a capture
+    /// that asked for neither, whatever `mode` and `task_context` say. What a
+    /// capture loads and what a load probe loads are configured here and
+    /// nowhere else, so the two cannot drift apart.
     fn configure(
         open_skel: &mut skel::OpenTaskStacksSkel<'_>,
         filter: &TargetFilter,
         mode: TaskStackFrames,
         members: bool,
         task_context: Option<TaskContextMode>,
+        remote: bool,
     ) -> Result<()> {
+        let python = mode.python() && remote;
+        let task_context = if remote { task_context } else { None };
         let rodata = open_skel
             .maps
             .rodata_data
@@ -861,7 +1038,8 @@ impl TaskStacksIter {
         set_target_filter!(rodata, filter);
         rodata.task_stacks_config.collect_kernel = mode.native() as u32;
         rodata.task_stacks_config.collect_user = mode.native() as u32;
-        rodata.task_stacks_config.collect_python = mode.python() as u32;
+        rodata.task_stacks_config.collect_python = python as u32;
+        rodata.task_stacks_config.remote_user_reads = remote as u32;
         // --include-task-context. Frozen with the rest of .rodata, so with
         // the flag off the one call site is dead code to the verifier and the
         // feature's maps (the main object's, in a capture) are not created,
@@ -873,7 +1051,7 @@ impl TaskStacksIter {
 
         // pystacks' own configuration, as the main object's (see
         // PystacksMaps::configure_bss): only the registered Python pids.
-        if mode.python() {
+        if python {
             let bss = open_skel
                 .maps
                 .bss_data
@@ -924,6 +1102,7 @@ impl TaskStacksIter {
         task_context: Option<(&SharedTaskContextMaps<'_>, TaskContextMode)>,
         mode: TaskStackFrames,
         member_dirs: &[BorrowedFd<'_>],
+        remote: bool,
     ) -> Result<LoadedObject> {
         let mut storage = MaybeUninit::uninit();
         let mut open_skel = skel::TaskStacksSkelBuilder::default()
@@ -935,6 +1114,7 @@ impl TaskStacksIter {
             mode,
             !member_dirs.is_empty(),
             task_context.map(|(_, task_context_mode)| task_context_mode),
+            remote,
         )?;
 
         let m = &mut open_skel.maps;
@@ -1018,13 +1198,19 @@ impl TaskStacksIter {
     /// capture this shares. A refused program fails the whole load, as in a
     /// capture: there is no second load without it here, so a refusal cannot
     /// read as a pass.
+    ///
+    /// `remote` is the capture's [`remote_reads`] verdict, handed in so that a
+    /// row can load the shape a host that may not read other tasks' memory
+    /// loads, on any host. The second value is what `configure` left in the
+    /// object's rodata, read back before the load: what the row loaded with.
     pub fn load_probe(
         filter: &TargetFilter,
         mode: TaskStackFrames,
         members: bool,
         task_context: Option<TaskContextMode>,
+        remote: bool,
         log_level: &dyn Fn(&str) -> u32,
-    ) -> Result<crate::bpf_load_shapes::LoadReport> {
+    ) -> Result<(crate::bpf_load_shapes::LoadReport, ConfiguredLegs)> {
         let probe = crate::systing_core::probe_lock();
 
         let members = members && crate::systing_core::kernel_has_kfunc(CSS_TASK_ITER_KFUNC);
@@ -1032,7 +1218,20 @@ impl TaskStacksIter {
         let mut open_skel = skel::TaskStacksSkelBuilder::default()
             .open(&mut storage)
             .context("Failed to open the task-stacks BPF object")?;
-        Self::configure(&mut open_skel, filter, mode, members, task_context)?;
+        Self::configure(&mut open_skel, filter, mode, members, task_context, remote)?;
+        let configured = {
+            let rodata = open_skel
+                .maps
+                .rodata_data
+                .as_deref()
+                .expect("'rodata' is not mmap'ed, your kernel is too old");
+            ConfiguredLegs {
+                collect_user: rodata.task_stacks_config.collect_user != 0,
+                collect_python: rodata.task_stacks_config.collect_python != 0,
+                remote_user_reads: rodata.task_stacks_config.remote_user_reads != 0,
+                task_context: rodata.task_context_config.enabled != 0,
+            }
+        };
 
         let mut autoloaded: Vec<String> = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
@@ -1067,14 +1266,22 @@ impl TaskStacksIter {
                 .collect()),
             Err(e) => Err(format!("{e:#}")),
         };
-        Ok(crate::bpf_load_shapes::LoadReport::from_load(
-            autoloaded, skipped, &log, outcome,
+        Ok((
+            crate::bpf_load_shapes::LoadReport::from_load(autoloaded, skipped, &log, outcome),
+            configured,
         ))
     }
 
     /// The walk this capture's snapshots take.
     pub fn walk(&self) -> TaskWalk {
         self.walk
+    }
+
+    /// Whether this capture reads other tasks' user memory. Where it does
+    /// not, a user stack is its first frame alone and there are no Python
+    /// frames and no task context, by design; no row says so by itself.
+    pub fn remote_reads(&self) -> bool {
+        self.remote_reads
     }
 
     /// The `--pid` targets now: the keys of the `pids` map, the processes the
@@ -1726,6 +1933,171 @@ impl TaskStacksRecorder {
 mod tests {
     use super::*;
     use crate::record::InMemoryCollector;
+
+    /// Every string is a whole `uname -r` value; `true` = the fix is present.
+    const FIND_VMA_CASES: &[(&str, bool)] = &[
+        // Release strings of the shapes distributions and vendors ship, each
+        // below its line's figure.
+        ("6.18.51-acme.1", false),
+        ("6.18.46-acme.1", false),
+        ("6.18.41-94.142.acme2023", false),
+        ("6.12.95-124.187.acme2023.aarch64", false),
+        ("6.12.68-92.122.acme2023.aarch64", false),
+        ("6.12.103-127.188.acme2023.aarch64", false),
+        ("6.12.95-124.187", false),
+        ("6.12.85+", false),
+        ("6.12.94+", false),
+        ("6.12.55+", false),
+        ("6.12.68+", false),
+        // A line with no fixed release listed.
+        ("6.14.0-1007-acme-gpu", false),
+        // Each listed line on both sides of its figure.
+        ("6.1.187", false),
+        ("6.1.188", true),
+        ("6.6.156", false),
+        ("6.6.157", true),
+        ("6.12.109", false),
+        ("6.12.110", true),
+        ("6.18.51", false),
+        ("6.18.52", true),
+        ("7.2.5", false),
+        ("7.2.6", true),
+        // A suffix neither opens nor closes.
+        ("6.18.52-acme.1", true),
+        ("6.12.110-130.190.acme2023.aarch64", true),
+        ("6.12.110+", true),
+        ("6.18.51-acme.9", false),
+        // A patch well above the figure.
+        ("6.18.100", true),
+        ("6.12.1000", true),
+        // Lines that are not listed, older and between.
+        ("6.13.5", false),
+        ("6.15.0", false),
+        ("6.17.9", false),
+        ("7.0.3", false),
+        ("7.1.0", false),
+        ("5.15.200", false),
+        ("5.10.240", false),
+        ("4.19.300", false),
+        // Lines newer than the newest listed one stay closed until a release
+        // that carries the fix from its first version is listed.
+        ("7.3.0", false),
+        ("7.4.2", false),
+        ("8.0.0", false),
+        // Strings that do not parse.
+        ("", false),
+        ("garbage", false),
+        ("6", false),
+        ("6.12", false),
+        ("6.12.", false),
+        ("6.12.x", false),
+        ("v6.12.110", false),
+        (" 6.12.110", false),
+        ("6.12.110abc", false),
+        ("6.12.0110", false),
+        ("6.012.110", false),
+        ("-6.12.110", false),
+        ("+6.12.110", false),
+        ("6.12.99999999999999999999", false),
+        ("6.12.110\n", false),
+        ("6.12.110\0-tail", false),
+        ("6.12.110-acme\0.1", false),
+    ];
+
+    #[test]
+    fn find_vma_fixed_reads_every_case_as_listed() {
+        for &(release, fixed) in FIND_VMA_CASES {
+            assert_eq!(
+                find_vma_fixed(release),
+                fixed,
+                "release {release:?} should read fixed={fixed}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_vma_fixed_judges_an_overlong_string_by_its_head_alone() {
+        // Length alone never decides: a long tail after a fixed triple stays
+        // fixed, and a long run of digits overflows and fails closed.
+        let long_tail = format!("6.18.52-{}", "x".repeat(300));
+        assert!(find_vma_fixed(&long_tail));
+        let long_digits = format!("6.18.{}", "9".repeat(300));
+        assert!(!find_vma_fixed(&long_digits));
+    }
+
+    #[test]
+    fn find_vma_table_is_sorted_with_one_entry_per_line() {
+        let mut lines: Vec<(u32, u32)> = FIND_VMA_FIXED_FROM
+            .iter()
+            .map(|&(major, minor, _)| (major, minor))
+            .collect();
+        let listed = lines.len();
+        lines.sort_unstable();
+        lines.dedup();
+        assert_eq!(lines.len(), listed, "a stable line is listed twice");
+        assert!(FIND_VMA_FIXED_FROM
+            .windows(2)
+            .all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)));
+    }
+
+    #[test]
+    fn remote_reads_is_closed_only_on_aarch64_below_the_fix() {
+        let facts = |aarch64: bool, release: &str| RemoteReadFacts {
+            aarch64,
+            kernel_release: release.to_string(),
+        };
+        // Elsewhere the unwinder never makes the lookup: any string is open,
+        // an empty one and an unfixed one included.
+        for release in ["", "garbage", "6.12.95-124.187", "6.18.52"] {
+            assert_eq!(remote_reads(&facts(false, release)), (true, None));
+        }
+        // On aarch64 a listed line at or past its figure is open.
+        for release in ["6.12.110", "6.18.52-acme.1", "7.2.6"] {
+            assert_eq!(remote_reads(&facts(true, release)), (true, None));
+        }
+        // Below it, on a line that is not listed, and on a string that cannot
+        // be placed at all, it is closed, and the reason names the string.
+        for release in ["6.12.95-124.187", "6.14.0-1007-acme-gpu", "garbage", ""] {
+            let (remote, why_not) = remote_reads(&facts(true, release));
+            assert!(!remote, "{release:?} should read closed");
+            let why_not = why_not.expect("a closed gate says why");
+            assert!(
+                why_not.contains(&format!("{release:?}")),
+                "{why_not:?} does not name {release:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_frames_alone_are_refused_where_nothing_could_be_recorded() {
+        let why_not = Some("kernel \"6.12.95\" is not known to carry the fix");
+        // With the reads on, and in the modes that record every targeted
+        // thread stack or not, there is something to record: no refusal.
+        for frames in [
+            TaskStackFrames::Native,
+            TaskStackFrames::Python,
+            TaskStackFrames::All,
+        ] {
+            assert_eq!(why_not_recordable(frames, true, None), None);
+        }
+        assert_eq!(
+            why_not_recordable(TaskStackFrames::Native, false, why_not),
+            None
+        );
+        assert_eq!(
+            why_not_recordable(TaskStackFrames::All, false, why_not),
+            None
+        );
+        // Python frames alone with the reads off: refused, with the reason.
+        let refusal = why_not_recordable(TaskStackFrames::Python, false, why_not)
+            .expect("nothing to record must be refused");
+        assert!(refusal.contains("Python frames alone cannot be recorded here"));
+        assert!(
+            refusal.contains("6.12.95"),
+            "{refusal:?} does not carry the reason"
+        );
+        assert!(refusal.contains("native or all"));
+    }
 
     fn task(tgid: u32, tid: u32, comm: &str) -> task_info {
         let mut name = [0u8; 16];

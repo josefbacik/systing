@@ -307,6 +307,27 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   on the walks that lost a thread. When any record did not fit the kernel's
   buffer and was unwound again at the next read, the line ends with how many:
   each is a thread walked twice within one snapshot, a cost and not a loss.
+- On aarch64 the recorder reads other threads' user memory only on a kernel
+  known to carry the fix that makes the unwinder's mapping lookup
+  (`bpf_find_vma` on another task) safe, CVE-2026-93137: 6.1.188, 6.6.157,
+  6.12.110, 6.18.52 or 7.2.6, and later releases of those stable lines. The
+  release is read once at start (`uname -r`) and judged by its leading
+  `MAJOR.MINOR.PATCH` alone: a string that cannot be placed, a line that is not
+  listed and a vendor build that carries the fix under an older number all
+  read as not fixed. There the capture prints
+  `task-stacks: not reading other tasks' memory: ...` at start and, by
+  design, every user stack is its first frame alone (where the thread was
+  interrupted, from its saved registers), with no Python frames and no task
+  context: its rows look like those of threads whose walk stopped at once.
+  `--task-stacks-frames python` would record nothing there and refuses to
+  start. No option and no environment variable opens this. The lookup is then
+  not in the loaded program at all. The calls that copy another task's memory
+  are never reached, and on Linux 6.8 or newer, where the kernel drops global
+  functions that nothing calls, they are not loaded either; on an older kernel
+  the loaded program still holds two functions of the Python walker,
+  `pystacks_get_frame_data` and `pystacks_read_stacks_global`, with those
+  calls inside, and nothing calls them. x86-64 is not affected: its unwinder
+  never makes the lookup.
 - The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
   with the stack by `stack_id` into `stack` like every other recorder's. With
   `--include-task-context` each row also has the id of its thread's task context
