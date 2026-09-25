@@ -10,8 +10,10 @@
 set -euo pipefail
 
 # Python versions must match PYTHON_VERSIONS in tests/trace_validation.rs.
-# One representative version per minor release that we support (3.8-3.14).
-PYTHON_VERSIONS=("3.8.20" "3.9.25" "3.10.19" "3.11.14" "3.12.12" "3.13.11" "3.14.6")
+# One representative version per minor release that we support (3.8-3.14),
+# plus the free-threaded build of the newest one (pyenv's "t" suffix, a
+# --disable-gil build): it is a different ABI, walked with its own offsets.
+PYTHON_VERSIONS=("3.8.20" "3.9.25" "3.10.19" "3.11.14" "3.12.12" "3.13.11" "3.14.6" "3.14.6t")
 
 if ! command -v pyenv &>/dev/null; then
     echo "ERROR: pyenv is not installed or not in PATH"
