@@ -34,8 +34,9 @@ name: bpf-load-shapes
 # Each guest job also boots its kernel a third time and runs the task-stacks
 # end-to-end cases (`test_e2e_task_stacks_scoped_walk*`, tests/trace_validation.rs)
 # as root: the scoped walks by pid and by cgroup, the listing of the cgroups below
-# a target, and a process that retires threads. Those cases are `#[ignore]`d for an
-# unprivileged `cargo test` and return early where they cannot do their work;
+# a target, a process that retires threads, and a target that forks past the scoped
+# walk's cap. Those cases are `#[ignore]`d for an unprivileged `cargo test` and return
+# early where they cannot do their work;
 # scripts/ci/vmtest-task-stacks-e2e.sh turns every such early return into a failure,
 # so a green row means the walks ran on that kernel.
 

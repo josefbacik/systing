@@ -6075,6 +6075,175 @@ fn test_e2e_task_stacks_scoped_walk_of_a_process_that_retires_threads() {
     at_rate("most walks whole", 1, 10, 300);
 }
 
+/// A target that forks children by the thousand, each gone at once: the
+/// capture has to stay on the scoped walk from its first snapshot to its
+/// last. The `pids` map gains a key at every fork and nothing in the kernel
+/// takes one out, so a walk that counted every key ever added would pass the
+/// most processes a snapshot walks one at a time (1024) within seconds and
+/// walk every thread on the host from then on: the children a target forked
+/// that have since gone must not count, and the recorder drops their keys.
+/// The same capture with the full walk forced is the control for the rows.
+/// The target is the capture's own command, which joins the `--pid` targets:
+/// the recorder holds it back until every program is attached and ends the
+/// capture when it exits, so every child it forks comes and goes inside the
+/// capture on a host of any speed, and nothing here is timed or measured.
+/// It forks twice the cap and exits 0 only if it forked them all; and one
+/// process it forked has to be in the scoped recording, where only its key
+/// puts it.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_task_stacks_scoped_walk_stays_scoped_past_a_thousand_forks() {
+    use std::time::{Duration, Instant};
+
+    const LABEL: &str = "--pid, forks past the cap";
+    // Twice the recorder's SCOPED_WALK_MAX_PROCESSES (1024), in four loops
+    // that run side by side.
+    const FORKS_EACH: u64 = 512;
+    const FORKS: u64 = 4 * FORKS_EACH;
+
+    // What the capture runs, and so targets: a shell that starts four loops
+    // in the background, each forking, exec'ing and reaping a child that
+    // exits at once (by path, so that no shell answers with a builtin), and
+    // waits for each loop by its pid. A loop that could not spawn a child or
+    // did not reach its end leaves the shell a status other than 0, and the
+    // shell's status is the capture's.
+    let script = format!(
+        "pids=''; \
+         for forker in 1 2 3 4; do \
+         ( i=0; while [ \"$i\" -lt {FORKS_EACH} ]; do /bin/true || exit 1; i=$((i+1)); done ) & \
+         pids=\"$pids $!\"; \
+         done; \
+         for pid in $pids; do wait \"$pid\" || exit 1; done"
+    );
+    // A backstop against a hang, not a length: the capture ends when its
+    // command does. If it is ever reached the command is interrupted, its
+    // status is not 0, and the capture fails for it.
+    let backstop_secs = SLOW_MACHINE_BUDGET.as_secs() as u32;
+
+    // The pid systing names as its command's. That process lives for the
+    // whole capture, so a recorded thread that is not it belongs to a process
+    // it forked.
+    let command_pid = |stderr: &str| -> u32 {
+        stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Traced command started (PID "))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("[{LABEL}] no line names the command's pid:\n{stderr}"))
+    };
+    // Whether the target itself is in a recording, and the recorded threads
+    // that are not it.
+    let recorded = |out_dir: &TempDir, target: u32| -> (bool, i64) {
+        let events = out_dir.path().join("task_stack_event.parquet");
+        let threads = out_dir.path().join("thread.parquet");
+        let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+        conn.query_row(
+            &format!(
+                "SELECT CAST(COUNT(DISTINCT CASE WHEN t.tid = {target} THEN t.tid END) AS BIGINT), \
+                        CAST(COUNT(DISTINCT CASE WHEN t.tid <> {target} THEN t.tid END) AS BIGINT) \
+                 FROM read_parquet('{}') e JOIN read_parquet('{}') t ON t.utid = e.utid",
+                events.display(),
+                threads.display()
+            ),
+            [],
+            |row| Ok((row.get::<_, i64>(0)? > 0, row.get::<_, i64>(1)?)),
+        )
+        .expect("Failed to count the recorded threads")
+    };
+
+    // One capture of the command, and how long the binary ran: its start-up
+    // and wind-down are in that figure, which is printed and judged nowhere.
+    let run = |full_walk: bool| -> (String, TempDir, Duration) {
+        let started = Instant::now();
+        let (stderr, out_dir) = task_stacks_capture(
+            &["--", "/bin/sh", "-c", &script],
+            250,
+            backstop_secs,
+            full_walk,
+        );
+        (stderr, out_dir, started.elapsed())
+    };
+
+    let (stderr, out_dir, ran) = run(false);
+    let (visited, targeted) = task_stacks_walk_counts(&stderr);
+    let coverage = task_stacks_coverage(&out_dir);
+    let (target_recorded, forked_recorded) = recorded(&out_dir, command_pid(&stderr));
+    eprintln!(
+        "[{LABEL}] as it comes: {FORKS} children forked and reaped inside the capture, in the \
+         {:.1} s the binary ran; visited {visited} for {targeted} targeted; {} threads recorded, \
+         {forked_recorded} of them in processes the target forked",
+        ran.as_secs_f64(),
+        coverage.threads
+    );
+    let (full_stderr, full_dir, full_ran) = run(true);
+    let (full_visited, _) = task_stacks_walk_counts(&full_stderr);
+    let full_coverage = task_stacks_coverage(&full_dir);
+    let (full_target_recorded, _) = recorded(&full_dir, command_pid(&full_stderr));
+    eprintln!(
+        "[{LABEL}] full walk forced: the same {FORKS} in {:.1} s; visited {full_visited}; {} \
+         threads recorded",
+        full_ran.as_secs_f64(),
+        full_coverage.threads
+    );
+
+    // That the forks outran the cap while the fork hook was attached needs no
+    // assertion here: the command starts after the hook and the capture ends
+    // after the command, and a capture whose command did not fork them all
+    // has already failed for its status. What is left to show is that the
+    // keys the forks added reached the walk: a process the target forked is
+    // in the recording only through its key.
+    assert!(
+        forked_recorded > 0,
+        "[{LABEL}] no process the target forked is in the scoped recording: the keys the forks \
+         add never reached the walk, and the cap was never in play"
+    );
+    // Both recordings hold the target itself, which stays for the whole
+    // capture.
+    for (which, there) in [
+        ("as it comes", target_recorded),
+        ("full walk forced", full_target_recorded),
+    ] {
+        assert!(
+            there,
+            "[{LABEL}, {which}] the target's own thread is not in the recording"
+        );
+    }
+    if !stderr.contains("task-stacks: walking the --pid targets' threads alone") {
+        // Nothing scoped to check, for the one reason a healthy host can
+        // give a `--pid` capture; any other is a failure, not a skip.
+        assert_eq!(
+            task_stacks_full_walk_reason(&stderr),
+            Some(TASK_STACKS_NOT_ROOT_PID_NS),
+            "[{LABEL}] a --pid capture walked every thread on the host for a reason no healthy \
+             host gives:\n{stderr}"
+        );
+        eprintln!(
+            "[{LABEL}] this capture took the walk over every thread on the host \
+             ({TASK_STACKS_NOT_ROOT_PID_NS}): nothing scoped to check"
+        );
+        return;
+    }
+    // Scoped at start, and at every snapshot after it: neither the line a
+    // snapshot prints the first time it gives the scoped walk up, nor the
+    // closing line's count of such snapshots.
+    assert!(
+        !stderr.contains("walked every thread on the host instead"),
+        "[{LABEL}] {FORKS} children forked and gone, and a snapshot walked every thread on the \
+         host instead:\n{stderr}"
+    );
+    // What staying scoped is worth: a fraction of the full walk's visits.
+    assert!(
+        visited * 4 < full_visited,
+        "[{LABEL}] the scoped walks visited {visited} tasks, the full walk {full_visited}: no \
+         fraction of it"
+    );
+    eprintln!(
+        "[{LABEL}] scoped: {FORKS} children forked and gone inside the capture, \
+         {forked_recorded} recorded threads in processes the target forked, and no snapshot left \
+         the scoped walk; {visited} visits against the full walk's {full_visited}"
+    );
+}
+
 /// The names a process gave its threads, read out of live interpreters: the
 /// `threading` module found through sys.modules, its `_active` dict, and each
 /// Thread's `_name` and `_native_id` wherever this instance keeps its
