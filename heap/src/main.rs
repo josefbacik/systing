@@ -19,8 +19,9 @@ use systing_heap::{db, jemalloc, perfetto, retention, symbolize, Format, Snapsho
 /// and deletes that process's older dumps once the database is written. A
 /// file or directory input is only loaded, never deleted.
 ///
-/// With --root, the inputs and every path the snapshots name are resolved
-/// beneath that directory, to read a container's snapshots from outside it.
+/// With --pid or --root-fd, the inputs and every path the snapshots name are
+/// resolved beneath that root, to read a container's snapshots from outside
+/// it.
 #[derive(Parser)]
 #[command(name = "systing-heap", version)]
 struct Cli {
@@ -62,43 +63,39 @@ struct Cli {
     /// Where to look first for each process's perf-<pid>.map, which names
     /// Python functions when it ran with perf trampolines
     /// (PYTHONPERFSUPPORT=1). Then beside the snapshot, then /tmp. With
-    /// --root all three are beneath the root, /tmp being the container's own.
+    /// --pid or --root-fd all three are beneath the root, /tmp being the
+    /// container's own.
     #[arg(long)]
     perf_map_dir: Option<PathBuf>,
 
     /// Resolve the inputs and every path the snapshots name (the binaries,
-    /// the perf maps) beneath DIR, as the kernel would for a process whose
-    /// root is DIR: absolute symlinks and ".." cannot leave it. For reading a
-    /// container's snapshots from outside it, DIR being the container's root
-    /// (such as /proc/<pid>/root). Takes prefix inputs only, and names frames
-    /// from the binaries' symbol tables alone, without debug information. The
-    /// output is not beneath DIR. Needs Linux 5.6 or later.
-    #[arg(long, value_name = "DIR", conflicts_with = "root_fd")]
-    root: Option<PathBuf>,
+    /// the perf maps) beneath the root of the running process PID, as the
+    /// kernel would for that process: absolute symlinks and ".." cannot leave
+    /// it. For reading a container's snapshots from outside it, PID being a
+    /// process in the container: its id as this tool sees it, which is not
+    /// the number in its dumps' names. The root, /proc/PID/root, is opened
+    /// once at start. Takes prefix inputs only, and names frames from the
+    /// binaries' symbol tables alone, without debug information. The output
+    /// is not beneath the root. Needs Linux 5.6 or later.
+    #[arg(short, long, value_name = "PID", conflicts_with = "root_fd")]
+    pid: Option<u32>,
 
-    /// As --root, with a directory descriptor inherited from the caller, by
-    /// its number, in place of a path.
+    /// As --pid, the root being a directory descriptor inherited from the
+    /// caller, by its number: any directory the caller opened and left open.
+    /// A caller that has checked which process a number names should pass
+    /// the directory it checked this way, since a number can come to name
+    /// another process.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
     root_fd: Option<i32>,
-
-    /// As --root, the root being that of the running process PID: the same
-    /// as --root /proc/PID/root, opened once at start. PID is the process's
-    /// id as this tool sees it, which inside a container is not the number
-    /// in its dumps' names. A caller that has checked which process PID
-    /// names should pass the directory it checked with --root-fd, since a
-    /// number can come to name another process.
-    #[arg(short, long, value_name = "PID", conflicts_with_all = ["root", "root_fd"])]
-    pid: Option<u32>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // --pid is --root /proc/PID/root by a shorter name.
     let pid_root = cli
         .pid
         .map(|pid| PathBuf::from(format!("/proc/{pid}/root")));
-    let root = match (cli.root.as_ref().or(pid_root.as_ref()), cli.root_fd) {
+    let root = match (pid_root.as_ref(), cli.root_fd) {
         (Some(dir), _) => {
             Some(Root::open(dir).with_context(|| format!("opening the root {}", dir.display()))?)
         }

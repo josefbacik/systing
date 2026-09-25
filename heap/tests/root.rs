@@ -1,6 +1,6 @@
 //! Reading a container's snapshots from outside it, through the binary:
-//! `--root`, `--root-fd` and `--pid` keep the prefix, the binaries and the
-//! perf map beneath the root, and take prefix inputs only.
+//! `--pid` and `--root-fd` keep the prefix, the binaries and the perf map
+//! beneath the root, and take prefix inputs only.
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -55,6 +55,20 @@ fn run(args: &[&str], db: &Path, input: &str) -> Output {
         .unwrap()
 }
 
+/// `path` opened so that a child inherits it under the same number; the
+/// file is returned to keep the descriptor open.
+fn inheritable(path: &Path) -> (std::fs::File, String) {
+    let file = std::fs::File::open(path).unwrap();
+    // SAFETY: a descriptor this test owns; without close-on-exec the child
+    // inherits it under the same number.
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
+        0
+    );
+    let number = file.as_raw_fd().to_string();
+    (file, number)
+}
+
 fn loaded(db: &Path) -> Vec<(i32, i64)> {
     let conn = Connection::open(db).unwrap();
     conn.prepare(
@@ -95,8 +109,9 @@ fn a_root_keeps_the_prefix_the_binaries_and_the_perf_map_beneath_it() {
     let (root, _outside) = container(123);
     let out_dir = tempfile::tempdir().unwrap();
     let db = out_dir.path().join("heap.duckdb");
+    let (_dir, number) = inheritable(root.path());
     let out = run(
-        &["--root", root.path().to_str().unwrap(), "--latest-only"],
+        &["--root-fd", number.as_str(), "--latest-only"],
         &db,
         "/heap-dumps/jeprof",
     );
@@ -104,34 +119,16 @@ fn a_root_keeps_the_prefix_the_binaries_and_the_perf_map_beneath_it() {
 }
 
 #[test]
-fn a_root_can_be_an_inherited_descriptor() {
+fn a_descriptor_that_is_no_directory_is_refused() {
     let (root, _outside) = container(123);
     let out_dir = tempfile::tempdir().unwrap();
     let db = out_dir.path().join("heap.duckdb");
-
-    let dir = std::fs::File::open(root.path()).unwrap();
-    // SAFETY: a descriptor this test owns; without close-on-exec the child
-    // inherits it under the same number.
-    assert_eq!(unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_SETFD, 0) }, 0);
-    let number = dir.as_raw_fd().to_string();
-    let out = run(
-        &["--root-fd", number.as_str(), "--latest-only"],
-        &db,
-        "/heap-dumps/jeprof",
-    );
-    assert_read_beneath_the_root(&out, &db, root.path());
-
-    let file = std::fs::File::open(root.path().join("lib/y.so")).unwrap();
-    // SAFETY: as above.
-    assert_eq!(
-        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
-        0
-    );
-    let number = file.as_raw_fd().to_string();
+    let (_file, number) = inheritable(&root.path().join("lib/y.so"));
     let out = run(&["--root-fd", number.as_str()], &db, "/heap-dumps/jeprof");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not a directory"), "{stderr}");
+    assert!(!db.exists());
 }
 
 #[test]
@@ -181,26 +178,20 @@ fn a_pid_that_names_no_process_is_refused() {
 }
 
 #[test]
-fn a_pid_and_a_root_are_not_both_taken() {
+fn a_pid_and_a_descriptor_are_not_both_taken() {
     let (root, _outside) = container(123);
     let out_dir = tempfile::tempdir().unwrap();
     let db = out_dir.path().join("heap.duckdb");
     let pid = std::process::id().to_string();
-    let dir = std::fs::File::open(root.path()).unwrap();
-    let number = dir.as_raw_fd().to_string();
-    for other in [
-        ["--root", root.path().to_str().unwrap()],
-        ["--root-fd", number.as_str()],
-    ] {
-        let out = run(
-            &["--pid", pid.as_str(), other[0], other[1]],
-            &db,
-            "/heap-dumps/jeprof",
-        );
-        assert!(!out.status.success(), "{}", other[0]);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("cannot be used with"), "{stderr}");
-    }
+    let (_dir, number) = inheritable(root.path());
+    let out = run(
+        &["--pid", pid.as_str(), "--root-fd", number.as_str()],
+        &db,
+        "/heap-dumps/jeprof",
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
     assert!(!db.exists());
 }
 
@@ -214,9 +205,10 @@ fn the_readers_own_tmp_is_no_place_for_a_map_beneath_a_root() {
     std::fs::write(&planted, PERF_MAP).unwrap();
     let out_dir = tempfile::tempdir().unwrap();
     let db = out_dir.path().join("heap.duckdb");
+    let (_dir, number) = inheritable(root.path());
 
     let beneath = run(
-        &["--root", root.path().to_str().unwrap(), "--latest-only"],
+        &["--root-fd", number.as_str(), "--latest-only"],
         &db,
         "/heap-dumps/jeprof",
     );
@@ -243,8 +235,9 @@ fn a_file_or_directory_input_is_refused_beneath_a_root() {
     let (root, _outside) = container(123);
     let out_dir = tempfile::tempdir().unwrap();
     let db = out_dir.path().join("heap.duckdb");
+    let (_dir, number) = inheritable(root.path());
     for input in ["/heap-dumps/jeprof.123.0.i0.heap", "/heap-dumps"] {
-        let out = run(&["--root", root.path().to_str().unwrap()], &db, input);
+        let out = run(&["--root-fd", number.as_str()], &db, input);
         assert!(!out.status.success(), "{input}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(

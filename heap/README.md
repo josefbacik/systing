@@ -41,7 +41,6 @@ systing-heap -o heap.duckdb ./snapshots/
 
 # A container's snapshots, read from outside it (see below).
 systing-heap -o heap.duckdb --pid 4242 --latest-only /data/heap/jeprof
-systing-heap -o heap.duckdb --root /proc/4242/root --latest-only /data/heap/jeprof
 ```
 
 An input that exists as a file or directory is only loaded.
@@ -110,12 +109,12 @@ Every frame except the innermost is a return address, so the tool looks up the b
 
 ## Reading a container's snapshots from outside it
 
-A collector on the host can read one container's snapshots without a shell in the container, given the container's root directory: `--root DIR`, where DIR is for instance a process's `/proc/<pid>/root`, or `--root-fd N`, where N is a descriptor for that directory the caller opened and left open for the tool to inherit.
-`--pid PID` is `--root /proc/PID/root` by a shorter name: PID is a process in the container as the host numbers it, which is not the number in its dumps' names, that being the process's own view of its id.
+A collector on the host can read one container's snapshots without a shell in the container, given the container's root directory: `--pid PID`, where PID is a process in the container as the host numbers it, which is not the number in its dumps' names, that being the process's own view of its id; or `--root-fd N`, where N is a descriptor for that directory the caller opened and left open for the tool to inherit.
+`--pid PID` reads beneath `/proc/PID/root`; `--root-fd` takes any directory, so a kept copy of a container's files with no process left is read the same way.
 
 ```bash
 systing-heap -o heap.pb --pid 4242 --latest-only /data/heap/jeprof
-systing-heap -o heap.pb --root /proc/4242/root --latest-only /data/heap/jeprof
+systing-heap -o heap.pb --root-fd 3 --latest-only /data/heap/jeprof 3< /mnt/kept-root
 ```
 
 The tool opens the root once, at start, and a process id can come to name another process between a caller's look at it and that open.
@@ -182,7 +181,7 @@ Things to know:
 - **Forking processes.** Each worker starts a perf map of its own, so the frames it inherited already running from the parent (a pre-fork server's loop, under every worker's stacks) are named in none the worker's dumps can use. On Python 3.13+, call `systing_heap_hooks.keep_perf_map_across_fork()` once in the parent, with trampolines on, before it forks: each child then adds the parent's map to its own. (CPython's own persist-after-fork setting is not used: it stops the child making trampolines, so what the worker runs afterwards goes unnamed.) The hook itself is fork-safe: unwinds take one lock, and a fork waits for any unwind in progress, since libunwind's cache lock has no fork handler of its own.
 - **Function granularity.** A trampoline is per function, so Python frames name the function and file (full path in `frame_file`), not the line. Library code gets pystacks' module prefix (`pkg.mod:Cls.run (python) [mod.py]`), so the same function has the same name as in a capture's stacks, apart from the line: pystacks writes `[mod.py:42]`, so drop the `:<line>` (`regexp_replace(name, ':\d+\]$', ']')`) to join the two by name.
 Application code has no module prefix, so two functions with the same qualified name in files with the same base name are one frame.
-- **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps, or read the container's own files with `--root`. Without the map, Python frames show as `unknown ([anon:exec])` and the tool warns. It prints which map named each process's frames, and a map is consulted only for addresses the dump's own memory map puts in anonymous executable memory, so a stale map cannot name data. A refused candidate falls through to the next. A map is read only if it is a regular file (symlinks are not followed) of at most 256 MiB, and one in a world-writable directory such as `/tmp` only if you or root own it, as perf requires: otherwise another user could name your frames.
+- **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps, or read the container's own files with `--pid`. Without the map, Python frames show as `unknown ([anon:exec])` and the tool warns. It prints which map named each process's frames, and a map is consulted only for addresses the dump's own memory map puts in anonymous executable memory, so a stale map cannot name data. A refused candidate falls through to the next. A map is read only if it is a regular file (symlinks are not followed) of at most 256 MiB, and one in a world-writable directory such as `/tmp` only if you or root own it, as perf requires: otherwise another user could name your frames.
 - **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran about 40% slower. Code that spends its time in C pays far less. The hook runs only for sampled allocations, so a finer sample period runs it more often (32 times as often per byte at a 16 KiB period as at the 512 KiB default), and threads unwinding at the same moment wait for one another.
 
 ## Sampling and unbiasing
