@@ -417,3 +417,72 @@ fn perfetto_output_keeps_processes_and_snapshot_order_apart() {
     assert_eq!(t91.len(), 2);
     assert!(t91[0] < t91[1], "{t91:?}");
 }
+
+// A stack as the hooks' "python" backtrace stores it: the native addresses,
+// then the Python frames innermost first, an entry frame outermost.
+fn python_slot_dump(dir: &std::path::Path) -> std::path::PathBuf {
+    let dump = "heap_v2/524288\n  t*: 1: 64 [0: 0]\n\
+                @ 0x30008 0x5059000001000000 0x5059000002000005 0x5059000000000000\n  t*: 1: 64 [0: 0]\n\
+                \nMAPPED_LIBRARIES:\n\
+                00030000-00031000 rw-p 00000000 00:00 0 \n\
+                7fe5b7d00000-7fe5b8200000 rw-p 00000000 00:01 94950 /memfd:systing-pycode-dead0a9f94b985ac (deleted)\n";
+    let path = dir.join("jeprof.12.0.m0.heap");
+    std::fs::write(&path, dump).unwrap();
+    path
+}
+
+#[test]
+fn a_code_map_names_python_slots_with_file_and_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut snapshot = jemalloc::read(&python_slot_dump(dir.path())).unwrap();
+    assert_eq!(
+        systing_heap::pycode::token_of(&snapshot.maps),
+        Some("dead0a9f94b985ac")
+    );
+    snapshot.py_code = systing_heap::pycode::CodeMap::parse(
+        "# systing-pycode 1 token=dead0a9f94b985ac pid=12 python=3.13\n\
+         1 8 1:6c65616b 1:2f7372762f6170702f776f726b2e7079 8000dc0d1290318e58\n\
+         2 3 1:4f757465722e72756e 1:2f6f70742f6c69622f707974686f6e332e31332f736974652d7061636b616765732f706b672f6d6f642e7079 -\n",
+    )
+    .map(std::sync::Arc::new);
+    let snapshots = vec![snapshot];
+    let symbolized = symbolize::symbolize(&snapshots);
+    // Root first. No native frame here is the bytecode loop, so the Python
+    // frames stand in front as one block; the entry frame is not shown.
+    assert_eq!(
+        symbolized.frames[0][0],
+        vec![
+            "pkg.mod:Outer.run (python) [mod.py]",
+            "leak (python) [work.py:8]",
+            "unknown ([anon]) <0x30008>",
+        ]
+    );
+    assert_eq!(
+        symbolized
+            .files
+            .get("leak (python) [work.py:8]")
+            .map(String::as_str),
+        Some("/srv/app/work.py")
+    );
+    assert_eq!(symbolized.stats.code_map_frames, 2);
+    assert!(symbolized.stats.unnamed_python.is_empty());
+}
+
+#[test]
+fn python_slots_without_a_code_map_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let snapshots = vec![jemalloc::read(&python_slot_dump(dir.path())).unwrap()];
+    let symbolized = symbolize::symbolize(&snapshots);
+    assert_eq!(
+        symbolized.frames[0][0],
+        vec![
+            "unknown (python) [unknown]",
+            "unknown (python) [unknown]",
+            "unknown ([anon]) <0x30008>",
+        ]
+    );
+    assert_eq!(
+        symbolized.stats.unnamed_python,
+        vec![snapshots[0].source_path.clone()]
+    );
+}

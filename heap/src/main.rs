@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use systing_heap::perfmap::{self, PerfMap};
+use systing_heap::pycode::{self, CodeMap};
 use systing_heap::root::Root;
 use systing_heap::{db, jemalloc, perfetto, retention, symbolize, Format, Snapshot};
 
@@ -60,10 +61,11 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
-    /// Where to look first for each process's perf-<pid>.map, which names
-    /// Python functions when it ran with perf trampolines
-    /// (PYTHONPERFSUPPORT=1). Then beside the snapshot, then /tmp. With
-    /// --pid or --root-fd all three are beneath the root, /tmp being the
+    /// Where to look first for the file that names each process's Python
+    /// frames: its code map (pycode-<pid>-<token>.map, the hooks' "python"
+    /// backtrace), else beside the snapshot; its perf map (perf-<pid>.map,
+    /// perf trampolines), else beside the snapshot, then /tmp. With --pid
+    /// or --root-fd all of these are beneath the root, /tmp being the
     /// container's own.
     #[arg(long)]
     perf_map_dir: Option<PathBuf>,
@@ -140,6 +142,7 @@ fn main() -> Result<()> {
         bail!("no snapshots found in {:?}", cli.inputs);
     }
     attach_perf_maps(&mut snapshots, cli.perf_map_dir.as_deref(), root);
+    attach_code_maps(&mut snapshots, cli.perf_map_dir.as_deref(), root);
     // Ids follow dump order: by process, then the allocator's sequence.
     snapshots.sort_by(|a, b| (a.pid, a.seq, &a.source_path).cmp(&(b.pid, b.seq, &b.source_path)));
 
@@ -182,6 +185,13 @@ fn main() -> Result<()> {
             f.display()
         );
     }
+    for f in &stats.unnamed_python {
+        eprintln!(
+            "warning: {} has Python frames that no code map names; \
+             keep the process's pycode-<pid>-<token>.map beside the snapshot or pass --perf-map-dir",
+            f.display()
+        );
+    }
     for f in &stats.changed_files {
         eprintln!(
             "warning: {} is not the file the process mapped (different inode); its names may be wrong",
@@ -203,7 +213,8 @@ fn main() -> Result<()> {
         }
     })?;
     println!(
-        "{}: {} snapshot(s), {} sample(s), {} stack(s), {} frame(s); {}/{} addresses symbolized, {} Python function(s) from perf maps",
+        "{}: {} snapshot(s), {} sample(s), {} stack(s), {} frame(s); {}/{} addresses symbolized, \
+         {} Python function(s) from perf maps, {} Python frame(s) from code maps",
         cli.output.display(),
         written.snapshots,
         written.samples,
@@ -211,7 +222,8 @@ fn main() -> Result<()> {
         written.frames,
         stats.resolved,
         stats.lookups,
-        stats.perf_map_frames
+        stats.perf_map_frames,
+        stats.code_map_frames
     );
 
     // Only now that the output is in place do older dumps go.
@@ -283,6 +295,50 @@ fn attach_perf_maps(snapshots: &mut [Snapshot], dir: Option<&Path>, root: Option
                     eprintln!("pid {pid}: Python frames named from {}", path.display());
                 }
                 s.perf_map = Some(map);
+                break;
+            }
+        }
+    }
+}
+
+/// Give each snapshot with Python frames of the hooks' own its process's
+/// code map: the one whose token the dump's maps name, so a process that
+/// got a recycled pid cannot name another's frames.
+fn attach_code_maps(snapshots: &mut [Snapshot], dir: Option<&Path>, root: Option<&Root>) {
+    // As for a perf map: beneath a root a map is judged by who owns the dump,
+    // so it is cached for that owner.
+    let mut cache: HashMap<(PathBuf, Option<u32>), Option<Arc<CodeMap>>> = HashMap::new();
+    for s in snapshots {
+        let (Some(pid), Some(token)) = (s.pid, pycode::token_of(&s.maps)) else {
+            continue;
+        };
+        let paths = match root {
+            Some(_) => pycode::places(pid, token, &s.source_path, dir),
+            None => pycode::candidates(pid, token, &s.source_path, dir),
+        };
+        let dump_owner = root.and(s.owner_uid);
+        for path in paths {
+            let map = cache
+                .entry((path.clone(), dump_owner))
+                .or_insert_with_key(|(path, owner)| {
+                    match pycode::read_in(root, path, token, *owner) {
+                        Ok(map) => {
+                            eprintln!("pid {pid}: Python frames named from {}", path.display());
+                            Some(Arc::new(map))
+                        }
+                        // Beneath a root nothing has yet said the place holds a map.
+                        Err(e) if root.is_some() && e.kind() == std::io::ErrorKind::NotFound => {
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!("warning: not using {}: {e}", path.display());
+                            None
+                        }
+                    }
+                })
+                .clone();
+            if map.is_some() {
+                s.py_code = map;
                 break;
             }
         }

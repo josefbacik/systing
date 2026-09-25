@@ -13,10 +13,13 @@
 
 pub mod db;
 pub mod format;
+#[cfg(test)]
+mod hook_offsets;
 pub mod jemalloc;
 pub mod maps;
 pub mod perfetto;
 pub mod perfmap;
+pub mod pycode;
 pub mod retention;
 pub mod root;
 pub mod symbolize;
@@ -49,6 +52,10 @@ pub struct Snapshot {
     /// The process's perf map (`perf-<pid>.map`), naming code it generated
     /// at runtime such as Python's perf trampolines; None if not found.
     pub perf_map: Option<std::sync::Arc<perfmap::PerfMap>>,
+    /// The process's code map (`pycode-<pid>-<token>.map`), naming the
+    /// Python frames the hooks' "python" backtrace stored; None if not
+    /// found.
+    pub py_code: Option<std::sync::Arc<pycode::CodeMap>>,
 }
 
 /// One allocation stack and what is allocated from it.

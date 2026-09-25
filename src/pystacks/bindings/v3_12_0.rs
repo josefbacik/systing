@@ -16,6 +16,11 @@ pub const PY_VAR_OBJECT_OB_SIZE: usize = 16;
 
 // PyASCIIObject
 pub const PY_ASCII_OBJECT_SIZE: usize = 40;
+pub const PY_ASCII_OBJECT_LENGTH: usize = 16;
+pub const PY_ASCII_OBJECT_STATE: usize = 32;
+
+// PyCompactUnicodeObject
+pub const PY_COMPACT_UNICODE_OBJECT_SIZE: usize = 56;
 
 // PyTupleObject
 pub const PY_TUPLE_OBJECT_OB_ITEM: usize = 24;
@@ -46,6 +51,7 @@ pub const PY_CODE_OBJECT_CO_QUALNAME: usize = 128;
 pub const PY_CODE_OBJECT_CO_LINETABLE: usize = 136;
 pub const PY_CODE_OBJECT_CO_FIRSTLINENO: usize = 68;
 pub const PY_CODE_OBJECT_CO_CODE_ADAPTIVE: usize = 192;
+pub const PY_CODE_OBJECT_CO_FIRSTTRACEABLE: usize = 176;
 
 // PyCoroObject / PyGenObject
 pub const PY_CORO_OBJECT_CR_ORIGIN_OR_FINALIZER: usize = 56;

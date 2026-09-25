@@ -189,6 +189,7 @@ pub fn parse(text: &str) -> Result<Snapshot> {
         samples,
         maps,
         perf_map: None,
+        py_code: None,
     })
 }
 

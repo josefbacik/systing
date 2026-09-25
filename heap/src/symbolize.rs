@@ -13,10 +13,13 @@ use std::path::{Path, PathBuf};
 
 use blazesym::symbolize::source::{Elf, Source};
 use blazesym::symbolize::{Input, Symbolizer};
+use systing::pystacks::stack_walker::PythonFrame;
+use systing::stack_recorder::interleave_python_frames;
 
 use crate::perfmap::{Entry, Symbol};
+use crate::pycode::{self, Slot};
 use crate::root::Root;
-use crate::Snapshot;
+use crate::{Sample, Snapshot};
 
 /// Frame names for every (snapshot, stack) in a set of snapshots.
 pub struct Symbolized {
@@ -24,7 +27,7 @@ pub struct Symbolized {
     /// order `stack.frame_ids` uses.
     pub frames: Vec<Vec<Vec<String>>>,
     /// The full source path of each frame name that has one (Python
-    /// frames named from a perf map), for `frame_file`.
+    /// frames named from a perf map or a code map), for `frame_file`.
     pub files: HashMap<String, String>,
     pub stats: Stats,
 }
@@ -53,6 +56,12 @@ pub struct Stats {
     /// memory) that no perf map names: Python ran without trampolines, or
     /// its perf-<pid>.map was not found.
     pub unnamed_generated: Vec<PathBuf>,
+    /// Distinct Python frames (a function at a line) named from a code map
+    /// (the hooks' "python" backtrace).
+    pub code_map_frames: usize,
+    /// Snapshots with Python frames that no code map names: its
+    /// pycode-<pid>-<token>.map was not found, or lacks them.
+    pub unnamed_python: Vec<PathBuf>,
 }
 
 /// Where one address points.
@@ -72,6 +81,22 @@ enum Target<'a> {
     Unmapped,
 }
 
+/// A sample's native addresses, leaf first, each with whether it is the
+/// leaf. The Python slots the "python" backtrace stores come after them.
+fn native(sample: &Sample) -> impl DoubleEndedIterator<Item = (u64, bool)> + '_ {
+    sample
+        .addrs
+        .iter()
+        .enumerate()
+        .filter(|(_, &a)| pycode::slot(a).is_none())
+        .map(|(i, &a)| (a, i == 0))
+}
+
+/// A sample's Python slots, innermost first.
+fn python(sample: &Sample) -> impl DoubleEndedIterator<Item = Slot> + '_ {
+    sample.addrs.iter().filter_map(|&a| pycode::slot(a))
+}
+
 pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
     symbolize_in(snapshots, None)
 }
@@ -84,8 +109,8 @@ pub fn symbolize_in(snapshots: &[Snapshot], root: Option<&Root>) -> Symbolized {
     let mut identities: HashMap<&str, ((u32, u32), u64)> = HashMap::new();
     for s in snapshots {
         for sample in &s.samples {
-            for (i, &addr) in sample.addrs.iter().enumerate() {
-                if let Target::File { path, lookup } = target(s, addr, i == 0) {
+            for (addr, leaf) in native(sample) {
+                if let Target::File { path, lookup } = target(s, addr, leaf) {
                     wanted.entry(path).or_default().insert(lookup);
                     let m = s.maps.lookup(addr).expect("target found it");
                     identities.entry(path).or_insert((m.dev, m.inode));
@@ -170,38 +195,32 @@ pub fn symbolize_in(snapshots: &[Snapshot], root: Option<&Root>) -> Symbolized {
     drop(open_files);
 
     let mut files: HashMap<String, String> = HashMap::new();
-    for (si, s) in snapshots.iter().enumerate() {
+    for s in snapshots {
         let generated = s.samples.iter().any(|sample| {
-            sample
-                .addrs
-                .iter()
-                .enumerate()
-                .any(|(i, &a)| matches!(target(s, a, i == 0), Target::Generated))
+            native(sample).any(|(a, leaf)| matches!(target(s, a, leaf), Target::Generated))
         });
         if generated {
-            stats
-                .unnamed_generated
-                .push(snapshots[si].source_path.clone());
+            stats.unnamed_generated.push(s.source_path.clone());
         }
     }
     let mut rendered: HashMap<(u64, bool, usize), String> = HashMap::new();
+    let mut rendered_python: HashMap<(Slot, usize), PythonFrame> = HashMap::new();
     let frames = snapshots
         .iter()
         .enumerate()
         .map(|(si, s)| {
-            s.samples
+            let mut unnamed = false;
+            let stacks = s
+                .samples
                 .iter()
                 .map(|sample| {
-                    sample
-                        .addrs
-                        .iter()
-                        .enumerate()
+                    let user: Vec<String> = native(sample)
                         .rev()
-                        .map(|(i, &addr)| {
+                        .map(|(addr, leaf)| {
                             rendered
-                                .entry((addr, i == 0, si))
+                                .entry((addr, leaf, si))
                                 .or_insert_with(|| {
-                                    let (name, file) = render(s, addr, i == 0, &names);
+                                    let (name, file) = render(s, addr, leaf, &names);
                                     if let Some(file) = file {
                                         stats.perf_map_frames += 1;
                                         files.entry(name.clone()).or_insert(file);
@@ -210,9 +229,39 @@ pub fn symbolize_in(snapshots: &[Snapshot], root: Option<&Root>) -> Symbolized {
                                 })
                                 .clone()
                         })
-                        .collect()
+                        .collect();
+                    let python: Vec<PythonFrame> = python(sample)
+                        .rev()
+                        .map(|slot| {
+                            rendered_python
+                                .entry((slot, si))
+                                .or_insert_with(|| {
+                                    let frame = python_frame(s, slot);
+                                    match &frame.file {
+                                        Some(file) => {
+                                            stats.code_map_frames += 1;
+                                            files
+                                                .entry(frame.name.clone())
+                                                .or_insert_with(|| file.clone());
+                                        }
+                                        None => unnamed |= !frame.entry,
+                                    }
+                                    frame
+                                })
+                                .clone()
+                        })
+                        .collect();
+                    if python.is_empty() {
+                        user
+                    } else {
+                        interleave_python_frames(python, user)
+                    }
                 })
-                .collect()
+                .collect();
+            if unnamed {
+                stats.unnamed_python.push(s.source_path.clone());
+            }
+            stacks
         })
         .collect();
     Symbolized {
@@ -277,19 +326,7 @@ fn render(
         Target::Perf(e) => {
             return match e.symbol() {
                 Symbol::Python { qualname, file } => {
-                    let base = Path::new(file)
-                        .file_name()
-                        .and_then(|f| f.to_str())
-                        .unwrap_or(file);
-                    // pystacks' module prefix for library code, so a frame
-                    // here and the same function in a capture share a name.
-                    let module = systing::pystacks::symbols::get_module_name_from_filename(file);
-                    let func = if module.is_empty() {
-                        qualname.to_string()
-                    } else {
-                        format!("{module}:{qualname}")
-                    };
-                    (format!("{func} (python) [{base}]"), Some(file.to_string()))
+                    (python_name(qualname, file, None), Some(file.to_string()))
                 }
                 Symbol::Other(name) => (format!("{name} ([jit]) <{addr:#x}>"), None),
             };
@@ -313,6 +350,48 @@ fn render(
         Target::Unmapped => format!("unknown ([unmapped]) <{addr:#x}>"),
     };
     (name, None)
+}
+
+/// A Python frame's name as pystacks writes it, `function (python)
+/// [file.py:line]`: library code with pystacks' module prefix, so a frame
+/// here and the same function in a capture share a name, and no line where
+/// none is known.
+fn python_name(qualname: &str, file: &str, line: Option<i32>) -> String {
+    let base = Path::new(file)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(file);
+    let module = systing::pystacks::symbols::get_module_name_from_filename(file);
+    let func = if module.is_empty() {
+        qualname.to_string()
+    } else {
+        format!("{module}:{qualname}")
+    };
+    match line {
+        Some(line) => format!("{func} (python) [{base}:{line}]"),
+        None => format!("{func} (python) [{base}]"),
+    }
+}
+
+/// The Python frame a slot stands for, named from the snapshot's code map.
+/// An entry frame names nothing: it is there for the interleave.
+fn python_frame(s: &Snapshot, slot: Slot) -> PythonFrame {
+    let unknown = |entry| PythonFrame {
+        name: "unknown (python) [unknown]".to_string(),
+        file: None,
+        entry,
+    };
+    let Slot::Frame { id, inst } = slot else {
+        return unknown(true);
+    };
+    match s.py_code.as_deref().and_then(|m| m.frame(id, inst)) {
+        Some(f) if !f.qualname.is_empty() && !f.filename.is_empty() => PythonFrame {
+            name: python_name(f.qualname, f.filename, f.line),
+            file: Some(f.filename.to_string()),
+            entry: false,
+        },
+        _ => unknown(false),
+    }
 }
 
 /// Whether `file` is on a kernel pseudo-filesystem, whose "regular" files

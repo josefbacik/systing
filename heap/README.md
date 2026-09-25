@@ -63,7 +63,7 @@ systing-heap -o heap.pb /data/heap/jeprof
 
 Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process gets a heap-profile track with a marker per snapshot, and clicking a marker shows its flamegraph.
 
-- **Frames are split like task stacks'.** A frame is named after the function alone, its module is the frame's mapping, and the source file and line are its symbols (Python frames: the file and line 0, since a trampoline names a function and its file but not a line). Python frames' mapping is `[python]`. Mappings carry a `systing-heap:<module>` build id, which Perfetto needs to attach the symbols; it is not an ELF build id.
+- **Frames are split like task stacks'.** A frame is named after the function alone, its module is the frame's mapping, and the source file and line are its symbols (a Python frame named from a perf map: the file and line 0, since a trampoline names a function and its file but not a line). Python frames' mapping is `[python]`. Mappings carry a `systing-heap:<module>` build id, which Perfetto needs to attach the symbols; it is not an ELF build id.
 - **The numbers are estimates.** Each stack's sampled counts are unbiased before anything is added up (see Sampling and unbiasing), the same `est_*` values the DuckDB tables hold.
 - **Each snapshot holds its increase since the previous one,** and Perfetto adds them up, so the flamegraph at a marker shows the state at that snapshot. "Unreleased" is the live estimate. "Total allocated" is jemalloc's cumulative total when it ran with `prof_accum:true`; otherwise it is the smallest total consistent with the live counts seen, which is a lower bound.
 - **Times are the dumps' own.** A marker's time is its dump file's modification time, wall-clock, and the trace declares every clock equal to it, so markers sit at the right distances from each other; opened beside a systing capture, whose times are on the boot clock, they land far from its events.
@@ -120,7 +120,7 @@ systing-heap -o heap.pb --root-fd 3 --latest-only /data/heap/jeprof 3< /mnt/kept
 The tool opens the root once, at start, and a process id can come to name another process between a caller's look at it and that open.
 A person at a shell need not care; a program that has checked which process a number names passes the directory it checked, with `--root-fd`, and what it checked is then what is read.
 
-Every path the tool did not choose itself is then looked up beneath that directory: the inputs, the binaries each dump names, and the three places a perf map is looked for, `--perf-map-dir` included.
+Every path the tool did not choose itself is then looked up beneath that directory: the inputs, the binaries each dump names, and the places a perf map or a code map is looked for, `--perf-map-dir` included.
 So they mean what they meant to the process: `/tmp` is the container's `/tmp`, and the binaries are the image's own.
 The output path is the caller's and is never beneath the root.
 
@@ -132,48 +132,125 @@ It needs Linux 5.6 or later; on an older kernel the run fails rather than fall b
 Only prefix inputs are taken beneath a root; a file or directory input is refused.
 The paths printed, and those stored in the output, are the container's.
 A prefix input still deletes older dumps unless told otherwise, so a reader that does not own the container's files passes `--latest-only` or `--keep-all`.
-One of the perf map's rules changes beneath a root, because the reader is outside the container and is not the user its processes run as: a map in a world-writable directory such as the container's `/tmp` is used only if root or the user who owns that process's dump owns it, the same process having written both.
+One of the rules a perf map or a code map is read by changes beneath a root, because the reader is outside the container and is not the user its processes run as: a map in a world-writable directory such as the container's `/tmp` is used only if root or the user who owns that process's dump owns it, the same process having written both.
 No other user in the container can then name that process's frames.
-A binary or a perf map that is on a FUSE or network filesystem beneath the root (a bucket or a file server mounted into the container) is left unread, with a warning, and its frames stay unresolved: whoever wrote the dumps chose those paths, a read there would be made with the reader's authority on storage the container only mounts, and it can stall without end.
+A binary, a perf map or a code map that is on a FUSE or network filesystem beneath the root (a bucket or a file server mounted into the container) is left unread, with a warning, and its frames stay unresolved: whoever wrote the dumps chose those paths, a read there would be made with the reader's authority on storage the container only mounts, and it can stall without end.
 Beneath a root, names come from the binaries' own symbol tables and the perf map: debug information is not read there, so there are no inlined frames, no file and line, and no name that lives only in debug information. The symbolizer looks a binary's separate debug file up (its debug link, its `.dwp`) by paths of its own making, which are the reader's and not the container's, and the name it looks up is the binary's to choose.
 
 ## Python stacks
 
-A Python program's heap stacks can show its Python functions among the native frames:
+A Python program's heap stacks can show its Python functions among the native frames, each with its file and line:
 
 ```
-_start → … → outer (python) [app.py] → leak_in_python (python) [app.py] → PyByteArray… → malloc
+_start → … → outer (python) [app.py:12] → leak_in_python (python) [app.py:10] → PyByteArray… → malloc
 ```
 
-Two things make this work, and the program chooses both at runtime with the helper in `hooks/`:
-
-- **Perf trampolines** (Python 3.12+). Python gives each Python function a small piece of generated code of its own, so a native stack shows one frame per Python function, and names that code in `/tmp/perf-<pid>.map`.
-- **A backtrace that walks through them.** The distro jemalloc captures stacks with libgcc's unwinder, which stops at the first trampoline, so only the innermost Python function shows. libunwind walks through them. The hook makes jemalloc use libunwind (`libunwind.so.8`, loaded at runtime).
+The program chooses how at runtime, with the helper in `hooks/`.
+There are two ways; the first is the one to use on CPython 3.12 to 3.14.
 
 ```bash
 make -C heap/hooks          # builds heap/hooks/libsysting_heap_hooks.so
 ```
 
+| Setup | Stacks show | Cost |
+|---|---|---|
+| `backtrace="python"` | Every Python function with file and line, among the native frames | Per sampled allocation only |
+| Trampolines + `backtrace="libunwind"` | Every Python function with its file, no line | Every Python call, and per sampled allocation |
+| Trampolines + a jemalloc built with `--enable-prof-libunwind` (no hook) | The same, expected: jemalloc's libunwind backend makes the same call as the hook; not tested here | The same |
+| Trampolines + jemalloc's default | Only the innermost Python function | Every Python call |
+| Neither | Native frames only (the interpreter's C functions) | None |
+
+### Choosing between the two
+
+Use `backtrace="python"`.
+Use trampolines with `backtrace="libunwind"` for a Python that `python` refuses: one newer than 3.14, a free-threaded or otherwise differently built one, or a process that may not read its own memory through the kernel.
+
+**What the stacks show**
+
+| | `backtrace="python"` | Trampolines + `backtrace="libunwind"` |
+|---|---|---|
+| A Python frame | Function, file and line | Function and file |
+| Frames already running when it is turned on | Shown | Unnamed, unless `PYTHONPERFSUPPORT=1` was set at startup |
+| A deep stack (jemalloc keeps 128 frames) | The innermost 64 Python frames. The native stack keeps the program's entry while the two fit in 128 together; past that it loses its outermost frames | About 40 Python frames: each takes three of the 128. Past about 36 Python frames deep, the stack loses its outermost frames, the program's entry first |
+| An allocation made with the GIL released | Python callers shown | Python callers shown |
+| A thread Python never saw | Native frames only | Native frames only |
+| A forked worker | Nothing to do | One more call in the parent on 3.13+; on 3.12 the frames inherited from the parent are unnamed |
+
+**What it costs**
+
+Measured on CPython 3.12.3 and 3.13.15, x86-64, one core, the distro's jemalloc 5.3 at the default sample period (`lg_prof_sample:19`).
+
+| | `backtrace="python"` | Trampolines + `backtrace="libunwind"` |
+|---|---|---|
+| Python function calls (a benchmark made only of calls) | No change | 40% to 65% slower; 63% in these runs, about 16 ns a call |
+| A sampled allocation at 30 Python frames, on top of jemalloc's own 4 µs | 25 to 26 µs | 9 µs on 3.12, 20 µs on 3.13 |
+| The same per GiB allocated | About 50 ms | 19 to 41 ms, plus the cost on every call |
+| System calls per sampled allocation, at that depth | About 37 (`process_vm_readv`, a little over one a frame) | About 39 (libunwind checks each address it reads: `mincore`, and a write to and a read from a pipe) |
+| Threads sampled at the same moment | Walk side by side; a short lock per frame to look its function up | One at a time: a lock is held for the whole unwind |
+| A mixed workload (tokenize, parse and compile 150 files) | No difference above run-to-run noise | No difference above run-to-run noise |
+| Memory | A 5 MiB table mapped at install, of which only the pages used are resident | 64 KiB of generated code for 1,300 functions |
+| Files | The code map: about 1 KiB per function that was in a sampled stack | The perf map: about 90 bytes per function that was ever called |
+
+`python` costs more per sample and nothing per call, so it is the cheaper of the two once a program makes more than about 300 (3.13) to 1,000 (3.12) Python calls per sampled allocation, which at the default period is per 512 KiB allocated.
+A program that allocates a great deal from very little Python is the one case where trampolines cost less.
+
+**What can go wrong**
+
+| | `backtrace="python"` | Trampolines + `backtrace="libunwind"` |
+|---|---|---|
+| What it depends on | CPython's private structures, by offsets kept per minor version | A feature CPython supports (3.12+, Linux), and libunwind8 in the image |
+| A new Python version | Refused until its offsets are added; stacks are native until then | Nothing here depends on the version |
+| A Python laid out otherwise (free-threaded, a debug or patched build) | Refused: `install()` compares its walk with Python's own view of the stack first | Nothing here depends on the layout |
+| A bad pointer | Cannot fault: every read of Python's memory is made by the kernel, and a refused read shortens the stack | libunwind checks each address before it reads it |
+| What it changes in the process | Nothing between samples. It never takes the GIL, touches a reference count or allocates | How every Python function is called, for the life of the process, and it maps executable memory at runtime |
+| What it needs from the environment | `process_vm_readv` on itself, or `/proc/self/mem`; refused if the process may use neither | `libunwind.so.8`, and `/tmp` writable |
+| Which process a map belongs to | The dump names its own map by a token, so a recycled pid cannot name another's frames | By pid alone: a map an earlier process left under the same pid is not told apart |
+| Where the map is | Beside the dumps | In `/tmp`, the container's own: copy it out with the dumps |
+
+### The `python` backtrace
+
 ```python
 import systing_heap_hooks   # heap/hooks on PYTHONPATH, or copy the .py and .so together
+print(systing_heap_hooks.install(backtrace="python"))
+# {'backtrace': 'python', 'trampolines': False, 'reasons': []}
+```
+
+When jemalloc samples an allocation, the hook takes jemalloc's own native stack and adds the Python frames of the thread that allocated, read from the interpreter's frame chain.
+Python runs at full speed: nothing happens between samples.
+It works on threads that have released the GIL (an allocation inside numpy or torch has its Python callers) and needs no libunwind.
+
+- **How a Python frame is stored.** jemalloc keeps a stack as addresses, so each Python frame is a 64-bit value no address can equal, holding a code id and an instruction index. The ids are named in a **code map**, `pycode-<pid>-<token>.map`, which the hook writes beside the dumps: one line per Python function the first time a sampled stack meets it, with its qualified name, file, first line and line table. `systing-heap` decodes them, so frames read `function (python) [file.py:42]`, the same as in a capture's stacks.
+- **Keep the code map with the dumps.** It is in the dumps' folder already; copy both together, or read the container's own files with `--pid`. `systing-heap` looks in `--perf-map-dir`, then beside the snapshot. Without it, Python frames show as `unknown (python) [unknown]` and the tool warns. A dump names its own map: the token is also the name of a mapping in the process (`systing-pycode-<token>`), which the dump's memory map records, so a later process with the same pid cannot name another's frames.
+- **Checked before it is used.** `install()` compares what the hook reads of the calling thread's stack with what Python says it is (every frame's code object, position, names and line table), with the GIL released. If they differ, the Python is not laid out as expected (a free-threaded or otherwise different build): the backtrace is not installed, and `reasons` says so.
+- **It cannot crash the program on a bad pointer.** Every read of Python's memory goes through the kernel (`process_vm_readv` on the process itself, or `/proc/self/mem`), so a bad address ends the walk and the native stack is still recorded. If the process may use neither, the backtrace is not installed. See [`hooks/README.md`](hooks/README.md) for the full list of what the hook may and may not do.
+- **Forking processes.** Nothing to do: the hook is inherited, and each child writes a code map of its own. A worker's heap holds what its parent allocated before the fork, so its map begins with the parent's lines and its ids go on from the parent's: those stacks are named in the worker's dumps as they are in the parent's. The map is made when the worker's first allocation is sampled; a worker that dumps before that has no map yet, and its Python frames are `unknown (python) [unknown]`.
+- **At exit.** The helper turns the Python walk off as the interpreter exits (`atexit`), before the interpreter frees the state of threads that are still running. Allocations sampled after that have native stacks.
+- **Threads Python never saw** (a native thread pool doing work on a Python thread's behalf) have no Python frames to read: their stacks are native.
+- **Depth.** jemalloc 5.3 keeps 128 frames per stack. Python frames get at most 64 of them, the innermost; the native stack gets the rest. Where the Python frames and the native bytecode-loop frames do not pair up (a truncated stack), the Python frames are placed in front of the native ones as one block.
+- **Cost.** About 25 µs per sampled allocation at 30 Python frames, on top of the 4 µs jemalloc's own native stack takes. At the default sample period that is about 50 ms per GiB allocated: under 1% of one core for a service allocating 100 MB/s. A finer sample period runs it more often.
+- **The frames are the ones Python shows.** A frame the interpreter is still setting up, or one it makes for itself around a call (3.13's frame under a class's `__init__`), is in no traceback, and in no stack here.
+- **Code maps are not deleted.** `systing-heap` deletes old dumps, not code maps: each process leaves one, a line per Python function its sampled stacks went through. It is created as jemalloc creates the dumps beside it, mode 0644 less the umask: whoever can read the dumps can read the names and source paths in it.
+- **Limits.** A process stops adding to its map at 128 MiB, and records at most 98,304 functions, fewer where many of them land in the same part of the hook's table (it looks in 64 places for each). Functions first met past these are `unknown (python) [unknown]`. `systing-heap` reads no line with a name of more than 1,024 characters, a file of more than 4,096 or a line table of more than 64 KiB, since the hook writes none, and prints U+FFFD in place of a control character in a name.
+
+What can't be done is skipped with a warning, and the result says what is active: `{'backtrace': 'default', ..., 'reasons': ['python frames need CPython 3.12, 3.13 or 3.14']}`.
+Pass `strict=True` to raise instead.
+`backtrace="default"` puts jemalloc's own back.
+
+### Perf trampolines
+
+For a Python the `python` backtrace refuses.
+Two things make it work:
+
+- **Perf trampolines** (Python 3.12+). Python gives each Python function a small piece of generated code of its own, so a native stack shows one frame per Python function, and names that code in `/tmp/perf-<pid>.map`.
+- **A backtrace that walks through them.** The distro jemalloc captures stacks with libgcc's unwinder, which stops at the first trampoline, so only the innermost Python function shows. libunwind walks through them. The hook makes jemalloc use libunwind (`libunwind.so.8`, loaded at runtime).
+
+```python
 print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
 # {'backtrace': 'libunwind', 'trampolines': True, 'reasons': []}
 ```
 
-What can't be done is skipped with a warning, and the result says what is active.
-For example, without libunwind8 you get `{'backtrace': 'default', ..., 'reasons': ['libunwind.so.8 not found']}`, and stacks keep only the innermost Python function.
+Without libunwind8 you get `{'backtrace': 'default', ..., 'reasons': ['libunwind.so.8 not found']}`, and stacks keep only the innermost Python function.
 It also reports when jemalloc isn't the process's allocator, when profiling is off (`MALLOC_CONF` without `prof:true`), and when jemalloc is older than 5.3.
-Pass `strict=True` to raise instead.
-`backtrace="default"` puts jemalloc's own back.
-
-The options, from most to least complete:
-
-| Setup | Stacks show |
-|---|---|
-| Trampolines + `backtrace="libunwind"` | Every Python function, among the native frames |
-| Trampolines + a jemalloc built with `--enable-prof-libunwind` (no hook) | The same, expected: jemalloc's libunwind backend makes the same call as the hook; not tested here |
-| Trampolines + jemalloc's default | Only the innermost Python function |
-| No trampolines | Native frames only (the interpreter's C functions) |
 
 Things to know:
 
@@ -182,7 +259,7 @@ Things to know:
 - **Function granularity.** A trampoline is per function, so Python frames name the function and file (full path in `frame_file`), not the line. Library code gets pystacks' module prefix (`pkg.mod:Cls.run (python) [mod.py]`), so the same function has the same name as in a capture's stacks, apart from the line: pystacks writes `[mod.py:42]`, so drop the `:<line>` (`regexp_replace(name, ':\d+\]$', ']')`) to join the two by name.
 Application code has no module prefix, so two functions with the same qualified name in files with the same base name are one frame.
 - **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps, or read the container's own files with `--pid`. Without the map, Python frames show as `unknown ([anon:exec])` and the tool warns. It prints which map named each process's frames, and a map is consulted only for addresses the dump's own memory map puts in anonymous executable memory, so a stale map cannot name data. A refused candidate falls through to the next. A map is read only if it is a regular file (symlinks are not followed) of at most 256 MiB, and one in a world-writable directory such as `/tmp` only if you or root own it, as perf requires: otherwise another user could name your frames.
-- **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran about 40% slower. Code that spends its time in C pays far less. The hook runs only for sampled allocations, so a finer sample period runs it more often (32 times as often per byte at a 16 KiB period as at the 512 KiB default), and threads unwinding at the same moment wait for one another.
+- **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran 40% to 65% slower. Code that spends its time in C pays far less. The hook runs only for sampled allocations (9 to 20 µs each at 30 Python frames), so a finer sample period runs it more often (32 times as often per byte at a 16 KiB period as at the 512 KiB default), and threads unwinding at the same moment wait for one another.
 
 ## Sampling and unbiasing
 

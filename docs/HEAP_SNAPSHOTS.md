@@ -10,7 +10,7 @@ For every column of the tables and more queries, see the tool's README, [`heap/R
 
 - **Any service** (part 1): run it with jemalloc as its allocator and turn on jemalloc's heap profiling. It then writes a snapshot at a regular interval. Environment variables only; no code changes.
 - **Python services** also set `PYTHONMALLOC=malloc`, so jemalloc sees all of Python's memory.
-- **To see Python functions in the stacks** (part 2): add `PYTHONPERFSUPPORT=1`, and one call at startup so every Python caller is kept.
+- **To see Python functions in the stacks** (part 2): one call at startup. Each Python function then shows with its file and line.
 - **To collect them**: run `systing-heap` on the snapshot folder, for a DuckDB database or a Perfetto trace.
 
 ## What a heap snapshot is
@@ -22,7 +22,7 @@ The two settings that matter most are how often jemalloc samples and how often i
 ## Before you start
 
 - **Linux**, and **jemalloc 5.3 or newer built with profiling**. Debian and Ubuntu's `libjemalloc2` package is.
-- For part 2: **Python 3.12 or newer** (tested on 3.13; older versions have no perf trampolines) and **`libunwind8`**.
+- For part 2: **CPython 3.12, 3.13 or 3.14** (the regular build, not the free-threaded one).
 - A folder for snapshots that the service can write to, on a volume if they must outlive the container.
 
 ## Part 1: Native stacks (any service)
@@ -99,42 +99,40 @@ Part 2 replaces those with the Python functions.
 
 ## Part 2: Python + native stacks
 
-Everything in part 1, plus two changes, so the stacks show each Python function in its place among the native frames:
+Everything in part 1, plus one call, so the stacks show each Python function in its place among the native frames, with its file and line:
 
 ```
-_start → … → outer (python) [app.py] → leak_in_python (python) [app.py] → PyByteArray… → malloc
+_start → … → outer (python) [app.py:12] → leak_in_python (python) [app.py:10] → PyByteArray… → malloc
 ```
 
-### 1. Give Python functions their own frames
+### 1. Install the Python backtrace
 
-```bash
-PYTHONPERFSUPPORT=1
-```
-
-Python then gives each Python function its own native frame (a "perf trampoline"), and writes `/tmp/perf-<pid>.map` naming them.
-**Keep that file** with the snapshots: without it, Python frames can't be named.
-Each process, forked workers included, writes its own map, named by its pid.
-Setting this in the environment, rather than from code, also covers the frames already running at startup, such as the main module and a long-lived loop.
-
-### 2. Keep every Python caller in the stack (recommended)
-
-jemalloc's built-in stack capture stops at the first Python function, so without this step a stack shows only the innermost one.
 Ship the helper from [`heap/hooks`](../heap/hooks) in the image (`make` builds `libsysting_heap_hooks.so`; put it next to `systing_heap_hooks.py`) and call it once, early:
 
 ```python
 import systing_heap_hooks
-print(systing_heap_hooks.install(backtrace="libunwind"))
-# {'backtrace': 'libunwind', 'trampolines': True, 'reasons': []}
+print(systing_heap_hooks.install(backtrace="python"))
+# {'backtrace': 'python', 'trampolines': False, 'reasons': []}
 ```
 
-If something is missing (no libunwind8, jemalloc not preloaded, profiling off), it falls back to jemalloc's own stacks and says why in `reasons`; it never stops the service.
+From then on, each time jemalloc samples an allocation it records the Python frames of the thread that allocated, along with the native stack.
+Nothing runs between samples, so Python itself is no slower.
+It also works for memory allocated by C code that has released the GIL, such as numpy or torch: the stack shows the Python code that called it.
+
+The helper checks first that it reads this Python's stack correctly, and installs nothing if it does not.
+If something is missing (jemalloc not preloaded, profiling off, a Python it does not support), it falls back to jemalloc's own stacks and says why in `reasons`; it never stops the service.
 Pass `strict=True` to fail instead.
 
-> **Services that fork workers** (gunicorn, multiprocessing with fork): call `install()` in each worker after it forks, for example in gunicorn's `post_fork` hook.
-> On Python 3.13+, also call `systing_heap_hooks.keep_perf_map_across_fork()` once in the parent at startup, before any worker forks.
-> Without it, frames the worker inherited already running from the parent, such as the server's own loop under every request, can't be named in the worker's snapshots.
+> **Services that fork workers** (gunicorn, multiprocessing with fork): nothing more to do. Call `install()` once, in the parent or in each worker. A worker's snapshots name what the parent allocated before the fork too.
+
+### 2. Keep the code maps with the snapshots
+
+The helper writes `pycode-<pid>-<token>.map` next to the snapshots, one per process: it names the Python functions in that process's stacks.
+**Keep these files with the snapshots.** Without them, Python frames show as `unknown (python) [unknown]`.
 
 ### Part 1 + part 2 as pod environment
+
+The same as part 1: part 2 is the one call in the service's code.
 
 ```yaml
 env:
@@ -144,12 +142,18 @@ env:
     value: prof:true,prof_prefix:/heap-dumps/jeprof,lg_prof_sample:19,lg_prof_interval:30
   - name: PYTHONMALLOC
     value: malloc
-  - name: PYTHONPERFSUPPORT
-    value: "1"
 volumeMounts:
   - name: heap-dumps
     mountPath: /heap-dumps
 ```
+
+### If the Python backtrace can't be used: perf trampolines
+
+For a Python the helper refuses, Python's perf trampolines give the functions and files, without line numbers, at the cost of slowing every Python call.
+Set `PYTHONPERFSUPPORT=1` in the environment, install `libunwind8`, and call `systing_heap_hooks.install(backtrace="libunwind")` instead.
+Python then writes `/tmp/perf-<pid>.map`; keep that file with the snapshots.
+See "Perf trampolines" in [`heap/README.md`](../heap/README.md) for the details, including what a service that forks workers must do.
+"Choosing between the two" there compares the two side by side: what the stacks show, what each costs, and what can go wrong.
 
 ## Optional: a snapshot on demand
 
@@ -205,7 +209,7 @@ It deletes only regular files directly in that folder whose names start with the
 | `--dry-run` | Print what would be loaded and deleted; change nothing. Try this first. |
 | `--keep-all` | Load every snapshot and delete nothing, for example to see how the heap grew over time. |
 | `-o heap.pb` | Write a Perfetto trace instead (also `.perfetto`, `.pftrace`, `.perfetto-trace`). Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process has a heap-profile track with a marker per snapshot, and clicking one shows its flamegraph. It loads every snapshot on disk, so the timeline shows all of them, then deletes the older ones as above. |
-| `--perf-map-dir DIR` | Where to look first for Python's `perf-<pid>.map` (part 2). Without it, the tool looks beside the snapshots, then in `/tmp`. |
+| `--perf-map-dir DIR` | Where to look first for the files that name Python frames (part 2): `pycode-<pid>-<token>.map`, or `perf-<pid>.map` with perf trampolines. Without it, the tool looks beside the snapshots (and for a perf map, then in `/tmp`). |
 
 Named files or a folder (`systing-heap -o heap.duckdb /heap-dumps/`) are only loaded, never deleted.
 
@@ -246,16 +250,18 @@ Coming soon: how to run this remotely, without a shell in the service's containe
 | jemalloc profiling | Small at the default `lg_prof_sample:19`. It grows as the number goes down, and each sampled allocation takes some extra memory. |
 | Snapshots | Disk: a few KB to a few MB each, as often as the interval fires. |
 | `PYTHONMALLOC=malloc` | Some CPU and memory for small objects, which now go through jemalloc instead of Python's pools. Measure it on your workload. |
-| Perf trampolines (part 2) | An extra native call on every Python function call: about 40% slower on a benchmark made only of Python calls, far less for code that spends its time in C (numpy, torch). |
-| The hook (part 2) | Runs only when jemalloc samples an allocation, so a lower `lg_prof_sample` runs it more often; threads unwinding at the same moment wait for one another. |
+| The Python backtrace (part 2) | Runs only when jemalloc samples an allocation: about 25 µs each at 30 Python frames, which at `lg_prof_sample:19` is about 50 ms per GiB the service allocates. A lower `lg_prof_sample` runs it more often. Python calls are not slowed. |
+| Perf trampolines (part 2, the alternative) | An extra native call on every Python function call: 40% to 65% slower on a benchmark made only of Python calls, far less for code that spends its time in C (numpy, torch). |
 
 ## Check that it works
 
 - **Part 1:** after the service has allocated the interval's worth of memory, `/heap-dumps` holds `jeprof.<pid>.<seq>.i<n>.heap` files whose first line is `heap_v2/…`.
-- **Part 2:** `install()` prints `'backtrace': 'libunwind'` with empty `reasons`, and `/tmp/perf-<pid>.map` lists lines starting `py::`.
+- **Part 2:** `install()` prints `'backtrace': 'python'` with empty `reasons`, and a `pycode-<pid>-<token>.map` appears beside the snapshots.
 
 ## Known limits
 
-- **No Python line numbers yet.** Python frames name the function and file, not the line, so two functions with the same name in files with the same name show as one.
+- **Python frames come from the thread that allocated.** Memory allocated on a native worker thread (a thread pool inside a library) has a native stack only.
+- **Code maps are not cleaned up.** `systing-heap` deletes old snapshots, not `pycode-*.map` files: each process leaves one.
+- **No line numbers with perf trampolines.** There, Python frames name the function and file only.
 - **One service per snapshot folder.** Processes are told apart by pid, and containers often share pid 1, so two services writing to one folder would mix.
 - **Same binaries later.** Stacks are resolved from the service's own binaries after the fact, so the image must still be available where the snapshots are loaded.
