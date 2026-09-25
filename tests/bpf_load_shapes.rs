@@ -429,6 +429,30 @@ fn every_instruction_is_verified_by_some_shape() {
 const CALL_FIND_VMA: &str = "call bpf_find_vma#";
 const CALL_COPY_FROM_USER_TASK: &str = "call bpf_copy_from_user_task";
 
+/// What a kernel that works out the live registers before its walk prints
+/// first at log level 2: this heading, and then every instruction of the
+/// program, whether the walk will reach it or not (mainline 6.17 does; 6.12
+/// and 6.14 do not).
+const LIVE_REGS_LISTING: &str = "Live regs before insn:";
+
+/// Whether a level-2 verifier log shows a WALKED instruction that holds
+/// `call`. A walked instruction is a line of the form `<n>: (<opcode>) ...`,
+/// its registers after it, as `systing::bpf_load_shapes::visited_insns` reads
+/// one. The lines under [`LIVE_REGS_LISTING`] are not of that form: each opens
+/// with padding and carries ten register marks between the index and the
+/// instruction. Nor is a line that quotes an instruction behind other words
+/// (`mark_precise: ... before 12: (85) call ...`). A search of the whole text
+/// would find in the listing a call the verifier never walks.
+fn log_walks(log: &str, call: &str) -> bool {
+    log.lines().any(|line| {
+        line.trim_start()
+            .split_once(": ")
+            .is_some_and(|(index, insn)| {
+                index.parse::<u32>().is_ok() && insn.starts_with('(') && insn.contains(call)
+            })
+    })
+}
+
 /// Whether this kernel leaves a global function that no verified path calls
 /// unverified (6.8 and later). Before that every global function of an object
 /// is verified and kept whatever calls it, and the task-stacks object carries
@@ -447,11 +471,13 @@ fn kernel_skips_uncalled_global_functions() -> bool {
 
 /// Load one row of the task-stacks table with every program at verifier log
 /// level 2, which prints each instruction the verifier walks, and say whether
-/// any program's log names a call to the mapping lookup, and to the remote
-/// copy. A row that does not load, a program that was loaded and printed no
-/// log, or a log that names no helper call at all, is no read of either and
-/// fails here.
-fn calls_that_read_another_task(shape: &TaskStacksLoadShape) -> (bool, bool) {
+/// any program's log shows a walked call to the mapping lookup, and to the
+/// remote copy ([`log_walks`]); and, third, whether a log opened with the
+/// listing of every instruction that newer kernels print before the walk,
+/// which is not read for either. A row that does not load, a program that was
+/// loaded and printed no log, or a log that shows no walked helper call at
+/// all, is no read of either and fails here.
+fn calls_that_read_another_task(shape: &TaskStacksLoadShape) -> (bool, bool, bool) {
     let (report, _) = TaskStacksIter::load_probe(
         &shape.filter,
         shape.mode,
@@ -491,10 +517,14 @@ fn calls_that_read_another_task(shape: &TaskStacksLoadShape) -> (bool, bool) {
         .iter()
         .filter_map(|p| p.verifier_log.as_deref())
         .collect();
+    // The read has to see a walked call at all: were a kernel to print a
+    // walked instruction in another form, every row would read as calling
+    // nothing, and this is where that fails.
     assert!(
-        logs.iter().any(|log| log.contains("call bpf_")),
-        "[{}] the verifier's log of {} program(s) names no helper call at all: the log was not \
-         captured, so nothing can be read off it",
+        logs.iter().any(|log| log_walks(log, "call bpf_")),
+        "[{}] the verifier's log of {} program(s) shows no walked helper call at all: the log \
+         was not captured, or its walked lines are not of the form read here, so nothing can be \
+         read off it",
         shape.name,
         logs.len()
     );
@@ -506,23 +536,26 @@ fn calls_that_read_another_task(shape: &TaskStacksLoadShape) -> (bool, bool) {
         shape.name
     );
     (
-        logs.iter().any(|log| log.contains(CALL_FIND_VMA)),
+        logs.iter().any(|log| log_walks(log, CALL_FIND_VMA)),
         logs.iter()
-            .any(|log| log.contains(CALL_COPY_FROM_USER_TASK)),
+            .any(|log| log_walks(log, CALL_COPY_FROM_USER_TASK)),
+        logs.iter().any(|log| log.contains(LIVE_REGS_LISTING)),
     )
 }
 
 /// The shape a host loads that may not read other tasks' memory makes no call
 /// that does, as far as its verifier's log shows. Every closed row of the
 /// task-stacks table is loaded with the verifier's log, and no program's log
-/// names the mapping lookup or, where the kernel does not verify the global
-/// functions nothing calls, the remote copy: a branch the verifier pruned on
-/// the frozen constant is never walked, so never printed. What this shows is
-/// "never walked by the verifier"; that such instructions are then gone from
-/// the loaded image is the kernel's dead-code removal on a privileged load,
-/// which this test does not see. The read is shown to see such a call first:
-/// the smallest open row, loaded the same way, has to name the remote copy,
-/// and the lookup where the unwinder makes it (aarch64).
+/// shows a walked call to the mapping lookup or, where the kernel does not
+/// verify the global functions nothing calls, to the remote copy: a branch the
+/// verifier pruned on the frozen constant is never walked. Only walked lines
+/// are read ([`log_walks`]): a kernel that lists every instruction before its
+/// walk names the calls in that listing whatever it then walks. What this
+/// shows is "never walked by the verifier"; that such instructions are then
+/// gone from the loaded image is the kernel's dead-code removal on a privileged
+/// load, which this test does not see. The read is shown to see such a call
+/// first: the smallest open row, loaded and read the same way, has to show the
+/// remote copy walked, and the lookup where the unwinder makes it (aarch64).
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn closed_task_stacks_rows_call_nothing_that_reads_another_task() {
@@ -533,14 +566,16 @@ fn closed_task_stacks_rows_call_nothing_that_reads_another_task() {
         .find(|s| s.name == "task-stacks-native")
         .expect("the open native row");
     assert!(open.remote_reads, "the control has to be an open row");
-    let (find_vma, copy) = calls_that_read_another_task(open);
+    let (find_vma, copy, listed) = calls_that_read_another_task(open);
     eprintln!(
-        "[{}] the control: calls bpf_find_vma={find_vma} bpf_copy_from_user_task={copy}",
+        "[{}] the control: calls bpf_find_vma={find_vma} bpf_copy_from_user_task={copy} \
+         (every instruction listed before the walk: {listed})",
         open.name
     );
     assert!(
         copy,
-        "[{}] the open row's log names no call to bpf_copy_from_user_task: this read cannot see one",
+        "[{}] the open row's log shows no walked call to bpf_copy_from_user_task: this read cannot \
+         see one",
         open.name
     );
     assert_eq!(
@@ -554,10 +589,11 @@ fn closed_task_stacks_rows_call_nothing_that_reads_another_task() {
     let closed: Vec<&TaskStacksLoadShape> = shapes.iter().filter(|s| !s.remote_reads).collect();
     assert!(!closed.is_empty(), "the table has no closed row");
     for shape in closed {
-        let (find_vma, copy) = calls_that_read_another_task(shape);
+        let (find_vma, copy, listed) = calls_that_read_another_task(shape);
         eprintln!(
             "[{}] closed: calls bpf_find_vma={find_vma} bpf_copy_from_user_task={copy} \
-             (this kernel leaves uncalled global functions unverified: {skips})",
+             (this kernel leaves uncalled global functions unverified: {skips}; every \
+             instruction listed before the walk: {listed})",
             shape.name
         );
         assert!(
@@ -573,4 +609,55 @@ fn closed_task_stacks_rows_call_nothing_that_reads_another_task() {
             );
         }
     }
+}
+
+/// [`log_walks`] on the two forms a level-2 log takes: one that opens with the
+/// listing of every instruction, where the calls to the lookup and to the
+/// remote copy are listed, quoted and never walked, and one without a listing,
+/// where both are walked. Runs anywhere: it loads nothing.
+#[test]
+fn log_walks_reads_walked_instructions_only() {
+    let listed_not_walked = "\
+Live regs before insn:
+      0: .1........ (bf) r6 = r1
+      1: ......6... (85) call bpf_find_vma#180
+  2   2: 0.....6... (85) call bpf_copy_from_user_task#191
+    103: 0......... (95) exit
+0: R1=ctx() R10=fp0
+; struct task_struct *task; @ prog.bpf.c:12
+0: (bf) r6 = r1                       ; R1=ctx() R6_w=ctx()
+1: (85) call bpf_map_lookup_elem#1    ; R0_w=map_value_or_null(id=1)
+mark_precise: frame0: regs=r2 stack= before 1: (85) call bpf_map_lookup_elem#1
+mark_precise: frame0: regs=r1 stack= before 1: (85) call bpf_find_vma#180
+regs=2 stack=0 before 2: (85) call bpf_copy_from_user_task#191
+
+from 1 to 103: R0=scalar() R10=fp0
+103: (95) exit
+processed 3 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0
+";
+    assert!(listed_not_walked.contains(LIVE_REGS_LISTING));
+    assert!(listed_not_walked.contains(CALL_FIND_VMA));
+    assert!(listed_not_walked.contains(CALL_COPY_FROM_USER_TASK));
+    assert!(log_walks(listed_not_walked, "call bpf_"));
+    assert!(log_walks(listed_not_walked, "call bpf_map_lookup_elem#"));
+    // Listed, and quoted in both forms a precision trace has taken: not walked.
+    assert!(!log_walks(listed_not_walked, CALL_FIND_VMA));
+    assert!(!log_walks(listed_not_walked, CALL_COPY_FROM_USER_TASK));
+
+    let walked = "\
+0: R1=ctx() R10=fp0
+0: (bf) r6 = r1                       ; R1=ctx() R6_w=ctx()
+1: (85) call bpf_find_vma#180         ; R0_w=scalar()
+2: (85) call bpf_copy_from_user_task#191
+3: (85) call bpf_copy_from_user_task_str#9001
+4: (95) exit
+processed 5 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0
+";
+    assert!(!walked.contains(LIVE_REGS_LISTING));
+    assert!(log_walks(walked, CALL_FIND_VMA));
+    assert!(log_walks(walked, CALL_COPY_FROM_USER_TASK));
+    // The helper itself, and a member of its family by the same prefix.
+    assert!(log_walks(walked, "call bpf_copy_from_user_task#"));
+    assert!(log_walks(walked, "call bpf_copy_from_user_task_str#"));
+    assert!(!log_walks(walked, "call bpf_map_lookup_elem#"));
 }
