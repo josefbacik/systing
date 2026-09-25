@@ -83,6 +83,7 @@ pub const PY_CODE_OBJECT_CO_FIRSTLINENO: usize = 68;
 pub const PY_CODE_OBJECT_CO_LINETABLE: usize = 136;
 pub const PY_CODE_OBJECT_CO_QUALNAME: usize = 128;
 pub const PY_CODE_OBJECT_CO_CODE_ADAPTIVE: usize = 208;
+pub const PY_CODE_OBJECT_CO_FIRSTTRACEABLE: usize = 192;
 
 // PyCoroObject / PyGenObject
 pub const PY_CORO_OBJECT_CR_ORIGIN_OR_FINALIZER: usize = 56;
