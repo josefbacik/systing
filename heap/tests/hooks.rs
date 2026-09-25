@@ -1,7 +1,7 @@
 //! The hooks library and its Python helper, for real: Python under jemalloc
 //! with perf trampolines, then systing-heap on the dump. Skipped (with a
 //! note) where there is no jemalloc, C compiler, or Python 3.12+; see
-//! `common::skip`.
+//! `common::skip`. The "python" backtrace has its own file, `python_hook.rs`.
 
 mod common;
 
@@ -77,6 +77,7 @@ fn setup() -> Option<Env> {
         ])
         .arg(&lib)
         .arg(Path::new(HOOKS).join("systing_heap_hooks.c"))
+        .arg(Path::new(HOOKS).join("systing_heap_hooks_python.c"))
         .args(["-ldl", "-lpthread"])
         .status();
     if !built.is_ok_and(|s| s.success()) {

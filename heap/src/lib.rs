@@ -13,6 +13,8 @@
 
 pub mod db;
 pub mod format;
+#[cfg(test)]
+mod hook_offsets;
 pub mod jemalloc;
 pub mod maps;
 pub mod perfetto;
