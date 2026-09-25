@@ -592,32 +592,80 @@ impl RemoteReadFacts {
     }
 }
 
+/// Whether a capture reads other tasks' user memory and, where it does not,
+/// why: one value for the one fact, so that "closed, for no reason" cannot be
+/// written down.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteReads {
+    On,
+    /// Off, with the reason as the start line prints it.
+    Off(String),
+}
+
+impl RemoteReads {
+    fn is_on(&self) -> bool {
+        matches!(self, RemoteReads::On)
+    }
+
+    fn why_off(&self) -> Option<&str> {
+        match self {
+            RemoteReads::On => None,
+            RemoteReads::Off(why) => Some(why.as_str()),
+        }
+    }
+}
+
+/// What the closed reason says of a release on a stable line newer than every
+/// line [`FIND_VMA_FIXED_FROM`] lists. Such a kernel may well carry the fix
+/// and still reads as not fixed, because nothing here can know it. The words
+/// are fixed so that a run on such a kernel can be told from a run on an old
+/// one, by a person and by a script alike, and the table gets its line.
+const NEWER_THAN_THE_TABLE: &str = "a stable line newer than every line this build lists";
+
+/// Whether `release` names a stable line past the newest one the table lists.
+/// A string that cannot be placed is not newer than anything.
+fn newer_than_every_listed_line(release: &str) -> bool {
+    let Some((major, minor, _)) = leading_release_triple(release) else {
+        return false;
+    };
+    FIND_VMA_FIXED_FROM
+        .iter()
+        .all(|&(m, n, _)| (major, minor) > (m, n))
+}
+
 /// Whether a capture on a host like `facts` reads other tasks' user memory,
 /// and when it does not, why. On aarch64 the lookup the unwinder makes on
 /// another task's address space is a use-after-free below the releases
 /// [`find_vma_fixed`] lists, and it is also what keeps the frame reads off
 /// device memory there: so where the lookup cannot be made, nothing of
 /// another task's memory is read by this object at all. A release string
-/// that cannot be placed reads as not fixed. Nothing opens this from the
-/// outside: no option and no environment variable.
-fn remote_reads(facts: &RemoteReadFacts) -> (bool, Option<String>) {
+/// that cannot be placed reads as not fixed, and so does a stable line newer
+/// than the table, whose reason says so ([`NEWER_THAN_THE_TABLE`]). Nothing
+/// opens this from the outside: no option and no environment variable.
+fn remote_reads(facts: &RemoteReadFacts) -> RemoteReads {
     if !facts.aarch64 || find_vma_fixed(&facts.kernel_release) {
-        return (true, None);
+        return RemoteReads::On;
     }
-    (
-        false,
-        Some(format!(
-            "kernel {:?} is not known to carry the fix that makes bpf_find_vma safe on another \
-             task (6.1.188, 6.6.157, 6.12.110, 6.18.52 or 7.2.6 and later on those lines)",
-            facts.kernel_release
-        )),
-    )
+    let newer = if newer_than_every_listed_line(&facts.kernel_release) {
+        format!(
+            "; it is on {NEWER_THAN_THE_TABLE}, which reads as fixed only once it is added to \
+             the table"
+        )
+    } else {
+        String::new()
+    };
+    RemoteReads::Off(format!(
+        "kernel {:?} is not known to carry the fix that makes bpf_find_vma safe on another \
+         task (6.1.188, 6.6.157, 6.12.110, 6.18.52 or 7.2.6 and later on those lines){newer}",
+        facts.kernel_release
+    ))
 }
 
 /// The `sysinfo.task_stacks_remote_reads` value of a capture whose iterator
 /// does (`true`) or does not read other tasks' user memory. Written for every
-/// capture the recorder runs in, open or not: an absent value is an older
-/// build's and means unknown.
+/// capture the recorder was asked for, open or not, the one whose iterator
+/// was not loaded included: an absent value is an older build's and means
+/// unknown.
 pub fn remote_reads_sysinfo_value(remote: bool) -> &'static str {
     if remote {
         "on"
@@ -626,24 +674,26 @@ pub fn remote_reads_sysinfo_value(remote: bool) -> &'static str {
     }
 }
 
-/// What a capture that collects `frames` records where `remote` says whether
-/// other tasks' memory may be read: the reason it cannot start, if it cannot.
-/// Python frames alone are about the Python threads and record no thread that
-/// has none, so without the reads such a capture would hold nothing and look
-/// like a host with no Python thread. The other modes still record every
-/// targeted thread, with its kernel frames, its first user frame, its CPU
-/// time and its state.
-fn why_not_recordable(
-    frames: TaskStackFrames,
-    remote: bool,
-    why_not: Option<&str>,
-) -> Option<String> {
-    if remote || frames != TaskStackFrames::Python {
+/// What a capture that collects `frames` says in place of loading the
+/// iterator, where `remote` leaves it nothing to record. Python frames alone
+/// are about the Python threads and record no thread that has none, so
+/// without the reads such a capture's table would be empty whatever ran, and
+/// would look like a host with no Python thread. The iterator is then not
+/// loaded at all: no snapshot walks the host for nothing, the rest of the
+/// capture runs on as it does where a leg of another recorder cannot attach,
+/// and `sysinfo.task_stacks_remote_reads` says why the table is empty. The
+/// other modes still record every targeted thread, with its kernel frames,
+/// its first user frame, its CPU time and its state.
+fn why_not_recordable(frames: TaskStackFrames, remote: &RemoteReads) -> Option<String> {
+    let why_off = remote.why_off()?;
+    if frames != TaskStackFrames::Python {
         return None;
     }
     Some(format!(
-        "task-stacks: Python frames alone cannot be recorded here: {}; ask for native or all",
-        why_not.unwrap_or("other tasks' memory is not read")
+        "task-stacks: not reading other tasks' memory: {why_off}; Python frames alone would \
+         record nothing here, so the task-stacks recorder is off for this capture and the rest \
+         of it runs on; ask for native or all to record each thread's kernel frames and first \
+         user frame"
     ))
 }
 
@@ -946,7 +996,9 @@ impl TaskStacksIter {
     /// Load the iterator with the capture's targeting, reading the main
     /// object's target and pystacks maps, collecting the stacks `mode` names.
     /// `cgroup_dirs` are the `--cgroup` targets' directories (none when the
-    /// kernel does not decide `--cgroup` membership).
+    /// kernel does not decide `--cgroup` membership). `None`, after one line
+    /// that says so, where the iterator would record nothing
+    /// ([`why_not_recordable`]): the capture then runs without it.
     pub fn load(
         filter: &TargetFilter,
         maps: &TargetFilterMaps<'_>,
@@ -954,13 +1006,18 @@ impl TaskStacksIter {
         task_context: Option<(&SharedTaskContextMaps<'_>, TaskContextMode)>,
         mode: TaskStackFrames,
         cgroup_dirs: &[BorrowedFd<'_>],
-    ) -> Result<Self> {
+    ) -> Result<Option<Self>> {
         // Decided once, here, before anything is opened: every program and
         // every link of this capture follows from it.
-        let (remote, why_not) = remote_reads(&RemoteReadFacts::of_this_host());
-        if let Some(refusal) = why_not_recordable(mode, remote, why_not.as_deref()) {
-            bail!("{refusal}");
+        let remote = remote_reads(&RemoteReadFacts::of_this_host());
+        if let Some(nothing_to_record) = why_not_recordable(mode, &remote) {
+            // Not an error: the capture's other recorders run on, and its
+            // sysinfo row says why this recorder's table is empty.
+            eprintln!("{nothing_to_record}");
+            return Ok(None);
         }
+        let why_not = remote.why_off().map(str::to_string);
+        let remote = remote.is_on();
         // With the reads off neither the task-context reader nor the Python
         // walker is configured into this object: the same paths as a capture
         // that asked for neither.
@@ -1007,7 +1064,7 @@ impl TaskStacksIter {
                  first frame alone; Python frames and task context are off"
             );
         }
-        Ok(Self {
+        Ok(Some(Self {
             link: loaded.link,
             walk,
             prog: loaded.prog,
@@ -1021,7 +1078,7 @@ impl TaskStacksIter {
             reread_processes: AtomicU64::new(0),
             still_short_processes: AtomicU64::new(0),
             remote_reads: remote,
-        })
+        }))
     }
 
     /// Configure the opened object for a capture targeted as `filter` that
@@ -2061,54 +2118,95 @@ mod tests {
         // Elsewhere the unwinder never makes the lookup: any string is open,
         // an empty one and an unfixed one included.
         for release in ["", "garbage", "6.12.95-124.187", "6.18.52"] {
-            assert_eq!(remote_reads(&facts(false, release)), (true, None));
+            assert_eq!(remote_reads(&facts(false, release)), RemoteReads::On);
         }
         // On aarch64 a listed line at or past its figure is open.
         for release in ["6.12.110", "6.18.52-acme.1", "7.2.6"] {
-            assert_eq!(remote_reads(&facts(true, release)), (true, None));
+            assert_eq!(remote_reads(&facts(true, release)), RemoteReads::On);
         }
         // Below it, on a line that is not listed, and on a string that cannot
         // be placed at all, it is closed, and the reason names the string.
+        // None of these is newer than the table, and none says it is.
         for release in ["6.12.95-124.187", "6.14.0-1007-acme-gpu", "garbage", ""] {
-            let (remote, why_not) = remote_reads(&facts(true, release));
-            assert!(!remote, "{release:?} should read closed");
-            let why_not = why_not.expect("a closed gate says why");
+            let remote = remote_reads(&facts(true, release));
+            assert!(!remote.is_on(), "{release:?} should read closed");
+            let why_not = remote.why_off().expect("a closed gate says why");
             assert!(
                 why_not.contains(&format!("{release:?}")),
                 "{why_not:?} does not name {release:?}"
+            );
+            assert!(
+                !why_not.contains(NEWER_THAN_THE_TABLE),
+                "{release:?} is not newer than the table, and {why_not:?} says it is"
             );
         }
     }
 
     #[test]
-    fn python_frames_alone_are_refused_where_nothing_could_be_recorded() {
-        let why_not = Some("kernel \"6.12.95\" is not known to carry the fix");
+    fn a_line_newer_than_the_table_reads_closed_and_says_so() {
+        let on_aarch64 = |release: &str| RemoteReadFacts {
+            aarch64: true,
+            kernel_release: release.to_string(),
+        };
+        // Past the newest listed line: closed like any line that is not
+        // listed, and the reason says which kind of unlisted it is.
+        for release in ["7.3.0", "7.10.2-acme.4", "8.0.0"] {
+            assert!(newer_than_every_listed_line(release), "{release:?}");
+            let remote = remote_reads(&on_aarch64(release));
+            let why_not = remote
+                .why_off()
+                .expect("a line newer than the table reads closed");
+            assert!(
+                why_not.contains(NEWER_THAN_THE_TABLE),
+                "{why_not:?} does not say that {release:?} is newer than the table"
+            );
+        }
+        // The newest listed line itself, an older line that is not listed, a
+        // line between two listed ones and a string that cannot be placed:
+        // none is newer than every listed line.
+        for release in ["7.2.5", "7.2.6", "6.14.0", "6.19.3", "garbage", ""] {
+            assert!(!newer_than_every_listed_line(release), "{release:?}");
+        }
+        // And elsewhere than aarch64 it never matters.
+        let elsewhere = RemoteReadFacts {
+            aarch64: false,
+            kernel_release: "7.3.0".to_string(),
+        };
+        assert_eq!(remote_reads(&elsewhere), RemoteReads::On);
+        // The arm64 job's contract step and the README quote these words: a
+        // change here is a change there.
+        assert_eq!(
+            NEWER_THAN_THE_TABLE,
+            "a stable line newer than every line this build lists"
+        );
+    }
+
+    #[test]
+    fn python_frames_alone_record_nothing_where_the_reads_are_off() {
+        let off = RemoteReads::Off("kernel \"6.12.95\" is not known to carry the fix".to_string());
         // With the reads on, and in the modes that record every targeted
-        // thread stack or not, there is something to record: no refusal.
+        // thread stack or not, there is something to record: nothing to say.
         for frames in [
             TaskStackFrames::Native,
             TaskStackFrames::Python,
             TaskStackFrames::All,
         ] {
-            assert_eq!(why_not_recordable(frames, true, None), None);
+            assert_eq!(why_not_recordable(frames, &RemoteReads::On), None);
         }
-        assert_eq!(
-            why_not_recordable(TaskStackFrames::Native, false, why_not),
-            None
-        );
-        assert_eq!(
-            why_not_recordable(TaskStackFrames::All, false, why_not),
-            None
-        );
-        // Python frames alone with the reads off: refused, with the reason.
-        let refusal = why_not_recordable(TaskStackFrames::Python, false, why_not)
-            .expect("nothing to record must be refused");
-        assert!(refusal.contains("Python frames alone cannot be recorded here"));
+        assert_eq!(why_not_recordable(TaskStackFrames::Native, &off), None);
+        assert_eq!(why_not_recordable(TaskStackFrames::All, &off), None);
+        // Python frames alone with the reads off: the iterator is not loaded,
+        // and the line that says so opens like the other modes' line, carries
+        // the reason, and says that the capture runs on.
+        let line = why_not_recordable(TaskStackFrames::Python, &off)
+            .expect("an empty table must be announced");
+        assert!(line.starts_with("task-stacks: not reading other tasks' memory: "));
         assert!(
-            refusal.contains("6.12.95"),
-            "{refusal:?} does not carry the reason"
+            line.contains("6.12.95"),
+            "{line:?} does not carry the reason"
         );
-        assert!(refusal.contains("native or all"));
+        assert!(line.contains("the rest of it runs on"));
+        assert!(line.contains("native or all"));
     }
 
     fn task(tgid: u32, tid: u32, comm: &str) -> task_info {

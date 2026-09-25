@@ -427,11 +427,22 @@ jobs:
         # The recorder decides by the kernel's release, with nothing forcing it either way.
         # A runner image on a release known to carry the fix runs the cases open, and the
         # cases for a kernel without it then did NOT run here: said as a warning on the run,
-        # never passed over in silence.
+        # never passed over in silence. A runner on a stable line newer than every line the
+        # recorder's table lists reads closed only because the table is behind, and the
+        # recorder says so in fixed words: that is an error here, naming the table, so that
+        # a new line is added when it appears and not when someone misses their stacks.
         if: always()
         run: |
           OUT="$GITHUB_WORKSPACE/task-context-e2e-arm64.log"
+          if [ ! -s "$OUT" ]; then
+            echo "::warning::no task_context end-to-end log was written: an earlier step ended before the cases ran, and its failure is the one to read"
+            exit 0
+          fi
           if grep -q -F 'TASK-STACKS-CONTRACT closed' "$OUT"; then
+            if grep -q -F 'a stable line newer than every line this build lists' "$OUT"; then
+              echo "::error::kernel $(uname -r) is on a stable line newer than every line the task-stacks recorder lists, so it read as not fixed: add the line to FIND_VMA_FIXED_FROM in src/task_stacks_recorder.rs"
+              exit 1
+            fi
             echo "::notice::kernel $(uname -r): the task-stacks recorder did not read other tasks' memory here, by its own decision at load, and its cases were held to that"
           elif grep -q -F 'TASK-STACKS-CONTRACT open' "$OUT"; then
             echo "::warning::kernel $(uname -r) reads as carrying the fix for the unwinder's mapping lookup: the task-stacks recorder read other tasks' memory, so the cases for a kernel without the fix did NOT run on this runner"

@@ -458,11 +458,15 @@ records it once, on `sysinfo`.
 
 ### Added columns
 - `sysinfo.task_stacks_remote_reads` (VARCHAR): `on`, or `off:kernel-release`.
-  Written by every capture whose task-stacks recorder ran, on every
-  architecture, open or not, so that an absent value never reads as open. NULL
-  when the task-stacks recorder did not run, and in traces recorded before
-  schema 28, where it means unknown: a one-frame user stack there may be a
-  thread whose walk stopped at once, or a capture that could not read further.
+  Written by every capture that asked for the task-stacks recorder, on every
+  architecture, open or not, so that an absent value never reads as open. With
+  Python frames alone (`--task-stacks-frames python`) a capture that may not
+  read other tasks' memory loads no task-stacks iterator and runs on: its
+  `task_stack_event` is empty and this value, `off:kernel-release`, is what
+  says why. NULL when the task-stacks recorder was not asked for, and in
+  traces recorded before schema 28, where it means unknown: a one-frame user
+  stack there may be a thread whose walk stopped at once, or a capture that
+  could not read further.
 
   ```sql
   SELECT trace_id, machine, release, task_stacks_remote_reads FROM sysinfo;

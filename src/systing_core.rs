@@ -6347,11 +6347,15 @@ pub fn systing(
                 task_stack_mode,
                 &cgroup_dirs,
             )?;
-            // Recorded for every capture the recorder runs in: nothing in its
-            // rows says whether other tasks' memory was read
-            // (sysinfo.task_stacks_remote_reads).
-            let _ = recorder.task_stacks_remote_reads.set(iter.remote_reads());
-            Some(iter)
+            // Recorded for every capture the recorder was asked for: nothing
+            // in its rows says whether other tasks' memory was read
+            // (sysinfo.task_stacks_remote_reads). No iterator comes back only
+            // where it would record nothing because that memory is not read,
+            // and then the value is what explains the empty table.
+            let _ = recorder
+                .task_stacks_remote_reads
+                .set(iter.as_ref().is_some_and(|iter| iter.remote_reads()));
+            iter
         } else {
             None
         };

@@ -922,7 +922,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- Python frames and no task context, by design; those rows read
             -- exactly like rows of threads whose walk stopped at once, so
             -- this column is the only marker. NULL when the task-stacks
-            -- recorder did not run, and in traces from before schema 28,
+            -- recorder was not asked for, and in traces from before schema 28,
             -- where it means unknown and never 'on'.
             task_stacks_remote_reads VARCHAR
         );

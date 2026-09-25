@@ -333,6 +333,8 @@ __noinline int task_stacks_read_python(pid_t tid)
 	int ret = 0;
 	u64 len;
 
+	/* remote_user_reads is tested here as well as at the call: below 6.8 a
+	 * global function is verified on its own (see task_stacks_config). */
 	if (!task_stacks_config.collect_python ||
 	    !task_stacks_config.remote_user_reads)
 		return 0;
@@ -369,6 +371,8 @@ __noinline u64 task_stacks_read_context(pid_t tid)
 	struct task_struct *task;
 	u64 id;
 
+	/* remote_user_reads is tested here as well as at the call: below 6.8 a
+	 * global function is verified on its own (see task_stacks_config). */
 	if (!task_context_config.enabled ||
 	    !task_stacks_config.remote_user_reads)
 		return 0;

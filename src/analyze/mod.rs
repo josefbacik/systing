@@ -317,8 +317,8 @@ pub struct TraceSystemInfo {
     /// that makes the unwinder's mapping lookup on another task safe; every
     /// user stack in `task_stack_event` is then its first frame alone, with
     /// no Python frames and no task context, and no row says so by itself);
-    /// `None` when the task-stacks recorder did not run, or for traces from
-    /// before schema 28, where it means unknown and never "on".
+    /// `None` when the task-stacks recorder was not asked for, or for traces
+    /// from before schema 28, where it means unknown and never "on".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_stacks_remote_reads: Option<String>,
 }

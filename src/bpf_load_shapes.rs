@@ -658,7 +658,7 @@ pub fn task_stacks_shape_table() -> Vec<TaskStacksLoadShape> {
         // for each part one constant prunes: the user stack past its first
         // frame, the Python walk asked for and held off, the context reader
         // asked for and held off. Python frames alone never load in it: such
-        // a capture refuses to start.
+        // a capture records nothing there and loads no iterator at all.
         gated(row(
             "task-stacks-gated-native",
             no_targets,

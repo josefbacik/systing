@@ -320,20 +320,26 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   design, every user stack is its first frame alone (where the thread was
   interrupted, from its saved registers), with no Python frames and no task
   context: its rows look like those of threads whose walk stopped at once.
-  `--task-stacks-frames python` would record nothing there and refuses to
-  start. No option and no environment variable opens this: it is decided once,
-  before the program is loaded, from a constant the kernel freezes at load, so
-  nothing at run time can turn it back on. The verifier then never walks the
-  lookup (its log for such a load does not name it), and what the verifier of
-  a privileged load never walked the kernel does not keep runnable: its
-  dead-code removal, read at its source and not seen in a dump of the loaded
-  program. The same holds for the calls that copy another task's memory on
-  Linux 6.8 or newer, where the kernel no longer verifies global functions
-  that nothing calls; on an older kernel two functions of the Python walker,
-  `pystacks_get_frame_data` and `pystacks_read_stacks_global`, are still
-  verified and kept with those calls inside, and nothing calls them. x86-64 is
-  not affected: its unwinder never makes the lookup. Which it was is recorded
-  for every capture the recorder runs in, as
+  `--task-stacks-frames python` would record nothing there: the capture says
+  so in that line, loads no task-stacks iterator and carries on with its
+  other recorders, its `task_stack_event` table empty. A kernel on a stable
+  line newer than every listed one reads as not fixed like any unlisted
+  line, and the line then names it
+  `a stable line newer than every line this build lists`: the cue to add it
+  to the table. No option and no environment variable opens this: it is
+  decided once, before the program is loaded, from a constant the kernel
+  freezes at load, so nothing at run time can turn it back on. The verifier
+  then never walks the lookup (its log for such a load does not name it),
+  and what the verifier of a privileged load never walked the kernel does
+  not keep runnable: its dead-code removal, read at its source and not seen
+  in a dump of the loaded program. The same holds for the calls that copy
+  another task's memory on Linux 6.8 or newer, where the kernel no longer
+  verifies global functions that nothing calls; on an older kernel two
+  functions of the Python walker, `pystacks_get_frame_data` and
+  `pystacks_read_stacks_global`, are still verified and kept with those
+  calls inside, and nothing calls them. x86-64 is not affected: its unwinder
+  never makes the lookup. Which it was is recorded for every capture the
+  recorder was asked for, the one that loaded no iterator included, as
   `sysinfo.task_stacks_remote_reads` (`on` or `off:kernel-release`, schema
   28): nothing in a row says so, and a capture from before the column reads
   NULL there, which means unknown and never `on`.

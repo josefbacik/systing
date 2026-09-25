@@ -672,7 +672,7 @@ pub struct SysInfoRecord {
     /// first frame alone and there are no Python frames and no task context,
     /// by design, and no row says so by itself: such rows read exactly like
     /// those of threads whose walk stopped at once, so this is the only
-    /// marker. `None` when the task-stacks recorder did not run, and in
+    /// marker. `None` when the task-stacks recorder was not asked for, and in
     /// traces from before schema 28, where it means unknown and never `on`.
     pub task_stacks_remote_reads: Option<String>,
 }
