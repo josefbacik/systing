@@ -153,6 +153,74 @@ fn keep_all_loads_everything_and_deletes_nothing() {
 }
 
 #[test]
+fn latest_only_loads_each_latest_and_deletes_nothing() {
+    let (dir, _elsewhere) = setup();
+    let d = dir.path();
+    let db = d.join("heap.duckdb");
+    let before = names(d);
+    let out = Command::new(BIN)
+        .arg(d.join("jeprof"))
+        .args(["--latest-only", "-o"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(loaded(&db), vec![(10, 2, 300), (11, 0, 400)]);
+    let mut expected = before.clone();
+    expected.push("heap.duckdb".into());
+    expected.sort();
+    assert_eq!(names(d), expected);
+
+    // Each of the two asks for what the other rules out.
+    let out = Command::new(BIN)
+        .arg(d.join("jeprof"))
+        .args(["--latest-only", "--keep-all", "-o"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(names(d), expected);
+}
+
+#[test]
+fn latest_only_holds_for_a_perfetto_output_too() {
+    use perfetto_protos::trace::Trace;
+    use protobuf::Message;
+
+    let (dir, _elsewhere) = setup();
+    let d = dir.path();
+    let out_dir = tempfile::tempdir().unwrap();
+    let pb = out_dir.path().join("heap.pb");
+    let before = names(d);
+    let out = Command::new(BIN)
+        .arg(d.join("jeprof"))
+        .args(["--latest-only", "-o"])
+        .arg(&pb)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // One dump a process, where a timeline would take all four that parse.
+    let trace = Trace::parse_from_bytes(&std::fs::read(&pb).unwrap()).unwrap();
+    let mut pids: Vec<u64> = trace
+        .packet
+        .iter()
+        .filter(|p| p.has_profile_packet())
+        .flat_map(|p| p.profile_packet().process_dumps.iter().map(|d| d.pid()))
+        .collect();
+    pids.sort();
+    assert_eq!(pids, vec![10, 11]);
+    assert_eq!(names(d), before);
+}
+
+#[test]
 fn dry_run_writes_and_deletes_nothing() {
     let (dir, _elsewhere) = setup();
     let d = dir.path();

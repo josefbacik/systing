@@ -33,6 +33,7 @@ cargo build --release -p systing-heap
 systing-heap -o heap.duckdb /data/heap/jeprof
 systing-heap -o heap.duckdb /data/heap/jeprof --dry-run   # show, change nothing
 systing-heap -o heap.duckdb /data/heap/jeprof --keep-all  # every snapshot, delete nothing
+systing-heap -o heap.duckdb /data/heap/jeprof --latest-only  # the latest of each process, delete nothing
 
 # Files or directories: loaded, never deleted.
 systing-heap -o heap.duckdb a.heap b.heap
@@ -63,7 +64,7 @@ Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process gets a heap-
 - **The numbers are estimates.** Each stack's sampled counts are unbiased before anything is added up (see Sampling and unbiasing), the same `est_*` values the DuckDB tables hold.
 - **Each snapshot holds its increase since the previous one,** and Perfetto adds them up, so the flamegraph at a marker shows the state at that snapshot. "Unreleased" is the live estimate. "Total allocated" is jemalloc's cumulative total when it ran with `prof_accum:true`; otherwise it is the smallest total consistent with the live counts seen, which is a lower bound.
 - **Times are the dumps' own.** A marker's time is its dump file's modification time, wall-clock, and the trace declares every clock equal to it, so markers sit at the right distances from each other; opened beside a systing capture, whose times are on the boot clock, they land far from its events.
-- **Every snapshot is loaded.** A timeline is for history, so with a prefix input a Perfetto output loads every snapshot on disk, then, once the trace is written, deletes each process's older ones as the DuckDB output does. The history is in the trace; each run's trace covers the snapshots written since the last run. `--keep-all` deletes nothing.
+- **Every snapshot is loaded.** A timeline is for history, so with a prefix input a Perfetto output loads every snapshot on disk, then, once the trace is written, deletes each process's older ones as the DuckDB output does. The history is in the trace; each run's trace covers the snapshots written since the last run. `--keep-all` deletes nothing. `--latest-only` loads only each process's latest snapshot, as for a DuckDB output, and deletes nothing.
 
 ## One snapshot per process
 
@@ -75,6 +76,7 @@ Users usually care about the current state, so with a prefix input the tool keep
 - **Loaded.** Each pid's latest snapshot. If the latest does not parse (jemalloc may still be writing it), the newest one that parses is loaded, and the unparsed newer file is kept. A Perfetto output loads the older ones too (see Perfetto output).
 - **Deleted.** That pid's files older than the loaded one, and only after the new output is in place and synced. Each deletion is printed. With a DuckDB output their contents are in no database: only the latest is loaded.
 - **Kept.** The loaded file itself, and any newer unparsed file.
+- **Reading without deleting.** `--latest-only` loads the same one snapshot per process and deletes nothing, for a reader that does not own the directory. `--keep-all` also deletes nothing, and loads every snapshot.
 
 A file is never read or deleted unless it is a regular file (symlinks are not followed) and its first line is `heap_v2/`.
 Files that start with the prefix but fail these checks, or have no pid after the prefix, are left alone with a warning.

@@ -46,6 +46,11 @@ struct Cli {
     #[arg(long)]
     keep_all: bool,
 
+    /// With a prefix input, load only each process's latest snapshot, also
+    /// for a Perfetto output, and delete nothing.
+    #[arg(long, conflicts_with = "keep_all")]
+    latest_only: bool,
+
     /// Print what would be loaded and deleted; write and delete nothing.
     #[arg(long)]
     dry_run: bool,
@@ -61,6 +66,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let as_perfetto = perfetto::is_perfetto_output(&cli.output);
+    let load_all = !cli.latest_only && (cli.keep_all || as_perfetto);
+    let delete_older = !cli.keep_all && !cli.latest_only;
     let mut snapshots: Vec<Snapshot> = Vec::new();
     let mut plans: Vec<retention::Plan> = Vec::new();
     for input in &cli.inputs {
@@ -69,7 +76,7 @@ fn main() -> Result<()> {
                 snapshots.push(read(&path, format)?);
             }
         } else {
-            let mut plan = retention::scan(input, cli.keep_all || as_perfetto, !cli.keep_all)?;
+            let mut plan = retention::scan(input, load_all, delete_older)?;
             snapshots.append(&mut plan.load);
             plans.push(plan);
         }
