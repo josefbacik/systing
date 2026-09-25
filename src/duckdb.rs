@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 27;
+pub const SCHEMA_VERSION: u32 = 28;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -913,7 +913,18 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- (zero-window, RTO, drops, backlog, memory pressure, TX queue
             -- stop/wake, state changes) are never sampled. NULL when the
             -- packets recorder did not run, and in traces from systing < 1.18.
-            network_packet_sample_rate BIGINT
+            network_packet_sample_rate BIGINT,
+            -- Whether the task-stacks recorder read other tasks' user
+            -- memory: 'on', or 'off:kernel-release' (an aarch64 kernel whose
+            -- release is not known to carry the fix that makes the unwinder's
+            -- mapping lookup on another task safe). With it off every user
+            -- stack in task_stack_event is its first frame alone, with no
+            -- Python frames and no task context, by design; those rows read
+            -- exactly like rows of threads whose walk stopped at once, so
+            -- this column is the only marker. NULL when the task-stacks
+            -- recorder was not asked for, and in traces from before schema 28,
+            -- where it means unknown and never 'on'.
+            task_stacks_remote_reads VARCHAR
         );
 
         -- Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on

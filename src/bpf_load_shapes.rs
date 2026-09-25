@@ -531,6 +531,13 @@ pub struct TaskStacksLoadShape {
     /// too. A row of its own for the frames it is combined with, since the
     /// verifier prunes by this constant like the others.
     pub task_context: Option<TaskContextMode>,
+    /// Whether the object may read other tasks' user memory. `false` is the
+    /// shape an aarch64 host loads below the kernel releases that make the
+    /// unwinder's mapping lookup safe: the unwinder past its first frame,
+    /// the Python walk and the context reader are all pruned by one
+    /// constant, whatever the row's frames and context ask for. A row for
+    /// each part that prunes.
+    pub remote_reads: bool,
 }
 
 /// The configurations of the task-stacks object that ship. The filter rows
@@ -560,9 +567,14 @@ pub fn task_stacks_shape_table() -> Vec<TaskStacksLoadShape> {
         mode,
         members,
         task_context: None,
+        remote_reads: true,
     };
     let with_task_context = |shape: TaskStacksLoadShape| TaskStacksLoadShape {
         task_context: Some(TaskContextMode { restricted: false }),
+        ..shape
+    };
+    let gated = |shape: TaskStacksLoadShape| TaskStacksLoadShape {
+        remote_reads: false,
         ..shape
     };
     vec![
@@ -642,6 +654,29 @@ pub fn task_stacks_shape_table() -> Vec<TaskStacksLoadShape> {
             TaskStackFrames::All,
             false,
         )),
+        // The shape of a host that may not read other tasks' memory, once
+        // for each part one constant prunes: the user stack past its first
+        // frame, the Python walk asked for and held off, the context reader
+        // asked for and held off. Python frames alone never load in it: such
+        // a capture records nothing there and loads no iterator at all.
+        gated(row(
+            "task-stacks-gated-native",
+            no_targets,
+            TaskStackFrames::Native,
+            false,
+        )),
+        gated(row(
+            "task-stacks-gated-all",
+            no_targets,
+            TaskStackFrames::All,
+            false,
+        )),
+        gated(with_task_context(row(
+            "task-stacks-gated-task-context-native",
+            no_targets,
+            TaskStackFrames::Native,
+            false,
+        ))),
     ]
 }
 
@@ -950,6 +985,22 @@ R0 unbounded memory access\n\
                 "no {mode:?} row with task_context"
             );
         }
+        // The shape that reads nothing of another task is verified for each
+        // part it prunes: the user stack, the Python walk, the context
+        // reader. Python frames alone never load in it.
+        let gated: Vec<&TaskStacksLoadShape> = shapes.iter().filter(|s| !s.remote_reads).collect();
+        assert!(gated
+            .iter()
+            .any(|s| s.mode == TaskStackFrames::Native && s.task_context.is_none()));
+        assert!(gated.iter().any(|s| s.mode.needs_pystacks()));
+        assert!(gated.iter().any(|s| s.task_context.is_some()));
+        assert!(gated.iter().all(|s| s.mode != TaskStackFrames::Python));
+        assert!(gated
+            .iter()
+            .all(|s| s.name.starts_with("task-stacks-gated-")));
+        assert!(shapes
+            .iter()
+            .all(|s| s.remote_reads != s.name.starts_with("task-stacks-gated-")));
     }
 
     #[test]

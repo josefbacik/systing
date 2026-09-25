@@ -445,6 +445,44 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 28 (systing 1.25.0) — 2026-09-25
+
+A capture says whether its task-stacks recorder read other tasks' user memory.
+On aarch64 the recorder does that only on a kernel whose release is known to
+carry the fix that makes the unwinder's mapping lookup on another task safe
+(see the README's Task Stacks section); where it does not, every user stack is
+its first frame alone and there are no Python frames and no task context, by
+design. No row of `task_stack_event` differs for it: such a row is exactly what
+an open capture writes for a thread whose walk stopped at once. So the capture
+records it once, on `sysinfo`.
+
+### Added columns
+- `sysinfo.task_stacks_remote_reads` (VARCHAR): `on`, or `off:kernel-release`.
+  Written by every capture that asked for the task-stacks recorder, on every
+  architecture, open or not, so that an absent value never reads as open. With
+  Python frames alone (`--task-stacks-frames python`) a capture that may not
+  read other tasks' memory loads no task-stacks iterator and runs on: its
+  `task_stack_event` is empty and this value, `off:kernel-release`, is what
+  says why. NULL when the task-stacks recorder was not asked for, and in
+  traces recorded before schema 28, where it means unknown: a one-frame user
+  stack there may be a thread whose walk stopped at once, or a capture that
+  could not read further.
+
+  ```sql
+  SELECT trace_id, machine, release, task_stacks_remote_reads FROM sysinfo;
+  ```
+
+  `systing-analyze trace info` (and the MCP `trace_info` tool) report it under
+  `system`.
+
+### Compatibility
+- A reader at this version imports an older `sysinfo.parquet` with the new
+  column NULL.
+- A reader older than this version that has the import guard (1.18.2 and
+  newer) imports a newer `sysinfo.parquet` without the column and warns once; a
+  reader older than 1.18.2 fails the import of it whole. So readers move to
+  this version before writers do.
+
 ## Schema Version 27 (systing 1.24.0) — 2026-09-24
 
 The task-stacks recorder carries a thread's task_context. With

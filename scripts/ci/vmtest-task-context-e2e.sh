@@ -123,11 +123,39 @@ want_count() {
     need_line "\[all of user memory\] $read_nothing"
     need_line "\[vfork child\] [0-9]+ samples of the child, none with a context id; [0-9]+ of the parent's carry one"
     # The task-stacks recorder's cases, with the CPU sampler off: what they read, the
-    # recorder's iterator read, from another task's memory.
+    # recorder's iterator read, from another task's memory. Where the recorder does not
+    # read other tasks' memory (an aarch64 kernel not known to carry the fix its
+    # unwinder's mapping lookup needs) it says so itself at the start of each capture,
+    # and its four captures are then held to that instead: events with no context id and
+    # an empty table, no context read through the recorder, and no refusal counted by a
+    # reader that never ran. All four say it or none does.
+    not_reading="task-stacks: not reading other tasks' memory: "
+    said_so="$(grep -c -F -- "$not_reading" "$RAW")"
     events_whole='[0-9]+ events, [0-9]+ with a context id, [0-9]+ contexts of 3 threads'
-    need_line "\[task stacks: linked in\] $events_whole"
-    need_line "\[task stacks: shared object\] $events_whole"
-    need_line "\[task stacks: shared object, dtv\] $events_whole"
+    events_not_read='not read \(off:kernel-release\): [0-9]+ events, none with a context id, no task_context row'
+    case "$said_so" in
+        0)
+            stacks_read=3
+            stacks_restricted=1
+            events_wanted="$events_whole"
+            ok "TASK-STACKS-CONTRACT open: the task-stacks recorder read other tasks' memory in its captures"
+            ;;
+        4)
+            stacks_read=0
+            stacks_restricted=0
+            events_wanted="$events_not_read"
+            ok "TASK-STACKS-CONTRACT closed: each of the task-stacks recorder's 4 captures said: $(grep -m 1 -F -- "$not_reading" "$RAW")"
+            ;;
+        *)
+            stacks_read=0
+            stacks_restricted=0
+            events_wanted="$events_not_read"
+            fail "$said_so of the task-stacks recorder's 4 captures said it does not read other tasks' memory: all of them or none"
+            ;;
+    esac
+    need_line "\[task stacks: linked in\] $events_wanted"
+    need_line "\[task stacks: shared object\] $events_wanted"
+    need_line "\[task stacks: shared object, dtv\] $events_wanted"
     need_line "\[task stacks: confidentiality mode\] [0-9]+ events, none with a context id, no task_context row"
 
     # The reader's own counters, one line a capture.
@@ -137,10 +165,10 @@ want_count() {
     cat "$counters"
     refusal='(unset|out_of_range|slot_read_failed|tp_implausible|block_read_failed|bad_header)=[1-9]'
     want_count "$(grep -c '' "$counters")" "$CAPTURES" "captures printed their counters"
-    want_count "$(grep -c -E 'new_id=[1-9]' "$counters")" 9 \
-        "captures read a context (the three started programs, the running program twice, the vfork parent, the three started programs again through the task-stacks recorder)"
-    want_count "$(grep -E 'restricted=[1-9]' "$counters" | grep -c -v -E '(new|same)_id=')" 2 \
-        "captures counted the confidentiality mode's refusals and read nothing (the sampler's, the task-stacks recorder's)"
+    want_count "$(grep -c -E 'new_id=[1-9]' "$counters")" "$((6 + stacks_read))" \
+        "captures read a context (the three started programs, the running program twice, the vfork parent, and through the task-stacks recorder the three started programs again where it reads other tasks' memory)"
+    want_count "$(grep -E 'restricted=[1-9]' "$counters" | grep -c -v -E '(new|same)_id=')" "$((1 + stacks_restricted))" \
+        "captures counted the confidentiality mode's refusals and read nothing (the sampler's, and the task-stacks recorder's where it reads other tasks' memory)"
     want_count "$(grep -v -E '(new_id|same_id|restricted)=' "$counters" | grep -c -E "$refusal")" 2 \
         "captures counted a refusal of the recipe planted on them and read nothing"
 
