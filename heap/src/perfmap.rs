@@ -111,25 +111,37 @@ pub fn candidates(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Vec<PathBuf>
         .collect()
 }
 
-/// Read a perf map found by [`find`]. Anyone can write /tmp, so the file is
-/// opened without following a symlink and must be a regular file, checked on
-/// the open handle, of at most [`MAX_BYTES`]. One in a world-writable
-/// directory must also be owned by this user or root, as perf requires, or
-/// another user could name our frames.
+/// Read a perf map found by [`candidates`], under the rules of
+/// [`read_text_in`].
 pub fn read(path: &Path) -> std::io::Result<PerfMap> {
     read_in(None, path, None)
 }
 
-/// As [`read`], with `path` beneath `root` when there is one. The reader is
-/// then outside the container and is not the user its processes run as, so
-/// the user who may own a map in a world-writable directory is the one who
-/// owns the process's dump, `dump_owner`: the same process wrote both. No
-/// other user in the container can then name that process's frames.
+/// As [`read`], with `path` beneath `root` when there is one.
 pub fn read_in(
     root: Option<&Root>,
     path: &Path,
     dump_owner: Option<u32>,
 ) -> std::io::Result<PerfMap> {
+    Ok(PerfMap::parse(&read_text_in(root, path, dump_owner)?))
+}
+
+/// The text of a file that names frames (a perf map, a code map). Anyone can
+/// write /tmp, so the file is opened without following a symlink and must be
+/// a regular file, checked on the open handle, of at most [`MAX_BYTES`]. One
+/// in a world-writable directory must also be owned by this user or root, as
+/// perf requires, or another user could name our frames.
+///
+/// With `path` beneath `root`, the reader is outside the container and is
+/// not the user its processes run as, so the user who may own a map in a
+/// world-writable directory is the one who owns the process's dump,
+/// `dump_owner`: the same process wrote both. No other user in the container
+/// can then name that process's frames.
+pub fn read_text_in(
+    root: Option<&Root>,
+    path: &Path,
+    dump_owner: Option<u32>,
+) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind};
     let (file, world_writable_dir, trusted_owner) = match root {
         Some(root) => {
@@ -178,7 +190,7 @@ pub fn read_in(
     }
     let mut text = String::new();
     (&file).take(MAX_BYTES).read_to_string(&mut text)?;
-    Ok(PerfMap::parse(&text))
+    Ok(text)
 }
 
 /// Whether a map owned by `owner` may be used. Anywhere but in a

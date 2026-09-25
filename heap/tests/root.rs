@@ -1,6 +1,6 @@
 //! Reading a container's snapshots from outside it, through the binary:
-//! `--pid` and `--root-fd` keep the prefix, the binaries and the perf map
-//! beneath the root, and take prefix inputs only.
+//! `--pid` and `--root-fd` keep the prefix, the binaries, the perf map and the
+//! code map beneath the root, and take prefix inputs only.
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -247,4 +247,135 @@ fn a_file_or_directory_input_is_refused_beneath_a_root() {
     }
     assert!(!db.exists());
     assert!(root.path().join("heap-dumps/jeprof.123.0.i0.heap").exists());
+}
+
+/// A dump of a process that ran the hooks' "python" backtrace: one stack
+/// with a Python frame in it, and the mapping that names the process's code
+/// map.
+const PYTHON_DUMP: &str = "heap_v2/524288\n  t*: 1: 64 [0: 0]\n\
+    @ 0x30008 0x5059000001000000 0x5059000000000000\n  t*: 1: 64 [0: 0]\n\
+    \nMAPPED_LIBRARIES:\n\
+    00030000-00031000 rw-p 00000000 00:00 0 \n\
+    7fe5b7d00000-7fe5b7d01000 r--p 00000000 00:01 94950 /memfd:systing-pycode-dead0a9f94b985ac (deleted)\n";
+
+const CODE_MAP: &str = "# systing-pycode 1 token=dead0a9f94b985ac pid=77 python=3.13\n\
+    1 8 1:6c65616b 1:2f7372762f6170702f776f726b2e7079 8000dc0d1290318e58\n";
+
+#[test]
+fn a_code_map_is_looked_for_beneath_the_root() {
+    let name = "pycode-77-dead0a9f94b985ac.map";
+    // Beside the dump, where the hook writes it; then in --perf-map-dir,
+    // which comes first.
+    for (place, args) in [
+        ("heap-dumps", vec![]),
+        ("maps", vec!["--perf-map-dir", "/maps"]),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["heap-dumps", "maps"] {
+            std::fs::create_dir(root.path().join(dir)).unwrap();
+        }
+        std::fs::write(
+            root.path().join("heap-dumps/jeprof.77.0.m0.heap"),
+            PYTHON_DUMP,
+        )
+        .unwrap();
+        std::fs::write(root.path().join(place).join(name), CODE_MAP).unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let db = out_dir.path().join("heap.duckdb");
+        let (_dir, number) = inheritable(root.path());
+        let mut all = vec!["--root-fd", number.as_str(), "--latest-only"];
+        all.extend(args);
+        let out = run(&all, &db, "/heap-dumps/jeprof");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{place}: {stderr}");
+        assert!(
+            stderr.contains(&format!("pid 77: Python frames named from /{place}/{name}")),
+            "{place}: {stderr}"
+        );
+        assert!(!stderr.contains("no code map names"), "{place}: {stderr}");
+        let conn = Connection::open(&db).unwrap();
+        let named: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM frame WHERE name = 'leak (python) [work.py:8]'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(named, 1, "{place}");
+    }
+}
+
+#[test]
+fn a_code_map_is_looked_for_beneath_the_root_a_pid_names() {
+    // This test's own root is the machine's, so the dumps' folder is reached
+    // beneath it by its full path.
+    let name = "pycode-77-dead0a9f94b985ac.map";
+    let pid = std::process::id().to_string();
+    for place in ["heap-dumps", "maps"] {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["heap-dumps", "maps"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("heap-dumps/jeprof.77.0.m0.heap"),
+            PYTHON_DUMP,
+        )
+        .unwrap();
+        let map = dir.path().join(place).join(name);
+        std::fs::write(&map, CODE_MAP).unwrap();
+        let maps = dir.path().join("maps");
+        let mut args = vec!["--pid", pid.as_str(), "--latest-only"];
+        if place == "maps" {
+            args.extend(["--perf-map-dir", maps.to_str().unwrap()]);
+        }
+        let out_dir = tempfile::tempdir().unwrap();
+        let db = out_dir.path().join("heap.duckdb");
+        let prefix = dir.path().join("heap-dumps/jeprof");
+        let out = run(&args, &db, prefix.to_str().unwrap());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{place}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "pid 77: Python frames named from {}",
+                map.display()
+            )),
+            "{place}: {stderr}"
+        );
+        assert!(!stderr.contains("no code map names"), "{place}: {stderr}");
+        let conn = Connection::open(&db).unwrap();
+        let named: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM frame WHERE name = 'leak (python) [work.py:8]'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(named, 1, "{place}");
+    }
+}
+
+#[test]
+fn the_readers_own_files_are_no_place_for_a_code_map_beneath_a_root() {
+    // The map is where the dump says, on the reader's side of the root and
+    // not beneath it: it names nothing.
+    let outside = tempfile::tempdir().unwrap();
+    let dumps = outside.path().join("heap-dumps");
+    std::fs::create_dir(&dumps).unwrap();
+    std::fs::write(dumps.join("pycode-77-dead0a9f94b985ac.map"), CODE_MAP).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let inside = root.path().join(dumps.strip_prefix("/").unwrap());
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::write(inside.join("jeprof.77.0.m0.heap"), PYTHON_DUMP).unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let db = out_dir.path().join("heap.duckdb");
+    let (_dir, number) = inheritable(root.path());
+    let out = run(
+        &["--root-fd", number.as_str(), "--latest-only"],
+        &db,
+        dumps.join("jeprof").to_str().unwrap(),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("Python frames named from"), "{stderr}");
+    assert!(stderr.contains("no code map names"), "{stderr}");
 }
