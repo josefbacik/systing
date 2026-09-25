@@ -313,24 +313,30 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   6.12.110, 6.18.52 or 7.2.6, and later releases of those stable lines. The
   release is read once at start (`uname -r`) and judged by its leading
   `MAJOR.MINOR.PATCH` alone: a string that cannot be placed, a line that is not
-  listed and a vendor build that carries the fix under an older number all
-  read as not fixed. There the capture prints
+  listed (a newer stable line too, until it is added to the table in
+  `src/task_stacks_recorder.rs`) and a vendor build that carries the fix under
+  an older number all read as not fixed. There the capture prints
   `task-stacks: not reading other tasks' memory: ...` at start and, by
   design, every user stack is its first frame alone (where the thread was
   interrupted, from its saved registers), with no Python frames and no task
   context: its rows look like those of threads whose walk stopped at once.
   `--task-stacks-frames python` would record nothing there and refuses to
-  start. No option and no environment variable opens this. The lookup is then
-  not in the loaded program at all. The calls that copy another task's memory
-  are never reached, and on Linux 6.8 or newer, where the kernel drops global
-  functions that nothing calls, they are not loaded either; on an older kernel
-  the loaded program still holds two functions of the Python walker,
-  `pystacks_get_frame_data` and `pystacks_read_stacks_global`, with those
-  calls inside, and nothing calls them. x86-64 is not affected: its unwinder
-  never makes the lookup. Which it was is recorded for every capture the
-  recorder runs in, as `sysinfo.task_stacks_remote_reads` (`on` or
-  `off:kernel-release`, schema 28): nothing in a row says so, and a capture
-  from before the column reads NULL there, which means unknown and never `on`.
+  start. No option and no environment variable opens this: it is decided once,
+  before the program is loaded, from a constant the kernel freezes at load, so
+  nothing at run time can turn it back on. The verifier then never walks the
+  lookup (its log for such a load does not name it), and what the verifier of
+  a privileged load never walked the kernel does not keep runnable: its
+  dead-code removal, read at its source and not seen in a dump of the loaded
+  program. The same holds for the calls that copy another task's memory on
+  Linux 6.8 or newer, where the kernel no longer verifies global functions
+  that nothing calls; on an older kernel two functions of the Python walker,
+  `pystacks_get_frame_data` and `pystacks_read_stacks_global`, are still
+  verified and kept with those calls inside, and nothing calls them. x86-64 is
+  not affected: its unwinder never makes the lookup. Which it was is recorded
+  for every capture the recorder runs in, as
+  `sysinfo.task_stacks_remote_reads` (`on` or `off:kernel-release`, schema
+  28): nothing in a row says so, and a capture from before the column reads
+  NULL there, which means unknown and never `on`.
 - The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
   with the stack by `stack_id` into `stack` like every other recorder's. With
   `--include-task-context` each row also has the id of its thread's task context

@@ -25,7 +25,7 @@ export LD_LIBRARY_PATH="$LIBDUCKDB_DIR"
     rc=$?
     # A second, small run: the task-stacks rows that may not read other tasks' memory are
     # loaded with the verifier's log (four loads at level 2, the first an open row that has
-    # to show the calls), and the log says what the loaded programs call.
+    # to show the calls), and the log says which calls the verifier walked in them.
     "$BIN" --ignored --test-threads=1 closed_task_stacks_rows_call_nothing_that_reads_another_task --nocapture
     closed_rc=$?
     [ "$rc" -ne 0 ] || rc="$closed_rc"

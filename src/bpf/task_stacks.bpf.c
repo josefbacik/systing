@@ -65,10 +65,12 @@ const volatile struct {
 	 * its first frame, a thread's Python frames, its task context. 0 unless
 	 * userspace sets it, and userspace sets it only where that is known to
 	 * be safe (see remote_reads() in task_stacks_recorder.rs). With it 0 the
-	 * unwinder and its bpf_find_vma() lookup on arm64 are dead code to the
-	 * verifier and are not loaded, and the Python walk and the task-context
-	 * reader are never reached; the kernel drops them too where it drops
-	 * global functions that nothing calls (6.8 and later). */
+	 * unwinder and its bpf_find_vma() lookup on arm64 sit behind a branch on
+	 * a frozen constant, so the verifier never walks them, and the Python
+	 * walk and the task-context reader are never reached. What the verifier
+	 * of a privileged load never walked the kernel does not keep runnable;
+	 * from 6.8 on that includes global functions that nothing calls, which
+	 * it no longer verifies. */
 	u32 remote_user_reads;
 } task_stacks_config = {0};
 

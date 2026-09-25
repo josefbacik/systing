@@ -101,6 +101,9 @@ const SELECTED_WHEN_KERNEL_HAS: &[(&str, &[&str])] = &[
 
 /// The task-stacks object's cgroup-members program.
 const TASK_STACKS_MEMBERS_PROG: &str = "systing_task_stacks_members";
+/// The task-stacks object's recording program: the one that walks a thread's
+/// user stack, and so the one whose verifier log the closed rows are read by.
+const TASK_STACKS_PROG: &str = "systing_task_stacks";
 
 /// The kfunc the cgroup-members program is written with.
 const CSS_TASK_ITER_SYMBOLS: &[&str] = &["bpf_iter_css_task_new"];
@@ -417,16 +420,21 @@ fn every_instruction_is_verified_by_some_shape() {
 }
 
 /// A call to each helper that reads another task's user memory, as the
-/// verifier prints one at log level 2.
+/// verifier prints one at log level 2 (`call <name>#<id>`). The mapping lookup
+/// is one helper, matched whole. The remote copy is a family: the helper
+/// `bpf_copy_from_user_task` and the kernel functions named after it
+/// (`bpf_copy_from_user_task_str`, `_dynptr`, `_str_dynptr`), so its needle
+/// ends before the `#` and matches every member by prefix. Today the object
+/// calls the helper alone.
 const CALL_FIND_VMA: &str = "call bpf_find_vma#";
-const CALL_COPY_FROM_USER_TASK: &str = "call bpf_copy_from_user_task#";
+const CALL_COPY_FROM_USER_TASK: &str = "call bpf_copy_from_user_task";
 
-/// Whether this kernel drops a global function that no verified path calls
-/// (6.8 and later). Before that every global function of an object is
-/// verified and kept whatever calls it, and the task-stacks object carries
+/// Whether this kernel leaves a global function that no verified path calls
+/// unverified (6.8 and later). Before that every global function of an object
+/// is verified and kept whatever calls it, and the task-stacks object carries
 /// two of the Python walker's that copy another task's memory, which nothing
 /// calls in a closed row.
-fn kernel_drops_uncalled_global_functions() -> bool {
+fn kernel_skips_uncalled_global_functions() -> bool {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
     let mut numbers = release
         .split(|c: char| !c.is_ascii_digit())
@@ -440,8 +448,9 @@ fn kernel_drops_uncalled_global_functions() -> bool {
 /// Load one row of the task-stacks table with every program at verifier log
 /// level 2, which prints each instruction the verifier walks, and say whether
 /// any program's log names a call to the mapping lookup, and to the remote
-/// copy. A row that does not load, or whose log names no helper call at all,
-/// is no read of either and fails here.
+/// copy. A row that does not load, a program that was loaded and printed no
+/// log, or a log that names no helper call at all, is no read of either and
+/// fails here.
 fn calls_that_read_another_task(shape: &TaskStacksLoadShape) -> (bool, bool) {
     let (report, _) = TaskStacksIter::load_probe(
         &shape.filter,
@@ -457,6 +466,25 @@ fn calls_that_read_another_task(shape: &TaskStacksLoadShape) -> (bool, bool) {
         "[{}] did not load at verifier log level 2: {}",
         shape.name,
         report.error.as_deref().unwrap_or("no error text")
+    );
+    // Every program that was loaded has to have printed its log, and the
+    // recording program has to be one of them: a program left out in silence
+    // would let another program's log answer for it.
+    for program in report.programs.iter().filter(|p| p.autoload) {
+        assert!(
+            program.verifier_log.is_some(),
+            "[{}] program `{}` was loaded and printed no verifier log",
+            shape.name,
+            program.name
+        );
+    }
+    assert!(
+        report
+            .programs
+            .iter()
+            .any(|p| p.name == TASK_STACKS_PROG && p.autoload && p.verifier_log.is_some()),
+        "[{}] the recording program `{TASK_STACKS_PROG}` is not among the logs read",
+        shape.name
     );
     let logs: Vec<&str> = report
         .programs
@@ -484,14 +512,17 @@ fn calls_that_read_another_task(shape: &TaskStacksLoadShape) -> (bool, bool) {
     )
 }
 
-/// The shape a host loads that may not read other tasks' memory holds no call
-/// that does. Every closed row of the task-stacks table is loaded with the
-/// verifier's log, and no program's log names the mapping lookup or, where
-/// the kernel drops the global functions nothing calls, the remote copy: a
-/// branch the verifier pruned on the frozen constant is never walked, so
-/// never printed. The read is shown to see such a call first: the smallest
-/// open row, loaded the same way, has to name the remote copy, and the
-/// lookup where the unwinder makes it (aarch64).
+/// The shape a host loads that may not read other tasks' memory makes no call
+/// that does, as far as its verifier's log shows. Every closed row of the
+/// task-stacks table is loaded with the verifier's log, and no program's log
+/// names the mapping lookup or, where the kernel does not verify the global
+/// functions nothing calls, the remote copy: a branch the verifier pruned on
+/// the frozen constant is never walked, so never printed. What this shows is
+/// "never walked by the verifier"; that such instructions are then gone from
+/// the loaded image is the kernel's dead-code removal on a privileged load,
+/// which this test does not see. The read is shown to see such a call first:
+/// the smallest open row, loaded the same way, has to name the remote copy,
+/// and the lookup where the unwinder makes it (aarch64).
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn closed_task_stacks_rows_call_nothing_that_reads_another_task() {
@@ -519,25 +550,25 @@ fn closed_task_stacks_rows_call_nothing_that_reads_another_task() {
         open.name
     );
 
-    let drops = kernel_drops_uncalled_global_functions();
+    let skips = kernel_skips_uncalled_global_functions();
     let closed: Vec<&TaskStacksLoadShape> = shapes.iter().filter(|s| !s.remote_reads).collect();
     assert!(!closed.is_empty(), "the table has no closed row");
     for shape in closed {
         let (find_vma, copy) = calls_that_read_another_task(shape);
         eprintln!(
             "[{}] closed: calls bpf_find_vma={find_vma} bpf_copy_from_user_task={copy} \
-             (this kernel drops uncalled global functions: {drops})",
+             (this kernel leaves uncalled global functions unverified: {skips})",
             shape.name
         );
         assert!(
             !find_vma,
-            "[{}] the loaded program calls bpf_find_vma",
+            "[{}] the verifier walked a call to bpf_find_vma",
             shape.name
         );
-        if drops {
+        if skips {
             assert!(
                 !copy,
-                "[{}] the loaded program calls bpf_copy_from_user_task",
+                "[{}] the verifier walked a call to bpf_copy_from_user_task",
                 shape.name
             );
         }
