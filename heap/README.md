@@ -33,10 +33,14 @@ cargo build --release -p systing-heap
 systing-heap -o heap.duckdb /data/heap/jeprof
 systing-heap -o heap.duckdb /data/heap/jeprof --dry-run   # show, change nothing
 systing-heap -o heap.duckdb /data/heap/jeprof --keep-all  # every snapshot, delete nothing
+systing-heap -o heap.duckdb /data/heap/jeprof --latest-only  # the latest of each process, delete nothing
 
 # Files or directories: loaded, never deleted.
 systing-heap -o heap.duckdb a.heap b.heap
 systing-heap -o heap.duckdb ./snapshots/
+
+# A container's snapshots, read from outside it (see below).
+systing-heap -o heap.duckdb --pid 4242 --latest-only /data/heap/jeprof
 ```
 
 An input that exists as a file or directory is only loaded.
@@ -63,7 +67,7 @@ Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process gets a heap-
 - **The numbers are estimates.** Each stack's sampled counts are unbiased before anything is added up (see Sampling and unbiasing), the same `est_*` values the DuckDB tables hold.
 - **Each snapshot holds its increase since the previous one,** and Perfetto adds them up, so the flamegraph at a marker shows the state at that snapshot. "Unreleased" is the live estimate. "Total allocated" is jemalloc's cumulative total when it ran with `prof_accum:true`; otherwise it is the smallest total consistent with the live counts seen, which is a lower bound.
 - **Times are the dumps' own.** A marker's time is its dump file's modification time, wall-clock, and the trace declares every clock equal to it, so markers sit at the right distances from each other; opened beside a systing capture, whose times are on the boot clock, they land far from its events.
-- **Every snapshot is loaded.** A timeline is for history, so with a prefix input a Perfetto output loads every snapshot on disk, then, once the trace is written, deletes each process's older ones as the DuckDB output does. The history is in the trace; each run's trace covers the snapshots written since the last run. `--keep-all` deletes nothing.
+- **Every snapshot is loaded.** A timeline is for history, so with a prefix input a Perfetto output loads every snapshot on disk, then, once the trace is written, deletes each process's older ones as the DuckDB output does. The history is in the trace; each run's trace covers the snapshots written since the last run. `--keep-all` deletes nothing. `--latest-only` loads only each process's latest snapshot, as for a DuckDB output, and deletes nothing.
 
 ## One snapshot per process
 
@@ -75,6 +79,7 @@ Users usually care about the current state, so with a prefix input the tool keep
 - **Loaded.** Each pid's latest snapshot. If the latest does not parse (jemalloc may still be writing it), the newest one that parses is loaded, and the unparsed newer file is kept. A Perfetto output loads the older ones too (see Perfetto output).
 - **Deleted.** That pid's files older than the loaded one, and only after the new output is in place and synced. Each deletion is printed. With a DuckDB output their contents are in no database: only the latest is loaded.
 - **Kept.** The loaded file itself, and any newer unparsed file.
+- **Reading without deleting.** `--latest-only` loads the same one snapshot per process and deletes nothing, for a reader that does not own the directory. `--keep-all` also deletes nothing, and loads every snapshot.
 
 A file is never read or deleted unless it is a regular file (symlinks are not followed) and its first line is `heap_v2/`.
 Files that start with the prefix but fail these checks, or have no pid after the prefix, are left alone with a warning.
@@ -101,6 +106,36 @@ Frames are named the way systing's recorders name them: `function (module [file:
 A frame in a known file with no symbol is `unknown (module) <0xaddr>`.
 Stripped system libraries (libc, the distro's libjemalloc) have no symbols for their internal functions, so those frames stay `unknown`.
 Every frame except the innermost is a return address, so the tool looks up the byte before it to land on the call itself.
+
+## Reading a container's snapshots from outside it
+
+A collector on the host can read one container's snapshots without a shell in the container, given the container's root directory: `--pid PID`, where PID is a process in the container as the host numbers it, which is not the number in its dumps' names, that being the process's own view of its id; or `--root-fd N`, where N is a descriptor for that directory the caller opened and left open for the tool to inherit.
+`--pid PID` reads beneath `/proc/PID/root`; `--root-fd` takes any directory, so a kept copy of a container's files with no process left is read the same way.
+
+```bash
+systing-heap -o heap.pb --pid 4242 --latest-only /data/heap/jeprof
+systing-heap -o heap.pb --root-fd 3 --latest-only /data/heap/jeprof 3< /mnt/kept-root
+```
+
+The tool opens the root once, at start, and a process id can come to name another process between a caller's look at it and that open.
+A person at a shell need not care; a program that has checked which process a number names passes the directory it checked, with `--root-fd`, and what it checked is then what is read.
+
+Every path the tool did not choose itself is then looked up beneath that directory: the inputs, the binaries each dump names, and the three places a perf map is looked for, `--perf-map-dir` included.
+So they mean what they meant to the process: `/tmp` is the container's `/tmp`, and the binaries are the image's own.
+The output path is the caller's and is never beneath the root.
+
+The kernel does the looking up (`openat2` with `RESOLVE_IN_ROOT`), as it would for a process whose root is that directory.
+An absolute symlink inside the container, a `..` at the top of a path, or a path a dump was made to name cannot lead outside it: joining the path onto the root by hand would follow such a link into the host's files.
+Links in `/proc` that jump elsewhere (`/proc/<pid>/exe`, `/proc/<pid>/fd/N`) are refused, and mounts beneath the root, such as the volume the dumps are on, are crossed.
+It needs Linux 5.6 or later; on an older kernel the run fails rather than fall back to plain opens.
+
+Only prefix inputs are taken beneath a root; a file or directory input is refused.
+The paths printed, and those stored in the output, are the container's.
+A prefix input still deletes older dumps unless told otherwise, so a reader that does not own the container's files passes `--latest-only` or `--keep-all`.
+One of the perf map's rules changes beneath a root, because the reader is outside the container and is not the user its processes run as: a map in a world-writable directory such as the container's `/tmp` is used only if root or the user who owns that process's dump owns it, the same process having written both.
+No other user in the container can then name that process's frames.
+A binary or a perf map that is on a FUSE or network filesystem beneath the root (a bucket or a file server mounted into the container) is left unread, with a warning, and its frames stay unresolved: whoever wrote the dumps chose those paths, a read there would be made with the reader's authority on storage the container only mounts, and it can stall without end.
+Beneath a root, names come from the binaries' own symbol tables and the perf map: debug information is not read there, so there are no inlined frames, no file and line, and no name that lives only in debug information. The symbolizer looks a binary's separate debug file up (its debug link, its `.dwp`) by paths of its own making, which are the reader's and not the container's, and the name it looks up is the binary's to choose.
 
 ## Python stacks
 
@@ -146,7 +181,7 @@ Things to know:
 - **Forking processes.** Each worker starts a perf map of its own, so the frames it inherited already running from the parent (a pre-fork server's loop, under every worker's stacks) are named in none the worker's dumps can use. On Python 3.13+, call `systing_heap_hooks.keep_perf_map_across_fork()` once in the parent, with trampolines on, before it forks: each child then adds the parent's map to its own. (CPython's own persist-after-fork setting is not used: it stops the child making trampolines, so what the worker runs afterwards goes unnamed.) The hook itself is fork-safe: unwinds take one lock, and a fork waits for any unwind in progress, since libunwind's cache lock has no fork handler of its own.
 - **Function granularity.** A trampoline is per function, so Python frames name the function and file (full path in `frame_file`), not the line. Library code gets pystacks' module prefix (`pkg.mod:Cls.run (python) [mod.py]`), so the same function has the same name as in a capture's stacks, apart from the line: pystacks writes `[mod.py:42]`, so drop the `:<line>` (`regexp_replace(name, ':\d+\]$', ']')`) to join the two by name.
 Application code has no module prefix, so two functions with the same qualified name in files with the same base name are one frame.
-- **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps. Without it, Python frames show as `unknown ([anon:exec])` and the tool warns. It prints which map named each process's frames, and a map is consulted only for addresses the dump's own memory map puts in anonymous executable memory, so a stale map cannot name data. A refused candidate falls through to the next. A map is read only if it is a regular file (symlinks are not followed) of at most 256 MiB, and one in a world-writable directory such as `/tmp` only if you or root own it, as perf requires: otherwise another user could name your frames.
+- **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps, or read the container's own files with `--pid`. Without the map, Python frames show as `unknown ([anon:exec])` and the tool warns. It prints which map named each process's frames, and a map is consulted only for addresses the dump's own memory map puts in anonymous executable memory, so a stale map cannot name data. A refused candidate falls through to the next. A map is read only if it is a regular file (symlinks are not followed) of at most 256 MiB, and one in a world-writable directory such as `/tmp` only if you or root own it, as perf requires: otherwise another user could name your frames.
 - **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran about 40% slower. Code that spends its time in C pays far less. The hook runs only for sampled allocations, so a finer sample period runs it more often (32 times as often per byte at a 16 KiB period as at the 512 KiB default), and threads unwinding at the same moment wait for one another.
 
 ## Sampling and unbiasing

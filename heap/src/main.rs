@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use systing_heap::perfmap::{self, PerfMap};
+use systing_heap::root::Root;
 use systing_heap::{db, jemalloc, perfetto, retention, symbolize, Format, Snapshot};
 
 /// Parse allocator heap snapshots (jemalloc prof dumps), symbolize their
@@ -17,6 +18,10 @@ use systing_heap::{db, jemalloc, perfetto, retention, symbolize, Format, Snapsho
 /// value given to MALLOC_CONF) loads the latest snapshot of each process
 /// and deletes that process's older dumps once the database is written. A
 /// file or directory input is only loaded, never deleted.
+///
+/// With --pid or --root-fd, the inputs and every path the snapshots name are
+/// resolved beneath that root, to read a container's snapshots from outside
+/// it.
 #[derive(Parser)]
 #[command(name = "systing-heap", version)]
 struct Cli {
@@ -46,30 +51,79 @@ struct Cli {
     #[arg(long)]
     keep_all: bool,
 
+    /// With a prefix input, load only each process's latest snapshot, also
+    /// for a Perfetto output, and delete nothing.
+    #[arg(long, conflicts_with = "keep_all")]
+    latest_only: bool,
+
     /// Print what would be loaded and deleted; write and delete nothing.
     #[arg(long)]
     dry_run: bool,
 
     /// Where to look first for each process's perf-<pid>.map, which names
     /// Python functions when it ran with perf trampolines
-    /// (PYTHONPERFSUPPORT=1). Then beside the snapshot, then /tmp.
+    /// (PYTHONPERFSUPPORT=1). Then beside the snapshot, then /tmp. With
+    /// --pid or --root-fd all three are beneath the root, /tmp being the
+    /// container's own.
     #[arg(long)]
     perf_map_dir: Option<PathBuf>,
+
+    /// Resolve the inputs and every path the snapshots name (the binaries,
+    /// the perf maps) beneath the root of the running process PID, as the
+    /// kernel would for that process: absolute symlinks and ".." cannot leave
+    /// it. For reading a container's snapshots from outside it, PID being a
+    /// process in the container: its id as this tool sees it, which is not
+    /// the number in its dumps' names. The root, /proc/PID/root, is opened
+    /// once at start. Takes prefix inputs only, and names frames from the
+    /// binaries' symbol tables alone, without debug information. The output
+    /// is not beneath the root. Needs Linux 5.6 or later.
+    #[arg(short, long, value_name = "PID", conflicts_with = "root_fd")]
+    pid: Option<u32>,
+
+    /// As --pid, the root being a directory descriptor inherited from the
+    /// caller, by its number: any directory the caller opened and left open.
+    /// A caller that has checked which process a number names should pass
+    /// the directory it checked this way, since a number can come to name
+    /// another process.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
+    root_fd: Option<i32>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let pid_root = cli
+        .pid
+        .map(|pid| PathBuf::from(format!("/proc/{pid}/root")));
+    let root = match (pid_root.as_ref(), cli.root_fd) {
+        (Some(dir), _) => {
+            Some(Root::open(dir).with_context(|| format!("opening the root {}", dir.display()))?)
+        }
+        (None, Some(fd)) => {
+            Some(Root::from_fd(fd).with_context(|| format!("taking descriptor {fd} as the root"))?)
+        }
+        (None, None) => None,
+    };
+    let root = root.as_ref();
+
     let as_perfetto = perfetto::is_perfetto_output(&cli.output);
+    let load_all = !cli.latest_only && (cli.keep_all || as_perfetto);
+    let delete_older = !cli.keep_all && !cli.latest_only;
     let mut snapshots: Vec<Snapshot> = Vec::new();
     let mut plans: Vec<retention::Plan> = Vec::new();
     for input in &cli.inputs {
-        if input.is_file() || input.is_dir() {
+        if is_file_or_dir(input, root)? {
+            if root.is_some() {
+                bail!(
+                    "{}: beneath a root an input must be a jemalloc prof_prefix, not a file or directory",
+                    input.display()
+                );
+            }
             for (path, format) in collect_inputs(input, cli.format)? {
                 snapshots.push(read(&path, format)?);
             }
         } else {
-            let mut plan = retention::scan(input, cli.keep_all || as_perfetto, !cli.keep_all)?;
+            let mut plan = retention::scan(input, load_all, delete_older, root)?;
             snapshots.append(&mut plan.load);
             plans.push(plan);
         }
@@ -85,7 +139,7 @@ fn main() -> Result<()> {
     if snapshots.is_empty() {
         bail!("no snapshots found in {:?}", cli.inputs);
     }
-    attach_perf_maps(&mut snapshots, cli.perf_map_dir.as_deref());
+    attach_perf_maps(&mut snapshots, cli.perf_map_dir.as_deref(), root);
     // Ids follow dump order: by process, then the allocator's sequence.
     snapshots.sort_by(|a, b| (a.pid, a.seq, &a.source_path).cmp(&(b.pid, b.seq, &b.source_path)));
 
@@ -101,7 +155,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let symbolized = symbolize::symbolize(&snapshots);
+    let symbolized = symbolize::symbolize_in(&snapshots, root);
     let stats = &symbolized.stats;
     for f in &stats.missing_files {
         eprintln!(
@@ -112,6 +166,12 @@ fn main() -> Result<()> {
     for f in &stats.refused_files {
         eprintln!(
             "warning: {} is not a regular file; not opened, its frames stay unresolved",
+            f.display()
+        );
+    }
+    for f in &stats.remote_files {
+        eprintln!(
+            "warning: {} is on a FUSE or network filesystem; not opened beneath a root, its frames stay unresolved",
             f.display()
         );
     }
@@ -167,23 +227,54 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Whether `input` exists as a file or a directory, beneath `root` when
+/// there is one; anything else is taken as a prefix.
+fn is_file_or_dir(input: &Path, root: Option<&Root>) -> Result<bool> {
+    let Some(root) = root else {
+        return Ok(input.is_file() || input.is_dir());
+    };
+    match root.open_at(input, libc::O_PATH) {
+        Ok(handle) => {
+            let meta = handle
+                .metadata()
+                .with_context(|| format!("examining {}", input.display()))?;
+            Ok(meta.is_file() || meta.is_dir())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("looking up {}", input.display()))),
+    }
+}
+
 /// Give each snapshot its process's perf map: the first candidate that may
 /// be read, a refused one falling through to the next. A map is read once
 /// however many snapshots share it, and the one used is printed, so a wrong
 /// or stale map is visible.
-fn attach_perf_maps(snapshots: &mut [Snapshot], dir: Option<&Path>) {
-    let mut cache: HashMap<PathBuf, Option<Arc<PerfMap>>> = HashMap::new();
+fn attach_perf_maps(snapshots: &mut [Snapshot], dir: Option<&Path>, root: Option<&Root>) {
+    // Beneath a root, whether a map may be used turns on who owns the dump
+    // whose frames it would name, so a map is cached for that owner.
+    let mut cache: HashMap<(PathBuf, Option<u32>), Option<Arc<PerfMap>>> = HashMap::new();
     let mut announced: std::collections::HashSet<PathBuf> = Default::default();
     for s in snapshots {
         let Some(pid) = s.pid else { continue };
-        for path in perfmap::candidates(pid, &s.source_path, dir) {
+        let paths = match root {
+            Some(_) => perfmap::places(pid, &s.source_path, dir),
+            None => perfmap::candidates(pid, &s.source_path, dir),
+        };
+        let dump_owner = root.and(s.owner_uid);
+        for path in paths {
             let map = cache
-                .entry(path.clone())
-                .or_insert_with_key(|path| match perfmap::read(path) {
-                    Ok(map) => Some(Arc::new(map)),
-                    Err(e) => {
-                        eprintln!("warning: not using {}: {e}", path.display());
-                        None
+                .entry((path.clone(), dump_owner))
+                .or_insert_with_key(|(path, owner)| {
+                    match perfmap::read_in(root, path, *owner) {
+                        Ok(map) => Some(Arc::new(map)),
+                        // Beneath a root nothing has yet said the place holds a map.
+                        Err(e) if root.is_some() && e.kind() == std::io::ErrorKind::NotFound => {
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!("warning: not using {}: {e}", path.display());
+                            None
+                        }
                     }
                 })
                 .clone();

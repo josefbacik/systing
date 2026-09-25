@@ -8,6 +8,8 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::root::Root;
+
 /// The largest perf map read: far beyond any real process's (one short
 /// line per Python function), small enough that a planted file cannot
 /// exhaust memory.
@@ -83,11 +85,9 @@ impl Entry {
     }
 }
 
-/// Where to look for `perf-<pid>.map`, in order: `dir` (--perf-map-dir),
-/// beside the snapshot, then /tmp where the process wrote it. Only the
-/// candidates that exist; [`read`] decides whether one may be used, and a
-/// refused one falls through to the next.
-pub fn candidates(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Vec<PathBuf> {
+/// Where `perf-<pid>.map` may be, in order: `dir` (--perf-map-dir), beside
+/// the snapshot, then /tmp where the process wrote it.
+pub fn places(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Vec<PathBuf> {
     let name = format!("perf-{pid}.map");
     let beside = snapshot.parent().map(|p| p.join(&name));
     [
@@ -97,8 +97,18 @@ pub fn candidates(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Vec<PathBuf>
     ]
     .into_iter()
     .flatten()
-    .filter(|p| p.symlink_metadata().is_ok())
     .collect()
+}
+
+/// The [`places`] that exist; [`read`] decides whether one may be used, and a
+/// refused one falls through to the next. Beneath a [`Root`] nothing filters
+/// them: each place is tried with [`read_in`], and one that holds nothing
+/// falls through too.
+pub fn candidates(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Vec<PathBuf> {
+    places(pid, snapshot, dir)
+        .into_iter()
+        .filter(|p| p.symlink_metadata().is_ok())
+        .collect()
 }
 
 /// Read a perf map found by [`find`]. Anyone can write /tmp, so the file is
@@ -107,11 +117,46 @@ pub fn candidates(pid: i32, snapshot: &Path, dir: Option<&Path>) -> Vec<PathBuf>
 /// directory must also be owned by this user or root, as perf requires, or
 /// another user could name our frames.
 pub fn read(path: &Path) -> std::io::Result<PerfMap> {
+    read_in(None, path, None)
+}
+
+/// As [`read`], with `path` beneath `root` when there is one. The reader is
+/// then outside the container and is not the user its processes run as, so
+/// the user who may own a map in a world-writable directory is the one who
+/// owns the process's dump, `dump_owner`: the same process wrote both. No
+/// other user in the container can then name that process's frames.
+pub fn read_in(
+    root: Option<&Root>,
+    path: &Path,
+    dump_owner: Option<u32>,
+) -> std::io::Result<PerfMap> {
     use std::io::{Error, ErrorKind};
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+    let (file, world_writable_dir, trusted_owner) = match root {
+        Some(root) => {
+            let (file, world_writable_dir) = open_beneath(root, path)?;
+            (file, world_writable_dir, dump_owner)
+        }
+        None => {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)?;
+            let world_writable_dir = path
+                .parent()
+                .and_then(|d| {
+                    std::fs::metadata(if d.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        d
+                    })
+                    .ok()
+                })
+                .is_some_and(|d| d.mode() & 0o002 != 0);
+            // SAFETY: geteuid cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            (file, world_writable_dir, Some(euid))
+        }
+    };
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
@@ -122,20 +167,7 @@ pub fn read(path: &Path) -> std::io::Result<PerfMap> {
             format!("larger than {MAX_BYTES} bytes"),
         ));
     }
-    let world_writable_dir = path
-        .parent()
-        .and_then(|d| {
-            std::fs::metadata(if d.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                d
-            })
-            .ok()
-        })
-        .is_some_and(|d| d.mode() & 0o002 != 0);
-    // SAFETY: geteuid cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    if world_writable_dir && meta.uid() != euid && meta.uid() != 0 {
+    if !owner_may_name_frames(world_writable_dir, meta.uid(), trusted_owner) {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
             format!(
@@ -147,6 +179,46 @@ pub fn read(path: &Path) -> std::io::Result<PerfMap> {
     let mut text = String::new();
     (&file).take(MAX_BYTES).read_to_string(&mut text)?;
     Ok(PerfMap::parse(&text))
+}
+
+/// Whether a map owned by `owner` may be used. Anywhere but in a
+/// world-writable directory it may; there, only when root or the `trusted`
+/// user owns it.
+fn owner_may_name_frames(world_writable_dir: bool, owner: u32, trusted: Option<u32>) -> bool {
+    !world_writable_dir || owner == 0 || trusted == Some(owner)
+}
+
+/// Open the map at `path` beneath `root`, and say whether its directory is
+/// world-writable. The directory is reached beneath the root, and the map is
+/// then opened inside it by its name alone, without following a symlink
+/// there: the directory judged is the one the map is in.
+fn open_beneath(root: &Root, path: &Path) -> std::io::Result<(std::fs::File, bool)> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a file path"))?;
+    let parent = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let dir = root.open_at(parent, libc::O_PATH | libc::O_DIRECTORY)?;
+    let remote = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "on a FUSE or network filesystem",
+        )
+    };
+    if crate::root::on_remote_fs(&dir) {
+        return Err(remote());
+    }
+    let world_writable_dir = dir.metadata()?.mode() & 0o002 != 0;
+    let file = Root::from_dir(dir)?.open_at(
+        Path::new(name),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )?;
+    if crate::root::on_remote_fs(&file) {
+        return Err(remote());
+    }
+    Ok((file, world_writable_dir))
 }
 
 #[cfg(test)]
@@ -206,6 +278,20 @@ garbage line
             read(Path::new("/dev/null")).is_err(),
             "a device is not a map"
         );
+    }
+
+    #[test]
+    fn in_a_world_writable_directory_only_root_or_the_trusted_user_may_own_a_map() {
+        // Elsewhere anyone may.
+        assert!(owner_may_name_frames(false, 1000, Some(2000)));
+        assert!(owner_may_name_frames(false, 1000, None));
+        // The trusted user's own map, or root's.
+        assert!(owner_may_name_frames(true, 1000, Some(1000)));
+        assert!(owner_may_name_frames(true, 0, Some(1000)));
+        assert!(owner_may_name_frames(true, 0, None));
+        // Another user's; and anyone's but root's when no user is trusted.
+        assert!(!owner_may_name_frames(true, 1001, Some(1000)));
+        assert!(!owner_may_name_frames(true, 1000, None));
     }
 
     #[test]

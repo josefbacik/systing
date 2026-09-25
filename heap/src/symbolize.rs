@@ -3,7 +3,8 @@
 //! A dump outlives its process, so addresses go through the memory map the
 //! dump carries: an address in a file mapping becomes (file, file offset),
 //! resolved against that file on this machine. That needs the same binaries
-//! at the same paths (the host, or the image the process ran in).
+//! at the same paths (the host, or the image the process ran in), or, read
+//! from outside the process's container, that container's root as a [`Root`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::fd::AsRawFd;
@@ -14,6 +15,7 @@ use blazesym::symbolize::source::{Elf, Source};
 use blazesym::symbolize::{Input, Symbolizer};
 
 use crate::perfmap::{Entry, Symbol};
+use crate::root::Root;
 use crate::Snapshot;
 
 /// Frame names for every (snapshot, stack) in a set of snapshots.
@@ -37,6 +39,9 @@ pub struct Stats {
     /// Paths the dumps name that are not regular files (devices, FIFOs,
     /// /proc, /dev, /sys), so they were not opened.
     pub refused_files: Vec<PathBuf>,
+    /// Files beneath a root that are on a FUSE or network filesystem, so
+    /// they were not opened (see [`crate::root::on_remote_fs`]).
+    pub remote_files: Vec<PathBuf>,
     /// Files on this machine that are not the one the process mapped (the
     /// device or inode differs): a copy or another build, so their names
     /// may be wrong.
@@ -68,6 +73,12 @@ enum Target<'a> {
 }
 
 pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
+    symbolize_in(snapshots, None)
+}
+
+/// As [`symbolize`], with the files the dumps name opened beneath `root` when
+/// there is one, so their paths mean what they meant to the process.
+pub fn symbolize_in(snapshots: &[Snapshot], root: Option<&Root>) -> Symbolized {
     // Every (file, offset) to look up, by file, so each file is opened once.
     let mut wanted: BTreeMap<&str, HashSet<u64>> = BTreeMap::new();
     let mut identities: HashMap<&str, ((u32, u32), u64)> = HashMap::new();
@@ -99,11 +110,14 @@ pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
         // or FIFO is opened before it is checked, and no pseudo-file read
         // can hang or never end; a file that passes is reopened through
         // that handle, so the file read is the one checked.
-        let handle = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-            .open(path)
-        {
+        let opened = match root {
+            Some(root) => root.open_at(Path::new(path), libc::O_PATH),
+            None => std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                .open(path),
+        };
+        let handle = match opened {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 stats.missing_files.push(PathBuf::from(path));
@@ -122,6 +136,10 @@ pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
             stats.refused_files.push(PathBuf::from(path));
             continue;
         };
+        if root.is_some() && crate::root::on_remote_fs(&handle) {
+            stats.remote_files.push(PathBuf::from(path));
+            continue;
+        }
         let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -139,7 +157,7 @@ pub fn symbolize(snapshots: &[Snapshot]) -> Symbolized {
         }
         let fd = file.as_raw_fd();
         open_files.push(file);
-        let src = Source::Elf(Elf::new(format!("/proc/self/fd/{fd}")));
+        let src = Source::Elf(elf_source(fd, root.is_some()));
         let Ok(results) = symbolizer.symbolize(&src, Input::FileOffset(&offsets)) else {
             continue;
         };
@@ -323,4 +341,31 @@ fn on_pseudo_fs(file: &std::fs::File) -> bool {
     // f_type is a long on some targets and an int on others; the magic
     // numbers are 32 bits either way.
     PSEUDO.contains(&(sfs.f_type as u32))
+}
+
+/// The symbolization source for a binary opened as descriptor `fd`.
+///
+/// Beneath a root only the file's own symbol table is read. With debug
+/// information on, the symbolizer follows the binary's debug link and looks
+/// for its `.dwp`, by paths of its own making: a build-id directory, its
+/// debug directories, and the directory the binary's path names to the
+/// reader. Those are the reader's files, not the container's; the name looked
+/// up is the binary's to choose, an absolute one is taken as it stands, and
+/// what is found is opened with a plain open. So beneath a root names come
+/// from the symbol table (and the perf map), without inlined frames.
+fn elf_source(fd: std::os::fd::RawFd, beneath_root: bool) -> Elf {
+    let mut elf = Elf::new(format!("/proc/self/fd/{fd}"));
+    elf.debug_syms = !beneath_root;
+    elf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn beneath_a_root_debug_information_is_not_consulted() {
+        assert!(elf_source(3, false).debug_syms);
+        assert!(!elf_source(3, true).debug_syms);
+    }
 }

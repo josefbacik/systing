@@ -184,6 +184,7 @@ pub fn parse(text: &str) -> Result<Snapshot> {
         seq: None,
         trigger: None,
         dumped_at_unix_ns: None,
+        owner_uid: None,
         sample_period,
         samples,
         maps,
