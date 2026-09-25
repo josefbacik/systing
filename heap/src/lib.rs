@@ -18,6 +18,7 @@ pub mod maps;
 pub mod perfetto;
 pub mod perfmap;
 pub mod retention;
+pub mod root;
 pub mod symbolize;
 
 use std::path::PathBuf;
@@ -38,6 +39,8 @@ pub struct Snapshot {
     /// `final`).
     pub trigger: Option<&'static str>,
     pub dumped_at_unix_ns: Option<i64>,
+    /// The user who owns the dump file, when it was found under a prefix.
+    pub owner_uid: Option<u32>,
     /// Mean bytes between samples, as the dump states it.
     pub sample_period: u64,
     pub samples: Vec<Sample>,
