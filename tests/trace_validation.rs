@@ -6086,6 +6086,10 @@ fn test_e2e_task_stacks_scoped_walk_of_a_process_that_retires_threads() {
 /// Two things make it prove what its name says: more children than twice the
 /// cap have to have come and gone inside the capture's own seconds, and one
 /// of them has to be in the scoped recording, where only its key puts it.
+/// How many seconds a capture runs follows from how fast this host forks,
+/// measured first with nothing attached, so the case asks the same of a slow
+/// host and a fast one; a host that cannot reach the count within the longest
+/// capture still fails, and says so.
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_task_stacks_scoped_walk_stays_scoped_past_a_thousand_forks() {
@@ -6095,8 +6099,10 @@ fn test_e2e_task_stacks_scoped_walk_stays_scoped_past_a_thousand_forks() {
     use std::time::{Duration, Instant};
 
     const LABEL: &str = "--pid, forks past the cap";
-    // Each capture: this many seconds of a snapshot every 250 ms.
-    const CAPTURE_SECS: u32 = 12;
+    // Each capture is a snapshot every 250 ms for at least, and at most, this
+    // many seconds: how many, the host's own fork rate decides (below).
+    const LEAST_CAPTURE_SECS: u32 = 12;
+    const MOST_CAPTURE_SECS: u32 = 60;
     // Twice the recorder's SCOPED_WALK_MAX_PROCESSES (1024): what has to have
     // come and gone while the fork hook was attached, with room to spare.
     const LEAST_FORKS: u64 = 2 * 1024;
@@ -6126,6 +6132,23 @@ fn test_e2e_task_stacks_scoped_walk_stays_scoped_past_a_thousand_forks() {
             })
         })
         .collect();
+
+    // How fast this host forks, read off the forkers' own counter with
+    // nothing attached yet. A capture then runs long enough for twice the
+    // count the case needs at that rate: the attached hooks slow a fork down,
+    // and no host is at its fastest for the whole of a capture.
+    let forks_a_second = {
+        const OVER: Duration = Duration::from_secs(2);
+        let before = forks.load(Ordering::Relaxed);
+        std::thread::sleep(OVER);
+        (forks.load(Ordering::Relaxed) - before) as f64 / OVER.as_secs_f64()
+    };
+    let capture_secs = ((2 * LEAST_FORKS) as f64 / forks_a_second.max(1.0)).ceil() as u32;
+    let capture_secs = capture_secs.clamp(LEAST_CAPTURE_SECS, MOST_CAPTURE_SECS);
+    eprintln!(
+        "[{LABEL}] this host forks and reaps about {forks_a_second:.0} children a second with \
+         nothing attached: each capture runs {capture_secs} s"
+    );
 
     // This process's own thread ids: every one of them lives for the whole
     // of both runs, so a recorded thread that is none of them is a child.
@@ -6159,14 +6182,14 @@ fn test_e2e_task_stacks_scoped_walk_stays_scoped_past_a_thousand_forks() {
     let run = |full_walk: bool| -> (String, TempDir, u64, Duration) {
         let before = forks.load(Ordering::Relaxed);
         let started = Instant::now();
-        let (stderr, out_dir) = task_stacks_capture(&["--pid", &pid], 250, CAPTURE_SECS, full_walk);
+        let (stderr, out_dir) = task_stacks_capture(&["--pid", &pid], 250, capture_secs, full_walk);
         let forked = forks.load(Ordering::Relaxed) - before;
         (stderr, out_dir, forked, started.elapsed())
     };
     // The children of a run's count that fell inside the capture's own
     // seconds, at the run's average rate.
     let inside_capture = |forked: u64, ran: Duration| -> u64 {
-        let capture = f64::from(CAPTURE_SECS);
+        let capture = f64::from(capture_secs);
         (forked as f64 * capture / ran.as_secs_f64().max(capture)) as u64
     };
 
@@ -6177,7 +6200,7 @@ fn test_e2e_task_stacks_scoped_walk_stays_scoped_past_a_thousand_forks() {
     let children = children_recorded(&out_dir);
     eprintln!(
         "[{LABEL}] as it comes: {forked} children forked and reaped in the {:.1} s the binary \
-         ran, about {in_capture} of them inside the capture's {CAPTURE_SECS} s; visited \
+         ran, about {in_capture} of them inside the capture's {capture_secs} s; visited \
          {visited} for {targeted} targeted; {} threads recorded, {children} of them children",
         ran.as_secs_f64(),
         coverage.threads
@@ -6197,7 +6220,7 @@ fn test_e2e_task_stacks_scoped_walk_stays_scoped_past_a_thousand_forks() {
     assert!(
         in_capture >= LEAST_FORKS,
         "[{LABEL}] about {in_capture} children came and went inside the capture's \
-         {CAPTURE_SECS} s ({forked} in the {:.1} s the binary ran, {} spawns failed), under \
+         {capture_secs} s ({forked} in the {:.1} s the binary ran, {} spawns failed), under \
          {LEAST_FORKS}: too few to pass the scoped walk's cap",
         ran.as_secs_f64(),
         failed_spawns.load(Ordering::Relaxed)
