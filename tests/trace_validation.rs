@@ -6075,6 +6075,187 @@ fn test_e2e_task_stacks_scoped_walk_of_a_process_that_retires_threads() {
     at_rate("most walks whole", 1, 10, 300);
 }
 
+/// A `--pid` target that forks children by the thousand, each gone at once:
+/// the capture has to stay on the scoped walk from its first snapshot to its
+/// last. The `pids` map gains a key at every fork and nothing in the kernel
+/// takes one out, so a walk that counted every key ever added would pass the
+/// most processes a snapshot walks one at a time (1024) within seconds and
+/// walk every thread on the host from then on: the children a target forked
+/// that have since gone must not count, and the recorder drops their keys.
+/// The same capture with the full walk forced is the control for the rows.
+/// Two things make it prove what its name says: more children than twice the
+/// cap have to have come and gone inside the capture's own seconds, and one
+/// of them has to be in the scoped recording, where only its key puts it.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_task_stacks_scoped_walk_stays_scoped_past_a_thousand_forks() {
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const LABEL: &str = "--pid, forks past the cap";
+    // Each capture: this many seconds of a snapshot every 250 ms.
+    const CAPTURE_SECS: u32 = 12;
+    // Twice the recorder's SCOPED_WALK_MAX_PROCESSES (1024): what has to have
+    // come and gone while the fork hook was attached, with room to spare.
+    const LEAST_FORKS: u64 = 2 * 1024;
+
+    // Four threads of this process that each fork, exec and reap a child
+    // that exits at once, for as long as the guard lives.
+    let forks = Arc::new(AtomicU64::new(0));
+    let failed_spawns = Arc::new(AtomicU64::new(0));
+    let _forkers: Vec<_> = (0..4)
+        .map(|_| {
+            let (forks, failed_spawns) = (forks.clone(), failed_spawns.clone());
+            stoppable_workload(move |stop| {
+                while !stop.load(Ordering::Relaxed) {
+                    let reaped = Command::new("/bin/true")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    if reaped.is_ok() {
+                        forks.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // Not a spin on a host that cannot spawn it at all.
+                        failed_spawns.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // This process's own thread ids: every one of them lives for the whole
+    // of both runs, so a recorded thread that is none of them is a child.
+    let own_tids: Vec<String> = std::fs::read_dir("/proc/self/task")
+        .expect("Failed to list this process's threads")
+        .flatten()
+        .filter_map(|task| task.file_name().into_string().ok())
+        .collect();
+    let children_recorded = |out_dir: &TempDir| -> i64 {
+        let events = out_dir.path().join("task_stack_event.parquet");
+        let threads = out_dir.path().join("thread.parquet");
+        let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+        conn.query_row(
+            &format!(
+                "SELECT CAST(COUNT(DISTINCT t.tid) AS BIGINT) FROM read_parquet('{}') e \
+                 JOIN read_parquet('{}') t ON t.utid = e.utid WHERE t.tid NOT IN ({})",
+                events.display(),
+                threads.display(),
+                own_tids.join(", ")
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to count the recorded children")
+    };
+
+    // One capture of this process, the children that came and went while the
+    // binary ran, and how long it ran: its start-up and wind-down are in both,
+    // and the fork hook is attached for the capture's own seconds alone.
+    let pid = std::process::id().to_string();
+    let run = |full_walk: bool| -> (String, TempDir, u64, Duration) {
+        let before = forks.load(Ordering::Relaxed);
+        let started = Instant::now();
+        let (stderr, out_dir) = task_stacks_capture(&["--pid", &pid], 250, CAPTURE_SECS, full_walk);
+        let forked = forks.load(Ordering::Relaxed) - before;
+        (stderr, out_dir, forked, started.elapsed())
+    };
+    // The children of a run's count that fell inside the capture's own
+    // seconds, at the run's average rate.
+    let inside_capture = |forked: u64, ran: Duration| -> u64 {
+        let capture = f64::from(CAPTURE_SECS);
+        (forked as f64 * capture / ran.as_secs_f64().max(capture)) as u64
+    };
+
+    let (stderr, out_dir, forked, ran) = run(false);
+    let in_capture = inside_capture(forked, ran);
+    let (visited, targeted) = task_stacks_walk_counts(&stderr);
+    let coverage = task_stacks_coverage(&out_dir);
+    let children = children_recorded(&out_dir);
+    eprintln!(
+        "[{LABEL}] as it comes: {forked} children forked and reaped in the {:.1} s the binary \
+         ran, about {in_capture} of them inside the capture's {CAPTURE_SECS} s; visited \
+         {visited} for {targeted} targeted; {} threads recorded, {children} of them children",
+        ran.as_secs_f64(),
+        coverage.threads
+    );
+    let (full_stderr, full_dir, full_forked, full_ran) = run(true);
+    let (full_visited, _) = task_stacks_walk_counts(&full_stderr);
+    let full_coverage = task_stacks_coverage(&full_dir);
+    eprintln!(
+        "[{LABEL}] full walk forced: {full_forked} children forked and reaped in {:.1} s; \
+         visited {full_visited}; {} threads recorded",
+        full_ran.as_secs_f64(),
+        full_coverage.threads
+    );
+
+    // The case proves nothing unless the forks outran the cap while the fork
+    // hook was attached: a slow host is a failure to look at, not a pass.
+    assert!(
+        in_capture >= LEAST_FORKS,
+        "[{LABEL}] about {in_capture} children came and went inside the capture's \
+         {CAPTURE_SECS} s ({forked} in the {:.1} s the binary ran, {} spawns failed), under \
+         {LEAST_FORKS}: too few to pass the scoped walk's cap",
+        ran.as_secs_f64(),
+        failed_spawns.load(Ordering::Relaxed)
+    );
+    // Nor unless the keys the forks added reached the walk: a child is in the
+    // recording only through its key.
+    assert!(
+        children > 0,
+        "[{LABEL}] no forked child is in the scoped recording: the keys the forks add never \
+         reached the walk, and the cap was never in play"
+    );
+    // Both recordings hold this process's own threads: the four forkers and
+    // the test's own, which stay for the whole capture.
+    for (which, threads) in [
+        ("as it comes", coverage.threads),
+        ("full walk forced", full_coverage.threads),
+    ] {
+        assert!(
+            threads >= 5,
+            "[{LABEL}, {which}] {threads} threads recorded: the target's own threads are missing"
+        );
+    }
+    if !stderr.contains("task-stacks: walking the --pid targets' threads alone") {
+        // Nothing scoped to check, for the one reason a healthy host can
+        // give a `--pid` capture; any other is a failure, not a skip.
+        assert_eq!(
+            task_stacks_full_walk_reason(&stderr),
+            Some(TASK_STACKS_NOT_ROOT_PID_NS),
+            "[{LABEL}] a --pid capture walked every thread on the host for a reason no healthy \
+             host gives:\n{stderr}"
+        );
+        eprintln!(
+            "[{LABEL}] this capture took the walk over every thread on the host \
+             ({TASK_STACKS_NOT_ROOT_PID_NS}): nothing scoped to check"
+        );
+        return;
+    }
+    // Scoped at start, and at every snapshot after it: neither the line a
+    // snapshot prints the first time it gives the scoped walk up, nor the
+    // closing line's count of such snapshots.
+    assert!(
+        !stderr.contains("walked every thread on the host instead"),
+        "[{LABEL}] {forked} children forked and gone, and a snapshot walked every thread on the \
+         host instead:\n{stderr}"
+    );
+    // What staying scoped is worth: a fraction of the full walk's visits.
+    assert!(
+        visited * 4 < full_visited,
+        "[{LABEL}] the scoped walks visited {visited} tasks, the full walk {full_visited}: no \
+         fraction of it"
+    );
+    eprintln!(
+        "[{LABEL}] scoped: about {in_capture} children forked and gone inside the capture, \
+         {children} of them recorded, and no snapshot left the scoped walk; {visited} visits \
+         against the full walk's {full_visited}"
+    );
+}
+
 /// The names a process gave its threads, read out of live interpreters: the
 /// `threading` module found through sys.modules, its `_active` dict, and each
 /// Thread's `_name` and `_native_id` wherever this instance keeps its

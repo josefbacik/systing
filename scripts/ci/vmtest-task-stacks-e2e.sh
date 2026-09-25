@@ -1,6 +1,6 @@
 #!/bin/bash
 # Guest side of the task-stacks end-to-end step (.github/workflows/bpf-load-shapes.yml):
-# run the three `test_e2e_task_stacks_scoped_walk*` cases of the pre-built
+# run the four `test_e2e_task_stacks_scoped_walk*` cases of the pre-built
 # `trace_validation` test binary as root on the guest kernel, and decide by what the
 # cases PRINT, not by the exit code alone.
 #
@@ -12,7 +12,7 @@
 # ways (a line that says it is skipping, `took the full walk`, `took the walk over
 # every thread`) and any of the three fails the step: that is what shows the walks
 # were scoped. A line only a run of each case prints is required of every case: that
-# is what shows all three ran.
+# is what shows all four ran.
 #
 # The verdict travels in the FILE, as in vmtest-load-shapes.sh: a guest kernel
 # without a virtio console makes the VM tool return 255 whatever the test did. The
@@ -82,7 +82,7 @@ forbid() {
     forbid 'skipping' 'a case skipped its work'
     forbid 'took the full walk' 'a scoped walk fell back to every thread on the host'
     forbid 'took the walk over every thread' 'a capture walked every thread on the host'
-    # One line or more of each case, so that all three ran. No line anchors: with one
+    # One line or more of each case, so that all four ran. No line anchors: with one
     # test thread the test runner prints `test <name> ... ` without a newline before a
     # case runs, so a case's first line follows it.
     need '[--pid] scoped: '
@@ -90,6 +90,7 @@ forbid() {
     need 'the listing came back whole: 10 processes in two cgroups below the target, all recorded'
     need 'most walks cut, as it comes] visited '
     need 'most walks whole, as it comes] visited '
+    need '[--pid, forks past the cap] scoped: '
     echo "VNG-TEST-EXIT:$rc"
 } > "$OUT" 2>&1
 sync
