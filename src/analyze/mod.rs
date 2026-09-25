@@ -312,6 +312,15 @@ pub struct TraceSystemInfo {
     /// or for traces from systing < 1.18.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_packet_sample_rate: Option<i64>,
+    /// Whether the task-stacks recorder read other tasks' user memory ("on",
+    /// or "off:kernel-release": an aarch64 kernel not known to carry the fix
+    /// that makes the unwinder's mapping lookup on another task safe; every
+    /// user stack in `task_stack_event` is then its first frame alone, with
+    /// no Python frames and no task context, and no row says so by itself);
+    /// `None` when the task-stacks recorder did not run, or for traces from
+    /// before schema 28, where it means unknown and never "on".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_stacks_remote_reads: Option<String>,
 }
 
 /// Trace metadata.
@@ -966,7 +975,7 @@ impl AnalyzeDb {
             }
         };
         let sql = format!(
-            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
             col("trace_id"),
             col("release"),
             col("machine"),
@@ -988,6 +997,7 @@ impl AnalyzeDb {
             col("memory_syscall_leg"),
             col("network_tw_leg"),
             col("network_packet_sample_rate"),
+            col("task_stacks_remote_reads"),
         );
 
         let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -1016,6 +1026,7 @@ impl AnalyzeDb {
                 memory_syscall_leg: row.get(18)?,
                 network_tw_leg: row.get(19)?,
                 network_packet_sample_rate: row.get(20)?,
+                task_stacks_remote_reads: row.get(21)?,
             })
         }) else {
             return Vec::new();
@@ -1475,11 +1486,11 @@ mod tests {
                  memory_alloc_sample_rate, memory_vfio_leg, memory_thp_leg, \
                  memory_thp_sample_rate, memory_iommu_overflow, \
                  memory_anon_huge_walk, memory_syscall_leg, network_tw_leg, \
-                 network_packet_sample_rate) \
+                 network_packet_sample_rate, task_stacks_remote_reads) \
                  VALUES ('t1', 'Linux', '6.12.0', '#1 SMP', 'x86_64', \
                  NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge', 'cpu-clock', 1000000, \
                  'tracepoint', 97, 1, NULL, 'on', NULL, NULL, 0, NULL, 'fentry', \
-                 'kprobe:nobtf', 8)",
+                 'kprobe:nobtf', 8, 'off:kernel-release')",
             )
             .unwrap();
         }
@@ -1520,6 +1531,10 @@ mod tests {
         assert_eq!(sys.memory_syscall_leg.as_deref(), Some("fentry"));
         assert_eq!(sys.network_tw_leg.as_deref(), Some("kprobe:nobtf"));
         assert_eq!(sys.network_packet_sample_rate, Some(8));
+        assert_eq!(
+            sys.task_stacks_remote_reads.as_deref(),
+            Some("off:kernel-release")
+        );
     }
 
     #[test]
@@ -1550,6 +1565,7 @@ mod tests {
                  ALTER TABLE sysinfo DROP COLUMN memory_syscall_leg; \
                  ALTER TABLE sysinfo DROP COLUMN network_tw_leg; \
                  ALTER TABLE sysinfo DROP COLUMN network_packet_sample_rate; \
+                 ALTER TABLE sysinfo DROP COLUMN task_stacks_remote_reads; \
                  INSERT INTO sysinfo (trace_id, sysname, release, version, machine) \
                  VALUES ('t1', 'Linux', '5.10.0', '#1 SMP', 'aarch64')",
             )
@@ -1579,6 +1595,10 @@ mod tests {
         assert_eq!(sys.memory_syscall_leg, None);
         assert_eq!(sys.network_tw_leg, None);
         assert_eq!(sys.network_packet_sample_rate, None);
+        assert_eq!(
+            sys.task_stacks_remote_reads, None,
+            "a database from before the column reads unknown, never \"on\""
+        );
     }
 
     #[test]

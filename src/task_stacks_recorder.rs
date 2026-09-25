@@ -614,6 +614,18 @@ fn remote_reads(facts: &RemoteReadFacts) -> (bool, Option<String>) {
     )
 }
 
+/// The `sysinfo.task_stacks_remote_reads` value of a capture whose iterator
+/// does (`true`) or does not read other tasks' user memory. Written for every
+/// capture the recorder runs in, open or not: an absent value is an older
+/// build's and means unknown.
+pub fn remote_reads_sysinfo_value(remote: bool) -> &'static str {
+    if remote {
+        "on"
+    } else {
+        "off:kernel-release"
+    }
+}
+
 /// What a capture that collects `frames` records where `remote` says whether
 /// other tasks' memory may be read: the reason it cannot start, if it cannot.
 /// Python frames alone are about the Python threads and record no thread that

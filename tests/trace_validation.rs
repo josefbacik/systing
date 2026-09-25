@@ -5375,7 +5375,37 @@ fn task_stacks_capture(
         output.status.success(),
         "systing {target:?} (full walk forced: {full_walk}) failed:\n{stderr}"
     );
+    // Every capture the recorder ran in says whether it read other tasks'
+    // memory, since nothing in its rows does. Off aarch64 it always reads it;
+    // on aarch64 either value is a true one, by the kernel's release.
+    let said = task_stacks_remote_reads(&out_dir);
+    let expected: &[&str] = if cfg!(target_arch = "aarch64") {
+        &["on", "off:kernel-release"]
+    } else {
+        &["on"]
+    };
+    assert!(
+        said.as_deref().is_some_and(|said| expected.contains(&said)),
+        "sysinfo.task_stacks_remote_reads = {said:?} after systing {target:?}: \
+         expected one of {expected:?}"
+    );
     (stderr, out_dir)
+}
+
+/// What a capture recorded about its own user stacks
+/// (`sysinfo.task_stacks_remote_reads`).
+fn task_stacks_remote_reads(out_dir: &TempDir) -> Option<String> {
+    let sysinfo = out_dir.path().join("sysinfo.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+    conn.query_row(
+        &format!(
+            "SELECT task_stacks_remote_reads FROM read_parquet('{}')",
+            sysinfo.display()
+        ),
+        [],
+        |row| row.get(0),
+    )
+    .expect("Failed to read sysinfo.task_stacks_remote_reads")
 }
 
 /// The task-stacks recorder's closing line out of what a capture printed.

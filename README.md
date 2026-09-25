@@ -327,7 +327,10 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   the loaded program still holds two functions of the Python walker,
   `pystacks_get_frame_data` and `pystacks_read_stacks_global`, with those
   calls inside, and nothing calls them. x86-64 is not affected: its unwinder
-  never makes the lookup.
+  never makes the lookup. Which it was is recorded for every capture the
+  recorder runs in, as `sysinfo.task_stacks_remote_reads` (`on` or
+  `off:kernel-release`, schema 28): nothing in a row says so, and a capture
+  from before the column reads NULL there, which means unknown and never `on`.
 - The rows are the `task_stack_event` table (`SCHEMA_CHANGES.md`, schema 23),
   with the stack by `stack_id` into `stack` like every other recorder's. With
   `--include-task-context` each row also has the id of its thread's task context

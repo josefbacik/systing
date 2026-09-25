@@ -665,6 +665,16 @@ pub struct SysInfoRecord {
     /// stop/wake, state changes) are never sampled. `None` when the packets
     /// recorder was off, and in traces from systing < 1.18.
     pub network_packet_sample_rate: Option<i64>,
+    /// Whether the task-stacks recorder read other tasks' user memory: `on`,
+    /// or `off:kernel-release` (an aarch64 kernel whose release is not known
+    /// to carry the fix that makes the unwinder's mapping lookup on another
+    /// task safe). With it off every user stack in `task_stack_event` is its
+    /// first frame alone and there are no Python frames and no task context,
+    /// by design, and no row says so by itself: such rows read exactly like
+    /// those of threads whose walk stopped at once, so this is the only
+    /// marker. `None` when the task-stacks recorder did not run, and in
+    /// traces from before schema 28, where it means unknown and never `on`.
+    pub task_stacks_remote_reads: Option<String>,
 }
 
 /// Per-CPU static frequency limits from sysfs cpufreq, in kHz.

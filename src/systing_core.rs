@@ -6339,14 +6339,19 @@ pub fn systing(
                     crate::task_stacks_recorder::TaskContextMode { restricted },
                 )
             });
-            Some(crate::task_stacks_recorder::TaskStacksIter::load(
+            let iter = crate::task_stacks_recorder::TaskStacksIter::load(
                 &target_filter,
                 &target_filter_maps(&skel),
                 &shared_pystacks_maps(&skel),
                 task_context,
                 task_stack_mode,
                 &cgroup_dirs,
-            )?)
+            )?;
+            // Recorded for every capture the recorder runs in: nothing in its
+            // rows says whether other tasks' memory was read
+            // (sysinfo.task_stacks_remote_reads).
+            let _ = recorder.task_stacks_remote_reads.set(iter.remote_reads());
+            Some(iter)
         } else {
             None
         };
