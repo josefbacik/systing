@@ -1,6 +1,6 @@
 //! Reading a container's snapshots from outside it, through the binary:
-//! `--root` and `--root-fd` keep the prefix, the binaries and the perf map
-//! beneath the root, and take prefix inputs only.
+//! `--root`, `--root-fd` and `--pid` keep the prefix, the binaries and the
+//! perf map beneath the root, and take prefix inputs only.
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -132,6 +132,76 @@ fn a_root_can_be_an_inherited_descriptor() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not a directory"), "{stderr}");
+}
+
+#[test]
+fn a_pid_names_the_root_of_that_process() {
+    // This test's own root is the machine's, so the made-up container is
+    // reached beneath it by its full path.
+    let (root, _outside) = container(123);
+    let out_dir = tempfile::tempdir().unwrap();
+    let db = out_dir.path().join("heap.duckdb");
+    let pid = std::process::id().to_string();
+
+    let prefix = root.path().join("heap-dumps/jeprof");
+    let out = run(
+        &["--pid", pid.as_str(), "--latest-only"],
+        &db,
+        prefix.to_str().unwrap(),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(loaded(&db), vec![(123, 1)]);
+    assert!(root.path().join("heap-dumps/jeprof.123.0.i0.heap").exists());
+
+    // The flag took a root: beneath one, only a prefix is an input.
+    let dir = root.path().join("heap-dumps");
+    let out = run(&["--pid", pid.as_str()], &db, dir.to_str().unwrap());
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("must be a jemalloc prof_prefix"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_pid_that_names_no_process_is_refused() {
+    let out_dir = tempfile::tempdir().unwrap();
+    let db = out_dir.path().join("heap.duckdb");
+    // Above any id the kernel gives out.
+    let out = run(&["--pid", "4294967295"], &db, "/heap-dumps/jeprof");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("opening the root /proc/4294967295/root"),
+        "{stderr}"
+    );
+    assert!(!db.exists());
+}
+
+#[test]
+fn a_pid_and_a_root_are_not_both_taken() {
+    let (root, _outside) = container(123);
+    let out_dir = tempfile::tempdir().unwrap();
+    let db = out_dir.path().join("heap.duckdb");
+    let pid = std::process::id().to_string();
+    let dir = std::fs::File::open(root.path()).unwrap();
+    let number = dir.as_raw_fd().to_string();
+    for other in [
+        ["--root", root.path().to_str().unwrap()],
+        ["--root-fd", number.as_str()],
+    ] {
+        let out = run(
+            &["--pid", pid.as_str(), other[0], other[1]],
+            &db,
+            "/heap-dumps/jeprof",
+        );
+        assert!(!out.status.success(), "{}", other[0]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("cannot be used with"), "{stderr}");
+    }
+    assert!(!db.exists());
 }
 
 #[test]

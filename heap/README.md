@@ -40,6 +40,7 @@ systing-heap -o heap.duckdb a.heap b.heap
 systing-heap -o heap.duckdb ./snapshots/
 
 # A container's snapshots, read from outside it (see below).
+systing-heap -o heap.duckdb --pid 4242 --latest-only /data/heap/jeprof
 systing-heap -o heap.duckdb --root /proc/4242/root --latest-only /data/heap/jeprof
 ```
 
@@ -110,10 +111,15 @@ Every frame except the innermost is a return address, so the tool looks up the b
 ## Reading a container's snapshots from outside it
 
 A collector on the host can read one container's snapshots without a shell in the container, given the container's root directory: `--root DIR`, where DIR is for instance a process's `/proc/<pid>/root`, or `--root-fd N`, where N is a descriptor for that directory the caller opened and left open for the tool to inherit.
+`--pid PID` is `--root /proc/PID/root` by a shorter name: PID is a process in the container as the host numbers it, which is not the number in its dumps' names, that being the process's own view of its id.
 
 ```bash
+systing-heap -o heap.pb --pid 4242 --latest-only /data/heap/jeprof
 systing-heap -o heap.pb --root /proc/4242/root --latest-only /data/heap/jeprof
 ```
+
+The tool opens the root once, at start, and a process id can come to name another process between a caller's look at it and that open.
+A person at a shell need not care; a program that has checked which process a number names passes the directory it checked, with `--root-fd`, and what it checked is then what is read.
 
 Every path the tool did not choose itself is then looked up beneath that directory: the inputs, the binaries each dump names, and the three places a perf map is looked for, `--perf-map-dir` included.
 So they mean what they meant to the process: `/tmp` is the container's `/tmp`, and the binaries are the image's own.

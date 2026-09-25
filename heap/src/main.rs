@@ -80,12 +80,25 @@ struct Cli {
     /// its number, in place of a path.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
     root_fd: Option<i32>,
+
+    /// As --root, the root being that of the running process PID: the same
+    /// as --root /proc/PID/root, opened once at start. PID is the process's
+    /// id as this tool sees it, which inside a container is not the number
+    /// in its dumps' names. A caller that has checked which process PID
+    /// names should pass the directory it checked with --root-fd, since a
+    /// number can come to name another process.
+    #[arg(short, long, value_name = "PID", conflicts_with_all = ["root", "root_fd"])]
+    pid: Option<u32>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let root = match (&cli.root, cli.root_fd) {
+    // --pid is --root /proc/PID/root by a shorter name.
+    let pid_root = cli
+        .pid
+        .map(|pid| PathBuf::from(format!("/proc/{pid}/root")));
+    let root = match (cli.root.as_ref().or(pid_root.as_ref()), cli.root_fd) {
         (Some(dir), _) => {
             Some(Root::open(dir).with_context(|| format!("opening the root {}", dir.display()))?)
         }
