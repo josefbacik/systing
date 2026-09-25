@@ -35,7 +35,10 @@
 //! alone (for the three builds, so that the DTV walk is read through
 //! `bpf_copy_from_user_task` as well as the fixed distance from the thread
 //! pointer; and once more in the confidentiality mode, when the iterator reads
-//! nothing).
+//! nothing). On an aarch64 kernel where the recorder does not read other
+//! tasks' memory the capture says so itself (`sysinfo.task_stacks_remote_reads`),
+//! and the first of the two then holds it to that: events, none with an id,
+//! no value.
 //!
 //! Three more tests hold what must NOT happen: a recipe that is wrong for its
 //! process (planted over a busy process that does not use the library) reads
@@ -780,9 +783,48 @@ fn record_task_stacks(program: &Path, restricted: bool) -> TempDir {
 /// iteration, and the iteration is 50 ms against a phase of 400.
 const MIN_EVENTS_PER_CONTEXT: usize = 2;
 
+/// What a capture recorded about its own reads of other tasks' memory
+/// (`sysinfo.task_stacks_remote_reads`): written by every capture the
+/// task-stacks recorder ran in.
+fn task_stacks_remote_reads(dir: &Path) -> String {
+    let path = dir.join("sysinfo.parquet");
+    assert!(path.exists(), "sysinfo.parquet not found");
+    let batch = batches(&path).next().expect("sysinfo has its one row");
+    let said = batch
+        .column_by_name("task_stacks_remote_reads")
+        .expect("every trace this build writes has sysinfo.task_stacks_remote_reads")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("task_stacks_remote_reads is Utf8");
+    assert!(
+        !said.is_null(0),
+        "the task-stacks recorder ran in this capture, which must then say whether it read \
+         other tasks' memory"
+    );
+    said.value(0).to_string()
+}
+
 /// Each thread's events carry the id of its context, and the id's values are
-/// in the table.
+/// in the table: where the recorder reads other tasks' memory. Where it does
+/// not (an aarch64 kernel not known to carry the fix its unwinder's mapping
+/// lookup needs) the capture says so itself, and then its events carry no
+/// context and the table is empty, by design. Which of the two a capture is
+/// held to is read off the capture, and only the one reason the recorder
+/// decides before it loads anything is accepted for the second.
 fn check_task_stacks_trace(dir: &Path, how: &str) {
+    let said = task_stacks_remote_reads(dir);
+    if said != "on" {
+        assert_eq!(
+            said, "off:kernel-release",
+            "[{how}] sysinfo.task_stacks_remote_reads has a value this test does not know"
+        );
+        assert!(
+            cfg!(target_arch = "aarch64"),
+            "[{how}] the capture says {said}: only an aarch64 capture can"
+        );
+        check_task_stacks_trace_without_remote_reads(dir, how, &said);
+        return;
+    }
     let events = events(dir);
     let contexts = contexts(dir);
     assert!(
@@ -839,6 +881,35 @@ fn check_task_stacks_trace(dir: &Path, how: &str) {
         events.len(),
         contexts.len(),
         threads.len()
+    );
+}
+
+/// A capture that says its task-stacks recorder did not read other tasks'
+/// memory: it still has events, none carries a context id, and with the CPU
+/// sampler off nothing else can have sent a value, so the table is empty.
+fn check_task_stacks_trace_without_remote_reads(dir: &Path, how: &str, said: &str) {
+    let events = events(dir);
+    assert!(
+        !events.is_empty(),
+        "[{how}] the capture has no task_stack_event: a recorder that does not read other tasks' \
+         memory still records every thread"
+    );
+    let carrying = events.iter().filter(|event| event.id.is_some()).count();
+    assert_eq!(
+        carrying,
+        0,
+        "[{how}] the capture says {said}, and {carrying} of its {} events carry a context id",
+        events.len()
+    );
+    let contexts = contexts(dir);
+    assert!(
+        contexts.is_empty(),
+        "[{how}] the capture says {said}, and its task_context table has rows: {contexts:?}"
+    );
+    eprintln!(
+        "[task stacks: {how}] not read ({said}): {} events, none with a context id, no \
+         task_context row",
+        events.len()
     );
 }
 

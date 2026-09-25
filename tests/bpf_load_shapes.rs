@@ -25,6 +25,14 @@
 //! the rest. It is still the slow one; run it on its own with a bound that
 //! fits the host.
 //!
+//! `closed_task_stacks_rows_call_nothing_that_reads_another_task` reads the
+//! same log for one question: the rows of the task-stacks object that may not
+//! read other tasks' memory (the shape an aarch64 host loads below the kernel
+//! releases that make the unwinder's mapping lookup safe) hold no call to the
+//! lookup, and none to the remote copy where the kernel drops the global
+//! functions nothing calls. Four small loads at level 2, the first of them an
+//! open row that has to show the calls.
+//!
 //! Requires root/BPF privileges; run via:
 //!   ./scripts/run-integration-tests.sh bpf_load_shapes
 //! (or the VM rig with a `-f every_shape_loads` filter for the gate alone).
@@ -32,7 +40,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use systing::bpf_load_shapes::{
-    coverage_gaps, ranges, shape_table, task_stacks_shape_table, LoadReport,
+    coverage_gaps, ranges, shape_table, task_stacks_shape_table, LoadReport, TaskStacksLoadShape,
 };
 use systing::systing_core::{bpf_load_probe, kallsyms_has_funcs, NETWORK_TW_SYMBOLS};
 use systing::task_stacks_recorder::TaskStacksIter;
@@ -406,4 +414,132 @@ fn every_instruction_is_verified_by_some_shape() {
         failures.len(),
         failures.join("\n  ")
     );
+}
+
+/// A call to each helper that reads another task's user memory, as the
+/// verifier prints one at log level 2.
+const CALL_FIND_VMA: &str = "call bpf_find_vma#";
+const CALL_COPY_FROM_USER_TASK: &str = "call bpf_copy_from_user_task#";
+
+/// Whether this kernel drops a global function that no verified path calls
+/// (6.8 and later). Before that every global function of an object is
+/// verified and kept whatever calls it, and the task-stacks object carries
+/// two of the Python walker's that copy another task's memory, which nothing
+/// calls in a closed row.
+fn kernel_drops_uncalled_global_functions() -> bool {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut numbers = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|n| n.parse::<u32>().ok());
+    matches!(
+        (numbers.next(), numbers.next()),
+        (Some(major), Some(minor)) if (major, minor) >= (6, 8)
+    )
+}
+
+/// Load one row of the task-stacks table with every program at verifier log
+/// level 2, which prints each instruction the verifier walks, and say whether
+/// any program's log names a call to the mapping lookup, and to the remote
+/// copy. A row that does not load, or whose log names no helper call at all,
+/// is no read of either and fails here.
+fn calls_that_read_another_task(shape: &TaskStacksLoadShape) -> (bool, bool) {
+    let (report, _) = TaskStacksIter::load_probe(
+        &shape.filter,
+        shape.mode,
+        shape.members,
+        shape.task_context,
+        shape.remote_reads,
+        &|_| 2,
+    )
+    .unwrap_or_else(|e| panic!("[{}] probe failed before load: {e:#}", shape.name));
+    assert!(
+        report.loaded,
+        "[{}] did not load at verifier log level 2: {}",
+        shape.name,
+        report.error.as_deref().unwrap_or("no error text")
+    );
+    let logs: Vec<&str> = report
+        .programs
+        .iter()
+        .filter_map(|p| p.verifier_log.as_deref())
+        .collect();
+    assert!(
+        logs.iter().any(|log| log.contains("call bpf_")),
+        "[{}] the verifier's log of {} program(s) names no helper call at all: the log was not \
+         captured, so nothing can be read off it",
+        shape.name,
+        logs.len()
+    );
+    // A log that ends before the verifier's closing line was cut: a call
+    // past the cut could not be seen.
+    assert!(
+        logs.iter().all(|log| log.contains("processed ")),
+        "[{}] the verifier's log of a program ends before its closing `processed N insns` line",
+        shape.name
+    );
+    (
+        logs.iter().any(|log| log.contains(CALL_FIND_VMA)),
+        logs.iter()
+            .any(|log| log.contains(CALL_COPY_FROM_USER_TASK)),
+    )
+}
+
+/// The shape a host loads that may not read other tasks' memory holds no call
+/// that does. Every closed row of the task-stacks table is loaded with the
+/// verifier's log, and no program's log names the mapping lookup or, where
+/// the kernel drops the global functions nothing calls, the remote copy: a
+/// branch the verifier pruned on the frozen constant is never walked, so
+/// never printed. The read is shown to see such a call first: the smallest
+/// open row, loaded the same way, has to name the remote copy, and the
+/// lookup where the unwinder makes it (aarch64).
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn closed_task_stacks_rows_call_nothing_that_reads_another_task() {
+    let shapes = task_stacks_shape_table();
+
+    let open = shapes
+        .iter()
+        .find(|s| s.name == "task-stacks-native")
+        .expect("the open native row");
+    assert!(open.remote_reads, "the control has to be an open row");
+    let (find_vma, copy) = calls_that_read_another_task(open);
+    eprintln!(
+        "[{}] the control: calls bpf_find_vma={find_vma} bpf_copy_from_user_task={copy}",
+        open.name
+    );
+    assert!(
+        copy,
+        "[{}] the open row's log names no call to bpf_copy_from_user_task: this read cannot see one",
+        open.name
+    );
+    assert_eq!(
+        find_vma,
+        cfg!(target_arch = "aarch64"),
+        "[{}] the unwinder makes the mapping lookup on aarch64 and nowhere else",
+        open.name
+    );
+
+    let drops = kernel_drops_uncalled_global_functions();
+    let closed: Vec<&TaskStacksLoadShape> = shapes.iter().filter(|s| !s.remote_reads).collect();
+    assert!(!closed.is_empty(), "the table has no closed row");
+    for shape in closed {
+        let (find_vma, copy) = calls_that_read_another_task(shape);
+        eprintln!(
+            "[{}] closed: calls bpf_find_vma={find_vma} bpf_copy_from_user_task={copy} \
+             (this kernel drops uncalled global functions: {drops})",
+            shape.name
+        );
+        assert!(
+            !find_vma,
+            "[{}] the loaded program calls bpf_find_vma",
+            shape.name
+        );
+        if drops {
+            assert!(
+                !copy,
+                "[{}] the loaded program calls bpf_copy_from_user_task",
+                shape.name
+            );
+        }
+    }
 }
