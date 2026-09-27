@@ -176,7 +176,7 @@ mallctl("prof.dump", NULL, NULL, NULL, 0);
 
 > **Experimental: no file at all.**
 > `systing-heap --pid PID --snoop` reads the profile jemalloc holds at that moment straight from the running process, so there is no interval to wait for and no snapshot file (or `lg_prof_interval`, or disk) needed; the process only needs `prof:true`.
-> It relies on jemalloc's private data structures. See "Reading a live process" in [`heap/README.md`](../heap/README.md).
+> It relies on jemalloc's private data structures, and reads them while the process runs: the database says how each such read went (`heap_live_read`). See "Reading a live process" in [`heap/README.md`](../heap/README.md).
 
 ## Collect the snapshots with systing-heap
 

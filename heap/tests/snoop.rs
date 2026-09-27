@@ -269,6 +269,128 @@ fn the_counts_are_the_ones_a_dump_of_the_same_heap_has() {
     }
 }
 
+/// A database says how the read of each snooped snapshot went, so that whoever
+/// opens it later can tell a clean read from one that was not; a dump, which
+/// jemalloc wrote under its own locks, has no such row.
+#[test]
+fn how_the_read_went_is_kept_with_the_snapshot() {
+    for lib in libs() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(bin) = build_target(dir.path()) else {
+            return;
+        };
+        let dump = dir.path().join("reference.heap");
+        let conf = "prof:true,lg_prof_sample:9";
+        let target = Target::start(&bin, Some(&lib), Some(conf), dump.to_str().unwrap());
+
+        let out = dir.path().join("snooped.duckdb");
+        let run = snoop_cli(target.pid(), &out, dir.path());
+        assert!(
+            run.status.success(),
+            "{lib:?}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let conn = Connection::open(&out).unwrap();
+        // One row, of the one snapshot.
+        let (rows, of_a_snapshot): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), count(s.id) FROM heap_live_read r
+                 LEFT JOIN heap_snapshot s
+                   ON s.trace_id = r.trace_id AND s.id = r.snapshot_id
+                  AND s.dump_trigger = 'snoop'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, of_a_snapshot), (1, 1), "{lib:?}");
+
+        let (found_by, object, period_from): (String, String, String) = conn
+            .query_row(
+                "SELECT found_by, object_path, sample_period_from FROM heap_live_read",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            ["symbol", "shape"].contains(&found_by.as_str()),
+            "{found_by}"
+        );
+        assert!(object.contains("jemalloc"), "{object}");
+        // The period is in the target's MALLOC_CONF, whatever the library has.
+        assert!(
+            ["symbols", "malloc_conf"].contains(&period_from.as_str()),
+            "{period_from}"
+        );
+
+        // The target is parked, so nothing moved under the read: it is clean,
+        // and what was read is at least what is reported.
+        let stacks: i64 = conn
+            .query_row("SELECT count(*) FROM heap_sample", [], |r| r.get(0))
+            .unwrap();
+        let (unsteady, read, skipped, threads, off, reads, bytes): (
+            bool,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT unsteady, backtraces_read,
+                        backtraces_skipped + thread_records_skipped, thread_records_read,
+                        links_out_of_order + counters_off, reads, bytes_read
+                 FROM heap_live_read",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(!unsteady, "{lib:?}");
+        assert_eq!((skipped, off), (0, 0), "{lib:?}");
+        assert!(
+            read >= stacks && stacks > 40,
+            "{lib:?}: {read} read, {stacks}"
+        );
+        assert!(threads >= stacks, "{lib:?}: {threads} thread records");
+        assert!(reads > 0 && bytes > 0, "{lib:?}");
+
+        // The same heap as jemalloc dumped it: snapshots, and no such row.
+        let dumped = dir.path().join("dumped.duckdb");
+        let run = Command::new(BIN)
+            .arg("-o")
+            .arg(&dumped)
+            .arg(&dump)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let conn = Connection::open(&dumped).unwrap();
+        let (snapshots, live_reads): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM heap_snapshot),
+                        (SELECT count(*) FROM heap_live_read)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((snapshots, live_reads), (1, 0), "{lib:?}");
+        target.stop();
+    }
+}
+
 /// With unbiasing on (the default) a dump prints counts that jeprof scales
 /// back to jemalloc's estimate, through integers; the estimate read from
 /// memory is jemalloc's own, so the two agree to rounding.
@@ -383,11 +505,14 @@ fn a_guessed_period_does_not_spoil_the_estimates() {
         // the case being tested. (With symbols it reads the right one.)
         if report.how == snoop::locate::How::Shape {
             assert_ne!(snooped.sample_period, dumped.sample_period, "{lib:?}");
+            // And the snapshot says that its period is a guess.
+            let kept = snooped.live_read.as_ref().unwrap();
+            assert_eq!(kept.sample_period_from, "default", "{lib:?}");
         }
         let (want, got) = (total(&dumped), total(&snooped));
         assert!(
             (got - want).abs() / want < 0.005,
-            "{lib:?}: dump {want}, memory {got}; period 2^{} from {}",
+            "{lib:?}: dump {want}, memory {got}; period 2^{} from {:?}",
             report.lg_prof_sample,
             report.sample_period_from
         );

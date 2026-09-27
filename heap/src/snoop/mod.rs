@@ -39,7 +39,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::maps::Maps;
 use crate::root::Root;
-use crate::{Format, Sample, Snapshot};
+use crate::{Format, LiveRead, Sample, Snapshot};
 
 use layout::Counts;
 use locate::How;
@@ -62,14 +62,44 @@ const MAX_MAPS_BYTES: u64 = 64 << 20;
 const MAX_STATUS_BYTES: u64 = 1 << 20;
 const MAX_ENVIRON_BYTES: u64 = 16 << 20;
 
+/// Where a snapshot's sample period is from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodFrom {
+    /// `lg_prof_sample` itself, read from the process at the library's symbol.
+    Symbols,
+    /// The `MALLOC_CONF` the process was started with.
+    MallocConf,
+    /// Neither could be read: jemalloc's default, which is a guess.
+    Default,
+}
+
+impl PeriodFrom {
+    /// As a sentence says it.
+    fn said(self) -> &'static str {
+        match self {
+            PeriodFrom::Symbols => "the library's symbols",
+            PeriodFrom::MallocConf => "the process's MALLOC_CONF",
+            PeriodFrom::Default => "jemalloc's default",
+        }
+    }
+
+    /// As `heap_live_read.sample_period_from` has it.
+    fn name(self) -> &'static str {
+        match self {
+            PeriodFrom::Symbols => "symbols",
+            PeriodFrom::MallocConf => "malloc_conf",
+            PeriodFrom::Default => "default",
+        }
+    }
+}
+
 /// What a snoop found, besides the snapshot: how, for the caller to say.
 #[derive(Debug)]
 pub struct Report {
     pub how: How,
     pub object: String,
     pub lg_prof_sample: u32,
-    /// Where `lg_prof_sample` came from.
-    pub sample_period_from: &'static str,
+    pub sample_period_from: PeriodFrom,
     /// Stacks read.
     pub stacks: usize,
     pub stats: walk::Stats,
@@ -206,10 +236,10 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
     let maps = Maps::parse(&process.read_text("maps", MAX_MAPS_BYTES)?);
 
     let (lg, from) = match found.lg_prof_sample {
-        Some(lg) => (lg, "the library's symbols"),
+        Some(lg) => (lg, PeriodFrom::Symbols),
         None => match lg_prof_sample_from_env(process) {
-            Some(lg) => (lg, "the process's MALLOC_CONF"),
-            None => (DEFAULT_LG_PROF_SAMPLE, "jemalloc's default"),
+            Some(lg) => (lg, PeriodFrom::MallocConf),
+            None => (DEFAULT_LG_PROF_SAMPLE, PeriodFrom::Default),
         },
     };
     let samples: Vec<Sample> = profile
@@ -219,6 +249,17 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
         .collect();
 
     let (reads, bytes) = mem.traffic();
+    let report = Report {
+        how: found.how,
+        object: found.object,
+        lg_prof_sample: lg,
+        sample_period_from: from,
+        stacks: profile.stacks.len(),
+        stats: profile.stats,
+        reads,
+        bytes,
+        millis: started.elapsed().as_millis(),
+    };
     let snapshot = Snapshot {
         format: Format::Jemalloc,
         source_path: PathBuf::from(format!("/proc/{pid}/mem")),
@@ -241,17 +282,7 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
         maps,
         perf_map: None,
         py_code: None,
-    };
-    let report = Report {
-        how: found.how,
-        object: found.object,
-        lg_prof_sample: lg,
-        sample_period_from: from,
-        stacks: profile.stacks.len(),
-        stats: profile.stats,
-        reads,
-        bytes,
-        millis: started.elapsed().as_millis(),
+        live_read: Some(report.live_read()),
     };
     Ok((snapshot, report))
 }
@@ -391,8 +422,34 @@ fn innermost_pid(status: &str) -> Option<u32> {
         .and_then(|l| l.split_whitespace().last()?.parse().ok())
 }
 
-/// What a caller prints about a snoop.
 impl Report {
+    /// The same, as the snapshot keeps it and the database has it.
+    pub fn live_read(&self) -> LiveRead {
+        let s = &self.stats;
+        LiveRead {
+            found_by: match self.how {
+                How::Symbol => "symbol",
+                How::Shape => "shape",
+            },
+            object_path: self.object.clone(),
+            sample_period_from: self.sample_period_from.name(),
+            walks_redone: s.retries,
+            unsteady: s.unsteady,
+            backtraces_read: s.gctx_read,
+            backtraces_skipped: s.gctx_skipped,
+            thread_records_read: s.tctx_read,
+            thread_records_skipped: s.tctx_skipped,
+            links_checked: s.order_checked,
+            links_out_of_order: s.order_violated,
+            counters_checked: s.counters_checked,
+            counters_off: s.counters_violated,
+            reads: self.reads,
+            bytes_read: self.bytes,
+            duration_ms: u64::try_from(self.millis).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// What a caller prints about a snoop.
     pub fn summary(&self, pid: u32) -> String {
         let moved =
             self.stats.retries > 0 || self.stats.gctx_skipped > 0 || self.stats.tctx_skipped > 0;
@@ -410,7 +467,7 @@ impl Report {
             self.reads,
             self.bytes / 1024,
             self.lg_prof_sample,
-            self.sample_period_from,
+            self.sample_period_from.said(),
         );
         if moved {
             out.push_str(&format!(
@@ -570,12 +627,76 @@ mod tests {
     }
 
     #[test]
+    fn what_is_kept_with_the_snapshot_is_what_the_walk_counted() {
+        let report = |stats| Report {
+            how: How::Shape,
+            object: "/lib/j.so".into(),
+            lg_prof_sample: 19,
+            sample_period_from: PeriodFrom::Default,
+            stacks: 3,
+            stats,
+            reads: 11,
+            bytes: 2048,
+            millis: 7,
+        };
+        let kept = report(walk::Stats {
+            retries: 2,
+            gctx_read: 5,
+            tctx_read: 9,
+            order_checked: 4,
+            counters_checked: 9,
+            ..Default::default()
+        })
+        .live_read();
+        assert_eq!(
+            (kept.found_by, kept.sample_period_from, &*kept.object_path),
+            ("shape", "default", "/lib/j.so")
+        );
+        assert_eq!(
+            (kept.walks_redone, kept.reads, kept.bytes_read),
+            (2, 11, 2048)
+        );
+        assert_eq!((kept.backtraces_read, kept.thread_records_read), (5, 9));
+        assert_eq!((kept.links_checked, kept.counters_checked), (4, 9));
+        assert_eq!(kept.duration_ms, 7);
+        // A walk done again is not held against the one that was kept.
+        assert!(kept.is_clean());
+
+        // Each of the things that can be wrong with a read makes it not clean.
+        let not_clean = [
+            walk::Stats {
+                unsteady: true,
+                ..Default::default()
+            },
+            walk::Stats {
+                gctx_skipped: 1,
+                ..Default::default()
+            },
+            walk::Stats {
+                tctx_skipped: 1,
+                ..Default::default()
+            },
+            walk::Stats {
+                order_violated: 1,
+                ..Default::default()
+            },
+            walk::Stats {
+                counters_violated: 1,
+                ..Default::default()
+            },
+        ];
+        for stats in not_clean {
+            assert!(!report(stats.clone()).live_read().is_clean(), "{stats:?}");
+        }
+    }
+
+    #[test]
     fn the_summary_says_what_the_layout_checks_had_to_go_on() {
         let report = |order_checked, counters_checked| Report {
             how: How::Symbol,
             object: "/lib/j.so".into(),
             lg_prof_sample: 9,
-            sample_period_from: "x",
+            sample_period_from: PeriodFrom::Symbols,
             stacks: 3,
             stats: walk::Stats {
                 order_checked,
@@ -735,7 +856,7 @@ mod tests {
             how: How::Shape,
             object: "/lib/a\x1bb.so".into(),
             lg_prof_sample: 9,
-            sample_period_from: "x",
+            sample_period_from: PeriodFrom::Symbols,
             stacks: 3,
             stats: walk::Stats::default(),
             reads: 1,

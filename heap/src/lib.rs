@@ -57,6 +57,60 @@ pub struct Snapshot {
     /// Python frames the hooks' "python" backtrace stored; None if not
     /// found.
     pub py_code: Option<std::sync::Arc<pycode::CodeMap>>,
+    /// How the read went, for a snapshot read out of a running process
+    /// (`--snoop`); None for a dump, which the allocator wrote under its own
+    /// locks.
+    pub live_read: Option<LiveRead>,
+}
+
+/// How reading a snapshot out of a running process's memory went
+/// ([`snoop`]). The process runs meanwhile and nothing of it is locked, so
+/// records that changed under the read are skipped and a walk the table
+/// changed under is done again; and the layout is judged by what was read.
+/// These are the counts, kept with the snapshot (`heap_live_read`) so that a
+/// reader of the database can tell a clean read from one that was not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRead {
+    /// How the profile was found: `symbol` or `shape`.
+    pub found_by: &'static str,
+    /// The file it was found in, as the process maps it.
+    pub object_path: String,
+    /// Where the sample period is from: `symbols`, `malloc_conf`, or
+    /// `default`, which is a guess.
+    pub sample_period_from: &'static str,
+    /// Walks done again.
+    pub walks_redone: u32,
+    /// The profile was changing during every walk: stacks may be missing.
+    pub unsteady: bool,
+    pub backtraces_read: u64,
+    pub backtraces_skipped: u64,
+    pub thread_records_read: u64,
+    pub thread_records_skipped: u64,
+    /// Parent and child thread records compared for jemalloc's order, and
+    /// those out of it.
+    pub links_checked: u64,
+    pub links_out_of_order: u64,
+    /// Thread records whose counters were compared with each other, and
+    /// those that cannot be jemalloc's.
+    pub counters_checked: u64,
+    pub counters_off: u64,
+    /// Reads of the process's memory, and the bytes read.
+    pub reads: u64,
+    pub bytes_read: u64,
+    pub duration_ms: u64,
+}
+
+impl LiveRead {
+    /// Nothing was skipped, nothing was out of place, and the profile held
+    /// still for the walk that was kept. A walk done again is not held
+    /// against it: the one kept is what is judged.
+    pub fn is_clean(&self) -> bool {
+        !self.unsteady
+            && self.backtraces_skipped == 0
+            && self.thread_records_skipped == 0
+            && self.links_out_of_order == 0
+            && self.counters_off == 0
+    }
 }
 
 /// One allocation stack and what is allocated from it.

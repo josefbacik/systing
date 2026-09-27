@@ -3,8 +3,9 @@
 //! The database has systing's full schema ([`systing::duckdb::create_schema`]),
 //! so it opens in `systing-analyze` and merges with other traces like any
 //! capture. Stacks go into `frame` / `stack`, the tables every recorder
-//! shares; the snapshots into `heap_snapshot` / `heap_sample`; each process
-//! that wrote a dump gets a `process` row.
+//! shares; the snapshots into `heap_snapshot` / `heap_sample`, and how the
+//! read went into `heap_live_read` for one read from a running process; each
+//! process that wrote a dump gets a `process` row.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -74,6 +75,7 @@ pub fn write(
     {
         let mut snapshot_rows = tx.appender("heap_snapshot")?;
         let mut sample_rows = tx.appender("heap_sample")?;
+        let mut live_read_rows = tx.appender("heap_live_read")?;
         for (si, s) in snapshots.iter().enumerate() {
             let snapshot_id = si as i64 + 1;
             let upid = match s.pid {
@@ -99,6 +101,30 @@ pub fn write(
                 s.dumped_at_unix_ns,
                 s.sample_period as i64
             ])?;
+            if let Some(r) = &s.live_read {
+                // Counts, none of them near what a BIGINT holds.
+                let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+                live_read_rows.append_row(params![
+                    trace_id,
+                    snapshot_id,
+                    r.found_by,
+                    r.object_path,
+                    r.sample_period_from,
+                    i32::try_from(r.walks_redone).unwrap_or(i32::MAX),
+                    r.unsteady,
+                    n(r.backtraces_read),
+                    n(r.backtraces_skipped),
+                    n(r.thread_records_read),
+                    n(r.thread_records_skipped),
+                    n(r.links_checked),
+                    n(r.links_out_of_order),
+                    n(r.counters_checked),
+                    n(r.counters_off),
+                    n(r.reads),
+                    n(r.bytes_read),
+                    n(r.duration_ms)
+                ])?;
+            }
             for (sample, names) in s.samples.iter().zip(&symbolized.frames[si]) {
                 let ids: Vec<i64> = names
                     .iter()
@@ -129,6 +155,7 @@ pub fn write(
         }
         snapshot_rows.flush()?;
         sample_rows.flush()?;
+        live_read_rows.flush()?;
     }
     drop(process);
 

@@ -191,6 +191,7 @@ pub fn parse(text: &str) -> Result<Snapshot> {
         maps,
         perf_map: None,
         py_code: None,
+        live_read: None,
     })
 }
 
