@@ -10,7 +10,7 @@ use std::sync::Arc;
 use systing_heap::perfmap::{self, PerfMap};
 use systing_heap::pycode::{self, CodeMap};
 use systing_heap::root::Root;
-use systing_heap::{db, jemalloc, perfetto, retention, symbolize, Format, Snapshot};
+use systing_heap::{db, jemalloc, perfetto, retention, snoop, symbolize, Format, Snapshot};
 
 /// Parse allocator heap snapshots (jemalloc prof dumps), symbolize their
 /// stacks, and write them into a systing DuckDB database.
@@ -23,12 +23,15 @@ use systing_heap::{db, jemalloc, perfetto, retention, symbolize, Format, Snapsho
 /// With --pid or --root-fd, the inputs and every path the snapshots name are
 /// resolved beneath that root, to read a container's snapshots from outside
 /// it.
+///
+/// With --pid and --snoop (EXPERIMENTAL) there is no snapshot file: the
+/// process's current jemalloc heap profile is read out of its memory.
 #[derive(Parser)]
 #[command(name = "systing-heap", version)]
 struct Cli {
     /// jemalloc prof_prefixes, snapshot files, or directories to load every
     /// snapshot file in (not recursively).
-    #[arg(required = true)]
+    #[arg(required_unless_present = "snoop")]
     inputs: Vec<PathBuf>,
 
     /// The output, replaced on every run: a DuckDB database, or a Perfetto
@@ -89,6 +92,21 @@ struct Cli {
     /// another process.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
     root_fd: Option<i32>,
+
+    /// EXPERIMENTAL. With --pid, read the process's current jemalloc heap
+    /// profile from its memory, instead of from a snapshot file: no input, no
+    /// dump interval to wait for, and no file is written. It relies on
+    /// jemalloc's private data structures and refuses a jemalloc whose layout
+    /// it does not know. The process needs `prof:true` in its MALLOC_CONF;
+    /// reading its memory needs the same access as ptrace. A Python code map
+    /// is looked for only in --perf-map-dir (there is no dump for it to be
+    /// beside).
+    #[arg(
+        long,
+        requires = "pid",
+        conflicts_with_all = ["inputs", "format", "keep_all", "latest_only", "dry_run"]
+    )]
+    snoop: bool,
 }
 
 fn main() -> Result<()> {
@@ -113,6 +131,15 @@ fn main() -> Result<()> {
     let delete_older = !cli.keep_all && !cli.latest_only;
     let mut snapshots: Vec<Snapshot> = Vec::new();
     let mut plans: Vec<retention::Plan> = Vec::new();
+    if let (true, Some(pid), Some(root)) = (cli.snoop, cli.pid, root) {
+        eprintln!(
+            "warning: --snoop is experimental: it reads jemalloc's private data structures \
+             out of process {pid}'s memory, and may fail or refuse on a jemalloc it does not know"
+        );
+        let (snapshot, report) = snoop::read(pid, root)?;
+        eprintln!("{}", report.summary(pid));
+        snapshots.push(snapshot);
+    }
     for input in &cli.inputs {
         if is_file_or_dir(input, root)? {
             if root.is_some() {
@@ -199,12 +226,15 @@ fn main() -> Result<()> {
         );
     }
 
-    let source = cli
-        .inputs
-        .iter()
-        .map(|p| p.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(",");
+    let source = match (cli.snoop, cli.pid) {
+        (true, Some(pid)) => format!("snoop:{pid}"),
+        _ => cli
+            .inputs
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(","),
+    };
     let written = write_replacing(&cli.output, !as_perfetto, |tmp| {
         if as_perfetto {
             perfetto::write(tmp, &snapshots, &symbolized)

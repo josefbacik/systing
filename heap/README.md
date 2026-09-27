@@ -137,6 +137,39 @@ No other user in the container can then name that process's frames.
 A binary, a perf map or a code map that is on a FUSE or network filesystem beneath the root (a bucket or a file server mounted into the container) is left unread, with a warning, and its frames stay unresolved: whoever wrote the dumps chose those paths, a read there would be made with the reader's authority on storage the container only mounts, and it can stall without end.
 Beneath a root, names come from the binaries' own symbol tables and the perf map: debug information is not read there, so there are no inlined frames, no file and line, and no name that lives only in debug information. The symbolizer looks a binary's separate debug file up (its debug link, its `.dwp`) by paths of its own making, which are the reader's and not the container's, and the name it looks up is the binary's to choose.
 
+## Reading a live process (experimental)
+
+> **Very experimental.**
+> This reads jemalloc's private data structures out of a running process, and jemalloc's authors are free to change them.
+> A jemalloc it does not recognise is refused, with a reason; it is never guessed at.
+> Expect it to change, and do not build on it yet.
+
+`--snoop` takes the heap profile a process holds right now, from its memory, instead of from a snapshot file:
+
+```bash
+systing-heap -o heap.duckdb --pid 4242 --snoop
+systing-heap -o heap.pb --pid 4242 --snoop        # or a Perfetto trace
+```
+
+- **No file, no wait.** No snapshot is written by jemalloc or by the tool, so the process needs no `prof_prefix`, `lg_prof_interval` or `prof_final`, and no disk: only `prof:true` in its `MALLOC_CONF` (and a `lg_prof_sample` that suits the question, see Sampling and unbiasing). The only file the tool creates is its output.
+- **Nothing is done to the process.** It is not stopped, signalled or made to run our code. The tool only reads `/proc/PID/mem`, which the kernel answers with an error for an address that is gone, so a read can neither fault nor crash the process. jemalloc's locks are not taken either (a dump takes them while it adds up), so the profile can be a little less steady than a dump: a stack's counts can be from slightly different moments. The summary line says when a walk had to be redone, or something was skipped because the heap moved during it.
+- **Who may.** As for `--pid`, the tool opens `/proc/PID/root`; it also needs to read the process's memory, which takes the same user, or root or `CAP_SYS_PTRACE`, and a `kernel.yama.ptrace_scope` that permits it.
+- **The snapshot is like a dump's.** One `heap_snapshot` row with `dump_trigger` `snoop`, its `heap_sample` rows, frames named from the binaries as for a dump. The process's pid in it is the one the process knows itself by (its innermost pid namespace), as a dump's file name has. Each stack's four counts are the ones a dump of the same heap would print: the tests compare them one by one against a dump jemalloc writes of the same process, with `prof_accum` on and off. With `prof_unbias:false` a dump prints raw counts instead, and a snoop has jemalloc's own per-object estimate, which is the better one.
+
+**How it finds the profile.** The table that holds every backtrace, `bt2gctx`, is a `static` in jemalloc: it has no exported name.
+A build that keeps its `.symtab` names it. A stripped one, such as Debian's and Ubuntu's `libjemalloc2`, does not, and there the table is found by its shape instead: the only static in the library that is a hash table of jemalloc's own backtrace records, each of which points back at itself.
+Either way what is found is checked against that shape before it is used, and every structure read afterwards is checked against jemalloc's own invariants, so memory that was freed and reused meanwhile is skipped.
+The code is in `src/snoop/`, and nothing else in the crate knows how it works.
+
+**What it knows.** The structures as jemalloc 5.3.0 and the current `dev` branch lay them out, on 64-bit Linux (x86-64 and aarch64, which lay them out alike; aarch64 is only exercised by CI). Tested against Ubuntu's `libjemalloc2` 5.3.0 (stripped), jemalloc 5.3.0 built from source, and `dev`, with `prof_accum` on and off and `prof_unbias` on and off. It has not been run on jemalloc 4 or 5.0 to 5.2, on a fork with its own changes, or on one linked statically into the program (the program itself is looked in when no jemalloc library is mapped, but that is untried).
+
+**Limits.**
+
+- **Sample period.** The `sample_period` in the snapshot comes from the library's symbols when it has them; else from the `MALLOC_CONF` the process started with, else jemalloc's default (2^19), and the summary line says which. `mallctl("prof.reset")` can change the period afterwards. A wrong period changes the label and the counts shown by a rounding, and hardly the estimates.
+- **`prof.reset`.** After it, a dump leaves out the counters of threads jemalloc has marked expired. This does not look at that mark, so those counters may still be read; not tested.
+- **Python frames.** A Python function's name comes from the hooks' code map, which the hook writes beside where the dumps would go (the directory of `prof_prefix`), and there is no dump here to look beside: pass `--perf-map-dir` that directory, or the tool warns and the frames stay unnamed. (That map is the one file the hook writes; the tool and jemalloc write none.) A perf trampoline's map is found in the container's `/tmp` as before.
+- **A young or idle heap.** A process that has sampled nothing yet has nothing to report, and the tool says so.
+
 ## Python stacks
 
 A Python program's heap stacks can show its Python functions among the native frames, each with its file and line:
@@ -299,11 +332,11 @@ A finer period gives a closer estimate, but sampling itself costs memory: jemall
 |---|---|
 | `id` | Snapshot id, dense within the trace |
 | `format` | `jemalloc` |
-| `source_path` | The file read |
+| `source_path` | The file read; `/proc/PID/mem` for a snoop |
 | `upid` | `process.upid` of the pid in the file name, as the writing process saw it in its own pid namespace; NULL if the name has none |
 | `seq` | The allocator's dump sequence number |
-| `dump_trigger` | `interval` (every `lg_prof_interval` bytes), `manual` (`mallctl("prof.dump")`), `gdump` (new high-water mark), `final` (at exit) |
-| `dumped_at_unix_ns` | The file's modification time when read, wall-clock; a copy that does not keep times moves it |
+| `dump_trigger` | `interval` (every `lg_prof_interval` bytes), `manual` (`mallctl("prof.dump")`), `gdump` (new high-water mark), `final` (at exit), `snoop` (read from the live process, see above) |
+| `dumped_at_unix_ns` | The file's modification time when read, wall-clock; a copy that does not keep times moves it. For a snoop, the time of the read |
 | `sample_period` | Mean bytes between samples (`2^lg_prof_sample`) |
 
 `heap_sample` has one row per distinct allocation stack in a snapshot.
