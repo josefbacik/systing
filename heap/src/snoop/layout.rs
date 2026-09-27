@@ -41,6 +41,10 @@ pub mod gctx {
 
 /// `prof_tctx_t`: one thread's counters for one backtrace.
 pub mod tctx {
+    /// The three fields the tree is ordered by (`prof_tctx_comp`), in order.
+    pub const THR_UID: usize = 8;
+    pub const THR_DISCRIM: usize = 16;
+    pub const TCTX_UID: usize = 104;
     pub const CNTS: usize = 32;
     pub const GCTX: usize = 96;
     /// Left child, and right child with the red-black colour in its low bit.
@@ -64,6 +68,9 @@ pub struct Ckh {
     pub count: u64,
     pub lg_min_buckets: u32,
     pub lg_cur_buckets: u32,
+    /// The hash and comparison functions: code in jemalloc's own object.
+    pub hash: u64,
+    pub keycomp: u64,
     pub tab: u64,
 }
 
@@ -80,6 +87,8 @@ impl Ckh {
             count: u64_at(ckh::COUNT),
             lg_min_buckets: u32_at(ckh::LG_MIN_BUCKETS),
             lg_cur_buckets: u32_at(ckh::LG_CUR_BUCKETS),
+            hash: u64_at(ckh::HASH),
+            keycomp: u64_at(ckh::KEYCOMP),
             tab: u64_at(ckh::TAB),
         }
     }

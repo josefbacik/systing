@@ -17,6 +17,9 @@ const MAX_SEGMENTS: u64 = 4096;
 const MAX_HEADER_ENTRY: u64 = 128;
 
 const SHT_SYMTAB: u32 = 2;
+/// Symbol types 0 (none) and 1 (object) are data; 2 is a function, 6 a
+/// thread-local.
+const STT_OBJECT: u8 = 1;
 const PT_LOAD: u32 = 1;
 const ET_EXEC: u16 = 2;
 
@@ -133,10 +136,16 @@ pub fn find(file: &File, wanted: &[&'static str]) -> io::Result<Symbols> {
         while done + ENTRY <= sym_size {
             let len = CHUNK.min(sym_size - done) / ENTRY * ENTRY;
             let mut buf = vec![0u8; len as usize];
-            file.read_exact_at(&mut buf, sym_off + done)?;
+            let at = sym_off
+                .checked_add(done)
+                .ok_or_else(|| invalid("symbol table"))?;
+            file.read_exact_at(&mut buf, at)?;
             for e in buf.as_chunks::<24>().0 {
                 let (name, shndx, value) = (u32_at(e, 0) as usize, u16_at(e, 6), u64_at(e, 8));
-                if shndx == 0 || value == 0 || name >= strtab.len() {
+                // What is wanted is data: an object, or a symbol with no type.
+                // A function or a thread-local of the same name is not it.
+                let kind = e[4] & 0xf;
+                if shndx == 0 || value == 0 || name >= strtab.len() || kind > STT_OBJECT {
                     continue;
                 }
                 let tail = &strtab[name..(name + window).min(strtab.len())];
@@ -262,6 +271,29 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn only_data_symbols_are_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let strtab = b"\0bt2gctx\0";
+        // The same name, as a function (type 2) and then as an object (type 1):
+        // the object is the one.
+        let mut func = symbol(1, 0x5000);
+        func[4] = 2;
+        let mut object = symbol(1, 0x6000);
+        object[4] = 1;
+        let symtab: Vec<u8> = [func, object].into_iter().flatten().collect();
+        let f = tiny_elf(dir.path(), 64, 3, &symtab, strtab);
+        assert_eq!(
+            find(&f, &["bt2gctx"]).unwrap().found.get("bt2gctx"),
+            Some(&0x6000)
+        );
+        // A thread-local (type 6) alone is not taken.
+        let mut tls = symbol(1, 0x7000);
+        tls[4] = 6;
+        let f = tiny_elf(dir.path(), 64, 3, &tls, strtab);
+        assert!(find(&f, &["bt2gctx"]).unwrap().found.is_empty());
     }
 
     #[test]

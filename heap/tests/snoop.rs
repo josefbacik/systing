@@ -250,6 +250,18 @@ fn the_counts_are_the_ones_a_dump_of_the_same_heap_has() {
                 assert_eq!(got.get(addrs), Some(counts), "{ctx}: stack {addrs:x?}");
             }
             assert_eq!(snooped.trigger, Some("snoop"));
+            // The checks over the whole walk had records to judge, and on a
+            // real jemalloc found nothing out of place: the thread records
+            // are in the order jemalloc keeps them, and the counters are
+            // ones jemalloc keeps.
+            let st = &report.stats;
+            assert!(st.counters_checked > 10, "{ctx}: {st:?}");
+            assert!(st.order_checked > 0, "{ctx}: {st:?}");
+            assert_eq!(
+                (st.counters_violated, st.order_violated),
+                (0, 0),
+                "{ctx}: {st:?}"
+            );
             // The same memory map, for symbolization.
             assert_eq!(snooped.maps.exe_name(), dumped.maps.exe_name());
             target.stop();

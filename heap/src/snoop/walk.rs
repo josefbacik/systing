@@ -66,6 +66,14 @@ pub struct Stats {
     pub tctx_skipped: u64,
     /// `tctx` read and counted.
     pub tctx_read: u64,
+    /// Parent and child thread records compared for the tree's order, and
+    /// those out of it (see [`read_tctxs`]).
+    pub order_checked: u64,
+    pub order_violated: u64,
+    /// Thread records whose counters were compared with each other, and those
+    /// that cannot be jemalloc's (see [`read_tctxs`]).
+    pub counters_checked: u64,
+    pub counters_violated: u64,
     /// The table was changing while it was read, and kept changing for every
     /// attempt: jemalloc was rebuilding it, or moving entries in it. The
     /// profile is what was read last and may be missing stacks.
@@ -111,8 +119,8 @@ pub fn walk(mem: &dyn Memory, bt2gctx: u64) -> io::Result<Profile> {
 fn walk_limited(mem: &dyn Memory, bt2gctx: u64, limits: Limits) -> io::Result<Profile> {
     let mut retries = 0;
     let mut last = io::Error::other("the profile kept changing");
-    // A walk that read a table which was not at rest, kept in case none is.
-    let mut unsteady: Option<Profile> = None;
+    // A walk that was not clean, kept in case none is.
+    let mut best: Option<Profile> = None;
     for _ in 0..ATTEMPTS {
         let head = Ckh::read(mem, bt2gctx)?;
         if !head.plausible() {
@@ -149,15 +157,28 @@ fn walk_limited(mem: &dyn Memory, bt2gctx: u64, limits: Limits) -> io::Result<Pr
         let slack = (head.count / 64).max(2);
         let at_rest = (entries.len() as u64).abs_diff(head.count) <= slack
             && head.count.abs_diff(after.count) <= slack;
-        if at_rest {
+        // A record that was freed and reused under the walk, or a tree that
+        // was rotated under it, shows as records skipped: worth another go.
+        let skips = stats.gctx_skipped + stats.tctx_skipped;
+        if at_rest && skips == 0 {
             stats.retries = retries;
             return Ok(Profile { stacks, stats });
         }
-        stats.unsteady = true;
-        unsteady = Some(Profile { stacks, stats });
+        stats.unsteady = !at_rest;
+        // Of the walks that were not clean, the one with the fewest problems.
+        let problems = |p: &Profile| {
+            p.stats.gctx_skipped + p.stats.tctx_skipped + u64::from(p.stats.unsteady) * (1 << 40)
+        };
+        let candidate = Profile { stacks, stats };
+        if best
+            .as_ref()
+            .is_none_or(|b| problems(&candidate) < problems(b))
+        {
+            best = Some(candidate);
+        }
         retries += 1;
     }
-    match unsteady {
+    match best {
         Some(mut profile) => {
             profile.stats.retries = retries;
             Ok(profile)
@@ -247,17 +268,34 @@ pub fn read_gctx(mem: &dyn Memory, key: u64, gaddr: u64) -> Option<(u64, Vec<u64
     Some((root, addrs))
 }
 
+/// The key jemalloc orders a `gctx`'s tree of thread records by
+/// (`prof_tctx_comp`): the thread, then which of its tdata, then the record.
+type TctxKey = (u64, u64, u64);
+
 /// The counters of every `tctx` in a `gctx`'s tree that a dump would add up.
+///
+/// Two things are checked across the whole walk and not record by record, since
+/// a moving heap breaks either for a moment, and `refuse_unusable` looks at the
+/// share: that each left child sorts below its parent and each right child
+/// above (the tree's own order, which ties the link offsets to the key
+/// offsets), and that a record's unbiased counters are at least its raw ones
+/// (each sampled object adds at least 8 to the shifted count and at least its
+/// size to the unbiased bytes, `prof_unbias_map_init`).
 fn read_tctxs(mem: &dyn Memory, gaddr: u64, root: u64, stats: &mut Stats) -> Vec<Counts> {
     let mut out = Vec::new();
-    let mut todo = vec![root];
+    // Each address to visit, with its parent's key and which side it hangs on.
+    let mut todo: Vec<(u64, Option<(TctxKey, bool)>)> = vec![(root, None)];
     let mut seen = HashSet::new();
-    while let Some(addr) = todo.pop() {
+    while let Some((addr, parent)) = todo.pop() {
         if addr == 0 {
             continue;
         }
         // The visited set bounds a tree that a torn read made cyclic.
-        if seen.len() >= MAX_TCTX_PER_GCTX || !seen.insert(addr) {
+        if seen.len() >= MAX_TCTX_PER_GCTX {
+            stats.tctx_skipped += 1;
+            break;
+        }
+        if !seen.insert(addr) {
             continue;
         }
         let Ok(b) = mem.bytes(addr, tctx::READ) else {
@@ -275,26 +313,49 @@ fn read_tctxs(mem: &dyn Memory, gaddr: u64, root: u64, stats: &mut Stats) -> Vec
             stats.tctx_skipped += 1;
             continue;
         }
+        let key: TctxKey = (
+            u64_at(&b, tctx::THR_UID),
+            u64_at(&b, tctx::THR_DISCRIM),
+            u64_at(&b, tctx::TCTX_UID),
+        );
+        if let Some((parent_key, is_left)) = parent {
+            stats.order_checked += 1;
+            if (is_left && key >= parent_key) || (!is_left && key <= parent_key) {
+                stats.order_violated += 1;
+            }
+        }
         // The low bit of the right link is the node's colour. A child is
         // either NULL or the address of a record, which is 8-aligned.
-        for child in [
-            u64_at(&b, tctx::LINK_LEFT),
-            u64_at(&b, tctx::LINK_RIGHT_RED) & !1,
+        for (child, is_left) in [
+            (u64_at(&b, tctx::LINK_LEFT), true),
+            (u64_at(&b, tctx::LINK_RIGHT_RED) & !1, false),
         ] {
             if child & 7 != 0 {
                 stats.tctx_skipped += 1;
             } else {
-                todo.push(child);
+                todo.push((child, Some((key, is_left))));
             }
         }
         // prof_tctx_merge_tdata() leaves a tctx that is `initializing` out of
-        // a dump, and so does this. (jemalloc 5.3.0 links a record into the
-        // tree only once it is nominal, so this mostly meets reused memory.)
+        // a dump, and so does this. It is counted as skipped, so that a layout
+        // whose "state" is some other field, which reads as 0 wherever a node
+        // has no right child, does not pass for an idle process. (jemalloc
+        // 5.3.0 links a record into the tree only once it is nominal.)
         if state == tctx::STATE_INITIALIZING {
+            stats.tctx_skipped += 1;
             continue;
         }
+        let c = Counts::parse(&b[tctx::CNTS..tctx::CNTS + CNT_SIZE]);
+        if c.cur_objs > 0 {
+            stats.counters_checked += 1;
+            if c.cur_objs_shifted_unbiased < c.cur_objs.saturating_mul(8)
+                || c.cur_bytes_unbiased < c.cur_bytes
+            {
+                stats.counters_violated += 1;
+            }
+        }
         stats.tctx_read += 1;
-        out.push(Counts::parse(&b[tctx::CNTS..tctx::CNTS + CNT_SIZE]));
+        out.push(c);
     }
     out
 }
@@ -349,6 +410,31 @@ mod tests {
                 mem: FakeMem::default(),
                 cells: Vec::new(),
             }
+        }
+
+        /// Set the key a `tctx` is ordered by.
+        fn key(&mut self, at: u64, key: (u64, u64, u64)) {
+            self.mem.poke_u64(at + tctx::THR_UID as u64, key.0);
+            self.mem.poke_u64(at + tctx::THR_DISCRIM as u64, key.1);
+            self.mem.poke_u64(at + tctx::TCTX_UID as u64, key.2);
+        }
+
+        /// A perfect binary tree of `tctx` for keys `lo..=hi` under `gaddr`,
+        /// ordered as jemalloc orders them (reversed if `backwards`); the
+        /// address of its root.
+        fn tree(&mut self, gaddr: u64, lo: u64, hi: u64, backwards: bool) -> u64 {
+            if lo > hi {
+                return 0;
+            }
+            let mid = (lo + hi) / 2;
+            let at = 0x100000 + mid * 0x100;
+            let left = self.tree(gaddr, lo, mid.wrapping_sub(1), backwards);
+            let right = self.tree(gaddr, mid + 1, hi, backwards);
+            self.tctx(at, gaddr, left, right, NOMINAL, (1, 100));
+            // The thread first, the record last: order on any of the three.
+            let k = if backwards { 100 - mid } else { mid };
+            self.key(at, (k, 0, 0));
+            at
         }
 
         /// A `tctx` under `gaddr`, with its children, and its counters.
@@ -437,14 +523,12 @@ mod tests {
         assert_eq!(p.stacks[0].counts.cur_bytes, 1000);
         assert_eq!(p.stacks[0].counts.cur_objs_shifted_unbiased, 80);
         assert_eq!(p.stats.tctx_read, 4);
+        assert_eq!(p.stats.gctx_read, 2);
         assert_eq!(
-            p.stats,
-            Stats {
-                gctx_read: 2,
-                tctx_read: 4,
-                ..Default::default()
-            }
+            (p.stats.retries, p.stats.gctx_skipped, p.stats.tctx_skipped),
+            (0, 0, 0)
         );
+        assert!(!p.stats.unsteady);
     }
 
     #[test]
@@ -592,6 +676,69 @@ mod tests {
             walk_limited(&mem, HEADER, limit(12)).unwrap().stacks.len(),
             3
         );
+    }
+
+    #[test]
+    fn a_tree_in_jemallocs_order_is_not_flagged_and_one_out_of_it_is() {
+        for (backwards, violated) in [(false, 0), (true, 14)] {
+            let mut h = Heap::new();
+            let root = h.tree(0x10000, 1, 15, backwards);
+            h.gctx(0x10000, &[0xa1], root);
+            let p = walk(&h.finish(), HEADER).unwrap();
+            assert_eq!(p.stats.tctx_read, 15);
+            assert_eq!(
+                (p.stats.order_checked, p.stats.order_violated),
+                (14, violated),
+                "backwards {backwards}"
+            );
+        }
+    }
+
+    #[test]
+    fn counters_that_cannot_be_jemallocs_are_counted() {
+        let mut h = Heap::new();
+        // Eight records: the first four with an unbiased count below the
+        // raw one, the rest as jemalloc keeps them.
+        for i in 0..8u64 {
+            let (g, t) = (0x10000 + i * 0x400, 0x100000 + i * 0x400);
+            h.tctx(t, g, 0, 0, NOMINAL, (2, 200));
+            h.gctx(g, &[0xa1 + i], t);
+            if i < 4 {
+                h.mem.poke_u64(t + tctx::CNTS as u64 + 8, 1); // shifted count
+            }
+        }
+        let p = walk(&h.finish(), HEADER).unwrap();
+        assert_eq!(
+            (p.stats.counters_checked, p.stats.counters_violated),
+            (8, 4)
+        );
+    }
+
+    #[test]
+    fn a_walk_with_skips_is_tried_again_and_the_cleanest_is_kept() {
+        // A record that reads as skipped every time: the walk goes round its
+        // attempts and returns the one it has, with the skip counted.
+        let mut h = Heap::new();
+        h.tctx(0x100000, 0x99999, 0, 0, NOMINAL, (2, 200));
+        h.gctx(0x10000, &[0xa1], 0x100000);
+        h.tctx(0x101000, 0x10400, 0, 0, NOMINAL, (3, 300));
+        h.gctx(0x10400, &[0xb1], 0x101000);
+        let p = walk(&h.finish(), HEADER).unwrap();
+        assert_eq!(p.stats.retries, ATTEMPTS);
+        assert_eq!(p.stats.tctx_skipped, 1);
+        assert_eq!(p.stacks.len(), 1);
+    }
+
+    #[test]
+    fn a_record_that_reads_as_initializing_is_counted_as_skipped() {
+        // What a layout with another field where the state is shows wherever
+        // a node has no right child. It must not pass for an idle process.
+        let mut h = Heap::new();
+        h.tctx(0x100000, 0x10000, 0, 0, tctx::STATE_INITIALIZING, (2, 200));
+        h.gctx(0x10000, &[0xa1], 0x100000);
+        let p = walk(&h.finish(), HEADER).unwrap();
+        assert_eq!((p.stats.tctx_read, p.stats.tctx_skipped), (0, 1));
+        assert_eq!(p.stats.gctx_read, 1);
     }
 
     #[test]

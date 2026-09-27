@@ -196,7 +196,8 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
     let profile = walk::walk(&mem, found.bt2gctx).with_context(|| {
         format!(
             "reading the profile at {:#x} in {}",
-            found.bt2gctx, found.object
+            found.bt2gctx,
+            locate::shown(&found.object)
         )
     })?;
     refuse_unusable(&profile)?;
@@ -267,6 +268,41 @@ fn refuse_unusable(profile: &walk::Profile) -> Result<()> {
     }
     if profile.stacks.is_empty() {
         bail!("the process has no live sampled allocations to report yet");
+    }
+    // A layout that differs somewhere the shape checks do not look shows as
+    // records that cannot be read, or that are not in the order jemalloc keeps
+    // them, or whose counters cannot be jemalloc's. A moving heap breaks each
+    // of these for a moment, for a few records; a share of them is not that.
+    let s = &profile.stats;
+    if s.tctx_skipped > s.tctx_read || s.gctx_skipped > s.gctx_read {
+        bail!(
+            "most of the records could not be read as jemalloc's ({} thread records skipped, \
+             {} read; {} backtraces skipped, {} read): the heap is being rewritten faster \
+             than it can be read, or this jemalloc is laid out differently from the ones \
+             this tool knows",
+            s.tctx_skipped,
+            s.tctx_read,
+            s.gctx_skipped,
+            s.gctx_read
+        );
+    }
+    let mostly = |violated: u64, checked: u64| checked >= 8 && violated * 4 > checked;
+    if mostly(s.order_violated, s.order_checked) {
+        bail!(
+            "the thread records are not in the order jemalloc keeps them in ({} of {} links out \
+             of order): this jemalloc is laid out differently from the ones this tool knows",
+            s.order_violated,
+            s.order_checked
+        );
+    }
+    if mostly(s.counters_violated, s.counters_checked) {
+        bail!(
+            "the counters of {} of {} thread records cannot be jemalloc's (fewer unbiased than \
+             sampled): this jemalloc is laid out differently from the ones this tool knows, or \
+             its sampling period was changed while the process ran",
+            s.counters_violated,
+            s.counters_checked
+        );
     }
     Ok(())
 }
@@ -407,6 +443,73 @@ mod tests {
         }))
         .unwrap_err();
         assert!(e.to_string().contains("no live sampled allocations"), "{e}");
+    }
+
+    #[test]
+    fn a_share_of_records_that_are_not_jemallocs_is_refused() {
+        let profile = |stats| walk::Profile {
+            stacks: vec![walk::Stack {
+                addrs: vec![1],
+                counts: Counts::default(),
+            }],
+            stats,
+        };
+        let base = walk::Stats {
+            gctx_read: 40,
+            tctx_read: 100,
+            order_checked: 60,
+            counters_checked: 100,
+            ..Default::default()
+        };
+        // A few records out is a busy process.
+        let busy = walk::Stats {
+            tctx_skipped: 3,
+            gctx_skipped: 2,
+            order_violated: 3,
+            counters_violated: 4,
+            ..base.clone()
+        };
+        assert!(refuse_unusable(&profile(busy)).is_ok());
+        for (stats, says) in [
+            (
+                walk::Stats {
+                    tctx_skipped: 150,
+                    ..base.clone()
+                },
+                "most of the records",
+            ),
+            (
+                walk::Stats {
+                    gctx_skipped: 60,
+                    ..base.clone()
+                },
+                "most of the records",
+            ),
+            (
+                walk::Stats {
+                    order_violated: 30,
+                    ..base.clone()
+                },
+                "not in the order",
+            ),
+            (
+                walk::Stats {
+                    counters_violated: 40,
+                    ..base.clone()
+                },
+                "cannot be jemalloc's",
+            ),
+        ] {
+            let e = refuse_unusable(&profile(stats)).unwrap_err();
+            assert!(e.to_string().contains(says), "{e}");
+        }
+        // With too few links to judge by, the vote does not count.
+        let few = walk::Stats {
+            order_checked: 4,
+            order_violated: 4,
+            ..base
+        };
+        assert!(refuse_unusable(&profile(few)).is_ok());
     }
 
     #[test]

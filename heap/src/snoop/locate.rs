@@ -166,8 +166,13 @@ fn try_object(
             let addr = v.wrapping_add(bias);
             let head = Ckh::read(mem, addr).context("reading bt2gctx")?;
             // A busy process can tear one of the entries looked at; a table
-            // named by a symbol is worth a few tries.
-            if (0..3).any(|_| is_gctx_table(mem, &head)) {
+            // named by a symbol is worth a few tries. Its two function
+            // pointers are jemalloc's own code, as the shape scan requires.
+            let in_code = code_ranges(maps, path);
+            if in_code(head.hash)
+                && in_code(head.keycomp)
+                && (0..3).any(|_| is_gctx_table(mem, &head))
+            {
                 return Ok(Located {
                     bt2gctx: addr,
                     how: How::Symbol,
@@ -178,9 +183,13 @@ fn try_object(
             if head.count == 0 || head.tab == 0 {
                 bail!("bt2gctx is empty: profiling is off (MALLOC_CONF needs prof:true) or nothing has been sampled yet");
             }
-            bail!("bt2gctx does not look like the table this tool knows (another jemalloc layout, or a file that is not the one mapped)");
+            // Not what the symbol says: the file on disk may not be the one
+            // mapped (a library replaced under a process that was not
+            // restarted), so look at the memory by its shape too.
+            note.push_str("the bt2gctx symbol does not name the table in memory; ");
+        } else {
+            note.push_str("no bt2gctx symbol (stripped); ");
         }
-        note.push_str("no bt2gctx symbol (stripped); ");
     }
     match scan(mem, maps, path, budget)? {
         Scan::Found(addr) => Ok(Located {
@@ -230,6 +239,15 @@ fn read_symbols(root: &Root, path: &str) -> std::result::Result<elf::Symbols, Un
     elf::find(&file, &wanted).map_err(failed)
 }
 
+/// Whether an address is in a part of `path` that is mapped as code.
+fn code_ranges<'a>(maps: &'a Maps, path: &'a str) -> impl Fn(u64) -> bool + 'a {
+    move |a| {
+        maps.mappings()
+            .iter()
+            .any(|m| m.path == path && m.exec && m.start <= a && a < m.end)
+    }
+}
+
 /// The most of a library's data read looking for the table, and the most read
 /// deciding whether candidates are it. The process may be lying about both.
 const SCAN_BYTES: u64 = 1 << 30;
@@ -246,12 +264,7 @@ enum Scan {
 /// (where zero-initialised statics live).
 fn scan(mem: &dyn Memory, maps: &Maps, path: &str, budget: &mut Budget) -> Result<Scan> {
     let all = maps.mappings();
-    let code: Vec<(u64, u64)> = all
-        .iter()
-        .filter(|m| m.path == path && m.exec)
-        .map(|m| (m.start, m.end))
-        .collect();
-    let in_code = |a: u64| code.iter().any(|&(s, e)| s <= a && a < e);
+    let in_code = code_ranges(maps, path);
 
     let mut regions: Vec<(u64, u64)> = Vec::new();
     for (i, m) in all.iter().enumerate() {
