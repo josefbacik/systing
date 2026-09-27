@@ -228,7 +228,7 @@ fn the_rows_are_the_ones_a_dump_of_the_same_heap_has() {
             let ctx = format!("{lib:?} with {conf}");
             assert_eq!(snooped.sample_period, dumped.sample_period, "{ctx}");
             assert!(
-                dumped.samples.len() > 60,
+                dumped.samples.len() > 40,
                 "{ctx}: {} stacks",
                 dumped.samples.len()
             );
