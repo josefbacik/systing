@@ -50,8 +50,10 @@ pub struct ProcMem {
 
 impl ProcMem {
     /// Open a process's `mem` file. The kernel decides who may: the caller
-    /// needs ptrace access to the process (the same user, unless it is root or
-    /// has CAP_SYS_PTRACE, and subject to `kernel.yama.ptrace_scope`).
+    /// must pass the check a ptrace attach would, though nothing attaches: the
+    /// same user as the process and a process that is dumpable (else
+    /// CAP_SYS_PTRACE, which root needs too), and `kernel.yama.ptrace_scope`
+    /// permitting it.
     pub fn open(mem_path: &std::path::Path) -> io::Result<ProcMem> {
         Ok(ProcMem {
             file: File::open(mem_path)?,

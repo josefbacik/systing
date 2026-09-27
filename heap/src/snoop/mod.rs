@@ -187,8 +187,9 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
     let started = std::time::Instant::now();
     let mem = ProcMem::open(&process.file("mem")).with_context(|| {
         format!(
-            "opening /proc/{pid}/mem: reading a process's memory needs the same user or root, \
-             and kernel.yama.ptrace_scope permitting it"
+            "opening /proc/{pid}/mem: reading a process's memory needs the same user as the \
+             process (any other, root included, needs CAP_SYS_PTRACE), a process that is \
+             dumpable, and a kernel.yama.ptrace_scope that permits it"
         )
     })?;
     let maps_text = process.read_text("maps", MAX_MAPS_BYTES)?;

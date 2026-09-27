@@ -98,7 +98,8 @@ struct Cli {
     /// dump interval to wait for, and no file is written. It relies on
     /// jemalloc's private data structures and refuses a jemalloc whose layout
     /// it does not know. The process needs `prof:true` in its MALLOC_CONF;
-    /// reading its memory needs the same access as ptrace. A Python code map
+    /// reading its memory needs the same user as the process (ptrace is not used,
+    /// and CAP_SYS_PTRACE is not needed then). A Python code map
     /// is looked for only in --perf-map-dir (there is no dump for it to be
     /// beside).
     #[arg(
