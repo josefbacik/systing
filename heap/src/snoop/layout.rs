@@ -136,7 +136,9 @@ impl Ckh {
 }
 
 fn cells_in_use(raw: &[u8]) -> impl Iterator<Item = (u64, u64)> + '_ {
-    raw.chunks_exact(ckh::CELL_SIZE as usize)
+    raw.as_chunks::<{ ckh::CELL_SIZE as usize }>()
+        .0
+        .iter()
         .map(|c| {
             (
                 u64::from_le_bytes(c[..8].try_into().unwrap()),

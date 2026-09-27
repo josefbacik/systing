@@ -134,7 +134,7 @@ pub fn find(file: &File, wanted: &[&'static str]) -> io::Result<Symbols> {
             let len = CHUNK.min(sym_size - done) / ENTRY * ENTRY;
             let mut buf = vec![0u8; len as usize];
             file.read_exact_at(&mut buf, sym_off + done)?;
-            for e in buf.chunks_exact(ENTRY as usize) {
+            for e in buf.as_chunks::<24>().0 {
                 let (name, shndx, value) = (u32_at(e, 0) as usize, u16_at(e, 6), u64_at(e, 8));
                 if shndx == 0 || value == 0 || name >= strtab.len() {
                     continue;
