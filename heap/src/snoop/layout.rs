@@ -50,6 +50,9 @@ pub mod tctx {
     /// Enough of it to hold everything above.
     pub const READ: usize = 136;
     pub const STATE_INITIALIZING: u32 = 0;
+    /// `prof_tctx_state_t` has four values, 0 to 3; anything else is not a
+    /// `prof_tctx_t`.
+    pub const STATE_MAX: u32 = 3;
 }
 
 /// `prof_cnt_t`: eight counters.

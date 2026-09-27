@@ -18,6 +18,8 @@
 //! unknown layout is an error, not a wrong answer.
 
 use std::collections::HashSet;
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -37,6 +39,27 @@ const LG_PROF_SAMPLE: [&str; 3] = [
     "je_lg_prof_sample",
     "_rjem_je_lg_prof_sample",
 ];
+
+/// The most files looked in: the ones named for jemalloc, then the program. A
+/// process can map as many as it likes under such names, and each costs a scan.
+const MAX_OBJECTS: usize = 8;
+
+/// A path taken from `/proc/PID/maps` is whatever the process's owner named
+/// its file. It is printed with control characters escaped, so it cannot
+/// write to the terminal of whoever runs the tool.
+pub fn shown(path: &str) -> String {
+    path.escape_debug().to_string()
+}
+
+/// What may be spent finding the table, in all, over every file looked in.
+/// The process chooses how many there are and what is in them.
+#[derive(Debug, Default)]
+struct Budget {
+    /// Bytes of a library's data scanned.
+    scanned: u64,
+    /// Bytes read deciding whether a candidate is the table.
+    validated: u64,
+}
 
 /// How the table was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,10 +87,11 @@ pub fn locate(mem: &dyn Memory, maps: &Maps, root: &Root) -> Result<Located> {
         bail!("the process has no file mapped");
     }
     let mut why: Vec<String> = Vec::new();
+    let mut budget = Budget::default();
     for path in &objects {
-        match try_object(mem, maps, root, path) {
+        match try_object(mem, maps, root, path, &mut budget) {
             Ok(found) => return Ok(found),
-            Err(e) => why.push(format!("{path}: {e:#}")),
+            Err(e) => why.push(format!("{}: {e:#}", shown(path))),
         }
     }
     let jemalloc = objects.iter().any(|p| p.contains("jemalloc"));
@@ -92,6 +116,7 @@ fn candidates(maps: &Maps) -> Vec<String> {
             out.push(m.path.clone());
         }
     }
+    out.truncate(MAX_OBJECTS - 1);
     if let Some(exe) = files.clone().next() {
         if !out.contains(&exe.path) {
             out.push(exe.path.clone());
@@ -100,7 +125,13 @@ fn candidates(maps: &Maps) -> Vec<String> {
     out
 }
 
-fn try_object(mem: &dyn Memory, maps: &Maps, root: &Root, path: &str) -> Result<Located> {
+fn try_object(
+    mem: &dyn Memory,
+    maps: &Maps,
+    root: &Root,
+    path: &str,
+    budget: &mut Budget,
+) -> Result<Located> {
     let ours: Vec<&Mapping> = maps.mappings().iter().filter(|m| m.path == path).collect();
     let image_start = ours
         .iter()
@@ -112,7 +143,11 @@ fn try_object(mem: &dyn Memory, maps: &Maps, root: &Root, path: &str) -> Result<
     // Symbols, if the file can be read and has any.
     let syms = match read_symbols(root, path) {
         Ok(s) => Some(s),
-        Err(e) => {
+        // The file is on a filesystem that is not to be read from (or is not a
+        // file): its pages, which a scan would read out of the process, may be
+        // on the same one and just as slow.
+        Err(Unreadable::Refused(why)) => bail!("{why}; its mapped pages are left unread too"),
+        Err(Unreadable::Failed(e)) => {
             note = format!("its symbols could not be read ({e:#}); ");
             None
         }
@@ -125,11 +160,14 @@ fn try_object(mem: &dyn Memory, maps: &Maps, root: &Root, path: &str) -> Result<
             .find_map(|n| s.found.get(n))
             .and_then(|v| mem.u64_at(v.wrapping_add(bias)).ok())
             .and_then(|lg| u32::try_from(lg).ok())
-            .filter(|&lg| (1..=63).contains(&lg));
+            // Zero is a period of one byte: every allocation is sampled.
+            .filter(|&lg| lg <= 63);
         if let Some(&v) = s.found.get(BT2GCTX) {
             let addr = v.wrapping_add(bias);
             let head = Ckh::read(mem, addr).context("reading bt2gctx")?;
-            if is_gctx_table(mem, &head) {
+            // A busy process can tear one of the entries looked at; a table
+            // named by a symbol is worth a few tries.
+            if (0..3).any(|_| is_gctx_table(mem, &head)) {
                 return Ok(Located {
                     bt2gctx: addr,
                     how: How::Symbol,
@@ -144,7 +182,7 @@ fn try_object(mem: &dyn Memory, maps: &Maps, root: &Root, path: &str) -> Result<
         }
         note.push_str("no bt2gctx symbol (stripped); ");
     }
-    match scan(mem, maps, path)? {
+    match scan(mem, maps, path, budget)? {
         Scan::Found(addr) => Ok(Located {
             bt2gctx: addr,
             how: How::Shape,
@@ -159,21 +197,37 @@ fn try_object(mem: &dyn Memory, maps: &Maps, root: &Root, path: &str) -> Result<
     }
 }
 
-fn read_symbols(root: &Root, path: &str) -> Result<elf::Symbols> {
-    let file = root
-        .open_at(Path::new(path), libc::O_RDONLY | libc::O_NONBLOCK)
-        .with_context(|| format!("opening {path}"))?;
-    if !file.metadata()?.is_file() {
-        bail!("not a regular file");
+/// Why symbols were not read.
+enum Unreadable {
+    /// Not to be opened: not a regular file, or on a filesystem that may stall.
+    Refused(String),
+    /// Could not be read (gone, not permitted, not ELF): a scan may still do.
+    Failed(anyhow::Error),
+}
+
+fn read_symbols(root: &Root, path: &str) -> std::result::Result<elf::Symbols, Unreadable> {
+    let failed = |e: std::io::Error| {
+        Unreadable::Failed(anyhow::Error::new(e).context(format!("opening {}", shown(path))))
+    };
+    // Opened as a bare handle first, so nothing the file is (a device, a FIFO)
+    // runs before it is known to be a plain file on a local filesystem.
+    let handle = root
+        .open_at(Path::new(path), libc::O_PATH)
+        .map_err(failed)?;
+    if !handle.metadata().map_err(failed)?.is_file() {
+        return Err(Unreadable::Refused("not a regular file".into()));
     }
     // Beneath a root, the paths are whoever wrote the process's to choose; a
     // read from a mount the container only borrows could stall.
-    if on_remote_fs(&file) {
-        bail!("on a FUSE or network filesystem, left unread");
+    if on_remote_fs(&handle) {
+        return Err(Unreadable::Refused(
+            "on a FUSE or network filesystem, left unread".into(),
+        ));
     }
+    let file = File::open(format!("/proc/self/fd/{}", handle.as_raw_fd())).map_err(failed)?;
     let mut wanted = vec![BT2GCTX];
     wanted.extend(LG_PROF_SAMPLE);
-    Ok(elf::find(&file, &wanted)?)
+    elf::find(&file, &wanted).map_err(failed)
 }
 
 /// The most of a library's data read looking for the table, and the most read
@@ -190,7 +244,7 @@ enum Scan {
 /// Scan the data of `path` for the table. The candidates are the file's
 /// mappings that are not code, and the anonymous mapping right after each
 /// (where zero-initialised statics live).
-fn scan(mem: &dyn Memory, maps: &Maps, path: &str) -> Result<Scan> {
+fn scan(mem: &dyn Memory, maps: &Maps, path: &str, budget: &mut Budget) -> Result<Scan> {
     let all = maps.mappings();
     let code: Vec<(u64, u64)> = all
         .iter()
@@ -215,14 +269,13 @@ fn scan(mem: &dyn Memory, maps: &Maps, path: &str) -> Result<Scan> {
     const CHUNK: usize = 1 << 20;
     const HEAD: usize = super::layout::ckh::SIZE;
     let mut hits: Vec<u64> = Vec::new();
-    let (mut scanned, mut validated) = (0u64, 0u64);
     let mut tables_seen: HashSet<u64> = HashSet::new();
     for (start, end) in regions {
         let mut at = start;
         while at < end {
             let len = (end - at).min((CHUNK + HEAD) as u64) as usize;
-            scanned += len as u64;
-            if scanned > SCAN_BYTES {
+            budget.scanned += len as u64;
+            if budget.scanned > SCAN_BYTES {
                 bail!(
                     "gave up looking for the table after {} MiB of data",
                     SCAN_BYTES >> 20
@@ -250,8 +303,8 @@ fn scan(mem: &dyn Memory, maps: &Maps, path: &str) -> Result<Scan> {
                     if !tables_seen.insert(head.tab) {
                         continue;
                     }
-                    validated += VALIDATE_BYTES;
-                    if validated > VALIDATE_TOTAL {
+                    budget.validated += VALIDATE_BYTES;
+                    if budget.validated > VALIDATE_TOTAL {
                         bail!("gave up: too many places that look like the table");
                     }
                     if is_gctx_table(mem, &head) {
@@ -332,7 +385,7 @@ mod tests {
             inner: &fake,
             bytes: Default::default(),
         };
-        let found = scan(&mem, &maps, "/lib/libjemalloc.so.2").unwrap();
+        let found = scan(&mem, &maps, "/lib/libjemalloc.so.2", &mut Budget::default()).unwrap();
         assert!(matches!(found, Scan::Nothing));
         // The data once (8 KiB) and the one table once (256 KiB), not a
         // hundred tables (25 MiB).
@@ -340,6 +393,71 @@ mod tests {
             mem.bytes.get() < 512 << 10,
             "{} bytes read",
             mem.bytes.get()
+        );
+    }
+
+    #[test]
+    fn what_is_spent_is_counted_over_every_file_looked_in() {
+        use crate::snoop::mem::fake::FakeMem;
+        let maps = Maps::parse(
+            "7f0000010000-7f0000011000 r-xp 00000000 08:01 7 /lib/libjemalloc.so.2\n\
+             7f0000020000-7f0000021000 rw-p 00010000 08:01 7 /lib/libjemalloc.so.2\n",
+        );
+        let mut fake = FakeMem::default();
+        fake.put(0x7f00_0002_0000, vec![0u8; 0x1000]);
+        // Scanning 4 KiB with the whole budget already spent is refused.
+        let mut spent = Budget {
+            scanned: SCAN_BYTES,
+            ..Default::default()
+        };
+        assert!(scan(&fake, &maps, "/lib/libjemalloc.so.2", &mut spent).is_err());
+        // With some left, it runs and adds to what was spent.
+        let mut some = Budget::default();
+        assert!(matches!(
+            scan(&fake, &maps, "/lib/libjemalloc.so.2", &mut some).unwrap(),
+            Scan::Nothing
+        ));
+        assert_eq!(some.scanned, 0x1000);
+    }
+
+    #[test]
+    fn a_process_cannot_make_the_tool_look_in_more_than_a_few_files() {
+        let mut text =
+            String::from("55d000000000-55d000001000 r-xp 00000000 08:01 5 /usr/bin/app\n");
+        for i in 0..100 {
+            text.push_str(&format!(
+                "7f00{i:08x}0000-7f00{i:08x}1000 r--p 00000000 08:01 {i} /tmp/libjemalloc{i}.so\n"
+            ));
+        }
+        let found = candidates(&Maps::parse(&text));
+        assert_eq!(found.len(), MAX_OBJECTS);
+        // The program is still one of them.
+        assert!(found.contains(&"/usr/bin/app".to_string()));
+    }
+
+    #[test]
+    fn a_file_that_is_not_plain_is_refused_before_anything_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("looks_like_a_library")).unwrap();
+        let root = Root::open(dir.path()).unwrap();
+        match read_symbols(&root, "/looks_like_a_library") {
+            Err(Unreadable::Refused(why)) => assert!(why.contains("regular"), "{why}"),
+            other => panic!("expected a refusal, got {}", other.is_ok()),
+        }
+        // A file that is not there is a failure, not a refusal: the pages of
+        // a deleted library may still be scanned.
+        assert!(matches!(
+            read_symbols(&root, "/gone.so"),
+            Err(Unreadable::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn a_path_is_shown_with_control_characters_escaped() {
+        assert_eq!(shown("/lib/a\x1b[31mb\x07"), "/lib/a\\u{1b}[31mb\\u{7}");
+        assert_eq!(
+            shown("/usr/lib/libjemalloc.so.2"),
+            "/usr/lib/libjemalloc.so.2"
         );
     }
 

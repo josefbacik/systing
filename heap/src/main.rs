@@ -139,13 +139,13 @@ fn main() -> Result<()> {
     let delete_older = !cli.keep_all && !cli.latest_only;
     let mut snapshots: Vec<Snapshot> = Vec::new();
     let mut plans: Vec<retention::Plan> = Vec::new();
-    if let (Some(process), Some(root)) = (pinned.as_ref(), root) {
+    if let Some(process) = pinned.as_ref() {
         let pid = process.pid();
         eprintln!(
             "warning: --snoop is experimental: it reads jemalloc's private data structures \
              out of process {pid}'s memory, and may fail or refuse on a jemalloc it does not know"
         );
-        let (snapshot, report) = snoop::read(process, root)?;
+        let (snapshot, report) = snoop::read_within(process, snoop::TIMEOUT)?;
         eprintln!("{}", report.summary(pid));
         snapshots.push(snapshot);
     }

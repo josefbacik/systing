@@ -150,6 +150,9 @@ pub fn find(file: &File, wanted: &[&'static str]) -> io::Result<Symbols> {
             }
             done += len;
         }
+        // A file has one symbol table. Reading another that the same bytes
+        // could be made to describe would only multiply the cost.
+        break;
     }
     Ok(out)
 }

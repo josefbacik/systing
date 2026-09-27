@@ -43,6 +43,11 @@ const MAX_TCTX_PER_GCTX: usize = 1 << 16;
 /// a table that claims millions of backtraces with thousands of threads each
 /// is not one, and is not read to the end.
 const MAX_TCTX_TOTAL: u64 = 1 << 22;
+/// The most frames held over a whole walk: 2^25 addresses is 256 MiB. Real
+/// profiles have a few million (hundreds of thousands of stacks of tens of
+/// frames); a process that lays out records to make each claim thousands of
+/// frames could otherwise make the tool hold tens of GiB.
+const MAX_FRAMES_TOTAL: u64 = 1 << 25;
 /// The most of a table read to decide whether it holds backtraces.
 pub const VALIDATE_BYTES: u64 = 1 << 20;
 /// How many times a walk is done again when the table changed under it.
@@ -59,6 +64,26 @@ pub struct Stats {
     pub tctx_skipped: u64,
     /// `tctx` read and counted.
     pub tctx_read: u64,
+    /// The table was changing while it was read, and kept changing for every
+    /// attempt: jemalloc was rebuilding it, or moving entries in it. The
+    /// profile is what was read last and may be missing stacks.
+    pub unsteady: bool,
+}
+
+/// What a walk will not go past.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    max_tctx: u64,
+    max_frames: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            max_tctx: MAX_TCTX_TOTAL,
+            max_frames: MAX_FRAMES_TOTAL,
+        }
+    }
 }
 
 /// One backtrace and its counters, added up over all threads.
@@ -78,12 +103,14 @@ pub struct Profile {
 
 /// Read the profile whose table header is at `bt2gctx`.
 pub fn walk(mem: &dyn Memory, bt2gctx: u64) -> io::Result<Profile> {
-    walk_limited(mem, bt2gctx, MAX_TCTX_TOTAL)
+    walk_limited(mem, bt2gctx, Limits::default())
 }
 
-fn walk_limited(mem: &dyn Memory, bt2gctx: u64, max_tctx: u64) -> io::Result<Profile> {
+fn walk_limited(mem: &dyn Memory, bt2gctx: u64, limits: Limits) -> io::Result<Profile> {
     let mut retries = 0;
     let mut last = io::Error::other("the profile kept changing");
+    // A walk that read a table which was not at rest, kept in case none is.
+    let mut unsteady: Option<Profile> = None;
     for _ in 0..ATTEMPTS {
         let head = Ckh::read(mem, bt2gctx)?;
         if !head.plausible() {
@@ -103,26 +130,49 @@ fn walk_limited(mem: &dyn Memory, bt2gctx: u64, max_tctx: u64) -> io::Result<Pro
             }
         };
         let mut stats = Stats::default();
-        let mut stacks = read_stacks(mem, &entries, &mut stats, max_tctx)?;
+        let mut stacks = read_stacks(mem, &entries, &mut stats, limits)?;
         let after = Ckh::read(mem, bt2gctx)?;
-        if (after.tab, after.lg_cur_buckets) == (head.tab, head.lg_cur_buckets) {
-            stacks.sort_by(|a, b| a.addrs.cmp(&b.addrs));
+        // The table was swapped for another meanwhile.
+        if (after.tab, after.lg_cur_buckets) != (head.tab, head.lg_cur_buckets) {
+            retries += 1;
+            continue;
+        }
+        stacks.sort_by(|a, b| a.addrs.cmp(&b.addrs));
+        // At rest, the cells in use are what `count` says. They are far from
+        // it while jemalloc rebuilds the table (it stores the new table first,
+        // sets `count` to 0 and inserts the entries again), so that read may be
+        // missing stacks, though the table's own fields are the same before and
+        // after. A few entries either way is a process adding and removing
+        // stacks as it runs, which every busy one does all the time.
+        let slack = (head.count / 64).max(2);
+        let at_rest = (entries.len() as u64).abs_diff(head.count) <= slack
+            && head.count.abs_diff(after.count) <= slack;
+        if at_rest {
             stats.retries = retries;
             return Ok(Profile { stacks, stats });
         }
+        stats.unsteady = true;
+        unsteady = Some(Profile { stacks, stats });
         retries += 1;
     }
-    Err(last)
+    match unsteady {
+        Some(mut profile) => {
+            profile.stats.retries = retries;
+            Ok(profile)
+        }
+        None => Err(last),
+    }
 }
 
 fn read_stacks(
     mem: &dyn Memory,
     entries: &[(u64, u64)],
     stats: &mut Stats,
-    max_tctx: u64,
+    limits: Limits,
 ) -> io::Result<Vec<Stack>> {
     let mut seen = HashSet::new();
     let mut stacks = Vec::new();
+    let mut frames = 0u64;
     for &(key, gaddr) in entries {
         // Cuckoo hashing moves entries: one seen twice is one entry.
         if !seen.insert(gaddr) {
@@ -137,12 +187,19 @@ fn read_stacks(
             counts.add(&c);
         }
         if counts.is_reported() {
+            frames += addrs.len() as u64;
             stacks.push(Stack { addrs, counts });
         }
-        if stats.tctx_read + stats.tctx_skipped > max_tctx {
+        if stats.tctx_read + stats.tctx_skipped > limits.max_tctx {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "more per-thread records than any real profile has; not reading on",
+            ));
+        }
+        if frames > limits.max_frames {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "more stack frames than any real profile has; not reading on",
             ));
         }
     }
@@ -208,12 +265,28 @@ fn read_tctxs(mem: &dyn Memory, gaddr: u64, root: u64, stats: &mut Stats) -> Vec
             stats.tctx_skipped += 1;
             continue;
         }
-        todo.push(u64_at(&b, tctx::LINK_LEFT));
-        // The low bit of the right link is the node's colour.
-        todo.push(u64_at(&b, tctx::LINK_RIGHT_RED) & !1);
-        // prof_tctx_merge_tdata() leaves a tctx still being set up out of a
-        // dump; so does this.
+        // What the enum holds is one of four values: anything else is not a
+        // `prof_tctx_t`, and its links are not followed.
         let state = u32::from_le_bytes(b[tctx::STATE..tctx::STATE + 4].try_into().unwrap());
+        if state > tctx::STATE_MAX {
+            stats.tctx_skipped += 1;
+            continue;
+        }
+        // The low bit of the right link is the node's colour. A child is
+        // either NULL or the address of a record, which is 8-aligned.
+        for child in [
+            u64_at(&b, tctx::LINK_LEFT),
+            u64_at(&b, tctx::LINK_RIGHT_RED) & !1,
+        ] {
+            if child & 7 != 0 {
+                stats.tctx_skipped += 1;
+            } else {
+                todo.push(child);
+            }
+        }
+        // prof_tctx_merge_tdata() leaves a tctx that is `initializing` out of
+        // a dump, and so does this. (jemalloc 5.3.0 links a record into the
+        // tree only once it is nominal, so this mostly meets reused memory.)
         if state == tctx::STATE_INITIALIZING {
             continue;
         }
@@ -488,13 +561,75 @@ mod tests {
         h.tctx(0x100c00, 0x10000, 0, 0, NOMINAL, (1, 100));
         h.gctx(0x10000, &[0xa1], 0x100000);
         let mem = h.finish();
-        assert!(walk_limited(&mem, HEADER, 3).is_err());
+        let limit = |max_tctx| Limits {
+            max_tctx,
+            ..Limits::default()
+        };
+        assert!(walk_limited(&mem, HEADER, limit(3)).is_err());
+        let p = walk_limited(&mem, HEADER, limit(4)).unwrap();
+        assert_eq!(p.stacks[0].counts.cur_objs, 4);
+    }
+
+    #[test]
+    fn a_walk_stops_at_more_frames_than_a_profile_has() {
+        let mut h = Heap::new();
+        for i in 0..3u64 {
+            let (g, t) = (0x10000 + i * 0x400, 0x100000 + i * 0x400);
+            h.tctx(t, g, 0, 0, NOMINAL, (1, 100));
+            h.gctx(g, &[0xa1, 0xa2, 0xa3, 0xa4], t);
+        }
+        let mem = h.finish();
+        let limit = |max_frames| Limits {
+            max_frames,
+            ..Limits::default()
+        };
+        assert!(walk_limited(&mem, HEADER, limit(11)).is_err());
         assert_eq!(
-            walk_limited(&mem, HEADER, 4).unwrap().stacks[0]
-                .counts
-                .cur_objs,
-            4
+            walk_limited(&mem, HEADER, limit(12)).unwrap().stacks.len(),
+            3
         );
+    }
+
+    #[test]
+    fn a_table_whose_cells_are_not_what_its_count_says_is_flagged() {
+        // What a read inside jemalloc's rebuild of the table sees: the header
+        // is the same before and after, but `count` says 50 and one cell is in
+        // use. Every attempt sees it, so the profile is returned, and says so.
+        let mut h = Heap::new();
+        h.tctx(0x100000, 0x10000, 0, 0, NOMINAL, (2, 200));
+        h.gctx(0x10000, &[0xa1], 0x100000);
+        let mut mem = h.finish();
+        mem.poke_u64(HEADER + ckh::COUNT as u64, 50);
+        let p = walk(&mem, HEADER).unwrap();
+        assert!(p.stats.unsteady);
+        assert_eq!(p.stats.retries, ATTEMPTS);
+        assert_eq!(p.stacks.len(), 1);
+        // At rest it is not flagged, nor is a table a couple of entries out,
+        // as a busy process's always is.
+        for count in [1, 3] {
+            mem.poke_u64(HEADER + ckh::COUNT as u64, count);
+            let p = walk(&mem, HEADER).unwrap();
+            assert!(!p.stats.unsteady, "count {count}");
+            assert_eq!(p.stats.retries, 0);
+        }
+    }
+
+    #[test]
+    fn a_thread_record_that_cannot_be_one_is_not_followed() {
+        let mut h = Heap::new();
+        // A root whose state is not one of the four, with a child that would
+        // add 9 objects if it were followed.
+        h.tctx(0x100000, 0x10000, 0x100400, 0, 77, (5, 500));
+        h.tctx(0x100400, 0x10000, 0, 0, NOMINAL, (9, 900));
+        h.gctx(0x10000, &[0xa1], 0x100000);
+        // A second gctx whose root has a child pointer that is not aligned.
+        h.tctx(0x101000, 0x10400, 0x100401, 0, NOMINAL, (3, 300));
+        h.gctx(0x10400, &[0xb1], 0x101000);
+        let p = walk(&h.finish(), HEADER).unwrap();
+        assert_eq!(p.stacks.len(), 1);
+        assert_eq!(p.stacks[0].addrs, vec![0xb1]);
+        assert_eq!(p.stacks[0].counts.cur_objs, 3);
+        assert_eq!(p.stats.tctx_skipped, 2);
     }
 
     #[test]

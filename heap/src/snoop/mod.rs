@@ -51,6 +51,17 @@ const DEFAULT_LG_PROF_SAMPLE: u32 = 19;
 /// The value `Snapshot::trigger` has for a snapshot taken this way.
 pub const TRIGGER: &str = "snoop";
 
+/// How long a whole snoop may take. Reading a real profile takes well under a
+/// second; a process (or a filesystem behind its memory) that makes it take
+/// longer is given up on, so a read that never returns cannot hold the tool.
+pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The most read of the process's own text files: what it maps, the fields of
+/// its status, and its environment (looked at for one option only).
+const MAX_MAPS_BYTES: u64 = 64 << 20;
+const MAX_STATUS_BYTES: u64 = 1 << 20;
+const MAX_ENVIRON_BYTES: u64 = 16 << 20;
+
 /// What a snoop found, besides the snapshot: how, for the caller to say.
 #[derive(Debug)]
 pub struct Report {
@@ -93,16 +104,80 @@ impl Process {
         PathBuf::from(format!("/proc/self/fd/{}/{name}", self.dir.as_raw_fd()))
     }
 
+    /// Another handle on the same process.
+    pub fn try_clone(&self) -> Result<Process> {
+        Ok(Process {
+            pid: self.pid,
+            dir: self
+                .dir
+                .try_clone()
+                .context("duplicating the process handle")?,
+        })
+    }
+
     /// The process's root directory, to read the files it names beneath.
     pub fn root(&self) -> Result<Root> {
         Root::open(&self.file("root"))
             .with_context(|| format!("opening the root of pid {}", self.pid))
     }
 
-    fn read_to_string(&self, name: &str) -> Result<String> {
-        std::fs::read_to_string(self.file(name))
-            .with_context(|| format!("reading /proc/{}/{name}", self.pid))
+    /// A file of the process's, no more than `cap` bytes of it: what a process
+    /// can be made to hold there is not the tool's to hold.
+    fn read_capped(&self, name: &str, cap: u64) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        File::open(self.file(name))
+            .and_then(|f| f.take(cap + 1).read_to_end(&mut buf))
+            .with_context(|| format!("reading /proc/{}/{name}", self.pid))?;
+        if buf.len() as u64 > cap {
+            bail!("/proc/{}/{name} is larger than {cap} bytes", self.pid);
+        }
+        Ok(buf)
     }
+
+    fn read_text(&self, name: &str, cap: u64) -> Result<String> {
+        Ok(String::from_utf8_lossy(&self.read_capped(name, cap)?).into_owned())
+    }
+}
+
+/// [`read`], given up on after `limit`. It runs on a thread of its own, on a
+/// second handle to the process, and if it has not finished in time the
+/// thread is left behind (it ends with the program, which is about to).
+pub fn read_within(process: &Process, limit: std::time::Duration) -> Result<(Snapshot, Report)> {
+    let process = process.try_clone()?;
+    match run_within(limit, move || {
+        let root = process.root()?;
+        read(&process, &root)
+    }) {
+        Ok(result) => result,
+        Err(Wait::TimedOut) => bail!(
+            "gave up after {} s: reading the process's memory did not finish, \
+             perhaps because a page of it is on a filesystem that stalls",
+            limit.as_secs()
+        ),
+        Err(Wait::Panicked) => bail!("reading the process's memory failed unexpectedly"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Wait {
+    TimedOut,
+    Panicked,
+}
+
+/// Run `f` on a thread and wait for it, no longer than `limit`.
+fn run_within<T: Send + 'static>(
+    limit: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, Wait> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(limit).map_err(|e| match e {
+        std::sync::mpsc::RecvTimeoutError::Timeout => Wait::TimedOut,
+        std::sync::mpsc::RecvTimeoutError::Disconnected => Wait::Panicked,
+    })
 }
 
 /// The heap profile of `process`, as of now. Files it names are read beneath
@@ -116,7 +191,7 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
              and kernel.yama.ptrace_scope permitting it"
         )
     })?;
-    let maps_text = process.read_to_string("maps")?;
+    let maps_text = process.read_text("maps", MAX_MAPS_BYTES)?;
     let found = locate::locate(&mem, &Maps::parse(&maps_text), root)?;
     let profile = walk::walk(&mem, found.bt2gctx).with_context(|| {
         format!(
@@ -134,7 +209,7 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
         );
     }
     // The mappings as of the end, so a library loaded meanwhile is named.
-    let maps = Maps::parse(&process.read_to_string("maps")?);
+    let maps = Maps::parse(&process.read_text("maps", MAX_MAPS_BYTES)?);
 
     let (lg, from) = match found.lg_prof_sample {
         Some(lg) => (lg, "the library's symbols"),
@@ -237,7 +312,7 @@ fn unbias_pair(objs_shifted: u64, bytes: u64, lg_prof_sample: u32) -> (u64, u64)
 /// `lg_prof_sample` from the `MALLOC_CONF` the process started with. A stopgap
 /// for a library with no symbols: `mallctl("prof.reset")` can change it later.
 fn lg_prof_sample_from_env(process: &Process) -> Option<u32> {
-    let environ = std::fs::read(process.file("environ")).ok()?;
+    let environ = process.read_capped("environ", MAX_ENVIRON_BYTES).ok()?;
     environ
         .split(|&b| b == 0)
         .find_map(|kv| kv.strip_prefix(b"MALLOC_CONF="))
@@ -249,14 +324,15 @@ fn lg_prof_sample_in(conf: &str) -> Option<u32> {
         .filter_map(|opt| opt.split_once(':'))
         .rfind(|(k, _)| k.trim() == "lg_prof_sample")
         .and_then(|(_, v)| v.trim().parse().ok())
-        .filter(|lg| (1..=63).contains(lg))
+        // Zero is a period of one byte: every allocation is sampled.
+        .filter(|lg| *lg <= 63)
 }
 
 /// The pid the process knows itself by: the innermost one of `NSpid` in
 /// `/proc/<pid>/status`, which is `pid` itself outside a pid namespace.
 fn own_pid(process: &Process) -> u32 {
     process
-        .read_to_string("status")
+        .read_text("status", MAX_STATUS_BYTES)
         .ok()
         .and_then(|status| innermost_pid(&status))
         .unwrap_or(process.pid)
@@ -272,11 +348,14 @@ fn innermost_pid(status: &str) -> Option<u32> {
 /// What a caller prints about a snoop.
 impl Report {
     pub fn summary(&self, pid: u32) -> String {
-        format!(
+        let moved =
+            self.stats.retries > 0 || self.stats.gctx_skipped > 0 || self.stats.tctx_skipped > 0;
+        let mut out = format!(
             "pid {pid}: {} stack(s) read from {} ({}) in {} ms: {} reads, {} KiB; \
-             sample period 2^{} from {}{}",
+             sample period 2^{} from {}",
             self.stacks,
-            self.object,
+            // A file name is the process owner's to choose.
+            locate::shown(&self.object),
             match self.how {
                 How::Symbol => "found by symbol",
                 How::Shape => "found by shape, no symbols",
@@ -286,17 +365,20 @@ impl Report {
             self.bytes / 1024,
             self.lg_prof_sample,
             self.sample_period_from,
-            if self.stats.retries + self.stats.gctx_skipped as u32 + self.stats.tctx_skipped as u32
-                > 0
-            {
-                format!(
-                    "; the heap moved meanwhile ({} retries, {} stacks and {} thread counters skipped)",
-                    self.stats.retries, self.stats.gctx_skipped, self.stats.tctx_skipped
-                )
-            } else {
-                String::new()
-            }
-        )
+        );
+        if moved {
+            out.push_str(&format!(
+                "; the heap moved meanwhile ({} retries, {} stacks and {} thread counters skipped)",
+                self.stats.retries, self.stats.gctx_skipped, self.stats.tctx_skipped
+            ));
+        }
+        if self.stats.unsteady {
+            out.push_str(
+                "; the profile table was being changed during every read (jemalloc \
+                 rebuilding it, or a busy process), so stacks may be missing: run it again",
+            );
+        }
+        out
     }
 }
 
@@ -386,6 +468,53 @@ mod tests {
     }
 
     #[test]
+    fn a_wait_that_takes_too_long_is_given_up_on() {
+        use std::time::Duration;
+        let started = std::time::Instant::now();
+        let r = run_within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(20));
+            1
+        });
+        assert_eq!(r, Err(Wait::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(run_within(Duration::from_secs(5), || 7), Ok(7));
+        let r: Result<u8, Wait> = run_within(Duration::from_secs(5), || panic!("no"));
+        assert_eq!(r, Err(Wait::Panicked));
+    }
+
+    #[test]
+    fn a_file_of_the_process_larger_than_its_cap_is_refused() {
+        let me = Process::open(std::process::id()).unwrap();
+        assert!(me.read_capped("maps", 64).is_err());
+        assert!(me.read_capped("maps", MAX_MAPS_BYTES).is_ok());
+    }
+
+    #[test]
+    fn the_summary_says_when_the_table_was_changing_and_escapes_the_path() {
+        let mut report = Report {
+            how: How::Shape,
+            object: "/lib/a\x1bb.so".into(),
+            lg_prof_sample: 9,
+            sample_period_from: "x",
+            stacks: 3,
+            stats: walk::Stats::default(),
+            reads: 1,
+            bytes: 2048,
+            millis: 1,
+        };
+        let plain = report.summary(7);
+        assert!(
+            !plain.contains('\x1b') && plain.contains("a\\u{1b}b.so"),
+            "{plain}"
+        );
+        assert!(!plain.contains("changed") && !plain.contains("moved"));
+        report.stats.unsteady = true;
+        assert!(report
+            .summary(7)
+            .contains("being changed during every read"));
+    }
+
+    #[test]
     fn the_period_is_read_from_malloc_conf() {
         assert_eq!(lg_prof_sample_in("prof:true,lg_prof_sample:9"), Some(9));
         assert_eq!(
@@ -393,6 +522,7 @@ mod tests {
             Some(12)
         );
         assert_eq!(lg_prof_sample_in("prof:true"), None);
+        assert_eq!(lg_prof_sample_in("lg_prof_sample:0"), Some(0));
         assert_eq!(lg_prof_sample_in("lg_prof_sample:99"), None);
         assert_eq!(lg_prof_sample_in("lg_prof_sample:x"), None);
     }

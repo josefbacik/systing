@@ -24,6 +24,10 @@ fn libs() -> Vec<PathBuf> {
     if let Some(p) = std::env::var_os("SYSTING_HEAP_TEST_JEMALLOC") {
         libs.push(PathBuf::from(p));
     }
+    // With none, the loops over them run nothing: say so (or, in CI, fail).
+    if libs.is_empty() {
+        common::skip("needs libjemalloc.so.2");
+    }
     libs
 }
 
@@ -321,16 +325,29 @@ fn a_process_without_jemalloc_is_refused() {
     assert!(!out.exists());
 }
 
-/// A process is pinned when it is opened: after it has exited, a read fails,
-/// and does not reach whichever process comes to have its number.
+/// A process is pinned when it is opened. While it lives it is read; after it
+/// has exited the same handle fails, and does not reach whichever process
+/// comes to have its number. (The process is one that can be read, so it is
+/// its death, not a missing jemalloc, that the failure comes from.)
 #[test]
 fn a_pinned_process_that_has_exited_is_not_read() {
-    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-    let process = snoop::Process::open(child.id()).unwrap();
+    let Some(lib) = common::jemalloc() else {
+        common::skip("needs libjemalloc.so.2");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(bin) = build_target(dir.path()) else {
+        return;
+    };
+    let mut target = Target::start(&bin, Some(&lib), Some("prof:true,lg_prof_sample:12"), "-");
+    let process = snoop::Process::open(target.pid()).unwrap();
     let root = process.root().unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    assert!(snoop::read(&process, &root).is_ok());
+
+    target.child.kill().unwrap();
+    target.child.wait().unwrap();
     assert!(snoop::read(&process, &root).is_err());
+    assert!(snoop::read_within(&process, snoop::TIMEOUT).is_err());
 }
 
 #[test]
