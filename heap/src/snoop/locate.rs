@@ -192,7 +192,12 @@ fn try_object(
             note.push_str("no bt2gctx symbol (stripped); ");
         }
     }
-    match scan(mem, maps, path, budget)? {
+    let scanned = match scan(mem, maps, path, budget) {
+        Ok(found) => found,
+        // Keep the reason the symbol gave, ahead of the scan's own.
+        Err(e) => bail!("{note}{e:#}"),
+    };
+    match scanned {
         Scan::Found(addr) => Ok(Located {
             bt2gctx: addr,
             how: How::Shape,

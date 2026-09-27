@@ -165,24 +165,28 @@ fn walk_limited(mem: &dyn Memory, bt2gctx: u64, limits: Limits) -> io::Result<Pr
         // A record that was freed and reused under the walk, or a tree that
         // was rotated under it, shows as records skipped: worth another go.
         let skips = stats.gctx_skipped + stats.tctx_skipped;
-        if at_rest && skips > 0 {
-            skip_tries += 1;
-        }
-        if at_rest && (skips == 0 || skip_tries > SKIP_TRIES) {
-            stats.retries = retries;
-            return Ok(Profile { stacks, stats });
-        }
         stats.unsteady = !at_rest;
+        let mut candidate = Profile { stacks, stats };
+        if at_rest && skips == 0 {
+            candidate.stats.retries = retries;
+            return Ok(candidate);
+        }
         // Of the walks that were not clean, the one with the fewest problems.
         let problems = |p: &Profile| {
             p.stats.gctx_skipped + p.stats.tctx_skipped + u64::from(p.stats.unsteady) * (1 << 40)
         };
-        let candidate = Profile { stacks, stats };
         if best
             .as_ref()
             .is_none_or(|b| problems(&candidate) < problems(b))
         {
             best = Some(candidate);
+        }
+        // A skip that stands is not going to go away by trying five times.
+        if at_rest {
+            skip_tries += 1;
+            if skip_tries > SKIP_TRIES {
+                break;
+            }
         }
         retries += 1;
     }
@@ -756,6 +760,51 @@ mod tests {
         let p = walk(&h.finish(), HEADER).unwrap();
         // The first walk and SKIP_TRIES more (three in all), not every attempt.
         assert_eq!(p.stats.retries, SKIP_TRIES);
+        assert_eq!(p.stats.tctx_skipped, 1);
+        assert_eq!(p.stacks.len(), 1);
+    }
+
+    /// Serves a record's back-pointer wrongly on some reads of it, as memory
+    /// being reused does: the walk with the fewest skips is the one kept.
+    struct Flaky {
+        inner: FakeMem,
+        record: u64,
+        reads: Cell<u32>,
+        bad_from: u32,
+    }
+
+    impl Memory for Flaky {
+        fn read_some(&self, addr: u64, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read_some(addr, buf)?;
+            if addr == self.record {
+                let k = self.reads.get();
+                self.reads.set(k + 1);
+                // The first walk reads it right, and every later one wrongly.
+                if k >= self.bad_from && n > tctx::GCTX + 8 {
+                    buf[tctx::GCTX..tctx::GCTX + 8].copy_from_slice(&0x99999u64.to_le_bytes());
+                }
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn the_walk_with_the_fewest_skips_is_the_one_returned() {
+        let mut h = Heap::new();
+        h.tctx(0x100000, 0x10000, 0, 0, NOMINAL, (2, 200));
+        h.gctx(0x10000, &[0xa1], 0x100000);
+        // Another stack that always skips, so no walk is clean.
+        h.tctx(0x101000, 0x99999, 0, 0, NOMINAL, (1, 100));
+        h.gctx(0x10400, &[0xb1], 0x101000);
+        let mem = Flaky {
+            inner: h.finish(),
+            record: 0x100000,
+            reads: Cell::new(0),
+            bad_from: 1,
+        };
+        let p = walk(&mem, HEADER).unwrap();
+        // The first walk skipped one record; the later ones two. The first is
+        // the one returned, though it is not the last.
         assert_eq!(p.stats.tctx_skipped, 1);
         assert_eq!(p.stacks.len(), 1);
     }

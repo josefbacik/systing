@@ -426,13 +426,19 @@ impl Report {
         // What the layout checks had to go on, so that a profile they could not
         // judge does not read the same as one they passed.
         let s = &self.stats;
+        // A check with fewer than eight records to judge refuses nothing, and
+        // says so. (A process where each stack is allocated from by one thread
+        // has no links at all, which is a fact about it and not a warning.)
+        let judged = |n: u64| if n < 8 { " (too few to judge)" } else { "" };
         out.push_str(&format!(
-            "; layout checks: {} of {} links out of order, {} of {} counters off",
-            s.order_violated, s.order_checked, s.counters_violated, s.counters_checked
+            "; layout checks: {} of {} links out of order{}, {} of {} counters off{}",
+            s.order_violated,
+            s.order_checked,
+            judged(s.order_checked),
+            s.counters_violated,
+            s.counters_checked,
+            judged(s.counters_checked)
         ));
-        if s.order_checked < 8 || s.counters_checked < 8 {
-            out.push_str(" (too few records for them to judge)");
-        }
         out
     }
 }
@@ -564,30 +570,39 @@ mod tests {
 
     #[test]
     fn the_summary_says_what_the_layout_checks_had_to_go_on() {
-        let mut report = Report {
+        let report = |order_checked, counters_checked| Report {
             how: How::Symbol,
             object: "/lib/j.so".into(),
             lg_prof_sample: 9,
             sample_period_from: "x",
             stacks: 3,
             stats: walk::Stats {
-                order_checked: 2,
-                counters_checked: 3,
+                order_checked,
+                counters_checked,
                 ..Default::default()
             },
             reads: 1,
             bytes: 2048,
             millis: 1,
         };
-        let few = report.summary(7);
+        // Each check says for itself whether it had enough to judge.
+        let few = report(2, 3).summary(7);
         assert!(
-            few.contains("0 of 2 links out of order, 0 of 3 counters off"),
+            few.contains(
+                "0 of 2 links out of order (too few to judge), \
+                 0 of 3 counters off (too few to judge)"
+            ),
             "{few}"
         );
-        assert!(few.contains("too few records for them to judge"), "{few}");
-        report.stats.order_checked = 40;
-        report.stats.counters_checked = 40;
-        assert!(!report.summary(7).contains("too few"));
+        // A process where each stack has one thread has no links at all: that
+        // is said of the links, and not of the counters.
+        let single = report(0, 40).summary(7);
+        assert!(
+            single.ends_with("0 of 0 links out of order (too few to judge), 0 of 40 counters off"),
+            "{single}"
+        );
+        let both = report(40, 40).summary(7);
+        assert!(!both.contains("too few"), "{both}");
     }
 
     #[test]
