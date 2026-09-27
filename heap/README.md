@@ -162,7 +162,7 @@ A build that keeps its `.symtab` names it. A stripped one, such as Debian's and 
 Either way what is found is checked against that shape before it is used, and every structure read afterwards is checked against jemalloc's own invariants, so memory that was freed and reused meanwhile is skipped.
 The code is in `src/snoop/`, and nothing else in the crate knows how it works.
 
-**What it knows.** The structures as jemalloc 5.3.0 and the current `dev` branch lay them out, on 64-bit Linux (x86-64 and aarch64, which lay them out alike; aarch64 is only exercised by CI). Tested against Ubuntu's `libjemalloc2` 5.3.0 (stripped), jemalloc 5.3.0 built from source, and `dev`, with `prof_accum` on and off and `prof_unbias` on and off. It has not been run on jemalloc 4 or 5.0 to 5.2, on a fork with its own changes, or on one linked statically into the program (the program itself is looked in when no jemalloc library is mapped, but that is untried).
+**What it knows.** The structures as jemalloc 5.3.0 and the current `dev` branch lay them out, on 64-bit Linux. x86-64 is what has been run; aarch64 lays them out the same on paper, but nothing has run on it (CI's arm64 job does not run these tests). Tested against Ubuntu's `libjemalloc2` 5.3.0 (stripped), jemalloc 5.3.0 built from source, and `dev`, with `prof_accum` on and off and `prof_unbias` on and off. It has not been run on jemalloc 4 or 5.0 to 5.2, on a fork with its own changes, or on one linked statically into the program (the program itself is looked in when no jemalloc library is mapped, but that is untried).
 
 **Limits.**
 
