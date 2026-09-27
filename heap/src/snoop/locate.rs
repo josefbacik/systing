@@ -164,29 +164,30 @@ fn try_object(
             .filter(|&lg| lg <= 63);
         if let Some(&v) = s.found.get(BT2GCTX) {
             let addr = v.wrapping_add(bias);
-            let head = Ckh::read(mem, addr).context("reading bt2gctx")?;
-            // A busy process can tear one of the entries looked at; a table
-            // named by a symbol is worth a few tries. Its two function
-            // pointers are jemalloc's own code, as the shape scan requires.
-            let in_code = code_ranges(maps, path);
-            if in_code(head.hash)
-                && in_code(head.keycomp)
-                && (0..3).any(|_| is_gctx_table(mem, &head))
-            {
-                return Ok(Located {
-                    bt2gctx: addr,
-                    how: How::Symbol,
-                    object: path.to_string(),
-                    lg_prof_sample,
-                });
+            match check_symbol_table(mem, maps, path, addr) {
+                SymbolTable::Table => {
+                    return Ok(Located {
+                        bt2gctx: addr,
+                        how: How::Symbol,
+                        object: path.to_string(),
+                        lg_prof_sample,
+                    })
+                }
+                // Whatever is wrong, the file on disk may not be the one
+                // mapped (a library replaced under a process that was not
+                // restarted), so the memory is looked at by its shape too.
+                SymbolTable::Empty => note.push_str(
+                    "the bt2gctx symbol names an empty table (profiling is off, or nothing \
+                     has been sampled yet, or the file is not the one mapped); ",
+                ),
+                SymbolTable::NotTable => note.push_str(
+                    "the bt2gctx symbol does not name the table in memory (another jemalloc \
+                     layout, or a file that is not the one mapped); ",
+                ),
+                SymbolTable::Unreadable => {
+                    note.push_str("the bt2gctx symbol names memory that cannot be read; ")
+                }
             }
-            if head.count == 0 || head.tab == 0 {
-                bail!("bt2gctx is empty: profiling is off (MALLOC_CONF needs prof:true) or nothing has been sampled yet");
-            }
-            // Not what the symbol says: the file on disk may not be the one
-            // mapped (a library replaced under a process that was not
-            // restarted), so look at the memory by its shape too.
-            note.push_str("the bt2gctx symbol does not name the table in memory; ");
         } else {
             note.push_str("no bt2gctx symbol (stripped); ");
         }
@@ -203,6 +204,37 @@ fn try_object(
              prof:true), nothing has been sampled yet, or this is not a jemalloc layout this tool knows"
         ),
         Scan::Many(n) => bail!("{note}{n} places look like the profile table; not guessing"),
+    }
+}
+
+/// What lies at the address a `bt2gctx` symbol gives.
+#[derive(Debug, PartialEq, Eq)]
+enum SymbolTable {
+    /// The table: function pointers in the library's code, entries that are
+    /// backtrace records.
+    Table,
+    /// A table with nothing in it, or no table yet.
+    Empty,
+    /// Something else.
+    NotTable,
+    /// Memory that cannot be read.
+    Unreadable,
+}
+
+fn check_symbol_table(mem: &dyn Memory, maps: &Maps, path: &str, addr: u64) -> SymbolTable {
+    let Ok(head) = Ckh::read(mem, addr) else {
+        return SymbolTable::Unreadable;
+    };
+    // A busy process can tear one of the entries looked at; a table named by a
+    // symbol is worth a few tries. Its two function pointers are jemalloc's own
+    // code, as the shape scan requires.
+    let in_code = code_ranges(maps, path);
+    if in_code(head.hash) && in_code(head.keycomp) && (0..3).any(|_| is_gctx_table(mem, &head)) {
+        SymbolTable::Table
+    } else if head.count == 0 || head.tab == 0 {
+        SymbolTable::Empty
+    } else {
+        SymbolTable::NotTable
     }
 }
 
@@ -471,6 +503,48 @@ mod tests {
         assert_eq!(
             shown("/usr/lib/libjemalloc.so.2"),
             "/usr/lib/libjemalloc.so.2"
+        );
+    }
+
+    /// What a `bt2gctx` symbol can lead to, on made-up memory: the table, a
+    /// stale address of zeros, a stale address of something else, and one that
+    /// is not mapped. All but the first go on to the scan, and none of them
+    /// says "profiling is off" as if that were known.
+    #[test]
+    fn a_symbol_that_does_not_name_the_table_is_told_apart() {
+        use crate::snoop::mem::fake::FakeMem;
+        let maps = Maps::parse(
+            "7f0000010000-7f0000011000 r-xp 00000000 08:01 7 /lib/libjemalloc.so.2\n\
+             7f0000020000-7f0000021000 rw-p 00010000 08:01 7 /lib/libjemalloc.so.2\n",
+        );
+        let path = "/lib/libjemalloc.so.2";
+        let header = |count: u64, tab: u64, hash: u64| {
+            let mut h = vec![0u8; 48];
+            h[8..16].copy_from_slice(&count.to_le_bytes());
+            h[16..20].copy_from_slice(&4u32.to_le_bytes());
+            h[20..24].copy_from_slice(&4u32.to_le_bytes());
+            h[24..32].copy_from_slice(&hash.to_le_bytes());
+            h[32..40].copy_from_slice(&0x7f00_0001_0200u64.to_le_bytes());
+            h[40..48].copy_from_slice(&tab.to_le_bytes());
+            h
+        };
+        let mut mem = FakeMem::default();
+        // A stale address that now holds zeros.
+        mem.put(0x7f00_0002_0000, vec![0u8; 48]);
+        // Function pointers outside the library's code, so not its table.
+        mem.put(0x7f00_0002_0100, header(5, 0x7f00_0010_0000, 0x1234));
+        mem.put(0x7f00_0010_0000, vec![0u8; 4096]);
+        assert_eq!(
+            check_symbol_table(&mem, &maps, path, 0x7f00_0002_0000),
+            SymbolTable::Empty
+        );
+        assert_eq!(
+            check_symbol_table(&mem, &maps, path, 0x7f00_0002_0100),
+            SymbolTable::NotTable
+        );
+        assert_eq!(
+            check_symbol_table(&mem, &maps, path, 0x7f00_00ff_0000),
+            SymbolTable::Unreadable
         );
     }
 

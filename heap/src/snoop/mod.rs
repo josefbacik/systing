@@ -274,7 +274,9 @@ fn refuse_unusable(profile: &walk::Profile) -> Result<()> {
     // them, or whose counters cannot be jemalloc's. A moving heap breaks each
     // of these for a moment, for a few records; a share of them is not that.
     let s = &profile.stats;
-    if s.tctx_skipped > s.tctx_read || s.gctx_skipped > s.gctx_read {
+    // A majority of eight or more records; fewer say too little either way.
+    let mostly_skipped = |skipped: u64, read: u64| skipped + read >= 8 && skipped > read;
+    if mostly_skipped(s.tctx_skipped, s.tctx_read) || mostly_skipped(s.gctx_skipped, s.gctx_read) {
         bail!(
             "most of the records could not be read as jemalloc's ({} thread records skipped, \
              {} read; {} backtraces skipped, {} read): the heap is being rewritten faster \
@@ -307,6 +309,9 @@ fn refuse_unusable(profile: &walk::Profile) -> Result<()> {
     Ok(())
 }
 
+/// A counter word this large has wrapped below zero: no count is that big.
+const WRAPPED: u64 = 1 << 63;
+
 /// One stack's row.
 ///
 /// The counts are the sampled ones jemalloc holds, as a dump with
@@ -326,18 +331,26 @@ fn sample(addrs: &[u64], c: &Counts) -> Sample {
     let objs = |shifted: u64| shifted.saturating_add(4) / 8;
     // Estimates are stored as BIGINT.
     let est = |v: u64| v.min(i64::MAX as u64);
+    // jemalloc takes a freed object's weight off at the period in force then,
+    // so after `prof.reset` to another period a counter can pass zero and wrap.
+    // No byte or object count is 2^63: such a stack has no estimate of its own,
+    // and gets the one the counts give at the snapshot's period.
+    let wrapped = c.cur_objs_shifted_unbiased.max(c.cur_bytes_unbiased) >= WRAPPED
+        || c.accum_objs_shifted_unbiased.max(c.accum_bytes_unbiased) >= WRAPPED;
     Sample {
         addrs: addrs.to_vec(),
         live_objects: c.cur_objs,
         live_bytes: c.cur_bytes,
         alloc_objects: c.accum_objs,
         alloc_bytes: c.accum_bytes,
-        exact_estimates: Some([
-            est(c.cur_bytes_unbiased),
-            est(objs(c.cur_objs_shifted_unbiased)),
-            est(c.accum_bytes_unbiased),
-            est(objs(c.accum_objs_shifted_unbiased)),
-        ]),
+        exact_estimates: (!wrapped).then(|| {
+            [
+                est(c.cur_bytes_unbiased),
+                est(objs(c.cur_objs_shifted_unbiased)),
+                est(c.accum_bytes_unbiased),
+                est(objs(c.accum_objs_shifted_unbiased)),
+            ]
+        }),
     }
 }
 
@@ -409,6 +422,16 @@ impl Report {
                 "; the profile table was being changed during every read (jemalloc \
                  rebuilding it, or a busy process), so stacks may be missing: run it again",
             );
+        }
+        // What the layout checks had to go on, so that a profile they could not
+        // judge does not read the same as one they passed.
+        let s = &self.stats;
+        out.push_str(&format!(
+            "; layout checks: {} of {} links out of order, {} of {} counters off",
+            s.order_violated, s.order_checked, s.counters_violated, s.counters_checked
+        ));
+        if s.order_checked < 8 || s.counters_checked < 8 {
+            out.push_str(" (too few records for them to judge)");
         }
         out
     }
@@ -510,6 +533,89 @@ mod tests {
             ..base
         };
         assert!(refuse_unusable(&profile(few)).is_ok());
+    }
+
+    #[test]
+    fn a_small_profile_is_not_refused_on_a_couple_of_skips() {
+        let profile = |stats| walk::Profile {
+            stacks: vec![walk::Stack {
+                addrs: vec![1],
+                counts: Counts::default(),
+            }],
+            stats,
+        };
+        // Two skipped against one read: a majority, but of three records.
+        let few = walk::Stats {
+            gctx_read: 1,
+            tctx_read: 1,
+            tctx_skipped: 2,
+            ..Default::default()
+        };
+        assert!(refuse_unusable(&profile(few)).is_ok());
+        // Five against three is a majority of eight.
+        let eight = walk::Stats {
+            gctx_read: 1,
+            tctx_read: 3,
+            tctx_skipped: 5,
+            ..Default::default()
+        };
+        assert!(refuse_unusable(&profile(eight)).is_err());
+    }
+
+    #[test]
+    fn the_summary_says_what_the_layout_checks_had_to_go_on() {
+        let mut report = Report {
+            how: How::Symbol,
+            object: "/lib/j.so".into(),
+            lg_prof_sample: 9,
+            sample_period_from: "x",
+            stacks: 3,
+            stats: walk::Stats {
+                order_checked: 2,
+                counters_checked: 3,
+                ..Default::default()
+            },
+            reads: 1,
+            bytes: 2048,
+            millis: 1,
+        };
+        let few = report.summary(7);
+        assert!(
+            few.contains("0 of 2 links out of order, 0 of 3 counters off"),
+            "{few}"
+        );
+        assert!(few.contains("too few records for them to judge"), "{few}");
+        report.stats.order_checked = 40;
+        report.stats.counters_checked = 40;
+        assert!(!report.summary(7).contains("too few"));
+    }
+
+    #[test]
+    fn a_counter_that_wrapped_gives_its_stack_no_estimate_of_its_own() {
+        let normal = Counts {
+            cur_objs: 2,
+            cur_objs_shifted_unbiased: 40,
+            cur_bytes: 2048,
+            cur_bytes_unbiased: 5000,
+            ..Default::default()
+        };
+        assert!(sample(&[1], &normal).exact_estimates.is_some());
+        // A free after a reset to a longer period took off more than was added.
+        for wrapped in [
+            Counts {
+                cur_bytes_unbiased: u64::MAX - 100,
+                ..normal
+            },
+            Counts {
+                cur_objs_shifted_unbiased: 1 << 63,
+                ..normal
+            },
+        ] {
+            let s = sample(&[1], &wrapped);
+            assert_eq!(s.exact_estimates, None);
+            // The raw counts are still there, for the pipeline to scale.
+            assert_eq!((s.live_objects, s.live_bytes), (2, 2048));
+        }
     }
 
     #[test]

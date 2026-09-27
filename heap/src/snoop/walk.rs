@@ -52,6 +52,10 @@ const MAX_FRAMES_TOTAL: u64 = 1 << 25;
 pub const VALIDATE_BYTES: u64 = 1 << 20;
 /// How many times a walk is done again when the table changed under it.
 const ATTEMPTS: u32 = 5;
+/// How many walks that only skipped records (freed or reused under the walk)
+/// are done again: a skip that stands is not going to go away by trying five
+/// times.
+const SKIP_TRIES: u32 = 2;
 
 /// What went wrong along the way, and did not stop the walk.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -121,6 +125,7 @@ fn walk_limited(mem: &dyn Memory, bt2gctx: u64, limits: Limits) -> io::Result<Pr
     let mut last = io::Error::other("the profile kept changing");
     // A walk that was not clean, kept in case none is.
     let mut best: Option<Profile> = None;
+    let mut skip_tries = 0;
     for _ in 0..ATTEMPTS {
         let head = Ckh::read(mem, bt2gctx)?;
         if !head.plausible() {
@@ -160,7 +165,10 @@ fn walk_limited(mem: &dyn Memory, bt2gctx: u64, limits: Limits) -> io::Result<Pr
         // A record that was freed and reused under the walk, or a tree that
         // was rotated under it, shows as records skipped: worth another go.
         let skips = stats.gctx_skipped + stats.tctx_skipped;
-        if at_rest && skips == 0 {
+        if at_rest && skips > 0 {
+            skip_tries += 1;
+        }
+        if at_rest && (skips == 0 || skip_tries > SKIP_TRIES) {
             stats.retries = retries;
             return Ok(Profile { stacks, stats });
         }
@@ -348,8 +356,13 @@ fn read_tctxs(mem: &dyn Memory, gaddr: u64, root: u64, stats: &mut Stats) -> Vec
         let c = Counts::parse(&b[tctx::CNTS..tctx::CNTS + CNT_SIZE]);
         if c.cur_objs > 0 {
             stats.counters_checked += 1;
+            // A word with its top bit set has wrapped below zero (see
+            // `mod.rs`), which no live count does.
+            let wrapped = |v: u64| v >= 1 << 63;
             if c.cur_objs_shifted_unbiased < c.cur_objs.saturating_mul(8)
                 || c.cur_bytes_unbiased < c.cur_bytes
+                || wrapped(c.cur_objs_shifted_unbiased)
+                || wrapped(c.cur_bytes_unbiased)
             {
                 stats.counters_violated += 1;
             }
@@ -695,6 +708,23 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_counter_is_one_that_cannot_be_jemallocs() {
+        let mut h = Heap::new();
+        for i in 0..8u64 {
+            let (g, t) = (0x10000 + i * 0x400, 0x100000 + i * 0x400);
+            h.tctx(t, g, 0, 0, NOMINAL, (2, 200));
+            h.gctx(g, &[0xa1 + i], t);
+            // A free after a reset to a longer period took off too much.
+            h.mem.poke_u64(t + tctx::CNTS as u64 + 24, u64::MAX - 5); // unbiased bytes
+        }
+        let p = walk(&h.finish(), HEADER).unwrap();
+        assert_eq!(
+            (p.stats.counters_checked, p.stats.counters_violated),
+            (8, 8)
+        );
+    }
+
+    #[test]
     fn counters_that_cannot_be_jemallocs_are_counted() {
         let mut h = Heap::new();
         // Eight records: the first four with an unbiased count below the
@@ -724,7 +754,8 @@ mod tests {
         h.tctx(0x101000, 0x10400, 0, 0, NOMINAL, (3, 300));
         h.gctx(0x10400, &[0xb1], 0x101000);
         let p = walk(&h.finish(), HEADER).unwrap();
-        assert_eq!(p.stats.retries, ATTEMPTS);
+        // The first walk and SKIP_TRIES more (three in all), not every attempt.
+        assert_eq!(p.stats.retries, SKIP_TRIES);
         assert_eq!(p.stats.tctx_skipped, 1);
         assert_eq!(p.stacks.len(), 1);
     }
