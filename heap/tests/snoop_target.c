@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #define NOINLINE __attribute__((noinline))
@@ -60,6 +61,10 @@ static void *worker(void *arg) {
 }
 
 int main(int argc, char **argv) {
+	// Under kernel.yama.ptrace_scope=1 (the default on many distributions) a
+	// process can be read only by its ancestors. The tool under test is the
+	// test's child, as this program is, so this lets it read us.
+	prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
 	steps[0][0] = step_0_0; steps[0][1] = step_0_1;
 	steps[1][0] = step_1_0; steps[1][1] = step_1_1;
 	steps[2][0] = step_2_0; steps[2][1] = step_2_1;
