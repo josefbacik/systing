@@ -22,6 +22,7 @@ pub mod perfmap;
 pub mod pycode;
 pub mod retention;
 pub mod root;
+pub mod snoop;
 pub mod symbolize;
 
 use std::path::PathBuf;
