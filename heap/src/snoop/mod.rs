@@ -199,15 +199,7 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
             found.bt2gctx, found.object
         )
     })?;
-    if profile.stacks.is_empty() {
-        bail!("the process has no live sampled allocations to report yet");
-    }
-    if profile.stats.tctx_read == 0 {
-        bail!(
-            "found backtraces but no per-thread counters under them: \
-             this jemalloc is laid out differently from the ones this tool knows"
-        );
-    }
+    refuse_unusable(&profile)?;
     // The mappings as of the end, so a library loaded meanwhile is named.
     let maps = Maps::parse(&process.read_text("maps", MAX_MAPS_BYTES)?);
 
@@ -221,7 +213,7 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
     let samples: Vec<Sample> = profile
         .stacks
         .iter()
-        .map(|s| sample(&s.addrs, &s.counts, lg))
+        .map(|s| sample(&s.addrs, &s.counts))
         .collect();
 
     let (reads, bytes) = mem.traffic();
@@ -262,51 +254,55 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
     Ok((snapshot, report))
 }
 
-/// One stack's row, the one a dump of the same heap would hold.
-///
-/// jemalloc keeps, next to each raw count, what the sampled objects stand for,
-/// summed object by object as they were sampled: `cur_objs_shifted_unbiased / 8`
-/// objects and `cur_bytes_unbiased` bytes. A dump does not print those. It
-/// prints the pair of counts that jeprof's unbiasing (what [`Sample::estimates`]
-/// does) turns back into them, and this makes the same pair, as jemalloc's
-/// `prof_do_unbias` does. So the row is the dump's row, and the estimate that
-/// comes of it is jemalloc's own to within a rounding: the same one a dump has.
-///
-/// The period is used to make the pair and again to take it apart, so a wrong
-/// period changes the counts shown but hardly the estimate.
-fn sample(addrs: &[u64], c: &Counts, lg_prof_sample: u32) -> Sample {
-    let (live_objects, live_bytes) = unbias_pair(
-        c.cur_objs_shifted_unbiased,
-        c.cur_bytes_unbiased,
-        lg_prof_sample,
-    );
-    let (alloc_objects, alloc_bytes) = unbias_pair(
-        c.accum_objs_shifted_unbiased,
-        c.accum_bytes_unbiased,
-        lg_prof_sample,
-    );
-    Sample {
-        addrs: addrs.to_vec(),
-        live_objects,
-        live_bytes,
-        alloc_objects,
-        alloc_bytes,
+/// Say why a profile that was read cannot be used, if it cannot.
+fn refuse_unusable(profile: &walk::Profile) -> Result<()> {
+    // Backtraces that were recognised, and no thread record under any of them
+    // that was: the layout behind the backtrace's own is not this tool's. This
+    // is asked before whether there are stacks, which it would otherwise hide.
+    if profile.stats.gctx_read > 0 && profile.stats.tctx_read == 0 {
+        bail!(
+            "found backtraces but no per-thread counters under them: \
+             this jemalloc is laid out differently from the ones this tool knows"
+        );
     }
+    if profile.stacks.is_empty() {
+        bail!("the process has no live sampled allocations to report yet");
+    }
+    Ok(())
 }
 
-/// jemalloc's `prof_do_unbias`: from an unbiased object count (kept times
-/// `1 << SC_LG_TINY_MIN`, that is 8) and byte count, the counts a dump prints.
-fn unbias_pair(objs_shifted: u64, bytes: u64, lg_prof_sample: u32) -> (u64, u64) {
-    if objs_shifted == 0 || bytes == 0 {
-        return (0, 0);
+/// One stack's row.
+///
+/// The counts are the sampled ones jemalloc holds, as a dump with
+/// `prof_unbias:false` prints them. Next to each, jemalloc keeps what the
+/// sampled objects stand for, summed object by object as they were sampled:
+/// `cur_objs_shifted_unbiased / 8` objects and `cur_bytes_unbiased` bytes.
+/// Those are the row's estimates, as they are.
+///
+/// A dump cannot say them: it prints a pair of counts that jeprof's unbiasing
+/// turns back into them, made with the sampling period. Here the period is
+/// not needed for an estimate at all, so an estimate cannot be wrong for a
+/// period that was guessed (a stripped library does not say what its period
+/// is); the period is only the label on the snapshot.
+fn sample(addrs: &[u64], c: &Counts) -> Sample {
+    // The counter is kept times 1 << SC_LG_TINY_MIN, to keep the rounding of
+    // each sampled object small.
+    let objs = |shifted: u64| shifted.saturating_add(4) / 8;
+    // Estimates are stored as BIGINT.
+    let est = |v: u64| v.min(i64::MAX as u64);
+    Sample {
+        addrs: addrs.to_vec(),
+        live_objects: c.cur_objs,
+        live_bytes: c.cur_bytes,
+        alloc_objects: c.accum_objs,
+        alloc_bytes: c.accum_bytes,
+        exact_estimates: Some([
+            est(c.cur_bytes_unbiased),
+            est(objs(c.cur_objs_shifted_unbiased)),
+            est(c.accum_bytes_unbiased),
+            est(objs(c.accum_objs_shifted_unbiased)),
+        ]),
     }
-    let c_out = objs_shifted as f64 / 8.0;
-    let s_out = bytes as f64;
-    let r = (1u64 << lg_prof_sample) as f64;
-    let x = s_out / c_out;
-    let y = s_out * (1.0 - (-x / r).exp());
-    // C's round() (half away from zero), then a saturating conversion.
-    (((y / x).round()) as u64, y.round() as u64)
 }
 
 /// `lg_prof_sample` from the `MALLOC_CONF` the process started with. A stopgap
@@ -386,74 +382,93 @@ impl Report {
 mod tests {
     use super::*;
 
-    /// A pair made for a stack comes back out of `Sample::estimates` as the
-    /// unbiased estimate jemalloc kept, to within the rounding of the integers
-    /// a dump has, for any period and mix of sizes.
     #[test]
-    fn a_rows_estimate_is_the_estimate_jemalloc_kept() {
-        for lg in [9, 12, 14, 19] {
-            for (objs, bytes) in [(1500u64, 1_000_000u64), (3, 3 * 65536), (40_000, 9_000_000)] {
-                let s = sample(
-                    &[1],
-                    &Counts {
-                        cur_objs_shifted_unbiased: objs * 8,
-                        cur_bytes_unbiased: bytes,
-                        ..Default::default()
-                    },
-                    lg,
-                );
-                let [b, n, ab, an] = s.estimates(1 << lg);
-                // The pair is made of integers, so half a count in c_in is
-                // the resolution: coarser for a stack of fewer sampled objects.
-                let tolerance = 1.0 / s.live_objects as f64 + 0.001;
-                let close = |got: u64, want: u64| {
-                    got.abs_diff(want) as f64 <= want as f64 * tolerance + 1.0
-                };
-                assert!(close(b, bytes), "lg {lg}: {b} bytes, want {bytes}");
-                assert!(close(n, objs), "lg {lg}: {n} objects, want {objs}");
-                assert_eq!((ab, an), (0, 0));
-            }
-        }
-    }
-
-    /// A stack of one sampled object of any size is one object of about its
-    /// size again (jemalloc rounds each object's unbiased count to an integer,
-    /// so about): a stack with one large object is not lost to the encoding.
-    #[test]
-    fn one_sampled_object_comes_out_as_one_object_of_its_size() {
-        let r = 524_288.0f64;
-        for size in [64.0f64, 4096.0, 65536.0, 1_048_576.0] {
-            let objs = 1.0 / (1.0 - (-size / r).exp());
-            let s = sample(
-                &[1],
-                &Counts {
-                    cur_objs_shifted_unbiased: (objs * 8.0).round() as u64,
-                    cur_bytes_unbiased: (objs * size).round() as u64,
-                    ..Default::default()
-                },
-                19,
-            );
-            assert_eq!(s.live_objects, 1, "size {size}");
-            assert!(
-                (s.live_bytes as f64 - size).abs() <= size * 0.05,
-                "size {size}: {} bytes",
-                s.live_bytes
-            );
-        }
+    fn a_layout_that_differs_behind_the_backtrace_is_refused_as_that() {
+        let profile = |stats| walk::Profile {
+            stacks: vec![],
+            stats,
+        };
+        // Backtraces found, thread records under them all skipped.
+        let e = refuse_unusable(&profile(walk::Stats {
+            gctx_read: 3,
+            tctx_skipped: 3,
+            ..Default::default()
+        }))
+        .unwrap_err();
+        assert!(e.to_string().contains("laid out differently"), "{e}");
+        // Nothing sampled yet is another thing.
+        let e = refuse_unusable(&profile(walk::Stats::default())).unwrap_err();
+        assert!(e.to_string().contains("no live sampled allocations"), "{e}");
+        // Backtraces with counters, none live: also just nothing to report.
+        let e = refuse_unusable(&profile(walk::Stats {
+            gctx_read: 3,
+            tctx_read: 3,
+            ..Default::default()
+        }))
+        .unwrap_err();
+        assert!(e.to_string().contains("no live sampled allocations"), "{e}");
     }
 
     #[test]
-    fn nothing_counted_is_a_row_of_zeros() {
-        assert_eq!(unbias_pair(0, 100, 12), (0, 0));
-        assert_eq!(unbias_pair(80, 0, 12), (0, 0));
+    fn a_row_holds_the_counts_and_the_estimate_jemalloc_kept() {
+        let s = sample(
+            &[1, 2],
+            &Counts {
+                cur_objs: 3,
+                cur_objs_shifted_unbiased: 8 * 1500 + 3,
+                cur_bytes: 1_000,
+                cur_bytes_unbiased: 1_000_000,
+                accum_objs: 4,
+                accum_objs_shifted_unbiased: 8 * 2000,
+                accum_bytes: 2_000,
+                accum_bytes_unbiased: 2_000_000,
+            },
+        );
+        assert_eq!((s.live_objects, s.live_bytes), (3, 1_000));
+        assert_eq!((s.alloc_objects, s.alloc_bytes), (4, 2_000));
+        // Whatever the period, and however wrong a guess of it was, the
+        // estimate is not scaled again.
+        for period in [1, 512, 1 << 19, 1 << 40] {
+            assert_eq!(s.estimates(period), [1_000_000, 1500, 2_000_000, 2000]);
+        }
+    }
+
+    /// The case that made a dump-style pair unsafe: a stack of a few small
+    /// objects, with a period assumed far above the true one. The pair rounds
+    /// to zero objects and the estimate is lost; the estimate kept here is not.
+    #[test]
+    fn a_wrong_period_does_not_lose_a_small_stacks_estimate() {
+        // Two sampled 1 KiB objects at a true period of 2 KiB: each stands for
+        // 1 / (1 - exp(-0.5)) = 2.54 objects.
+        let unbiased = 1.0 / (1.0 - (-0.5f64).exp());
+        let s = sample(
+            &[1],
+            &Counts {
+                cur_objs: 2,
+                cur_objs_shifted_unbiased: (2.0 * unbiased * 8.0).round() as u64,
+                cur_bytes: 2048,
+                cur_bytes_unbiased: (2.0 * unbiased * 1024.0).round() as u64,
+                ..Default::default()
+            },
+        );
+        let [bytes, objs, ..] = s.estimates(1 << 19);
+        assert_eq!(objs, 5);
+        assert!(bytes > 5_000 && bytes < 5_300, "{bytes}");
     }
 
     #[test]
     fn counters_from_a_torn_read_cannot_make_a_row_panic() {
-        // Absurd counters from a half-updated structure: no panic.
-        let _ = unbias_pair(u64::MAX, 1, 12);
-        let _ = unbias_pair(1, u64::MAX, 63);
-        let _ = unbias_pair(1, 1, 1);
+        let s = sample(
+            &[1],
+            &Counts {
+                cur_objs_shifted_unbiased: u64::MAX,
+                cur_bytes_unbiased: u64::MAX,
+                accum_objs_shifted_unbiased: u64::MAX,
+                accum_bytes_unbiased: u64::MAX,
+                ..Default::default()
+            },
+        );
+        assert!(s.estimates(512).iter().all(|&v| v <= i64::MAX as u64));
     }
 
     #[test]

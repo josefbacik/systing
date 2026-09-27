@@ -32,10 +32,16 @@ fn libs() -> Vec<PathBuf> {
 }
 
 fn build_target(dir: &Path) -> Option<PathBuf> {
-    let bin = dir.join("snoop_target");
+    build_target_as(dir, "snoop_target", &[])
+}
+
+/// The target, named `name`, built with more compiler arguments.
+fn build_target_as(dir: &Path, name: &str, more: &[String]) -> Option<PathBuf> {
+    let bin = dir.join(name);
     let built = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
         .args(["-O1", "-g", "-fno-omit-frame-pointer", "-pthread", "-o"])
         .arg(&bin)
+        .args(more)
         .arg(TARGET_C)
         .arg("-ldl")
         .status();
@@ -63,9 +69,10 @@ impl Target {
         if let Some(lib) = lib {
             cmd.env("LD_PRELOAD", lib);
         }
-        if let Some(conf) = malloc_conf {
-            cmd.env("MALLOC_CONF", conf);
-        }
+        match malloc_conf {
+            Some(conf) => cmd.env("MALLOC_CONF", conf),
+            None => cmd.env_remove("MALLOC_CONF"),
+        };
         let mut child = cmd.spawn().unwrap();
         let mut line = String::new();
         BufReader::new(child.stdout.take().unwrap())
@@ -209,14 +216,15 @@ fn rows(samples: &[systing_heap::Sample]) -> Rows {
 }
 
 /// What jemalloc dumps of a heap and what is read from its memory are the
-/// same profile: every stack's four counts are identical, with `prof_accum`
-/// on and off. (The heap is not touched between the dump and the read.)
+/// same profile. With `prof_unbias:false` a dump prints the raw sampled counts,
+/// and every stack's four counts must be identical, with `prof_accum` on and
+/// off. (The heap is not touched between the dump and the read.)
 #[test]
-fn the_rows_are_the_ones_a_dump_of_the_same_heap_has() {
+fn the_counts_are_the_ones_a_dump_of_the_same_heap_has() {
     for lib in libs() {
         for conf in [
-            "prof:true,lg_prof_sample:9,prof_accum:true",
-            "prof:true,lg_prof_sample:12,prof_accum:false",
+            "prof:true,lg_prof_sample:9,prof_accum:true,prof_unbias:false",
+            "prof:true,lg_prof_sample:12,prof_accum:false,prof_unbias:false",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let Some(bin) = build_target(dir.path()) else {
@@ -241,14 +249,6 @@ fn the_rows_are_the_ones_a_dump_of_the_same_heap_has() {
             for (addrs, counts) in &want {
                 assert_eq!(got.get(addrs), Some(counts), "{ctx}: stack {addrs:x?}");
             }
-            // So the estimates are the same too.
-            let est = |s: &systing_heap::Snapshot| -> u64 {
-                s.samples
-                    .iter()
-                    .map(|x| x.estimates(s.sample_period)[0])
-                    .sum()
-            };
-            assert_eq!(est(&snooped), est(&dumped), "{ctx}");
             assert_eq!(snooped.trigger, Some("snoop"));
             // The same memory map, for symbolization.
             assert_eq!(snooped.maps.exe_name(), dumped.maps.exe_name());
@@ -257,8 +257,48 @@ fn the_rows_are_the_ones_a_dump_of_the_same_heap_has() {
     }
 }
 
-/// With `prof_unbias:false` a dump prints raw counts, which systing-heap then
-/// scales at each stack's mean object size; a snoop has jemalloc's own
+/// With unbiasing on (the default) a dump prints counts that jeprof scales
+/// back to jemalloc's estimate, through integers; the estimate read from
+/// memory is jemalloc's own, so the two agree to rounding.
+#[test]
+fn the_estimates_agree_with_those_of_a_dump_of_the_same_heap() {
+    for lib in libs() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(bin) = build_target(dir.path()) else {
+            return;
+        };
+        let dump = dir.path().join("reference.heap");
+        let conf = "prof:true,lg_prof_sample:12";
+        let target = Target::start(&bin, Some(&lib), Some(conf), dump.to_str().unwrap());
+
+        let dumped = jemalloc::read(&dump).unwrap();
+        let process = snoop::Process::open(target.pid()).unwrap();
+        let (snooped, _) = snoop::read(&process, &process.root().unwrap()).unwrap();
+
+        let by_addrs = |s: &systing_heap::Snapshot| -> std::collections::BTreeMap<Vec<u64>, f64> {
+            s.samples
+                .iter()
+                .map(|x| (x.addrs.clone(), x.estimates(s.sample_period)[0] as f64))
+                .collect()
+        };
+        let (want, got) = (by_addrs(&dumped), by_addrs(&snooped));
+        let (w, g): (f64, f64) = (want.values().sum(), got.values().sum());
+        assert!((g - w).abs() / w < 0.005, "{lib:?}: dump {w}, memory {g}");
+        // Large stacks agree one by one.
+        for (addrs, w) in want.iter().filter(|(_, w)| **w > 100_000.0) {
+            let g = got[addrs];
+            assert!(
+                (g - w).abs() / w < 0.01,
+                "{lib:?}: stack {addrs:x?}: dump {w}, memory {g}"
+            );
+        }
+        target.stop();
+    }
+}
+
+/// The estimate does not depend on the sampling period the tool has in mind:
+/// with `prof_unbias:false` a dump prints raw counts and systing-heap scales
+/// them at each stack's mean object size; a snoop has jemalloc's own
 /// per-object estimate. They agree on the heap as a whole.
 #[test]
 fn without_unbiasing_the_total_estimate_still_agrees_with_a_dump() {
@@ -285,6 +325,59 @@ fn without_unbiasing_the_total_estimate_still_agrees_with_a_dump() {
         assert!(
             (got - want).abs() / want < 0.01,
             "{lib:?}: dump {want}, memory {got}"
+        );
+        target.stop();
+    }
+}
+
+/// A process that sets its options in the program (a `malloc_conf` it defines)
+/// gives a stripped library no way to say what its sampling period is: neither
+/// its environment nor a symbol does, so the tool guesses, and the guess is
+/// only a label. The estimates are jemalloc's own and do not depend on it.
+#[test]
+fn a_guessed_period_does_not_spoil_the_estimates() {
+    for lib in libs() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = "prof:true,lg_prof_sample:12";
+        let define = format!("-DCOMPILED_MALLOC_CONF=\"{conf}\"");
+        // Exported, so that the preloaded jemalloc finds the program's variable.
+        let Some(bin) = build_target_as(
+            dir.path(),
+            "snoop_target_conf",
+            &["-rdynamic".into(), define],
+        ) else {
+            return;
+        };
+        let dump = dir.path().join("reference.heap");
+        // No MALLOC_CONF in the environment: only the program knows.
+        let target = Target::start(&bin, Some(&lib), None, dump.to_str().unwrap());
+
+        let dumped = jemalloc::read(&dump).unwrap();
+        assert_eq!(
+            dumped.sample_period,
+            1 << 12,
+            "{lib:?}: the program's own conf"
+        );
+        let process = snoop::Process::open(target.pid()).unwrap();
+        let (snooped, report) = snoop::read(&process, &process.root().unwrap()).unwrap();
+
+        let total = |s: &systing_heap::Snapshot| -> f64 {
+            s.samples
+                .iter()
+                .map(|x| x.estimates(s.sample_period)[0] as f64)
+                .sum()
+        };
+        // Without symbols the tool could only guess, and guessed wrong: that is
+        // the case being tested. (With symbols it reads the right one.)
+        if report.how == snoop::locate::How::Shape {
+            assert_ne!(snooped.sample_period, dumped.sample_period, "{lib:?}");
+        }
+        let (want, got) = (total(&dumped), total(&snooped));
+        assert!(
+            (got - want).abs() / want < 0.005,
+            "{lib:?}: dump {want}, memory {got}; period 2^{} from {}",
+            report.lg_prof_sample,
+            report.sample_period_from
         );
         target.stop();
     }

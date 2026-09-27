@@ -58,6 +58,8 @@ const ATTEMPTS: u32 = 5;
 pub struct Stats {
     /// Walks done again because the table changed during them.
     pub retries: u32,
+    /// `gctx` read: backtraces that passed the shape check.
+    pub gctx_read: u64,
     /// `gctx` skipped: freed or reused while being read.
     pub gctx_skipped: u64,
     /// `tctx` skipped for the same reason.
@@ -182,6 +184,7 @@ fn read_stacks(
             stats.gctx_skipped += 1;
             continue;
         };
+        stats.gctx_read += 1;
         let mut counts = Counts::default();
         for c in read_tctxs(mem, gaddr, root, stats) {
             counts.add(&c);
@@ -437,6 +440,7 @@ mod tests {
         assert_eq!(
             p.stats,
             Stats {
+                gctx_read: 2,
                 tctx_read: 4,
                 ..Default::default()
             }

@@ -18,6 +18,12 @@
 #include <sys/prctl.h>
 #include <unistd.h>
 
+#ifdef COMPILED_MALLOC_CONF
+// jemalloc's options given by the program itself, as a service might: neither
+// the environment nor any file says what they are.
+const char *malloc_conf = COMPILED_MALLOC_CONF;
+#endif
+
 #define NOINLINE __attribute__((noinline))
 static void *volatile sink;
 

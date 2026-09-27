@@ -69,6 +69,11 @@ pub struct Sample {
     /// Cumulative since start; 0 unless the allocator tracked them.
     pub alloc_objects: u64,
     pub alloc_bytes: u64,
+    /// The allocator's own estimate for this stack (live bytes, live
+    /// objects, alloc bytes, alloc objects), for a source that has one:
+    /// [`Sample::estimates`] gives it as it is. A dump has none, and its
+    /// counts are scaled at the sample period instead.
+    pub exact_estimates: Option<[u64; 4]>,
 }
 
 impl Sample {
@@ -83,6 +88,9 @@ impl Sample {
     /// done after unbiasing samples"). jemalloc 5.3 writes each stack's pair
     /// so that this per-stack step gives its own estimate.
     pub fn estimates(&self, sample_period: u64) -> [u64; 4] {
+        if let Some(exact) = self.exact_estimates {
+            return exact;
+        }
         let (live_bytes, live_objects) = unbias(self.live_bytes, self.live_objects, sample_period);
         let (alloc_bytes, alloc_objects) =
             unbias(self.alloc_bytes, self.alloc_objects, sample_period);
@@ -119,6 +127,7 @@ mod tests {
             live_bytes: bytes,
             alloc_objects: 0,
             alloc_bytes: 0,
+            exact_estimates: None,
         };
         // 256-byte objects at a 16 KiB period: each is sampled with
         // probability about 1/64.5.
@@ -134,5 +143,12 @@ mod tests {
         assert_eq!(sample(1, 1).estimates(u64::MAX), [1, 1, 0, 0]);
         let [b, n, _, _] = sample(u64::MAX, 1 << 40).estimates(1);
         assert!(b <= i64::MAX as u64 && n <= i64::MAX as u64);
+        // An allocator's own estimate is not scaled again, whatever the period.
+        let exact = Sample {
+            exact_estimates: Some([7, 6, 5, 4]),
+            ..sample(256, 1)
+        };
+        assert_eq!(exact.estimates(16384), [7, 6, 5, 4]);
+        assert_eq!(exact.estimates(1), [7, 6, 5, 4]);
     }
 }
