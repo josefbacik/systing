@@ -30,6 +30,8 @@ pub mod locate;
 pub mod mem;
 pub mod walk;
 
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -65,18 +67,56 @@ pub struct Report {
     pub millis: u128,
 }
 
-/// The heap profile of process `pid`, as of now. Files it names are read
-/// beneath `root` (its own, `/proc/<pid>/root`).
-pub fn read(pid: u32, root: &Root) -> Result<(Snapshot, Report)> {
+/// One process, pinned. A pid can come to name another process between one
+/// look at it and the next, so it is opened once, as a directory, and its
+/// files (memory, maps, root, ...) are all opened through that handle: they
+/// are all of the process it was when this was called, or fail if it has since
+/// exited.
+pub struct Process {
+    pid: u32,
+    dir: File,
+}
+
+impl Process {
+    pub fn open(pid: u32) -> Result<Process> {
+        let dir =
+            File::open(format!("/proc/{pid}")).with_context(|| format!("opening /proc/{pid}"))?;
+        Ok(Process { pid, dir })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// `name` in the process's `/proc` directory, through the handle.
+    fn file(&self, name: &str) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}/{name}", self.dir.as_raw_fd()))
+    }
+
+    /// The process's root directory, to read the files it names beneath.
+    pub fn root(&self) -> Result<Root> {
+        Root::open(&self.file("root"))
+            .with_context(|| format!("opening the root of pid {}", self.pid))
+    }
+
+    fn read_to_string(&self, name: &str) -> Result<String> {
+        std::fs::read_to_string(self.file(name))
+            .with_context(|| format!("reading /proc/{}/{name}", self.pid))
+    }
+}
+
+/// The heap profile of `process`, as of now. Files it names are read beneath
+/// `root`, which must be the process's own ([`Process::root`]).
+pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
+    let pid = process.pid;
     let started = std::time::Instant::now();
-    let mem = ProcMem::open(pid).with_context(|| {
+    let mem = ProcMem::open(&process.file("mem")).with_context(|| {
         format!(
             "opening /proc/{pid}/mem: reading a process's memory needs the same user or root, \
              and kernel.yama.ptrace_scope permitting it"
         )
     })?;
-    let maps_text = std::fs::read_to_string(format!("/proc/{pid}/maps"))
-        .with_context(|| format!("reading /proc/{pid}/maps"))?;
+    let maps_text = process.read_to_string("maps")?;
     let found = locate::locate(&mem, &Maps::parse(&maps_text), root)?;
     let profile = walk::walk(&mem, found.bt2gctx).with_context(|| {
         format!(
@@ -94,14 +134,11 @@ pub fn read(pid: u32, root: &Root) -> Result<(Snapshot, Report)> {
         );
     }
     // The mappings as of the end, so a library loaded meanwhile is named.
-    let maps = Maps::parse(
-        &std::fs::read_to_string(format!("/proc/{pid}/maps"))
-            .with_context(|| format!("reading /proc/{pid}/maps"))?,
-    );
+    let maps = Maps::parse(&process.read_to_string("maps")?);
 
     let (lg, from) = match found.lg_prof_sample {
         Some(lg) => (lg, "the library's symbols"),
-        None => match lg_prof_sample_from_env(pid) {
+        None => match lg_prof_sample_from_env(process) {
             Some(lg) => (lg, "the process's MALLOC_CONF"),
             None => (DEFAULT_LG_PROF_SAMPLE, "jemalloc's default"),
         },
@@ -117,7 +154,7 @@ pub fn read(pid: u32, root: &Root) -> Result<(Snapshot, Report)> {
         format: Format::Jemalloc,
         source_path: PathBuf::from(format!("/proc/{pid}/mem")),
         // A dump's file name has the pid the process saw for itself; so does this.
-        pid: i32::try_from(own_pid(pid)).ok(),
+        pid: i32::try_from(own_pid(process)).ok(),
         seq: None,
         trigger: Some(TRIGGER),
         dumped_at_unix_ns: SystemTime::now()
@@ -125,7 +162,9 @@ pub fn read(pid: u32, root: &Root) -> Result<(Snapshot, Report)> {
             .ok()
             .and_then(|d| i64::try_from(d.as_nanos()).ok()),
         // The user a file the process wrote would belong to.
-        owner_uid: std::fs::metadata(format!("/proc/{pid}"))
+        owner_uid: process
+            .dir
+            .metadata()
             .ok()
             .map(|m| std::os::unix::fs::MetadataExt::uid(&m)),
         sample_period: 1u64 << lg,
@@ -197,8 +236,8 @@ fn unbias_pair(objs_shifted: u64, bytes: u64, lg_prof_sample: u32) -> (u64, u64)
 
 /// `lg_prof_sample` from the `MALLOC_CONF` the process started with. A stopgap
 /// for a library with no symbols: `mallctl("prof.reset")` can change it later.
-fn lg_prof_sample_from_env(pid: u32) -> Option<u32> {
-    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+fn lg_prof_sample_from_env(process: &Process) -> Option<u32> {
+    let environ = std::fs::read(process.file("environ")).ok()?;
     environ
         .split(|&b| b == 0)
         .find_map(|kv| kv.strip_prefix(b"MALLOC_CONF="))
@@ -215,11 +254,12 @@ fn lg_prof_sample_in(conf: &str) -> Option<u32> {
 
 /// The pid the process knows itself by: the innermost one of `NSpid` in
 /// `/proc/<pid>/status`, which is `pid` itself outside a pid namespace.
-fn own_pid(pid: u32) -> u32 {
-    std::fs::read_to_string(format!("/proc/{pid}/status"))
+fn own_pid(process: &Process) -> u32 {
+    process
+        .read_to_string("status")
         .ok()
         .and_then(|status| innermost_pid(&status))
-        .unwrap_or(pid)
+        .unwrap_or(process.pid)
 }
 
 fn innermost_pid(status: &str) -> Option<u32> {
@@ -341,7 +381,8 @@ mod tests {
         assert_eq!(innermost_pid("NSpid:\t42\n"), Some(42));
         assert_eq!(innermost_pid("Name:\tapp\n"), None);
         // This process is read from where it is.
-        assert_eq!(own_pid(std::process::id()), std::process::id());
+        let me = Process::open(std::process::id()).unwrap();
+        assert_eq!(own_pid(&me), std::process::id());
     }
 
     #[test]

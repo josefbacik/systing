@@ -49,12 +49,12 @@ pub struct ProcMem {
 }
 
 impl ProcMem {
-    /// Open the memory of `pid`. The kernel decides who may: the caller needs
-    /// ptrace access to the process (the same user, unless it is root or has
-    /// CAP_SYS_PTRACE, and subject to `kernel.yama.ptrace_scope`).
-    pub fn open(pid: u32) -> io::Result<ProcMem> {
+    /// Open a process's `mem` file. The kernel decides who may: the caller
+    /// needs ptrace access to the process (the same user, unless it is root or
+    /// has CAP_SYS_PTRACE, and subject to `kernel.yama.ptrace_scope`).
+    pub fn open(mem_path: &std::path::Path) -> io::Result<ProcMem> {
         Ok(ProcMem {
-            file: File::open(format!("/proc/{pid}/mem"))?,
+            file: File::open(mem_path)?,
             reads: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
         })

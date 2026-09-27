@@ -39,6 +39,12 @@ const MAX_FRAMES: usize = 8192;
 const FIRST_FRAMES: usize = 32;
 /// The most `prof_tctx_t` visited under one `gctx`: one per allocating thread.
 const MAX_TCTX_PER_GCTX: usize = 1 << 16;
+/// The most visited in a whole walk. A real profile has a few per backtrace;
+/// a table that claims millions of backtraces with thousands of threads each
+/// is not one, and is not read to the end.
+const MAX_TCTX_TOTAL: u64 = 1 << 22;
+/// The most of a table read to decide whether it holds backtraces.
+pub const VALIDATE_BYTES: u64 = 1 << 20;
 /// How many times a walk is done again when the table changed under it.
 const ATTEMPTS: u32 = 5;
 
@@ -72,6 +78,10 @@ pub struct Profile {
 
 /// Read the profile whose table header is at `bt2gctx`.
 pub fn walk(mem: &dyn Memory, bt2gctx: u64) -> io::Result<Profile> {
+    walk_limited(mem, bt2gctx, MAX_TCTX_TOTAL)
+}
+
+fn walk_limited(mem: &dyn Memory, bt2gctx: u64, max_tctx: u64) -> io::Result<Profile> {
     let mut retries = 0;
     let mut last = io::Error::other("the profile kept changing");
     for _ in 0..ATTEMPTS {
@@ -93,7 +103,7 @@ pub fn walk(mem: &dyn Memory, bt2gctx: u64) -> io::Result<Profile> {
             }
         };
         let mut stats = Stats::default();
-        let mut stacks = read_stacks(mem, &entries, &mut stats);
+        let mut stacks = read_stacks(mem, &entries, &mut stats, max_tctx)?;
         let after = Ckh::read(mem, bt2gctx)?;
         if (after.tab, after.lg_cur_buckets) == (head.tab, head.lg_cur_buckets) {
             stacks.sort_by(|a, b| a.addrs.cmp(&b.addrs));
@@ -105,7 +115,12 @@ pub fn walk(mem: &dyn Memory, bt2gctx: u64) -> io::Result<Profile> {
     Err(last)
 }
 
-fn read_stacks(mem: &dyn Memory, entries: &[(u64, u64)], stats: &mut Stats) -> Vec<Stack> {
+fn read_stacks(
+    mem: &dyn Memory,
+    entries: &[(u64, u64)],
+    stats: &mut Stats,
+    max_tctx: u64,
+) -> io::Result<Vec<Stack>> {
     let mut seen = HashSet::new();
     let mut stacks = Vec::new();
     for &(key, gaddr) in entries {
@@ -124,8 +139,14 @@ fn read_stacks(mem: &dyn Memory, entries: &[(u64, u64)], stats: &mut Stats) -> V
         if counts.is_reported() {
             stacks.push(Stack { addrs, counts });
         }
+        if stats.tctx_read + stats.tctx_skipped > max_tctx {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "more per-thread records than any real profile has; not reading on",
+            ));
+        }
     }
-    stacks
+    Ok(stacks)
 }
 
 fn u64_at(b: &[u8], o: usize) -> u64 {
@@ -209,17 +230,15 @@ pub fn is_gctx_table(mem: &dyn Memory, head: &Ckh) -> bool {
     if !head.plausible() {
         return false;
     }
-    let Ok(entries) = head.entries(mem) else {
+    // The first few entries are enough to tell, and all of a table that may
+    // not be one is not worth reading.
+    let Ok(entries) = head.first_entries(mem, 16, VALIDATE_BYTES) else {
         return false;
     };
-    let mut checked = 0;
-    for &(key, gaddr) in entries.iter().take(16) {
-        if read_gctx(mem, key, gaddr).is_none() {
-            return false;
-        }
-        checked += 1;
-    }
-    checked > 0
+    !entries.is_empty()
+        && entries
+            .iter()
+            .all(|&(key, gaddr)| read_gctx(mem, key, gaddr).is_some())
 }
 
 #[cfg(test)]
@@ -457,6 +476,44 @@ mod tests {
         mem.poke(HEADER + ckh::LG_CUR_BUCKETS as u64, &99u32.to_le_bytes());
         assert!(walk(&mem, HEADER).is_err());
         assert!(!is_gctx_table(&mem, &Ckh::read(&mem, HEADER).unwrap()));
+    }
+
+    #[test]
+    fn a_walk_stops_at_more_records_than_a_profile_has() {
+        let mut h = Heap::new();
+        // One gctx with a chain of four tctx.
+        h.tctx(0x100000, 0x10000, 0x100400, 0, NOMINAL, (1, 100));
+        h.tctx(0x100400, 0x10000, 0x100800, 0, NOMINAL, (1, 100));
+        h.tctx(0x100800, 0x10000, 0x100c00, 0, NOMINAL, (1, 100));
+        h.tctx(0x100c00, 0x10000, 0, 0, NOMINAL, (1, 100));
+        h.gctx(0x10000, &[0xa1], 0x100000);
+        let mem = h.finish();
+        assert!(walk_limited(&mem, HEADER, 3).is_err());
+        assert_eq!(
+            walk_limited(&mem, HEADER, 4).unwrap().stacks[0]
+                .counts
+                .cur_objs,
+            4
+        );
+    }
+
+    #[test]
+    fn a_table_is_judged_by_its_first_entries_without_reading_the_rest() {
+        // A table of 2^15 buckets (2 MiB) whose entries are all one real
+        // gctx: recognised, and only the first piece of it was read.
+        let mut h = Heap::new();
+        h.tctx(0x100000, 0x10000, 0, 0, NOMINAL, (2, 200));
+        h.gctx(0x10000, &[0xa1], 0x100000);
+        let mut mem = h.finish();
+        mem.poke(HEADER + ckh::LG_CUR_BUCKETS as u64, &15u32.to_le_bytes());
+        // The table claims 2 MiB but its memory ends after 16 KiB: reading it
+        // all fails, and the first entries are all that is asked for.
+        let mut first = mem.bytes(TAB, 1024).unwrap();
+        first.resize(16 << 10, 0);
+        mem.put(TAB, first);
+        let head = Ckh::read(&mem, HEADER).unwrap();
+        assert!(head.entries(&mem).is_err());
+        assert!(is_gctx_table(&mem, &head));
     }
 
     #[test]

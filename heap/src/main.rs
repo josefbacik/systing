@@ -112,17 +112,25 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // A snoop pins the process once, and takes the root from that handle, so
+    // its memory and its root are surely one process.
+    let pinned = match (cli.snoop, cli.pid) {
+        (true, Some(pid)) => Some(snoop::Process::open(pid)?),
+        _ => None,
+    };
     let pid_root = cli
         .pid
+        .filter(|_| pinned.is_none())
         .map(|pid| PathBuf::from(format!("/proc/{pid}/root")));
-    let root = match (pid_root.as_ref(), cli.root_fd) {
-        (Some(dir), _) => {
+    let root = match (pinned.as_ref(), pid_root.as_ref(), cli.root_fd) {
+        (Some(process), _, _) => Some(process.root()?),
+        (None, Some(dir), _) => {
             Some(Root::open(dir).with_context(|| format!("opening the root {}", dir.display()))?)
         }
-        (None, Some(fd)) => {
+        (None, None, Some(fd)) => {
             Some(Root::from_fd(fd).with_context(|| format!("taking descriptor {fd} as the root"))?)
         }
-        (None, None) => None,
+        (None, None, None) => None,
     };
     let root = root.as_ref();
 
@@ -131,12 +139,13 @@ fn main() -> Result<()> {
     let delete_older = !cli.keep_all && !cli.latest_only;
     let mut snapshots: Vec<Snapshot> = Vec::new();
     let mut plans: Vec<retention::Plan> = Vec::new();
-    if let (true, Some(pid), Some(root)) = (cli.snoop, cli.pid, root) {
+    if let (Some(process), Some(root)) = (pinned.as_ref(), root) {
+        let pid = process.pid();
         eprintln!(
             "warning: --snoop is experimental: it reads jemalloc's private data structures \
              out of process {pid}'s memory, and may fail or refuse on a jemalloc it does not know"
         );
-        let (snapshot, report) = snoop::read(pid, root)?;
+        let (snapshot, report) = snoop::read(process, root)?;
         eprintln!("{}", report.summary(pid));
         snapshots.push(snapshot);
     }

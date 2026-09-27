@@ -17,6 +17,7 @@
 //! used, so a wrong symbol (a different build than the one mapped) or an
 //! unknown layout is an error, not a wrong answer.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -24,7 +25,7 @@ use anyhow::{bail, Context, Result};
 use super::elf;
 use super::layout::Ckh;
 use super::mem::Memory;
-use super::walk::is_gctx_table;
+use super::walk::{is_gctx_table, VALIDATE_BYTES};
 use crate::maps::{Mapping, Maps};
 use crate::root::{on_remote_fs, Root};
 
@@ -175,6 +176,11 @@ fn read_symbols(root: &Root, path: &str) -> Result<elf::Symbols> {
     Ok(elf::find(&file, &wanted)?)
 }
 
+/// The most of a library's data read looking for the table, and the most read
+/// deciding whether candidates are it. The process may be lying about both.
+const SCAN_BYTES: u64 = 1 << 30;
+const VALIDATE_TOTAL: u64 = 256 << 20;
+
 enum Scan {
     Found(u64),
     Nothing,
@@ -209,10 +215,19 @@ fn scan(mem: &dyn Memory, maps: &Maps, path: &str) -> Result<Scan> {
     const CHUNK: usize = 1 << 20;
     const HEAD: usize = super::layout::ckh::SIZE;
     let mut hits: Vec<u64> = Vec::new();
+    let (mut scanned, mut validated) = (0u64, 0u64);
+    let mut tables_seen: HashSet<u64> = HashSet::new();
     for (start, end) in regions {
         let mut at = start;
         while at < end {
             let len = (end - at).min((CHUNK + HEAD) as u64) as usize;
+            scanned += len as u64;
+            if scanned > SCAN_BYTES {
+                bail!(
+                    "gave up looking for the table after {} MiB of data",
+                    SCAN_BYTES >> 20
+                );
+            }
             let mut buf = vec![0u8; len];
             // A chunk that cannot be read (guard pages, a hole) is skipped.
             if mem.read_exact(at, &mut buf).is_ok() {
@@ -229,6 +244,15 @@ fn scan(mem: &dyn Memory, maps: &Maps, path: &str) -> Result<Scan> {
                     );
                     if head.count == 0 || !head.plausible() || !in_code(hash) || !in_code(keycomp) {
                         continue;
+                    }
+                    // Many headers pointing at one table are judged once, and
+                    // what is spent judging is bounded.
+                    if !tables_seen.insert(head.tab) {
+                        continue;
+                    }
+                    validated += VALIDATE_BYTES;
+                    if validated > VALIDATE_TOTAL {
+                        bail!("gave up: too many places that look like the table");
                     }
                     if is_gctx_table(mem, &head) {
                         hits.push(at + off as u64);
@@ -264,6 +288,58 @@ mod tests {
                 "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2".to_string(),
                 "/usr/bin/app".to_string()
             ]
+        );
+    }
+
+    /// Counts what is read.
+    struct Counting<'a> {
+        inner: &'a crate::snoop::mem::fake::FakeMem,
+        bytes: std::cell::Cell<u64>,
+    }
+
+    impl Memory for Counting<'_> {
+        fn read_some(&self, addr: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read_some(addr, buf)?;
+            self.bytes.set(self.bytes.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn many_candidates_pointing_at_one_table_read_it_once() {
+        use crate::snoop::mem::fake::FakeMem;
+        let maps = Maps::parse(
+            "7f0000010000-7f0000011000 r-xp 00000000 08:01 7 /lib/libjemalloc.so.2\n\
+             7f0000020000-7f0000022000 rw-p 00010000 08:01 7 /lib/libjemalloc.so.2\n",
+        );
+        // A hundred look-alikes of the table's header in the data, each with
+        // code pointers into the library and the same 256 KiB `tab`, which
+        // holds nothing.
+        let mut data = vec![0u8; 0x2000];
+        for i in 0..100usize {
+            let h = &mut data[i * 48..(i + 1) * 48];
+            h[8..16].copy_from_slice(&5u64.to_le_bytes());
+            h[16..20].copy_from_slice(&4u32.to_le_bytes());
+            h[20..24].copy_from_slice(&12u32.to_le_bytes());
+            h[24..32].copy_from_slice(&0x7f00_0001_0100u64.to_le_bytes());
+            h[32..40].copy_from_slice(&0x7f00_0001_0200u64.to_le_bytes());
+            h[40..48].copy_from_slice(&0x7f00_0010_0000u64.to_le_bytes());
+        }
+        let mut fake = FakeMem::default();
+        fake.put(0x7f00_0002_0000, data);
+        fake.put(0x7f00_0010_0000, vec![0u8; 256 << 10]);
+        let mem = Counting {
+            inner: &fake,
+            bytes: Default::default(),
+        };
+        let found = scan(&mem, &maps, "/lib/libjemalloc.so.2").unwrap();
+        assert!(matches!(found, Scan::Nothing));
+        // The data once (8 KiB) and the one table once (256 KiB), not a
+        // hundred tables (25 MiB).
+        assert!(
+            mem.bytes.get() < 512 << 10,
+            "{} bytes read",
+            mem.bytes.get()
         );
     }
 

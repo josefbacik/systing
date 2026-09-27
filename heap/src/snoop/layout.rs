@@ -64,9 +64,10 @@ pub struct Ckh {
     pub tab: u64,
 }
 
-/// The most buckets a table is believed to have: 2^22 buckets of 64 bytes is
-/// 256 MiB, far past any real profile. It bounds what one read can ask for.
-pub const MAX_LG_BUCKETS: u32 = 22;
+/// The most buckets a table is believed to have: 2^20 buckets of 64 bytes is
+/// 64 MiB, room for millions of backtraces, far past any real profile. It
+/// bounds what one read can ask for.
+pub const MAX_LG_BUCKETS: u32 = 20;
 
 impl Ckh {
     pub fn parse(b: &[u8]) -> Ckh {
@@ -102,17 +103,47 @@ impl Ckh {
     /// Every (key, data) cell in use, read out of the table's memory.
     pub fn entries(&self, mem: &dyn Memory) -> std::io::Result<Vec<(u64, u64)>> {
         let raw = mem.bytes(self.tab, (self.cells() * ckh::CELL_SIZE) as usize)?;
-        Ok(raw
-            .chunks_exact(ckh::CELL_SIZE as usize)
-            .map(|c| {
-                (
-                    u64::from_le_bytes(c[..8].try_into().unwrap()),
-                    u64::from_le_bytes(c[8..].try_into().unwrap()),
-                )
-            })
-            .filter(|&(key, _)| key != 0)
-            .collect())
+        Ok(cells_in_use(&raw).collect())
     }
+
+    /// Up to `want` cells in use, taken from the start of the table: it is
+    /// read in small pieces, and no more than `max_bytes` of it. Enough to
+    /// tell what a table holds without reading all of one that may not be
+    /// what it claims. A piece that cannot be read ends the reading, and what
+    /// came before it is returned; only a failure of the first is an error.
+    pub fn first_entries(
+        &self,
+        mem: &dyn Memory,
+        want: usize,
+        max_bytes: u64,
+    ) -> std::io::Result<Vec<(u64, u64)>> {
+        const PIECE: u64 = 16 << 10;
+        let total = (self.cells() * ckh::CELL_SIZE).min(max_bytes);
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < total && out.len() < want {
+            let len = PIECE.min(total - at) as usize;
+            match mem.bytes(self.tab.wrapping_add(at), len) {
+                Ok(raw) => out.extend(cells_in_use(&raw).take(want - out.len())),
+                // What was read is still what the table holds.
+                Err(_) if !out.is_empty() => break,
+                Err(e) => return Err(e),
+            }
+            at += len as u64;
+        }
+        Ok(out)
+    }
+}
+
+fn cells_in_use(raw: &[u8]) -> impl Iterator<Item = (u64, u64)> + '_ {
+    raw.chunks_exact(ckh::CELL_SIZE as usize)
+        .map(|c| {
+            (
+                u64::from_le_bytes(c[..8].try_into().unwrap()),
+                u64::from_le_bytes(c[8..].try_into().unwrap()),
+            )
+        })
+        .filter(|&(key, _)| key != 0)
 }
 
 /// The eight counters of a `prof_cnt_t`, as jemalloc keeps them.

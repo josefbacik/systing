@@ -13,6 +13,8 @@ use std::os::unix::fs::FileExt;
 const MAX_TABLE: u64 = 256 << 20;
 const MAX_SECTIONS: u64 = 65_535;
 const MAX_SEGMENTS: u64 = 4096;
+/// Real header entries are 56 and 64 bytes; the file says how big it claims.
+const MAX_HEADER_ENTRY: u64 = 128;
 
 const SHT_SYMTAB: u32 = 2;
 const PT_LOAD: u32 = 1;
@@ -78,7 +80,7 @@ pub fn find(file: &File, wanted: &[&'static str]) -> io::Result<Symbols> {
         ..Default::default()
     };
 
-    if e_phentsize < 56 || e_phnum > MAX_SEGMENTS {
+    if !(56..=MAX_HEADER_ENTRY).contains(&e_phentsize) || e_phnum > MAX_SEGMENTS {
         return Err(invalid("program headers"));
     }
     let mut min_vaddr: Option<u64> = None;
@@ -96,7 +98,7 @@ pub fn find(file: &File, wanted: &[&'static str]) -> io::Result<Symbols> {
     if e_shnum == 0 || e_shoff == 0 {
         return Ok(out);
     }
-    if e_shentsize < 64 || e_shnum > MAX_SECTIONS {
+    if !(64..=MAX_HEADER_ENTRY).contains(&e_shentsize) || e_shnum > MAX_SECTIONS {
         return Err(invalid("section headers"));
     }
     let mut shdrs = vec![0u8; (e_shnum * e_shentsize) as usize];
@@ -120,6 +122,10 @@ pub fn find(file: &File, wanted: &[&'static str]) -> io::Result<Symbols> {
         let mut strtab = vec![0u8; str_size as usize];
         file.read_exact_at(&mut strtab, str_off)?;
 
+        // A name longer than every one wanted cannot be one, so no name is
+        // looked at past that: a table with no NUL in it must not cost a scan
+        // of the whole table for each of millions of symbols.
+        let window = wanted.iter().map(|w| w.len()).max().unwrap_or(0) + 1;
         // In chunks: a large program's table has millions of entries.
         const ENTRY: u64 = 24;
         const CHUNK: u64 = 1 << 20;
@@ -133,11 +139,11 @@ pub fn find(file: &File, wanted: &[&'static str]) -> io::Result<Symbols> {
                 if shndx == 0 || value == 0 || name >= strtab.len() {
                     continue;
                 }
-                let end = strtab[name..]
-                    .iter()
-                    .position(|&c| c == 0)
-                    .map_or(strtab.len(), |n| name + n);
-                let name = &strtab[name..end];
+                let tail = &strtab[name..(name + window).min(strtab.len())];
+                let Some(len) = tail.iter().position(|&c| c == 0) else {
+                    continue;
+                };
+                let name = &tail[..len];
                 if let Some(&w) = wanted.iter().find(|w| w.as_bytes() == name) {
                     out.found.entry(w).or_insert(value);
                 }
@@ -179,6 +185,94 @@ mod tests {
         let addr = value + syms.load_bias(image_start);
         assert_eq!(addr, &HEAP_SNOOP_ELF_TEST_SYMBOL as *const u64 as u64);
         assert!(!syms.found.contains_key("heap_snoop_elf_test_symbol"));
+    }
+
+    /// A little ELF file: a header, three section headers (null, symtab,
+    /// strtab) and the two tables.
+    fn tiny_elf(
+        dir: &std::path::Path,
+        shentsize: u16,
+        shnum: u16,
+        symtab: &[u8],
+        strtab: &[u8],
+    ) -> File {
+        let mut b = vec![0u8; 256];
+        b[..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+        b[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[40..48].copy_from_slice(&64u64.to_le_bytes()); // e_shoff
+        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[58..60].copy_from_slice(&shentsize.to_le_bytes());
+        b[60..62].copy_from_slice(&shnum.to_le_bytes());
+        let sec = |b: &mut Vec<u8>, i: usize, ty: u32, off: u64, size: u64, link: u32| {
+            let at = 64 + i * 64;
+            b[at + 4..at + 8].copy_from_slice(&ty.to_le_bytes());
+            b[at + 24..at + 32].copy_from_slice(&off.to_le_bytes());
+            b[at + 32..at + 40].copy_from_slice(&size.to_le_bytes());
+            b[at + 40..at + 44].copy_from_slice(&link.to_le_bytes());
+        };
+        sec(&mut b, 1, SHT_SYMTAB, 256, symtab.len() as u64, 2);
+        sec(
+            &mut b,
+            2,
+            3,
+            256 + symtab.len() as u64,
+            strtab.len() as u64,
+            0,
+        );
+        b.extend_from_slice(symtab);
+        b.extend_from_slice(strtab);
+        let path = dir.join("tiny.elf");
+        std::fs::write(&path, b).unwrap();
+        File::open(path).unwrap()
+    }
+
+    fn symbol(name: u32, value: u64) -> [u8; 24] {
+        let mut e = [0u8; 24];
+        e[..4].copy_from_slice(&name.to_le_bytes());
+        e[6..8].copy_from_slice(&1u16.to_le_bytes()); // defined in section 1
+        e[8..16].copy_from_slice(&value.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn a_file_that_claims_enormous_header_entries_is_refused_not_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        // 65535 sections of 65535 bytes each would be 4 GiB.
+        let f = tiny_elf(dir.path(), u16::MAX, u16::MAX, &[], b"\0");
+        let err = find(&f, &["a"]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+    }
+
+    #[test]
+    fn a_string_table_with_no_terminator_costs_no_more_than_its_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        // 200k symbols whose names all start at the front of an 8 MiB table of
+        // letters with no NUL: scanning each name to its end would be 1.6 TB.
+        let symtab: Vec<u8> = (0..200_000).flat_map(|_| symbol(0, 0x1000)).collect();
+        let strtab = vec![b'a'; 8 << 20];
+        let f = tiny_elf(dir.path(), 64, 3, &symtab, &strtab);
+        let started = std::time::Instant::now();
+        let found = find(&f, &["bt2gctx"]).unwrap();
+        assert!(found.found.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_wanted_symbol_is_found_among_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let strtab = b"\0other\0bt2gctx\0bt2gctx_longer\0";
+        let symtab: Vec<u8> = [symbol(1, 0x2000), symbol(7, 0x3000), symbol(15, 0x4000)]
+            .into_iter()
+            .flatten()
+            .collect();
+        let f = tiny_elf(dir.path(), 64, 3, &symtab, strtab);
+        let found = find(&f, &["bt2gctx"]).unwrap();
+        assert_eq!(found.found.get("bt2gctx"), Some(&0x3000));
+        assert_eq!(found.found.len(), 1);
     }
 
     #[test]

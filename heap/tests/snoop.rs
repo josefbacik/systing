@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 
 use duckdb::Connection;
-use systing_heap::root::Root;
 use systing_heap::{jemalloc, snoop};
 
 const BIN: &str = env!("CARGO_BIN_EXE_systing-heap");
@@ -223,8 +222,8 @@ fn the_rows_are_the_ones_a_dump_of_the_same_heap_has() {
             let target = Target::start(&bin, Some(&lib), Some(conf), dump.to_str().unwrap());
 
             let dumped = jemalloc::read(&dump).unwrap();
-            let root = Root::open(Path::new(&format!("/proc/{}/root", target.pid()))).unwrap();
-            let (snooped, report) = snoop::read(target.pid(), &root).unwrap();
+            let process = snoop::Process::open(target.pid()).unwrap();
+            let (snooped, report) = snoop::read(&process, &process.root().unwrap()).unwrap();
 
             let ctx = format!("{lib:?} with {conf}");
             assert_eq!(snooped.sample_period, dumped.sample_period, "{ctx}");
@@ -269,8 +268,8 @@ fn without_unbiasing_the_total_estimate_still_agrees_with_a_dump() {
         let target = Target::start(&bin, Some(&lib), Some(conf), dump.to_str().unwrap());
 
         let dumped = jemalloc::read(&dump).unwrap();
-        let root = Root::open(Path::new(&format!("/proc/{}/root", target.pid()))).unwrap();
-        let (snooped, _) = snoop::read(target.pid(), &root).unwrap();
+        let process = snoop::Process::open(target.pid()).unwrap();
+        let (snooped, _) = snoop::read(&process, &process.root().unwrap()).unwrap();
 
         let total = |s: &systing_heap::Snapshot| -> f64 {
             s.samples
@@ -320,6 +319,18 @@ fn a_process_without_jemalloc_is_refused() {
     assert!(!run.status.success());
     assert!(stderr.contains("no jemalloc"), "{stderr}");
     assert!(!out.exists());
+}
+
+/// A process is pinned when it is opened: after it has exited, a read fails,
+/// and does not reach whichever process comes to have its number.
+#[test]
+fn a_pinned_process_that_has_exited_is_not_read() {
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let process = snoop::Process::open(child.id()).unwrap();
+    let root = process.root().unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(snoop::read(&process, &root).is_err());
 }
 
 #[test]
