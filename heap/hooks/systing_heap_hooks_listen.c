@@ -23,6 +23,9 @@
  *
  * - It answers the process's own user and root, and no one else: the socket
  *   is made for its owner alone, and the peer's credentials are checked.
+ * - The socket is known by what it is, not by its number alone: a program
+ *   that closes descriptors it did not open may give the number to a socket
+ *   of its own, and the thread then ends instead of answering there.
  * - It runs nothing of the program's and takes none of its locks. Every
  *   signal is blocked on it, so no handler of the program's runs there.
  * - It is an ordinary thread outside malloc: jemalloc's "prof.dump" is called
@@ -59,6 +62,9 @@ static pthread_mutex_t listen_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t at_exit_once = PTHREAD_ONCE_INIT;
 static shh_mallctl_fn mallctl_p;
 static int listen_fd = -1;
+/* What listen_fd is: the number can come to name something else. */
+static dev_t listen_dev;
+static ino_t listen_ino;
 /* The process that listens: a forked child must not take the socket of the
  * process it was forked from away as it exits. */
 static pid_t listen_pid;
@@ -197,12 +203,45 @@ static void answer(int c)
 		close(fds[1]);
 }
 
+/* Whether `fd` is still the socket that was made to listen. */
+static int is_the_socket(int fd)
+{
+	struct stat st;
+	return fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode) &&
+	       st.st_dev == listen_dev && st.st_ino == listen_ino;
+}
+
+/* The thread is ending: the process listens no more, and may ask to again.
+ * The descriptor is closed only if it is still the socket. */
+static void stop_listening(int fd)
+{
+	pthread_mutex_lock(&listen_lock);
+	if (listen_fd == fd && listen_pid == getpid()) {
+		if (is_the_socket(fd)) {
+			if (socket_path[0])
+				unlink(socket_path);
+			close(fd);
+		}
+		listen_fd = -1;
+		socket_path[0] = '\0';
+	}
+	pthread_mutex_unlock(&listen_lock);
+}
+
 static void *respond(void *arg)
 {
 	int fd = (int)(long)arg;
 	pthread_setname_np(pthread_self(), "heap-responder");
 	for (;;) {
 		int c = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
+		/* Whatever came of it, it was asked of this number: if the
+		 * number has come to name something else, what was taken from
+		 * it is the program's, and is let go without a word. */
+		if (!is_the_socket(fd)) {
+			if (c >= 0)
+				close(c);
+			break;
+		}
 		if (c < 0) {
 			if (errno == EINTR || errno == ECONNABORTED)
 				continue;
@@ -213,16 +252,20 @@ static void *respond(void *arg)
 				sleep(1);
 				continue;
 			}
-			return NULL;
+			break;
 		}
 		answer(c);
 		close(c);
 	}
+	stop_listening(fd);
+	return NULL;
 }
 
 static void forget_the_socket(void)
 {
-	pthread_mutex_lock(&listen_lock);
+	/* At exit nothing is waited for: a lock that is held stays held. */
+	if (pthread_mutex_trylock(&listen_lock) != 0)
+		return;
 	if (listen_fd >= 0 && listen_pid == getpid() && socket_path[0])
 		unlink(socket_path);
 	pthread_mutex_unlock(&listen_lock);
@@ -238,16 +281,18 @@ void shh_listen_after_fork_child(void)
 	/* The thread is not in the child, and the socket is the parent's: the
 	 * child lets go of its copy, and listens once it asks to. */
 	pthread_mutex_init(&listen_lock, NULL);
-	if (listen_fd >= 0)
+	if (listen_fd >= 0 && is_the_socket(listen_fd))
 		close(listen_fd);
 	listen_fd = -1;
 	socket_path[0] = '\0';
 }
 
-/* Whether something answers at `addr`. */
+/* Whether something answers at `addr`. It is asked without waiting: a
+ * socket whose queue is full is one that someone listens on, and whoever
+ * made it must not be able to hold the program that asks. */
 static int someone_listens(const struct sockaddr_un *addr)
 {
-	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 	if (fd < 0)
 		return 1;
 	int rc = connect(fd, (const struct sockaddr *)addr, sizeof(*addr));
@@ -261,8 +306,8 @@ static int bind_and_listen(const struct sockaddr_un *addr)
 	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0)
 		return -1;
-	/* The mode the socket's file is made with: its owner's alone,
-	 * whatever the program's umask. */
+	/* The mode the socket's file is made with: its owner's alone, where
+	 * the program's umask would have let others in. */
 	if (fchmod(fd, 0600) != 0)
 		goto fail;
 	if (bind(fd, (const struct sockaddr *)addr, sizeof(*addr)) != 0) {
@@ -311,6 +356,19 @@ static int listen_locked(const char *dir)
 	int fd = bind_and_listen(&addr);
 	if (fd < 0)
 		return SHH_ERR_SOCKET;
+	struct stat st;
+	if (fstat(fd, &st) != 0) {
+		unlink(addr.sun_path);
+		close(fd);
+		return SHH_ERR_SOCKET;
+	}
+	/* Known from here on, before there is a thread: a child forked by
+	 * another thread meanwhile lets go of it like any other. */
+	listen_dev = st.st_dev;
+	listen_ino = st.st_ino;
+	listen_pid = getpid();
+	memcpy(socket_path, addr.sun_path, sizeof(socket_path));
+	listen_fd = fd;
 
 	/* The thread starts with every signal blocked, as the thread that
 	 * makes it has them for that moment. */
@@ -325,14 +383,12 @@ static int listen_locked(const char *dir)
 	pthread_attr_destroy(&attr);
 	pthread_sigmask(SIG_SETMASK, &before, NULL);
 	if (rc != 0) {
+		listen_fd = -1;
+		socket_path[0] = '\0';
 		unlink(addr.sun_path);
 		close(fd);
 		return SHH_ERR_SOCKET;
 	}
-
-	listen_fd = fd;
-	listen_pid = getpid();
-	memcpy(socket_path, addr.sun_path, sizeof(socket_path));
 	return SHH_OK;
 }
 

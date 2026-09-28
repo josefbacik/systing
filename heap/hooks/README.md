@@ -41,11 +41,13 @@ It is apart from the backtraces: a process can have either without the other.
 
 - One thread is started, named `heap-responder`. It waits in `accept()` until someone asks, and costs nothing until then.
 - The socket is a file, `.systing-heap.<pid>`, in `dir`, else in the directory `SYSTING_HEAP_HOOKS_SOCKET_DIR` names, else in `/tmp`. Its path must fit a Unix socket's address (107 bytes).
-- It answers the process's own user and root: the file is made for its owner alone whatever the program's umask, and the peer's credentials are checked as well.
+- It answers the process's own user and root: the file is made for its owner alone, and the peer's credentials are checked as well.
+- A socket already at that path is taken over if no one answers there. Whether someone does is asked without waiting, so a socket put in the way cannot hold the program that calls `listen()`; the call then fails.
+- The socket is known by what it is, not by its number alone. A program that closes descriptors it did not open may give the number to a socket of its own: the thread then ends instead of answering there, and `listen()` can be called again.
 - jemalloc writes the dump into an anonymous file (`memfd_create`), which is then sealed and handed over as a descriptor, with the code map's when the `"python"` backtrace writes one. Nothing is written to disk.
 - Every signal is blocked on the thread, so no handler of the program's runs there. It calls nothing of Python's, and takes no lock of the program's.
 - Requests are answered one at a time, and a peer that says or reads nothing is given up on after 5 seconds.
-- A process that is killed leaves its socket's file behind. The next process to listen under that name takes it over if no one answers there, and a process that exits removes its own.
+- A process that is killed, or that ends with `_exit()` as a worker forked by Python's `multiprocessing` does, leaves its socket's file behind. The next process to listen under that name takes it over, and a process that exits removes its own. A server that replaces its workers leaves one such file for each until then.
 - **fork.** The thread is not in a forked child, which lets go of its parent's socket; a child that is to answer calls `listen()` itself. The Python helper does that in every child. Python 3.12 and later warn (`DeprecationWarning`) when a process with more than one thread forks, and the responder is a thread.
 
 ## Installing from C
