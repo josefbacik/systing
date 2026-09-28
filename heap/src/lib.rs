@@ -11,6 +11,7 @@
 //! same `frame` / `stack` tables every systing recorder uses plus
 //! `heap_snapshot` / `heap_sample`.
 
+pub mod ask;
 pub mod db;
 pub mod format;
 #[cfg(test)]

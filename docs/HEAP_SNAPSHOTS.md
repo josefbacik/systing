@@ -178,6 +178,12 @@ mallctl("prof.dump", NULL, NULL, NULL, 0);
 > `systing-heap --pid PID --snoop` reads the profile jemalloc holds at that moment straight from the running process, so there is no interval to wait for and no snapshot file (or `lg_prof_interval`, or disk) needed; the process only needs `prof:true`.
 > It relies on jemalloc's private data structures, and reads them while the process runs: the database says how each such read went (`heap_live_read`). See "Reading a live process" in [`heap/README.md`](../heap/README.md).
 
+> **Experimental: asked from outside.**
+> `systing-heap --pid PID --ask` has the process write a dump at that moment, with no code of the service's own to call `prof.dump`.
+> A service that calls `systing_heap_hooks.listen()` at startup (experimental as well) answers on a socket, whatever its threads are doing, and nothing is written to disk.
+> A Python 3.14 service that loaded nothing answers through its interpreter, once its main thread comes back to Python.
+> Neither way is settled: expect both to change. See "Asking a live process" in [`heap/README.md`](../heap/README.md).
+
 ## Collect the snapshots with systing-heap
 
 `systing-heap` reads the snapshot files, turns their addresses into function names, scales the samples up into estimates of the real heap, and writes a DuckDB database (for SQL) or a Perfetto trace (to browse as flamegraphs).
