@@ -12,6 +12,7 @@
 //! `heap_snapshot` / `heap_sample`.
 
 pub mod ask;
+pub mod check;
 pub mod db;
 pub mod format;
 #[cfg(test)]

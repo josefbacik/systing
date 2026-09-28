@@ -38,6 +38,57 @@ pub const TRIGGER: &str = "asked";
 /// own filesystem, unless told otherwise.
 pub const DEFAULT_DIR: &str = "/tmp";
 
+/// The variable a process's environment names its responder's directory with.
+const SOCKET_DIR: &[u8] = b"SYSTING_HEAP_HOOKS_SOCKET_DIR=";
+
+/// The most read of a process's environment.
+const MAX_ENVIRON_BYTES: u64 = 16 << 20;
+
+/// Where `process`'s responder may have its socket when nothing else is
+/// said, the likeliest first: where the environment it was started with
+/// says, then [`DEFAULT_DIR`]. Both, because what a process was told in a
+/// call stands over what its environment says, and a call that says nothing
+/// means [`DEFAULT_DIR`] where the environment says nothing. A directory the
+/// environment names relative to the process's working directory is not
+/// looked in: that process is asked with the directory given.
+pub fn socket_dirs(process: &Process) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let named = process
+        .read_capped("environ", MAX_ENVIRON_BYTES)
+        .ok()
+        .and_then(|environ| {
+            environ
+                .split(|b| *b == 0)
+                .find_map(|kv| kv.strip_prefix(SOCKET_DIR))
+                .filter(|dir| dir.first() == Some(&b'/'))
+                .map(|dir| PathBuf::from(std::ffi::OsString::from_vec(dir.to_vec())))
+        });
+    let mut dirs: Vec<PathBuf> = named.into_iter().collect();
+    if !dirs.iter().any(|d| d == Path::new(DEFAULT_DIR)) {
+        dirs.push(PathBuf::from(DEFAULT_DIR));
+    }
+    dirs
+}
+
+/// The first of `dirs` in which `look` finds a responder. Where none has
+/// one, what the first said; any other failure ends the looking, since it is
+/// of a socket that is there.
+pub(crate) fn in_the_first_of<T>(
+    dirs: &[PathBuf],
+    mut look: impl FnMut(&Path) -> Result<T>,
+) -> Result<T> {
+    let mut first: Option<anyhow::Error> = None;
+    for dir in dirs {
+        match look(dir) {
+            Err(e) if e.downcast_ref::<responder::NoResponder>().is_some() => {
+                first.get_or_insert(e);
+            }
+            found_or_failed => return found_or_failed,
+        }
+    }
+    Err(first.unwrap_or_else(|| anyhow::anyhow!("no directory to look for a responder in")))
+}
+
 /// How long the process is given to answer, unless told otherwise.
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(30);
 
@@ -79,23 +130,28 @@ impl Report {
 }
 
 /// Ask `process` for a dump, `how`, and wait for it no longer than `wait`.
-/// `dir` is where the socket or the script is, as the process sees it;
-/// `root` must be the process's own ([`Process::root`]).
+/// `dir` is where the socket or the script is, as the process sees it: when
+/// it is not given, the socket is looked for where the process's environment
+/// says and in [`DEFAULT_DIR`] ([`socket_dirs`]), and the script is put in
+/// [`DEFAULT_DIR`]. `root` must be the process's own ([`Process::root`]).
 pub fn ask(
     process: &Process,
     root: &Root,
     how: How,
-    dir: &Path,
+    dir: Option<&Path>,
     wait: Duration,
 ) -> Result<(Snapshot, Report)> {
+    let sockets_in = dir.map_or_else(|| socket_dirs(process), |dir| vec![dir.to_path_buf()]);
+    let script_in = dir.unwrap_or(Path::new(DEFAULT_DIR));
+    let responder = || in_the_first_of(&sockets_in, |dir| responder::ask(process, root, dir, wait));
     match how {
-        How::Responder => responder::ask(process, root, dir, wait),
-        How::Python => python::ask(process, root, dir, wait),
-        How::Auto => match responder::ask(process, root, dir, wait) {
+        How::Responder => responder(),
+        How::Python => python::ask(process, root, script_in, wait),
+        How::Auto => match responder() {
             Ok(asked) => Ok(asked),
             // No one listens there: the process may still be a Python.
             Err(e) if e.downcast_ref::<responder::NoResponder>().is_some() => {
-                python::ask(process, root, dir, wait).with_context(|| {
+                python::ask(process, root, script_in, wait).with_context(|| {
                     format!("{e:#}, and asking its Python interpreter instead did not work either")
                 })
             }
@@ -110,17 +166,17 @@ pub fn ask(
 pub fn ask_within(
     process: &Process,
     how: How,
-    dir: &Path,
+    dir: Option<&Path>,
     wait: Duration,
 ) -> Result<(Snapshot, Report)> {
     let process = process.try_clone()?;
-    let dir = dir.to_path_buf();
+    let dir = dir.map(Path::to_path_buf);
     // Asking waits `wait` for the request to be taken up and as long again
     // for it to be answered; the rest is for reading the answer.
     let limit = wait.saturating_mul(3) + Duration::from_secs(10);
     match snoop::run_within(limit, move || {
         let root = process.root()?;
-        ask(&process, &root, how, &dir, wait)
+        ask(&process, &root, how, dir.as_deref(), wait)
     }) {
         Ok(result) => result,
         Err(snoop::Wait::TimedOut) => bail!(
@@ -172,7 +228,7 @@ fn read_handed(file: &File, what: &str, cap: u64) -> Result<Vec<u8>> {
 /// Text of the process's choosing, as it is shown: with its control
 /// characters escaped, so that it cannot write to the terminal of whoever
 /// runs the tool.
-fn shown(text: &str) -> String {
+pub(crate) fn shown(text: &str) -> String {
     text.chars()
         .flat_map(|c| {
             let escaped = c
@@ -201,7 +257,40 @@ fn snapshot_of(process: &Process, dump: &[u8], source: PathBuf) -> Result<Snapsh
 
 #[cfg(test)]
 mod tests {
-    use super::shown;
+    use super::{in_the_first_of, responder, shown};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_responder_is_looked_for_in_each_directory_until_one_has_it() {
+        let dirs = [PathBuf::from("/run/x"), PathBuf::from("/tmp")];
+        let none = |dir: &std::path::Path| -> anyhow::Result<&'static str> {
+            Err(responder::NoResponder::new(format!("none in {}", dir.display())).into())
+        };
+        let mut looked = Vec::new();
+        let found = in_the_first_of(&dirs, |dir| {
+            looked.push(dir.to_path_buf());
+            match dir.ends_with("tmp") {
+                true => Ok("answered"),
+                false => none(dir),
+            }
+        });
+        assert_eq!(found.unwrap(), "answered");
+        assert_eq!(looked, dirs);
+        // Where none has one, what is said is of the likeliest.
+        let e = in_the_first_of(&dirs, none).unwrap_err();
+        assert_eq!(e.to_string(), "none in /run/x");
+        // A socket that is there and fails is not looked past.
+        let mut looked = 0;
+        let e = in_the_first_of(&dirs, |_| -> anyhow::Result<()> {
+            looked += 1;
+            anyhow::bail!("answered by another process")
+        })
+        .unwrap_err();
+        assert_eq!(
+            (looked, e.to_string().as_str()),
+            (1, "answered by another process")
+        );
+    }
 
     #[test]
     fn what_a_process_says_cannot_write_to_the_terminal() {

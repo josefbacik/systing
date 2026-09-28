@@ -23,8 +23,11 @@ use common::HOOKS;
 // A service with the hooks: Python frames in its stacks, and a responder.
 // Its main thread then waits in one call, as a service's does that leaves
 // the work to other threads.
-const SERVICE: &str = r#"import os, sys, time
+const SERVICE: &str = r#"import ctypes, os, sys, time
 import systing_heap_hooks
+# Its memory is read by a tool that the tests start beside it and not above
+# it: where kernel.yama.ptrace_scope is 1 that takes the process's leave.
+ctypes.CDLL(None).prctl(0x59616d61, ctypes.c_ulong(-1), 0, 0, 0)
 systing_heap_hooks.install(backtrace="python", strict=True)
 print("listening", systing_heap_hooks.listen(sys.argv[1], strict=True), flush=True)
 keep = []
@@ -40,6 +43,8 @@ if sys.argv[2] == "fork":
         print("child", os.getpid(), flush=True)
         time.sleep(3600)
 print("ready", flush=True)
+while sys.argv[2] == "loop":
+    time.sleep(0.01)
 time.sleep(3600)
 "#;
 
@@ -173,14 +178,15 @@ fn setup(hooks: bool) -> Option<Env> {
 }
 
 /// How a target is run: the script and its arguments, options of Python's
-/// own before them, more environment, jemalloc's `prof` setting, and a
-/// library loaded into it beside jemalloc.
+/// own before them, more environment, jemalloc's `prof` setting and more
+/// of its settings, and a library loaded into it beside jemalloc.
 struct Run<'a> {
     script: &'a str,
     args: &'a [&'a str],
     options: &'a [&'a str],
     env: &'a [(&'a str, &'a str)],
     prof: bool,
+    conf: &'a str,
     preload: Option<&'a Path>,
 }
 
@@ -192,6 +198,7 @@ impl<'a> Run<'a> {
             options: &[],
             env: &[],
             prof: true,
+            conf: "",
             preload: None,
         }
     }
@@ -228,9 +235,10 @@ impl Target {
             .env(
                 "MALLOC_CONF",
                 format!(
-                    "prof:{},lg_prof_sample:16,prof_prefix:{}/jeprof",
+                    "prof:{},lg_prof_sample:16,prof_prefix:{}/jeprof{}",
                     run.prof,
-                    env.dir.path().display()
+                    env.dir.path().display(),
+                    run.conf
                 ),
             )
             .env("PYTHONPATH", env.dir.path())
@@ -894,5 +902,195 @@ fn a_process_that_is_no_python_is_refused() {
         said(&out).contains("maps no file named as a Python is"),
         "{}",
         said(&out)
+    );
+}
+
+/// `systing-heap --pid <pid> --check ...`.
+fn check(pid: u32, more: &[&str]) -> Output {
+    Command::new(BIN)
+        .args(["--pid", &pid.to_string(), "--check"])
+        .args(more)
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .unwrap()
+}
+
+/// The commands a report says will work.
+fn commands_in(report: &str) -> Vec<String> {
+    report
+        .lines()
+        .filter_map(|l| l.strip_prefix("  systing-heap "))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn what_a_check_says_will_work_works() {
+    let Some(env) = setup(true) else { return };
+    let pairs = pairs();
+    if pairs.is_empty() {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+    }
+    for pair in pairs {
+        // The socket's folder is one a shell would make several words of,
+        // and more: the commands are run by a shell, as they are printed.
+        let sockets = env.dir.path().join(format!("s {};$x", pair.minor));
+        std::fs::create_dir(&sockets).unwrap();
+        // A service that has everything: files at an interval, a responder,
+        // Python functions in its stacks, and a main thread that comes back
+        // to Python.
+        let target = Target::start(
+            &env,
+            &pair,
+            Run {
+                conf: ",lg_prof_interval:22",
+                env: &[("SYSTING_HEAP_HOOKS_SOCKET_DIR", sockets.to_str().unwrap())],
+                ..Run::of("service.py", &[sockets.to_str().unwrap(), "loop"])
+            },
+        );
+        let out = check(target.pid(), &[]);
+        let report = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{pair:?}: {report}{}", said(&out));
+        let commands = commands_in(&report);
+        let ways = |what: &str| commands.iter().filter(|c| c.contains(what)).count();
+        assert_eq!(
+            (
+                ways("--latest-only"),
+                ways("--ask responder"),
+                ways("--ask python"),
+                ways("--snoop"),
+            ),
+            (1, 1, usize::from(pair.minor == 14), 1),
+            "{pair:?}: {report}"
+        );
+        // The socket is found where the service's environment says, and the
+        // command has the folder in it, as one word.
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.ends_with(&format!("--ask-dir '{}'", sockets.display()))),
+            "{pair:?}: {report}"
+        );
+        for (n, command) in commands.iter().enumerate() {
+            let db = env
+                .dir
+                .path()
+                .join(format!("check-{}-{n}.duckdb", pair.minor));
+            let ran = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "\"$BIN\" {}",
+                    command.replace("-o heap.duckdb", "-o \"$DB\"")
+                ))
+                .env("BIN", BIN)
+                .env("DB", &db)
+                .env("RUST_BACKTRACE", "0")
+                .output()
+                .unwrap();
+            assert!(ran.status.success(), "{pair:?}: {command}: {}", said(&ran));
+            // Its stacks name Python functions, whichever way they were read.
+            let frames = frames(&db);
+            assert!(
+                names_python_function(&frames, "leak_in_python"),
+                "{pair:?}: {command}: {frames:#?}"
+            );
+        }
+        // The Python was asked with its files in its /tmp, and they are gone.
+        assert_eq!(
+            left_behind(Path::new("/tmp")),
+            Vec::<PathBuf>::new(),
+            "{pair:?}"
+        );
+    }
+}
+
+#[test]
+fn a_check_writes_no_request_into_a_python() {
+    let Some(env) = setup(false) else { return };
+    for pair in pairs_314() {
+        // Its main thread does not come back to Python: a request that was
+        // written would still be waiting.
+        let mut target = Target::start(&env, &pair, Run::of("plain.py", &["sleep"]));
+        let out = check(target.pid(), &[]);
+        let report = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{pair:?}: {report}{}", said(&out));
+        assert!(report.contains("it can be asked"), "{pair:?}: {report}");
+
+        let db = env.dir.path().join("after-check.duckdb");
+        let place = env.dir.path().to_str().unwrap();
+        let asked = ask(
+            target.pid(),
+            "python",
+            &db,
+            &["--ask-dir", place, "--ask-wait", "1"],
+        );
+        assert!(
+            said(&asked).contains("the request was withdrawn"),
+            "{pair:?}: {}",
+            said(&asked)
+        );
+        assert!(target.is_running(), "{pair:?}");
+    }
+}
+
+#[test]
+fn a_check_of_a_service_with_jemalloc_alone_says_what_is_left_and_what_more_there_is() {
+    let Some(env) = setup(false) else { return };
+    let older: Vec<Pair> = pairs().into_iter().filter(|p| p.minor < 14).collect();
+    if older.is_empty() {
+        common::skip("needs Python 3.12 or 3.13 and a libjemalloc.so.2");
+    }
+    for pair in older {
+        let mut target = Target::start(&env, &pair, Run::of("plain.py", &["sleep"]));
+        let threads = |pid: u32| {
+            std::fs::read_dir(format!("/proc/{pid}/task"))
+                .unwrap()
+                .count()
+        };
+        let before = threads(target.pid());
+        let out = check(target.pid(), &[]);
+        let report = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{pair:?}: {report}{}", said(&out));
+        let commands = commands_in(&report);
+        assert_eq!(commands.len(), 1, "{pair:?}: {report}");
+        assert!(commands[0].ends_with("--snoop"), "{pair:?}: {report}");
+        for recipe in ["Files at an interval", "Asked, by environment"] {
+            assert!(
+                report.contains(&format!("recipe: {recipe}")),
+                "{pair:?}: {report}"
+            );
+        }
+        // Looking changed nothing.
+        assert_eq!(threads(target.pid()), before, "{pair:?}");
+        assert!(target.is_running(), "{pair:?}");
+    }
+}
+
+#[test]
+fn a_check_of_a_service_without_profiling_ends_with_an_error() {
+    let Some(env) = setup(false) else { return };
+    let Some(pair) = pairs().into_iter().next() else {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+        return;
+    };
+    let target = Target::start(
+        &env,
+        &pair,
+        Run {
+            prof: false,
+            ..Run::of("plain.py", &["loop"])
+        },
+    );
+    let out = check(target.pid(), &[]);
+    let report = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!out.status.success(), "{report}");
+    assert!(commands_in(&report).is_empty(), "{report}");
+    assert!(
+        report.contains("off: its environment says prof:false"),
+        "{report}"
+    );
+    assert!(
+        report.contains("started with jemalloc and prof:true"),
+        "{report}"
     );
 }

@@ -49,6 +49,13 @@ const MAX_FDS: usize = 2;
 #[derive(Debug)]
 pub struct NoResponder(String);
 
+impl NoResponder {
+    #[cfg(test)]
+    pub(crate) fn new(why: String) -> NoResponder {
+        NoResponder(why)
+    }
+}
+
 impl std::fmt::Display for NoResponder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -57,16 +64,24 @@ impl std::fmt::Display for NoResponder {
 
 impl std::error::Error for NoResponder {}
 
-pub fn ask(
+/// Where the process's socket is, as the process sees it.
+fn socket_of(process: &Process, dir: &Path) -> (String, std::path::PathBuf) {
+    let name = format!(".systing-heap.{}", snoop::own_pid(process));
+    let shown = dir.join(&name);
+    (name, shown)
+}
+
+/// A connection to the process's responder, which is that process's: what
+/// answers at the socket has been checked to be the process asked about, and
+/// nothing has been said to it yet.
+fn connect(
     process: &Process,
     root: &Root,
     dir: &Path,
     wait: Duration,
-) -> Result<(Snapshot, Report)> {
+) -> Result<(UnixStream, std::path::PathBuf)> {
     let pid = process.pid();
-    let started = Instant::now();
-    let name = format!(".systing-heap.{}", snoop::own_pid(process));
-    let shown = dir.join(&name);
+    let (name, shown) = socket_of(process, dir);
 
     // The directory is opened beneath the process's root and the socket is
     // named through that handle, which also keeps the name short of what a
@@ -141,6 +156,27 @@ pub fn ask(
             shown.display()
         );
     }
+
+    Ok((stream, shown))
+}
+
+/// Whether the process has a responder that answers: the socket, as the
+/// process sees it. Nothing is asked of it: the connection is made, what
+/// answers is checked, and the connection is let go.
+pub fn answers(process: &Process, root: &Root, dir: &Path) -> Result<std::path::PathBuf> {
+    let (_, shown) = connect(process, root, dir, Duration::from_secs(5))?;
+    Ok(shown)
+}
+
+pub fn ask(
+    process: &Process,
+    root: &Root,
+    dir: &Path,
+    wait: Duration,
+) -> Result<(Snapshot, Report)> {
+    let pid = process.pid();
+    let started = Instant::now();
+    let (stream, shown) = connect(process, root, dir, wait)?;
 
     (&stream)
         .write_all(REQUEST)

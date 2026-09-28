@@ -9,6 +9,7 @@ The tool parses each snapshot, symbolizes its stacks, and writes them into the s
 The database opens in `systing-analyze` and merges with other traces like any capture.
 
 To set a service up to write snapshots, see [`docs/HEAP_SNAPSHOTS.md`](../docs/HEAP_SNAPSHOTS.md).
+Its "Which way to go" asks, in order, what to set up in a service and which of the commands below to run.
 
 ## Formats
 
@@ -46,6 +47,9 @@ systing-heap -o heap.duckdb --pid 4242 --latest-only /data/heap/jeprof
 # a running process, or a dump the process is asked to write now.
 systing-heap -o heap.duckdb --pid 4242 --snoop
 systing-heap -o heap.duckdb --pid 4242 --ask
+
+# Which of all these will work on a process (experimental, see below).
+systing-heap --pid 4242 --check
 ```
 
 An input that exists as a file or directory is only loaded.
@@ -228,9 +232,61 @@ The script calls jemalloc's `prof.dump`, then writes how it went; the tool waits
 - **What is refused, and said.** A process that maps no Python; a Python other than 3.14 (its own table of offsets says which it is), a pre-release, or a free-threaded build, on which this has not been tried; an interpreter with remote debugging turned off (`PYTHON_DISABLE_REMOTE_DEBUG`, `-X disable-remote-debug`); one with no main thread (an embedded interpreter that does not say which thread is); a request of someone else's still waiting. Nothing is written to any of these.
 - **Who may.** As for `--snoop`, and the process's memory is opened to write as well.
 
+**Where.** `--ask-dir` says where the responder's socket is and where the script's files are made, as the process sees it. Without it the socket is looked for where the environment the process was started with says (`SYSTING_HEAP_HOOKS_SOCKET_DIR`), then in its `/tmp`, and the script's files are made in its `/tmp`. A process that was told another directory in a call, or whose environment names one relative to its working directory, is asked with `--ask-dir`.
+
 **The snapshot.** One `heap_snapshot` row with `dump_trigger` `asked`; `source_path` is the socket, or the dump's file as the process saw it. There is no `heap_live_read` row: that is for a read jemalloc did not make.
 
 **What it knows.** Run on x86-64, on CPython 3.14.7 with jemalloc 5.3.1 (both ways) and CPython 3.13 with Ubuntu's `libjemalloc2` 5.3.0 (the responder, also as the library by itself and switched on from the environment). Nothing has run on aarch64, on a free-threaded Python, or across a user namespace, where the responder would see root as another user and refuse it.
+
+## Looking at what a process has (experimental)
+
+> **Very experimental.**
+> What it looks for and what it prints will change with the ways of reading a heap, which are experimental themselves.
+
+Which of the commands above works on a process depends on how the process was set up, and whoever is looking at it may not be who set it up.
+`--check` looks, and loads nothing:
+
+```bash
+systing-heap --pid 4242 --check
+```
+
+```text
+pid 4242 (python3.13, pid 7 to itself)
+
+  jemalloc............ yes: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+  profiling........... on
+  snapshot files...... 12 under /heap-dumps/jeprof, the newest written 5 min ago; one every 1 GiB it allocates
+  hooks library....... not loaded
+  responder........... no: there is no /tmp/.systing-heap.7
+  Python.............. cannot be asked: the process is Python 3.13: asking needs CPython 3.14
+  Python functions.... not in its stacks: install(backtrace="python") was not called
+  its memory.......... read: 40 stack(s)
+
+What will work, the one to try first first:
+
+  systing-heap -o heap.duckdb --pid 4242 --latest-only /heap-dumps/jeprof
+      jemalloc's own dump, the latest of each process that writes under that prefix; this one's is from 5 min ago
+  systing-heap -o heap.duckdb --pid 4242 --snoop
+      the profile as it is in memory now; stacks can be missing (experimental)
+
+What the service would have to be given for more (the recipes are in docs/HEAP_SNAPSHOTS.md):
+
+  a dump of this moment, whatever its threads are doing: the responder (experimental)
+      recipe: Asked, by environment
+  Python functions in its stacks, with file and line: install(backtrace="python")
+      recipe: Python functions in the stacks
+```
+
+- **The commands are whole.** Each can be run as it is printed: the process's pid, the prefix its files are under, the directory its socket is in and the one its code map is in are in them. The tests run every command a check prints, on a service that has everything, and look for the Python functions in what each one loads.
+- **What the process chose cannot become a command.** The prefix and the directories are the process's to choose, in the environment it was started with, and what is printed is copied into a shell by whoever is looking, who may be root. Each is an absolute path, printed as one word of the command: as it is where a shell takes it for one, else in single quotes. One with a control character in it, or that was not text, is not printed in a command at all: the way it belongs to is still listed, with a line in place of its command that says so. Everything else the process chose is printed with its control characters escaped.
+- **A Python is asked only where profiling was seen.** `--ask python` writes to the process's memory, so it is listed only where the profile was read from memory or the responder answers. What the environment asks for is not taken for that: a process can have the variable and no jemalloc. It then says that profiling was asked for and not seen.
+- **It gives up after 90 seconds**, as a whole: the process's memory, its socket and the folder its files are in are all the process's to make slow.
+- **Nothing is done to the process.** Nothing is written to it and nothing is asked of it. What it maps, the environment it was started with and its memory are read, as `--snoop` reads them; the folder its snapshots are in is listed; and its responder's socket is connected to and let go without a word, to see that the process itself answers there.
+- **It reads the profile to say that it can be read.** That is a whole `--snoop`, whose result is not kept. It is given 30 seconds where `--snoop` itself is given three minutes, so a profile that slow to read is said not to be readable.
+- **Only files are counted as snapshots**, by their names: `PREFIX.<pid>.….heap` of this process. Whether each is a dump is for the command that loads them to say.
+- **What it cannot see.** jemalloc's settings are taken from the environment the process was started with. Settings compiled into the program or in `/etc/malloc.conf` are not looked at, so a prefix or an interval given there is not seen, and neither is a snapshot the service writes by calling jemalloc itself. A responder whose directory was given in a call, and not in the environment, is found with `--ask-dir`. Whether a Python that can be asked will answer is its main thread's to say: the check says that it can be asked, and the command that it gives up after 30 seconds.
+- **It ends with an error when nothing will work**, so a script can tell. A way whose command is not printed counts as one that works.
+- **Who may.** As for `--snoop`.
 
 ## Python stacks
 

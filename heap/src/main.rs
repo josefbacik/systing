@@ -10,7 +10,9 @@ use std::sync::Arc;
 use systing_heap::perfmap::{self, PerfMap};
 use systing_heap::pycode::{self, CodeMap};
 use systing_heap::root::Root;
-use systing_heap::{ask, db, jemalloc, perfetto, retention, snoop, symbolize, Format, Snapshot};
+use systing_heap::{
+    ask, check, db, jemalloc, perfetto, retention, snoop, symbolize, Format, Snapshot,
+};
 
 /// Parse allocator heap snapshots (jemalloc prof dumps), symbolize their
 /// stacks, and write them into a systing DuckDB database.
@@ -29,19 +31,22 @@ use systing_heap::{ask, db, jemalloc, perfetto, retention, snoop, symbolize, For
 ///
 /// With --pid and --ask (EXPERIMENTAL) the process is asked to write a dump
 /// now, and that dump is loaded.
+///
+/// With --pid and --check (EXPERIMENTAL) nothing is loaded: what the process
+/// has is looked at, and the commands that will work on it are printed.
 #[derive(Parser)]
 #[command(name = "systing-heap", version)]
 struct Cli {
     /// jemalloc prof_prefixes, snapshot files, or directories to load every
     /// snapshot file in (not recursively).
-    #[arg(required_unless_present_any = ["snoop", "ask"])]
+    #[arg(required_unless_present_any = ["snoop", "ask", "check"])]
     inputs: Vec<PathBuf>,
 
     /// The output, replaced on every run: a DuckDB database, or a Perfetto
     /// trace of native heap profiles when it ends in .pb, .perfetto, .pftrace
     /// or .perfetto-trace (open it at ui.perfetto.dev).
-    #[arg(short, long)]
-    output: PathBuf,
+    #[arg(short, long, required_unless_present = "check")]
+    output: Option<PathBuf>,
 
     /// Read every file or directory input as this format instead of going
     /// by its extension. Prefix inputs are always jemalloc.
@@ -133,15 +138,38 @@ struct Cli {
         num_args = 0..=1,
         default_missing_value = "auto",
         requires = "pid",
+        group = "asking",
         conflicts_with_all = ["inputs", "format", "keep_all", "latest_only", "dry_run", "snoop"]
     )]
     ask: Option<ask::How>,
 
-    /// EXPERIMENTAL. With --ask, the directory the responder's socket is in, and the one
-    /// the script's files are made in: as the process sees it, and for
-    /// `python` one the process's user may write to.
-    #[arg(long, value_name = "DIR", requires = "ask", default_value = ask::DEFAULT_DIR)]
-    ask_dir: PathBuf,
+    /// EXPERIMENTAL. With --pid, load nothing: look at what the process has
+    /// for its heap to be read, and print which of the commands will work
+    /// on it, the one to try first first, and what the service would have to
+    /// be given for more. For a service someone else set up. Nothing is
+    /// written to the process and nothing is asked of it: what it maps, the
+    /// environment it was started with and its memory are read, and its
+    /// responder's socket is connected to and let go. It gives up after 90
+    /// seconds, and ends with an error when nothing will work.
+    #[arg(
+        long,
+        requires = "pid",
+        group = "asking",
+        conflicts_with_all = [
+            "inputs", "output", "format", "keep_all", "latest_only", "dry_run", "snoop",
+            "perf_map_dir"
+        ]
+    )]
+    check: bool,
+
+    /// EXPERIMENTAL. With --ask or --check, the directory the responder's
+    /// socket is in, and the one the script's files are made in: as the
+    /// process sees it, and for `python` one the process's user may write
+    /// to. Not given, the socket is looked for where the environment the
+    /// process was started with says (SYSTING_HEAP_HOOKS_SOCKET_DIR), then
+    /// in its /tmp, and the script's files are made in its /tmp.
+    #[arg(long, value_name = "DIR", requires = "asking")]
+    ask_dir: Option<PathBuf>,
 
     /// EXPERIMENTAL. With --ask, how long the process is given to answer.
     #[arg(
@@ -159,9 +187,23 @@ fn main() -> Result<()> {
 
     // A snoop pins the process once, and takes the root from that handle, so
     // its memory and its root are surely one process. So does asking.
-    let pinned = match (cli.snoop || cli.ask.is_some(), cli.pid) {
+    let pinned = match (cli.snoop || cli.ask.is_some() || cli.check, cli.pid) {
         (true, Some(pid)) => Some(snoop::Process::open(pid)?),
         _ => None,
+    };
+    if let (true, Some(process)) = (cli.check, pinned.as_ref()) {
+        let facts = check::check_within(process, cli.ask_dir.as_deref(), check::WITHIN)?;
+        print!("{}", facts.report());
+        if facts.ways().is_empty() {
+            bail!(
+                "nothing here can look at the heap of pid {} as it runs now",
+                process.pid()
+            );
+        }
+        return Ok(());
+    }
+    let Some(output) = cli.output.clone() else {
+        bail!("no output named (-o)");
     };
     let pid_root = cli
         .pid
@@ -179,7 +221,7 @@ fn main() -> Result<()> {
     };
     let root = root.as_ref();
 
-    let as_perfetto = perfetto::is_perfetto_output(&cli.output);
+    let as_perfetto = perfetto::is_perfetto_output(&output);
     let load_all = !cli.latest_only && (cli.keep_all || as_perfetto);
     let delete_older = !cli.keep_all && !cli.latest_only;
     let mut snapshots: Vec<Snapshot> = Vec::new();
@@ -191,7 +233,7 @@ fn main() -> Result<()> {
              which for a Python that has no responder means writing to its memory"
         );
         let wait = std::time::Duration::from_secs(cli.ask_wait);
-        let (snapshot, report) = ask::ask_within(process, how, &cli.ask_dir, wait)?;
+        let (snapshot, report) = ask::ask_within(process, how, cli.ask_dir.as_deref(), wait)?;
         eprintln!("{}", report.summary(pid));
         snapshots.push(snapshot);
     } else if let Some(process) = pinned.as_ref() {
@@ -300,7 +342,7 @@ fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .join(","),
     };
-    let written = write_replacing(&cli.output, !as_perfetto, |tmp| {
+    let written = write_replacing(&output, !as_perfetto, |tmp| {
         if as_perfetto {
             perfetto::write(tmp, &snapshots, &symbolized)
         } else {
@@ -310,7 +352,7 @@ fn main() -> Result<()> {
     println!(
         "{}: {} snapshot(s), {} sample(s), {} stack(s), {} frame(s); {}/{} addresses symbolized, \
          {} Python function(s) from perf maps, {} Python frame(s) from code maps",
-        cli.output.display(),
+        output.display(),
         written.snapshots,
         written.samples,
         written.stacks,

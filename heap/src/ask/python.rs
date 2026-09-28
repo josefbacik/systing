@@ -145,9 +145,25 @@ impl Memory for ProcMem {
     }
 }
 
+/// `/proc/<pid>/mem`, open to read: what is only looked at is not opened to
+/// be written.
+struct ReadOnly(File);
+
+impl Memory for ReadOnly {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.0.read_exact_at(buf, addr)
+    }
+
+    fn write(&self, _: u64, _: &[u8]) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+}
+
 /// The offsets a request needs, out of the process's own table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Offsets {
+    /// `PY_VERSION_HEX`, as the interpreter says it.
+    version: u64,
     interpreters_head: u64,
     interpreter_id: u64,
     interpreter_next: u64,
@@ -199,6 +215,7 @@ impl Offsets {
             );
         }
         let offsets = Offsets {
+            version,
             interpreters_head: word(at::INTERPRETERS_HEAD),
             interpreter_id: word(at::INTERPRETER_ID),
             interpreter_next: word(at::INTERPRETER_NEXT),
@@ -719,6 +736,42 @@ impl Drop for Place {
             );
         }
     }
+}
+
+/// What asking a process through its interpreter would come to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Would {
+    /// The process maps no Python.
+    NotPython,
+    /// It is a Python that cannot be asked, and why.
+    Cannot(String),
+    /// It is a CPython 3.14 that can be: its version. Whether it answers
+    /// is then its main thread's to say, by coming back to Python.
+    Answer(String),
+}
+
+/// What asking `process` would come to, as far as looking can tell: nothing
+/// is written to the process, and its memory is opened to read alone.
+pub fn would(process: &Process) -> Result<Would> {
+    let pid = process.pid();
+    let maps_text = process.maps_text()?;
+    if !maps_a_python(&maps_text) {
+        return Ok(Would::NotPython);
+    }
+    let mem = ReadOnly(
+        File::open(process.file("mem")).with_context(|| format!("opening /proc/{pid}/mem"))?,
+    );
+    let found = find_runtime(&mem, &maps_text)
+        .and_then(|(runtime, offsets)| main_thread(&mem, runtime, &offsets).map(|_| offsets));
+    Ok(match found {
+        Ok(offsets) => Would::Answer(format!(
+            "{}.{}.{}",
+            offsets.version >> 24 & 0xff,
+            offsets.version >> 16 & 0xff,
+            offsets.version >> 8 & 0xff
+        )),
+        Err(why) => Would::Cannot(format!("{why:#}")),
+    })
 }
 
 pub fn ask(
