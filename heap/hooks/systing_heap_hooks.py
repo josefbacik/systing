@@ -48,6 +48,10 @@ One thread is started for it, which sleeps until someone asks, runs nothing
 of Python's and answers whatever the program's own threads are doing. The
 dump is handed over as a descriptor of an anonymous file: nothing is written
 to disk. Each process this one forks listens for itself.
+
+A service that is not to be changed needs no call and none of this file: with
+the library preloaded (LD_PRELOAD) and SYSTING_HEAP_HOOKS_LISTEN=1 in its
+environment it listens as if it had called listen().
 """
 
 import atexit
@@ -72,20 +76,22 @@ def _load(path):
             or os.path.join(os.path.dirname(os.path.abspath(__file__)), _LIB_NAME)
         )
         lib = ctypes.CDLL(path)
-        lib.systing_heap_hooks_install.argtypes = [ctypes.c_char_p]
-        lib.systing_heap_hooks_install.restype = ctypes.c_int
-        lib.systing_heap_hooks_active.restype = ctypes.c_char_p
-        lib.systing_heap_hooks_strerror.argtypes = [ctypes.c_int]
-        lib.systing_heap_hooks_strerror.restype = ctypes.c_char_p
-        lib.systing_heap_hooks_prepare.argtypes = [ctypes.c_char_p]
-        lib.systing_heap_hooks_prepare.restype = ctypes.c_int
-        lib.systing_heap_hooks_python_check.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
-        lib.systing_heap_hooks_python_check.restype = ctypes.c_int
-        lib.systing_heap_hooks_python_map.restype = ctypes.c_char_p
-        lib.systing_heap_hooks_python_stop.restype = None
-        lib.systing_heap_hooks_listen.argtypes = [ctypes.c_char_p]
-        lib.systing_heap_hooks_listen.restype = ctypes.c_int
-        lib.systing_heap_hooks_socket.restype = ctypes.c_char_p
+        # The library that is the responder alone has the last three only.
+        for name, restype, argtypes in (
+            ("install", ctypes.c_int, [ctypes.c_char_p]),
+            ("active", ctypes.c_char_p, []),
+            ("prepare", ctypes.c_int, [ctypes.c_char_p]),
+            ("python_check", ctypes.c_int, [ctypes.c_char_p, ctypes.c_size_t]),
+            ("python_map", ctypes.c_char_p, []),
+            ("python_stop", None, []),
+            ("strerror", ctypes.c_char_p, [ctypes.c_int]),
+            ("listen", ctypes.c_int, [ctypes.c_char_p]),
+            ("socket", ctypes.c_char_p, []),
+        ):
+            function = getattr(lib, "systing_heap_hooks_" + name, None)
+            if function is not None:
+                function.restype = restype
+                function.argtypes = argtypes
         _lib = lib
     return _lib
 
@@ -233,10 +239,16 @@ def install(backtrace="libunwind", trampolines=None, strict=False, lib=None):
         else:
             reasons.append(why)
 
+    hooks = None
     try:
         hooks = _load(lib)
     except OSError as e:
         reasons.append(f"{_LIB_NAME}: {e}")
+    if hooks is not None and not hasattr(hooks, "systing_heap_hooks_install"):
+        reasons.append("the library loaded is the responder alone, and has no backtraces")
+        hooks = None
+
+    if hooks is None:
         active_backtrace = "default"
     else:
         if backtrace == "python":

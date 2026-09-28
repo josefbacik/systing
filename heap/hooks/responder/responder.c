@@ -32,7 +32,18 @@
  *   as any thread of the program may call it.
  * - A peer that says nothing, or reads nothing, is given up after
  *   IO_TIMEOUT_S seconds; requests are answered one at a time.
- * - A forked child has no such thread and listens nowhere until it asks to.
+ * - A forked child has no such thread and listens nowhere until it asks to,
+ *   or unless the environment said that the processes this one forks listen
+ *   as well.
+ *
+ * A program that is not changed at all listens when the library is loaded
+ * into it with SYSTING_HEAP_HOOKS_LISTEN set in its environment: to 1, or to
+ * fork for the processes it forks to listen as well. The socket is where
+ * systing_heap_hooks_listen(NULL) puts it.
+ *
+ * This file and common.c are all the responder is: the library that is only
+ * those two, libsysting_heap_responder.so, has nothing in it of Python or
+ * of the backtraces.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -50,8 +61,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#include "systing_heap_hooks.h"
-#include "systing_heap_hooks_listen.h"
+#include <stdbool.h>
+
+#include "../common/common.h"
+#include "../systing_heap_hooks.h"
 
 #define REQUEST "systing-heap 1 dump\n"
 #define IO_TIMEOUT_S 5
@@ -69,6 +82,9 @@ static ino_t listen_ino;
  * process it was forked from away as it exits. */
 static pid_t listen_pid;
 static char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+/* Whether a process this one forks listens as this one does, and where. */
+static int listen_in_children;
+static char listen_dir[sizeof(socket_path)];
 
 static void say(int c, const char *line, const int *fds, int nfds)
 {
@@ -150,12 +166,12 @@ static int dump(const char **why)
 }
 
 /* The code map the "python" backtrace writes, open for reading; -1 when
- * there is none. It is the file at the map's path now, if a regular one:
- * what it holds is read by the tool as any file of the process's is. */
+ * there is none, as in a library without that backtrace. It is the file at
+ * the map's path now, if a regular one: what it holds is read by the tool as
+ * any file of the process's is. */
 static int code_map(void)
 {
-	shh_python_make_map();
-	const char *path = systing_heap_hooks_python_map();
+	const char *path = shh_code_map();
 	if (!path || !path[0])
 		return -1;
 	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
@@ -276,16 +292,25 @@ static void register_at_exit(void)
 	atexit(forget_the_socket);
 }
 
-void shh_listen_after_fork_child(void)
+static int listen_locked(const char *dir);
+
+static void after_fork_in_child(void)
 {
 	/* The thread is not in the child, and the socket is the parent's: the
 	 * child lets go of its copy, and listens once it asks to. */
 	pthread_mutex_init(&listen_lock, NULL);
-	if (listen_fd >= 0 && is_the_socket(listen_fd))
+	int listened = listen_fd >= 0;
+	if (listened && is_the_socket(listen_fd))
 		close(listen_fd);
 	listen_fd = -1;
 	socket_path[0] = '\0';
+	/* Asked for in the environment: the child has a socket and a thread
+	 * of its own before fork() returns in it. */
+	if (listened && listen_in_children)
+		listen_locked(listen_dir);
 }
+
+static const struct shh_fork_part fork_part = {NULL, NULL, after_fork_in_child};
 
 /* Whether something answers at `addr`. It is asked without waiting: a
  * socket whose queue is full is one that someone listens on, and whoever
@@ -368,6 +393,8 @@ static int listen_locked(const char *dir)
 	listen_ino = st.st_ino;
 	listen_pid = getpid();
 	memcpy(socket_path, addr.sun_path, sizeof(socket_path));
+	if (dir != listen_dir)
+		snprintf(listen_dir, sizeof(listen_dir), "%s", dir);
 	listen_fd = fd;
 
 	/* The thread starts with every signal blocked, as the thread that
@@ -394,7 +421,7 @@ static int listen_locked(const char *dir)
 
 int systing_heap_hooks_listen(const char *dir)
 {
-	shh_register_fork_handlers();
+	shh_at_fork(&fork_part);
 	pthread_once(&at_exit_once, register_at_exit);
 	pthread_mutex_lock(&listen_lock);
 	int rc = listen_locked(dir);
@@ -409,4 +436,26 @@ const char *systing_heap_hooks_socket(void)
 	const char *path = listen_fd >= 0 ? socket_path : "";
 	pthread_mutex_unlock(&listen_lock);
 	return path;
+}
+
+/* What the environment asks for, when the library is loaded. There is no
+ * caller to tell what came of it, so a request that fails is said once, on
+ * standard error. */
+__attribute__((constructor)) static void listen_as_the_environment_says(void)
+{
+	const char *how = secure_getenv("SYSTING_HEAP_HOOKS_LISTEN");
+	if (!how || !how[0] || strcmp(how, "0") == 0)
+		return;
+	bool children = strcmp(how, "fork") == 0;
+	int rc = SHH_ERR_LISTEN_HOW;
+	if (children || strcmp(how, "1") == 0)
+		rc = systing_heap_hooks_listen(NULL);
+	if (rc == SHH_OK) {
+		pthread_mutex_lock(&listen_lock);
+		listen_in_children = children;
+		pthread_mutex_unlock(&listen_lock);
+		return;
+	}
+	dprintf(STDERR_FILENO, "systing_heap_hooks: SYSTING_HEAP_HOOKS_LISTEN=%.16s: %s\n",
+		how, systing_heap_hooks_strerror(rc));
 }

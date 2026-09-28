@@ -1,6 +1,14 @@
 /*
- * systing-heap hooks: replace how jemalloc captures a sampled allocation's
- * stack. See systing_heap_hooks.c.
+ * systing-heap hooks: what a program calls. Two pieces, and a program takes
+ * either without the other:
+ *
+ *   the backtraces   replace how jemalloc captures a sampled allocation's
+ *                    stack (backtrace/): install, prepare, active, python_*
+ *   the responder    answers requests for a heap dump (responder/,
+ *                    EXPERIMENTAL): listen, socket
+ *
+ * libsysting_heap_hooks.so has both. libsysting_heap_responder.so has the
+ * responder alone, and none of the backtraces' functions.
  */
 #ifndef SYSTING_HEAP_HOOKS_H
 #define SYSTING_HEAP_HOOKS_H
@@ -17,6 +25,7 @@
 #define SHH_ERR_PY_MAP 9
 #define SHH_ERR_SOCKET_PATH 10
 #define SHH_ERR_SOCKET 11
+#define SHH_ERR_LISTEN_HOW 12
 
 #include <stddef.h>
 
@@ -72,6 +81,11 @@ void systing_heap_hooks_python_backtrace(void **vec, unsigned *len, unsigned max
  * listens already (wherever that is), or an SHH_ERR_* code.
  *
  * A forked child listens nowhere until it calls this itself.
+ *
+ * A program that is not changed listens when the library is loaded into it
+ * (LD_PRELOAD) with SYSTING_HEAP_HOOKS_LISTEN=1 in its environment, as if it
+ * had called this with NULL; with SYSTING_HEAP_HOOKS_LISTEN=fork the
+ * processes it forks listen as well.
  */
 int systing_heap_hooks_listen(const char *dir);
 

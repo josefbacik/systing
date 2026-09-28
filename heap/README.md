@@ -202,7 +202,7 @@ The process needs `prof:true` in its `MALLOC_CONF`, as for every dump.
 | | `--ask responder` | `--ask python` | `--snoop` |
 |---|---|---|---|
 | Status | experimental | experimental | experimental |
-| The process loaded | the hooks library, and called `listen()` | nothing of ours | nothing of ours |
+| The process loaded | the responder, and called `listen()` or had `SYSTING_HEAP_HOOKS_LISTEN` in its environment | nothing of ours | nothing of ours |
 | Which processes | any with jemalloc | CPython 3.14 | any with jemalloc |
 | What is done to the process | a request on its socket | three writes to its memory; it runs a script | nothing |
 | Written to disk | nothing | a script and the dump, in a directory removed afterwards | nothing |
@@ -210,7 +210,7 @@ The process needs `prof:true` in its `MALLOC_CONF`, as for every dump.
 | The dump | jemalloc's own | jemalloc's own | a walk of jemalloc's private structures |
 | Python frames named | the code map comes with the dump | `--perf-map-dir` | `--perf-map-dir` |
 
-**The responder (experimental).** A process that called `systing_heap_hooks.listen()` (see [`hooks/README.md`](hooks/README.md)) has one thread that waits on a Unix socket, `.systing-heap.<pid>` in its `/tmp` or the directory it was given; `--ask-dir` says which, as the process sees it.
+**The responder (experimental).** A process that called `systing_heap_hooks.listen()`, or that was started with the responder preloaded and `SYSTING_HEAP_HOOKS_LISTEN=1` and is otherwise unchanged (see [`hooks/README.md`](hooks/README.md)), has one thread that waits on a Unix socket, `.systing-heap.<pid>` in its `/tmp` or the directory it was given; `--ask-dir` says which, as the process sees it.
 The tool opens that directory beneath the process's root, opens the name as a socket and no link, connects through that handle, and checks that what answers is the process it was asked about (the peer's pid) before it says anything.
 What the process answers when it refuses is printed with its control characters escaped.
 The answer carries the dump as a descriptor of an anonymous file that can no longer be written, and the Python code map's when the process writes one: no path is looked up for either.
@@ -230,7 +230,7 @@ The script calls jemalloc's `prof.dump`, then writes how it went; the tool waits
 
 **The snapshot.** One `heap_snapshot` row with `dump_trigger` `asked`; `source_path` is the socket, or the dump's file as the process saw it. There is no `heap_live_read` row: that is for a read jemalloc did not make.
 
-**What it knows.** Run on x86-64, on CPython 3.14.7 with jemalloc 5.3.1 (both ways) and CPython 3.13 with Ubuntu's `libjemalloc2` 5.3.0 (the responder). Nothing has run on aarch64, on a free-threaded Python, or across a user namespace, where the responder would see root as another user and refuse it.
+**What it knows.** Run on x86-64, on CPython 3.14.7 with jemalloc 5.3.1 (both ways) and CPython 3.13 with Ubuntu's `libjemalloc2` 5.3.0 (the responder, also as the library by itself and switched on from the environment). Nothing has run on aarch64, on a free-threaded Python, or across a user namespace, where the responder would see root as another user and refuse it.
 
 ## Python stacks
 
@@ -244,7 +244,7 @@ The program chooses how at runtime, with the helper in `hooks/`.
 There are two ways; the first is the one to use on CPython 3.12 to 3.14.
 
 ```bash
-make -C heap/hooks          # builds heap/hooks/libsysting_heap_hooks.so
+make -C heap/hooks          # builds heap/hooks/libsysting_heap_hooks.so (and the responder alone, beside it)
 ```
 
 | Setup | Stacks show | Cost |

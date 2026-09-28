@@ -1,25 +1,40 @@
-# Builds libsysting_heap_hooks.so. It links only libdl and libpthread: libunwind is opened
-# at runtime, when a program asks for the "libunwind" backtrace.
+# Builds the hooks libraries. They link only libdl and libpthread: libunwind is
+# opened at runtime, when a program asks for the "libunwind" backtrace.
 #
-#   make            # ./libsysting_heap_hooks.so
-#   make OUT=/dir   # /dir/libsysting_heap_hooks.so
+#   make             # both libraries, in this directory
+#   make OUT=/dir    # both, in /dir
+#   make hooks       # libsysting_heap_hooks.so: the backtraces and the responder
+#   make responder   # libsysting_heap_responder.so: the responder alone
+#
+# README.md says which a service wants.
 
 CC ?= cc
 CFLAGS ?= -O2 -g
 OUT ?= .
 
-LIB := $(OUT)/libsysting_heap_hooks.so
+HOOKS := $(OUT)/libsysting_heap_hooks.so
+RESPONDER := $(OUT)/libsysting_heap_responder.so
 
-all: $(LIB)
+COMMON_SRC := common/common.c
+BACKTRACE_SRC := backtrace/backtrace.c backtrace/python.c
+RESPONDER_SRC := responder/responder.c
+HDR := systing_heap_hooks.h common/common.h backtrace/python.h backtrace/py_offsets.h
 
-SRC := systing_heap_hooks.c systing_heap_hooks_python.c systing_heap_hooks_listen.c
-HDR := systing_heap_hooks.h systing_heap_hooks_python.h systing_heap_hooks_listen.h py_offsets.h
+BUILD = $(CC) $(CFLAGS) -Wall -Wextra -fPIC -shared -fno-omit-frame-pointer
 
-$(LIB): $(SRC) $(HDR)
-	$(CC) $(CFLAGS) -Wall -Wextra -fPIC -shared -fno-omit-frame-pointer \
-		-o $@ $(SRC) -ldl -lpthread
+all: hooks responder
+
+hooks: $(HOOKS)
+
+responder: $(RESPONDER)
+
+$(HOOKS): $(COMMON_SRC) $(BACKTRACE_SRC) $(RESPONDER_SRC) $(HDR)
+	$(BUILD) -o $@ $(COMMON_SRC) $(BACKTRACE_SRC) $(RESPONDER_SRC) -ldl -lpthread
+
+$(RESPONDER): $(COMMON_SRC) $(RESPONDER_SRC) systing_heap_hooks.h common/common.h
+	$(BUILD) -o $@ $(COMMON_SRC) $(RESPONDER_SRC) -ldl -lpthread
 
 clean:
-	rm -f $(LIB)
+	rm -f $(HOOKS) $(RESPONDER)
 
-.PHONY: all clean
+.PHONY: all hooks responder clean

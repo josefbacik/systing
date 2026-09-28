@@ -1,17 +1,46 @@
 # systing-heap hooks
 
-Optional replacements for how jemalloc captures a sampled allocation's stack, installed at runtime by the program that wants them.
-See "Python stacks" in [`../README.md`](../README.md) for when to use them.
+What a service loads to get more than jemalloc gives by itself. There are two pieces, and a service takes either without the other:
 
-- `systing_heap_hooks.c` / `.h`: the library. It links only libdl and libpthread and does nothing until `systing_heap_hooks_install()` is called.
-- `systing_heap_hooks_python.c`: the `"python"` backtrace, which reads the allocating thread's Python frames from the interpreter.
-- `systing_heap_hooks_listen.c`: the responder (experimental), a thread that answers requests for a heap dump on a Unix socket.
-- `py_offsets.h`: the CPython struct offsets it reads, by version. Rendered from systing's pystacks offsets; `cargo test -p systing-heap hook_offsets` fails when the two differ, and rewrites the header when run with `SYSTING_HEAP_UPDATE_OFFSETS=1`.
-- `systing_heap_hooks.py`: the Python helper that loads the library with `ctypes`, checks the `"python"` backtrace against Python's own view of the stack before installing it, can turn on perf trampolines, and starts the responder (`listen()`, experimental).
-- `make` builds `libsysting_heap_hooks.so`; `make OUT=/dir` puts it elsewhere. It needs a C compiler only: no Python headers, no libunwind.
+- **the backtraces**: other ways of capturing a sampled allocation's stack, which put Python functions in the stacks;
+- **the responder** (experimental): a thread that answers requests for a dump.
 
-The helper finds the library through its `lib` argument, then `SYSTING_HEAP_HOOKS_LIB`, then next to the `.py` file.
-`SYSTING_HEAP_HOOKS_LIBUNWIND` names the libunwind to load instead of `libunwind.so.8`.
+See "Python stacks" and "Asking a live process" in [`../README.md`](../README.md) for when to use them.
+A service that wants neither loads nothing of this: jemalloc's own snapshots, `--snoop` and `--ask python` need none of it.
+
+## What to take, for what
+
+| To get | The library | In the service | What else must be in the image |
+|---|---|---|---|
+| Python functions in the stacks, with file and line | `libsysting_heap_hooks.so`, with `systing_heap_hooks.py` | `install(backtrace="python")` | nothing |
+| Stacks walked through Python's perf trampolines | the same | `install(backtrace="libunwind")` | `libunwind.so.8`, opened when asked for |
+| An answer to `systing-heap --ask`, from a Python service (experimental) | the same | `listen()` | nothing |
+| The same, from a service that is not changed (experimental) | `libsysting_heap_responder.so`, preloaded | nothing: `SYSTING_HEAP_HOOKS_LISTEN=1` in its environment | nothing |
+| The same, from a C, C++ or Rust service that calls it (experimental) | `libsysting_heap_responder.so` | `systing_heap_hooks_listen(NULL)` | nothing |
+
+`libsysting_heap_hooks.so` has both pieces, and is what a Python service loads.
+`libsysting_heap_responder.so` is the responder alone: nothing in it knows of Python or of the backtraces, and it is about a twentieth of the other's size (14 KB against 276 KB, nearly all of the difference the `"python"` backtrace's tables).
+Either does nothing when it is loaded and not asked: no thread, no file, no socket.
+
+## What is where
+
+```
+heap/hooks/
+  systing_heap_hooks.h    what a C program includes: both pieces' functions
+  systing_heap_hooks.py   what a Python program imports
+  Makefile                builds the libraries
+  common/                 what the pieces share: finding jemalloc, fork, what the errors mean
+  backtrace/              the backtraces: backtrace.c, and python.c with py_offsets.h
+  responder/              the responder: responder.c
+```
+
+Each piece is built from its own folder and `common/`, and calls nothing of the other piece.
+The one thing that passes between them is the code map: the `"python"` backtrace says how it is asked for, through `common/`, and the responder hands over what it is given, which in the library without the backtraces is nothing.
+
+- `make` builds both libraries here; `make OUT=/dir` puts them elsewhere. `make hooks` and `make responder` build one. It needs a C compiler only: no Python headers, no libunwind. Both link only libdl and libpthread.
+- `backtrace/py_offsets.h`: the CPython struct offsets the `"python"` backtrace reads, by version. Rendered from systing's pystacks offsets; `cargo test -p systing-heap hook_offsets` fails when the two differ, and rewrites the header when run with `SYSTING_HEAP_UPDATE_OFFSETS=1`.
+- `systing_heap_hooks.py` loads the library with `ctypes`, checks the `"python"` backtrace against Python's own view of the stack before installing it, can turn on perf trampolines, and starts the responder (`listen()`, experimental). It finds the library through its `lib` argument, then `SYSTING_HEAP_HOOKS_LIB`, then next to the `.py` file. Given the library that is the responder alone, `listen()` works and `install()` says why it cannot.
+- `SYSTING_HEAP_HOOKS_LIBUNWIND` names the libunwind to load instead of `libunwind.so.8`.
 
 Backtraces: `"default"` (jemalloc's own), `"libunwind"` and `"python"`.
 Each is one entry in `systing_heap_hooks_install()`.
@@ -49,6 +78,27 @@ It is apart from the backtraces: a process can have either without the other.
 - Requests are answered one at a time, and a peer that says or reads nothing is given up on after 5 seconds.
 - A process that is killed, or that ends with `_exit()` as a worker forked by Python's `multiprocessing` does, leaves its socket's file behind. The next process to listen under that name takes it over, and a process that exits removes its own. A server that replaces its workers leaves one such file for each until then.
 - **fork.** The thread is not in a forked child, which lets go of its parent's socket; a child that is to answer calls `listen()` itself. The Python helper does that in every child. Python 3.12 and later warn (`DeprecationWarning`) when a process with more than one thread forks, and the responder is a thread.
+
+### A service that is not changed
+
+A service listens without a line of it being changed when the library is loaded into it and its environment says so:
+
+```yaml
+env:
+  - name: LD_PRELOAD
+    value: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2:/opt/systing/libsysting_heap_responder.so
+  - name: MALLOC_CONF
+    value: prof:true
+  - name: SYSTING_HEAP_HOOKS_LISTEN
+    value: "1"
+```
+
+- `SYSTING_HEAP_HOOKS_LISTEN=1` is `systing_heap_hooks_listen(NULL)`, called as the library is loaded: the socket is in the directory `SYSTING_HEAP_HOOKS_SOCKET_DIR` names, else in `/tmp`. Unset, empty or `0`, nothing is done.
+- `SYSTING_HEAP_HOOKS_LISTEN=fork` has the processes this one forks listen as well, each on a socket of its own, as a server's workers must if they are to be asked. The child's thread is started inside `fork()`, before it returns in the child. That has worked wherever it was tried, and the C library promises less of a forked child of a process with threads than this relies on: it is asked for by name for that reason.
+- There is no caller to tell what came of it. A request that cannot be followed (no jemalloc, profiling off, a directory that is not there, a value that is neither) is said in one line on standard error, and the service runs as it would have.
+- **Every program started with that environment listens**, not the service alone: a shell command it runs, a helper it starts. Each has a thread and a socket of its own for as long as it runs. Where that is not wanted, the service takes the variables out of the environment it gives the programs it starts, or calls `listen()` itself and leaves the environment alone.
+- jemalloc comes first in `LD_PRELOAD`: the library looks for it as it is loaded.
+
 
 ## Installing from C
 

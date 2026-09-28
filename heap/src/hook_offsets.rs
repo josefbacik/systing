@@ -1,4 +1,4 @@
-//! `hooks/py_offsets.h`: the CPython struct offsets the hooks' Python
+//! `hooks/backtrace/py_offsets.h`: the CPython struct offsets the hooks' Python
 //! backtrace reads, rendered from the offsets systing's own Python walker
 //! uses ([`systing::pystacks::offsets`]) so the two cannot disagree.
 //!
@@ -129,7 +129,7 @@ pub fn render() -> String {
 mod tests {
     use super::*;
 
-    const HEADER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks/py_offsets.h");
+    const HEADER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks/backtrace/py_offsets.h");
 
     #[test]
     fn hook_offsets_header_matches_the_pystacks_offsets() {

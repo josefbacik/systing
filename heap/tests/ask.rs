@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use duckdb::Connection;
 
 const BIN: &str = env!("CARGO_BIN_EXE_systing-heap");
-const HOOKS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks");
+use common::HOOKS;
 
 // A service with the hooks: Python frames in its stacks, and a responder.
 // Its main thread then waits in one call, as a service's does that leaves
@@ -35,6 +35,19 @@ def outer():
     leak_in_python(256)
 outer()
 if sys.argv[2] == "fork":
+    pid = os.fork()
+    if pid == 0:
+        print("child", os.getpid(), flush=True)
+        time.sleep(3600)
+print("ready", flush=True)
+time.sleep(3600)
+"#;
+
+// A service as it is: nothing of ours is imported or called, and its main
+// thread waits in one call. With `fork` it has forked a worker first.
+const UNCHANGED: &str = r#"import os, sys, time
+keep = [bytearray(64 * 1024) for _ in range(256)]
+if sys.argv[1] == "fork":
     pid = os.fork()
     if pid == 0:
         print("child", os.getpid(), flush=True)
@@ -145,26 +158,9 @@ fn setup(hooks: bool) -> Option<Env> {
     std::fs::create_dir(dir.path().join("s")).unwrap();
     std::fs::write(dir.path().join("service.py"), SERVICE).unwrap();
     std::fs::write(dir.path().join("plain.py"), PLAIN).unwrap();
+    std::fs::write(dir.path().join("unchanged.py"), UNCHANGED).unwrap();
     if hooks {
-        let built = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
-            .args([
-                "-O2",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-fPIC",
-                "-shared",
-                "-fno-omit-frame-pointer",
-                "-o",
-            ])
-            .arg(dir.path().join("libsysting_heap_hooks.so"))
-            .arg(Path::new(HOOKS).join("systing_heap_hooks.c"))
-            .arg(Path::new(HOOKS).join("systing_heap_hooks_python.c"))
-            .arg(Path::new(HOOKS).join("systing_heap_hooks_listen.c"))
-            .args(["-ldl", "-lpthread"])
-            .status();
-        if !built.is_ok_and(|s| s.success()) {
-            common::skip("no C compiler to build the hooks library");
+        if !common::make_hooks(Path::new(HOOKS), dir.path()) {
             return None;
         }
         std::fs::copy(
@@ -177,13 +173,15 @@ fn setup(hooks: bool) -> Option<Env> {
 }
 
 /// How a target is run: the script and its arguments, options of Python's
-/// own before them, more environment, and jemalloc's `prof` setting.
+/// own before them, more environment, jemalloc's `prof` setting, and a
+/// library loaded into it beside jemalloc.
 struct Run<'a> {
     script: &'a str,
     args: &'a [&'a str],
     options: &'a [&'a str],
     env: &'a [(&'a str, &'a str)],
     prof: bool,
+    preload: Option<&'a Path>,
 }
 
 impl<'a> Run<'a> {
@@ -194,6 +192,7 @@ impl<'a> Run<'a> {
             options: &[],
             env: &[],
             prof: true,
+            preload: None,
         }
     }
 }
@@ -218,7 +217,13 @@ impl Target {
         cmd.args(run.options)
             .arg(env.dir.path().join(run.script))
             .args(run.args)
-            .env("LD_PRELOAD", &pair.jemalloc)
+            .env(
+                "LD_PRELOAD",
+                match run.preload {
+                    Some(library) => format!("{}:{}", pair.jemalloc.display(), library.display()),
+                    None => pair.jemalloc.display().to_string(),
+                },
+            )
             .env("PYTHONMALLOC", "malloc")
             .env(
                 "MALLOC_CONF",
@@ -241,14 +246,25 @@ impl Target {
 
     /// The rest of the first line that starts with `word`.
     fn wait_for(&mut self, word: &str) -> String {
-        loop {
+        self.wait_for_each(&[word]).remove(0)
+    }
+
+    /// The rest of the first line that starts with each of `words`, in the
+    /// order of `words`: the lines may come in any order, as those of a
+    /// process and of one it forked do.
+    fn wait_for_each(&mut self, words: &[&str]) -> Vec<String> {
+        let mut found: Vec<Option<String>> = vec![None; words.len()];
+        while found.iter().any(Option::is_none) {
             let mut line = String::new();
             let n = self.lines.read_line(&mut line).unwrap();
-            assert_ne!(n, 0, "the target ended before it said {word:?}");
-            if let Some(rest) = line.trim_end().strip_prefix(word) {
-                return rest.trim().to_string();
+            assert_ne!(n, 0, "the target ended before it said all of {words:?}");
+            for (word, slot) in words.iter().zip(found.iter_mut()) {
+                if let (None, Some(rest)) = (&slot, line.trim_end().strip_prefix(word)) {
+                    *slot = Some(rest.trim().to_string());
+                }
             }
         }
+        found.into_iter().flatten().collect()
     }
 
     fn pid(&self) -> u32 {
@@ -390,6 +406,178 @@ fn a_responder_answers_while_the_main_thread_waits() {
     }
 }
 
+/// The sockets in `dir`, by the pid in their names.
+fn sockets_in(dir: &Path) -> Vec<u32> {
+    let mut pids: Vec<u32> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name();
+            name.to_str()?.strip_prefix(".systing-heap.")?.parse().ok()
+        })
+        .collect();
+    pids.sort();
+    pids
+}
+
+#[test]
+fn a_service_that_is_not_changed_answers_when_its_environment_says_so() {
+    let Some(env) = setup(true) else { return };
+    let Some(pair) = pairs().into_iter().next() else {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+        return;
+    };
+    let sockets = env.sockets();
+    // The library that is the responder alone: it has nothing of Python in it.
+    let library = env.dir.path().join("libsysting_heap_responder.so");
+    let switched_on = [
+        ("SYSTING_HEAP_HOOKS_LISTEN", "1"),
+        ("SYSTING_HEAP_HOOKS_SOCKET_DIR", sockets.to_str().unwrap()),
+    ];
+    let target = Target::start(
+        &env,
+        &pair,
+        Run {
+            env: &switched_on,
+            preload: Some(&library),
+            ..Run::of("unchanged.py", &["stay"])
+        },
+    );
+    assert_eq!(sockets_in(&sockets), vec![target.pid()]);
+    let db = env.dir.path().join("unchanged.duckdb");
+    let out = ask(
+        target.pid(),
+        "responder",
+        &db,
+        &["--ask-dir", sockets.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", said(&out));
+    let (trigger, _, samples) = snapshot(&db);
+    assert_eq!(trigger, "asked");
+    assert!(samples > 0);
+}
+
+#[test]
+fn a_library_that_is_loaded_and_not_asked_does_nothing() {
+    let Some(env) = setup(true) else { return };
+    let Some(pair) = pairs().into_iter().next() else {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+        return;
+    };
+    let sockets = env.sockets();
+    for library in ["libsysting_heap_responder.so", "libsysting_heap_hooks.so"] {
+        let library = env.dir.path().join(library);
+        let target = Target::start(
+            &env,
+            &pair,
+            Run {
+                env: &[("SYSTING_HEAP_HOOKS_SOCKET_DIR", sockets.to_str().unwrap())],
+                preload: Some(&library),
+                ..Run::of("unchanged.py", &["stay"])
+            },
+        );
+        assert_eq!(sockets_in(&sockets), Vec::<u32>::new(), "{library:?}");
+        let threads = std::fs::read_dir(format!("/proc/{}/task", target.pid()))
+            .unwrap()
+            .count();
+        assert_eq!(threads, 1, "{library:?}");
+    }
+}
+
+#[test]
+fn the_processes_a_service_forks_answer_when_its_environment_says_so() {
+    let Some(env) = setup(true) else { return };
+    let Some(pair) = pairs().into_iter().next() else {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+        return;
+    };
+    let library = env.dir.path().join("libsysting_heap_responder.so");
+    for (how, children_listen) in [("fork", true), ("1", false)] {
+        let sockets = env.dir.path().join(format!("s-{how}"));
+        std::fs::create_dir(&sockets).unwrap();
+        let mut target = Target::spawn(
+            &env,
+            &pair,
+            Run {
+                env: &[
+                    ("SYSTING_HEAP_HOOKS_LISTEN", how),
+                    ("SYSTING_HEAP_HOOKS_SOCKET_DIR", sockets.to_str().unwrap()),
+                    // Python says that a process with a thread forks.
+                    ("PYTHONWARNINGS", "ignore"),
+                ],
+                preload: Some(&library),
+                ..Run::of("unchanged.py", &["fork"])
+            },
+        );
+        let child: u32 = target.wait_for_each(&["child", "ready"])[0]
+            .parse()
+            .unwrap();
+        let db = env.dir.path().join(format!("forked-{how}.duckdb"));
+        let out = ask(
+            child,
+            "responder",
+            &db,
+            &["--ask-dir", sockets.to_str().unwrap()],
+        );
+        let parent = ask(
+            target.pid(),
+            "responder",
+            &db,
+            &["--ask-dir", sockets.to_str().unwrap()],
+        );
+        kill(child);
+        assert!(parent.status.success(), "{how}: {}", said(&parent));
+        assert_eq!(
+            out.status.success(),
+            children_listen,
+            "{how}: {}",
+            said(&out)
+        );
+        if !children_listen {
+            assert!(
+                said(&out).contains("has no responder"),
+                "{how}: {}",
+                said(&out)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_switch_that_cannot_be_followed_says_so_and_the_service_runs() {
+    let Some(env) = setup(true) else { return };
+    let Some(pair) = pairs().into_iter().next() else {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+        return;
+    };
+    let library = env.dir.path().join("libsysting_heap_responder.so");
+    let sockets = env.sockets();
+    for (how, prof, why) in [
+        ("yes", true, "expected 1"),
+        ("1", false, "profiling is off"),
+    ] {
+        let mut cmd = Command::new(&pair.python);
+        let out = cmd
+            .args(["-c", "print('ran')"])
+            .env(
+                "LD_PRELOAD",
+                format!("{}:{}", pair.jemalloc.display(), library.display()),
+            )
+            .env("MALLOC_CONF", format!("prof:{prof}"))
+            .env("SYSTING_HEAP_HOOKS_LISTEN", how)
+            .env("SYSTING_HEAP_HOOKS_SOCKET_DIR", &sockets)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{how}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n", "{how}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("SYSTING_HEAP_HOOKS_LISTEN") && err.contains(why),
+            "{how}: {err}"
+        );
+    }
+    assert_eq!(sockets_in(&sockets), Vec::<u32>::new());
+}
+
 #[test]
 fn asking_without_saying_how_finds_the_responder() {
     let Some(env) = setup(true) else { return };
@@ -432,8 +620,9 @@ fn a_forked_child_answers_for_itself_and_names_what_it_was_forked_with() {
         &pair,
         Run::of("service.py", &[sockets.to_str().unwrap(), "fork"]),
     );
-    let child: u32 = target.wait_for("child").parse().unwrap();
-    target.wait_for("ready");
+    let child: u32 = target.wait_for_each(&["child", "ready"])[0]
+        .parse()
+        .unwrap();
 
     let db = env.dir.path().join("child.duckdb");
     let out = ask(

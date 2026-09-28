@@ -65,9 +65,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../common/common.h"
+#include "../systing_heap_hooks.h"
 #include "py_offsets.h"
-#include "systing_heap_hooks.h"
-#include "systing_heap_hooks_python.h"
+#include "python.h"
 
 /* A slot is 64 bits in an array of addresses. */
 _Static_assert(sizeof(void *) == sizeof(uint64_t), "the python backtrace needs 64-bit addresses");
@@ -809,8 +810,12 @@ static unsigned span(unsigned have, int offset, unsigned size)
 	return end > have ? end : have;
 }
 
+static const struct shh_fork_part fork_part;
+static const char *code_map_now(void);
+
 int shh_python_prepare(shh_mallctl_fn mallctl, shh_backtrace_fn native)
 {
+	shh_at_fork(&fork_part);
 	if (atomic_load(&enabled))
 		return SHH_OK;
 
@@ -897,6 +902,7 @@ int shh_python_prepare(shh_mallctl_fn mallctl, shh_backtrace_fn native)
 	}
 	native_p = native;
 	atomic_store(&enabled, 1);
+	shh_set_code_map(code_map_now);
 	return SHH_OK;
 }
 
@@ -914,17 +920,17 @@ void systing_heap_hooks_python_stop(void)
 		close_mem();
 }
 
-void shh_python_before_fork(void)
+static void before_fork(void)
 {
 	pthread_mutex_lock(&py_lock);
 }
 
-void shh_python_after_fork_parent(void)
+static void after_fork_in_parent(void)
 {
 	pthread_mutex_unlock(&py_lock);
 }
 
-void shh_python_after_fork_child(void)
+static void after_fork_in_child(void)
 {
 	/* The child's only thread is this one. */
 	pthread_mutex_init(&py_lock, NULL);
@@ -953,6 +959,9 @@ void shh_python_after_fork_child(void)
 		close_mem();
 	}
 }
+
+static const struct shh_fork_part fork_part = {before_fork, after_fork_in_parent,
+					       after_fork_in_child};
 
 /* ---- the self-test ------------------------------------------------------ */
 
@@ -1009,14 +1018,21 @@ const char *systing_heap_hooks_python_map(void)
 	return atomic_load(&enabled) ? map_path : "";
 }
 
-void shh_python_make_map(void)
+/*
+ * The code map's path, for whoever hands the map over with a dump; its file
+ * is made now if this process has written none yet. A forked child makes its
+ * own with the first line it adds, and until then a dump of it has the
+ * stacks it was forked with and no map that names them.
+ */
+static const char *code_map_now(void)
 {
 	if (!atomic_load(&enabled))
-		return;
+		return "";
 	/* Nothing between these two allocates: a sampled allocation on this
 	 * thread would wait on the lock it holds. */
 	pthread_mutex_lock(&py_lock);
 	if (!map_made && table && table_pid == getpid())
 		append_map(NULL, 0);
 	pthread_mutex_unlock(&py_lock);
+	return map_path;
 }
