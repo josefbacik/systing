@@ -29,6 +29,13 @@ void shh_python_after_fork_child(void);
 /* Whether the calling thread is inside fork(), between the handlers. */
 int shh_forking_here(void);
 
+/*
+ * The code map's file, made now if this process has written none yet. A
+ * forked child makes its own with the first line it adds, and until then a
+ * dump of it has the stacks it was forked with and no map that names them.
+ */
+void shh_python_make_map(void);
+
 #pragma GCC visibility pop
 
 #endif

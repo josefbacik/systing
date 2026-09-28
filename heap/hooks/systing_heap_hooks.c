@@ -16,8 +16,12 @@
  *   "python"     jemalloc's own, then the allocating thread's Python frames
  *                read from the interpreter (systing_heap_hooks_python.c)
  *
+ * Apart from the backtraces, systing_heap_hooks_listen() starts the thread
+ * that answers requests for a dump (systing_heap_hooks_listen.c,
+ * experimental).
+ *
  * The library links only libdl and libpthread, and does nothing until
- * systing_heap_hooks_install() is called.
+ * systing_heap_hooks_install() or systing_heap_hooks_listen() is called.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -27,6 +31,7 @@
 #include <string.h>
 
 #include "systing_heap_hooks.h"
+#include "systing_heap_hooks_listen.h"
 #include "systing_heap_hooks_python.h"
 
 typedef shh_mallctl_fn mallctl_fn;
@@ -88,7 +93,7 @@ static void libunwind_backtrace(void **vec, unsigned *len, unsigned max_len)
 	*len = (unsigned)(n - 1);
 }
 
-static mallctl_fn find_mallctl(void)
+shh_mallctl_fn shh_find_mallctl(void)
 {
 	/* The plain name, then the prefixed names jemalloc builds export. */
 	static const char *const names[] = {"mallctl", "je_mallctl",
@@ -134,6 +139,7 @@ static void after_fork_child(void)
 	/* The child's thread is the one that forked, with the same handle. */
 	forking = 0;
 	shh_python_after_fork_child();
+	shh_listen_after_fork_child();
 	pthread_mutex_unlock(&unwind_lock);
 	/* The child's only thread is the one that forked: an install that
 	 * another thread had in progress never finishes there. install_lock is
@@ -145,6 +151,11 @@ static void after_fork_child(void)
 static void register_fork_handlers(void)
 {
 	pthread_atfork(before_fork, after_fork_parent, after_fork_child);
+}
+
+void shh_register_fork_handlers(void)
+{
+	pthread_once(&fork_handlers_once, register_fork_handlers);
 }
 
 static int load_libunwind(void)
@@ -216,7 +227,7 @@ static int install_locked(const char *backtrace, bool install)
 		return SHH_ERR_UNKNOWN_BACKTRACE;
 
 	if (!mallctl_p)
-		mallctl_p = find_mallctl();
+		mallctl_p = shh_find_mallctl();
 	if (!mallctl_p)
 		return SHH_ERR_NO_JEMALLOC;
 
@@ -289,6 +300,10 @@ const char *systing_heap_hooks_strerror(int code)
 		return "python frames: no protected way to read memory (process_vm_readv and /proc/self/mem both refused)";
 	case SHH_ERR_PY_MAP:
 		return "python frames: cannot start the code map beside the dumps (memfd_create, or the prof_prefix directory is not writable)";
+	case SHH_ERR_SOCKET_PATH:
+		return "the responder's socket: its path is too long for a Unix socket";
+	case SHH_ERR_SOCKET:
+		return "the responder's socket: cannot listen there (the directory is missing or not writable, another process answers at that path, or no thread could be started)";
 	default:
 		return "unknown error";
 	}

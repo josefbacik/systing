@@ -37,6 +37,17 @@ each worker after the fork, and keep_perf_map_across_fork() once in the
 parent before it: a child starts a perf map of its own, and without this the
 frames it inherited running from the parent (the parent's loop under every
 worker) are named in no map the child's dumps can use.
+
+Apart from the backtraces, listen() (EXPERIMENTAL: it may change) makes the
+process answer requests for a heap dump, so that one can be asked for at any moment from outside it:
+
+    systing_heap_hooks.listen()
+    # then, as the process's user or root:  systing-heap --pid PID --ask -o heap.duckdb
+
+One thread is started for it, which sleeps until someone asks, runs nothing
+of Python's and answers whatever the program's own threads are doing. The
+dump is handed over as a descriptor of an anonymous file: nothing is written
+to disk. Each process this one forks listens for itself.
 """
 
 import atexit
@@ -46,7 +57,7 @@ import stat
 import sys
 import warnings
 
-__all__ = ["install", "keep_perf_map_across_fork"]
+__all__ = ["install", "keep_perf_map_across_fork", "listen"]
 
 _LIB_NAME = "libsysting_heap_hooks.so"
 _lib = None
@@ -72,6 +83,9 @@ def _load(path):
         lib.systing_heap_hooks_python_check.restype = ctypes.c_int
         lib.systing_heap_hooks_python_map.restype = ctypes.c_char_p
         lib.systing_heap_hooks_python_stop.restype = None
+        lib.systing_heap_hooks_listen.argtypes = [ctypes.c_char_p]
+        lib.systing_heap_hooks_listen.restype = ctypes.c_int
+        lib.systing_heap_hooks_socket.restype = ctypes.c_char_p
         _lib = lib
     return _lib
 
@@ -303,3 +317,41 @@ def keep_perf_map_across_fork(strict=False):
         raise RuntimeError(message)
     warnings.warn(message, RuntimeWarning, stacklevel=2)
     return False
+
+
+_listen_in_children = False
+
+
+def listen(dir=None, strict=False, lib=None):
+    """EXPERIMENTAL: this and what asks may change.
+
+    Answer requests for a heap dump (`systing-heap --pid PID --ask`) on a
+    Unix socket in `dir`: by default the directory SYSTING_HEAP_HOOKS_SOCKET_DIR
+    names, else /tmp. The socket is this process's user's alone, and root's.
+    Returns the socket's path, or None with a warning when the process cannot
+    listen (strict=True raises instead)."""
+    global _listen_in_children
+    why = None
+    try:
+        hooks = _load(lib)
+    except OSError as e:
+        why = f"{_LIB_NAME}: {e}"
+    else:
+        rc = hooks.systing_heap_hooks_listen(None if dir is None else os.fsencode(dir))
+        if rc != 0:
+            why = hooks.systing_heap_hooks_strerror(rc).decode()
+    if why is None:
+        if not _listen_in_children:
+            # The thread that answers is not in a forked child, which is
+            # another process with another socket: it starts its own.
+            def listen_again():
+                hooks.systing_heap_hooks_listen(None if dir is None else os.fsencode(dir))
+
+            os.register_at_fork(after_in_child=listen_again)
+            _listen_in_children = True
+        return os.fsdecode(hooks.systing_heap_hooks_socket())
+    message = "systing_heap_hooks: " + why
+    if strict:
+        raise RuntimeError(message)
+    warnings.warn(message, RuntimeWarning, stacklevel=2)
+    return None

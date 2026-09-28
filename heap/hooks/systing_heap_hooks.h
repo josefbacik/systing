@@ -15,6 +15,8 @@
 #define SHH_ERR_PY_VERSION 7
 #define SHH_ERR_PY_READ 8
 #define SHH_ERR_PY_MAP 9
+#define SHH_ERR_SOCKET_PATH 10
+#define SHH_ERR_SOCKET 11
 
 #include <stddef.h>
 
@@ -58,6 +60,23 @@ void systing_heap_hooks_python_stop(void);
 
 /* The "python" backtrace itself, as jemalloc calls it. */
 void systing_heap_hooks_python_backtrace(void **vec, unsigned *len, unsigned max_len);
+
+/*
+ * EXPERIMENTAL: what is asked and answered may change.
+ *
+ * Answer requests for a heap dump on a Unix socket, from this process's own
+ * user and from root: the file .systing-heap.<pid> in `dir`, or when that is
+ * NULL in the directory SYSTING_HEAP_HOOKS_SOCKET_DIR names, else in /tmp.
+ * `systing-heap --pid PID --ask` is what asks. One thread is started for it,
+ * which sleeps until someone does. Returns SHH_OK, also when this process
+ * listens already (wherever that is), or an SHH_ERR_* code.
+ *
+ * A forked child listens nowhere until it calls this itself.
+ */
+int systing_heap_hooks_listen(const char *dir);
+
+/* EXPERIMENTAL. The socket this process answers on; "" when it does not. */
+const char *systing_heap_hooks_socket(void);
 
 /* What an SHH_* code means. */
 const char *systing_heap_hooks_strerror(int code);

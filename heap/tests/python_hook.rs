@@ -444,6 +444,7 @@ fn setup() -> Option<Env> {
         .arg(&lib)
         .arg(Path::new(HOOKS).join("systing_heap_hooks.c"))
         .arg(Path::new(HOOKS).join("systing_heap_hooks_python.c"))
+        .arg(Path::new(HOOKS).join("systing_heap_hooks_listen.c"))
         .args(["-ldl", "-lpthread"])
         .status();
     if !built.is_ok_and(|s| s.success()) {
@@ -938,6 +939,7 @@ fn built_with(env: &Env, field: &str, value: u32) -> PathBuf {
         .arg(&lib)
         .arg(dir.join("systing_heap_hooks.c"))
         .arg(dir.join("systing_heap_hooks_python.c"))
+        .arg(dir.join("systing_heap_hooks_listen.c"))
         .args(["-ldl", "-lpthread"])
         .status()
         .unwrap();

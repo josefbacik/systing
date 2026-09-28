@@ -1008,3 +1008,15 @@ const char *systing_heap_hooks_python_map(void)
 {
 	return atomic_load(&enabled) ? map_path : "";
 }
+
+void shh_python_make_map(void)
+{
+	if (!atomic_load(&enabled))
+		return;
+	/* Nothing between these two allocates: a sampled allocation on this
+	 * thread would wait on the lock it holds. */
+	pthread_mutex_lock(&py_lock);
+	if (!map_made && table && table_pid == getpid())
+		append_map(NULL, 0);
+	pthread_mutex_unlock(&py_lock);
+}

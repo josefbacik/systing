@@ -5,8 +5,9 @@ See "Python stacks" in [`../README.md`](../README.md) for when to use them.
 
 - `systing_heap_hooks.c` / `.h`: the library. It links only libdl and libpthread and does nothing until `systing_heap_hooks_install()` is called.
 - `systing_heap_hooks_python.c`: the `"python"` backtrace, which reads the allocating thread's Python frames from the interpreter.
+- `systing_heap_hooks_listen.c`: the responder (experimental), a thread that answers requests for a heap dump on a Unix socket.
 - `py_offsets.h`: the CPython struct offsets it reads, by version. Rendered from systing's pystacks offsets; `cargo test -p systing-heap hook_offsets` fails when the two differ, and rewrites the header when run with `SYSTING_HEAP_UPDATE_OFFSETS=1`.
-- `systing_heap_hooks.py`: the Python helper that loads the library with `ctypes`, checks the `"python"` backtrace against Python's own view of the stack before installing it, and can turn on perf trampolines.
+- `systing_heap_hooks.py`: the Python helper that loads the library with `ctypes`, checks the `"python"` backtrace against Python's own view of the stack before installing it, can turn on perf trampolines, and starts the responder (`listen()`, experimental).
 - `make` builds `libsysting_heap_hooks.so`; `make OUT=/dir` puts it elsewhere. It needs a C compiler only: no Python headers, no libunwind.
 
 The helper finds the library through its `lib` argument, then `SYSTING_HEAP_HOOKS_LIB`, then next to the `.py` file.
@@ -28,6 +29,24 @@ It runs inside malloc, in the service's process, mostly on threads that do not h
 - Where reads go through `/proc/self/mem`, a forked child closes its parent's descriptor and opens its own.
 - jemalloc's own backtrace is called exactly as jemalloc calls it, with the whole array.
 - A forked child keeps the ids it was forked with, and its code map begins with its parent's lines: jemalloc keeps the stacks sampled before the fork, and the child's dumps hold them.
+
+## The responder (experimental)
+
+> **Very experimental.**
+> It puts a thread and a socket of ours in the service, and what it is asked and answers may change, as may `systing-heap --ask` with it.
+> Expect it to change, and do not build on it yet.
+
+`systing_heap_hooks.listen()`, or `systing_heap_hooks_listen(dir)` from C, makes the process answer requests for a heap dump: `systing-heap --pid PID --ask` asks (see "Asking a live process" in [`../README.md`](../README.md)).
+It is apart from the backtraces: a process can have either without the other.
+
+- One thread is started, named `heap-responder`. It waits in `accept()` until someone asks, and costs nothing until then.
+- The socket is a file, `.systing-heap.<pid>`, in `dir`, else in the directory `SYSTING_HEAP_HOOKS_SOCKET_DIR` names, else in `/tmp`. Its path must fit a Unix socket's address (107 bytes).
+- It answers the process's own user and root: the file is made for its owner alone whatever the program's umask, and the peer's credentials are checked as well.
+- jemalloc writes the dump into an anonymous file (`memfd_create`), which is then sealed and handed over as a descriptor, with the code map's when the `"python"` backtrace writes one. Nothing is written to disk.
+- Every signal is blocked on the thread, so no handler of the program's runs there. It calls nothing of Python's, and takes no lock of the program's.
+- Requests are answered one at a time, and a peer that says or reads nothing is given up on after 5 seconds.
+- A process that is killed leaves its socket's file behind. The next process to listen under that name takes it over if no one answers there, and a process that exits removes its own.
+- **fork.** The thread is not in a forked child, which lets go of its parent's socket; a child that is to answer calls `listen()` itself. The Python helper does that in every child. Python 3.12 and later warn (`DeprecationWarning`) when a process with more than one thread forks, and the responder is a thread.
 
 ## Installing from C
 
