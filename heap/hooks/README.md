@@ -5,7 +5,7 @@ What a service loads to get more than jemalloc gives by itself. There are two pi
 - **the backtraces**: other ways of capturing a sampled allocation's stack, which put Python functions in the stacks;
 - **the responder** (experimental): a thread that answers requests for a dump.
 
-See "Python stacks" and "Asking a live process" in [`../README.md`](../README.md) for when to use them.
+See "Python stacks" and "Asking a live process" in [`../README.md`](../README.md) for when to use them, and "Which way to go" in [`../../docs/HEAP_SNAPSHOTS.md`](../../docs/HEAP_SNAPSHOTS.md) for which of them a service wants.
 A service that wants neither loads nothing of this: jemalloc's own snapshots, `--snoop` and `--ask python` need none of it.
 
 ## What to take, for what

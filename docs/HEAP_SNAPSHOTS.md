@@ -12,9 +12,231 @@ For every column of the tables and more queries, see the tool's README, [`heap/R
 - **Python services** also set `PYTHONMALLOC=malloc`, so jemalloc sees all of Python's memory.
 - **To see Python functions in the stacks** (part 2): one call at startup. Each Python function then shows with its file and line.
 - **To collect them**: run `systing-heap` on the snapshot folder, for a DuckDB database or a Perfetto trace.
+- **Not sure which of these a service needs?** "Which way to go", next, starts with the simplest way, then asks the questions in order: each answer says what to set up and what to run.
+
+## Which way to go
+
+### Start here
+
+A service with no special need takes the simplest way: jemalloc writes a snapshot file at a regular interval, with native stacks.
+It is environment variables only, nothing of systing's is loaded into the service, no code changes, and none of it is experimental.
+That is the recipe "Files at an interval" below, and part 1 of this guide in full.
+
+Go on to the questions only if that is not enough: a snapshot is wanted at a moment of someone's choosing, or the stacks are to name Python functions.
+
+For a service that is running and that someone else set up, there is nothing to choose and nothing to know beforehand: `systing-heap --pid PID --check` (experimental) looks at what it has, prints the commands that will work on it, and says which recipe would give it more.
+
+### The questions
+
+Each answer says what to set up in the service (the write side) and what to run to collect (the read side), and names the recipe that has both in full.
+What is marked (exp.) is experimental: expect it to change.
+
+```text
+Can the service be started again with new settings?
+│
+├─ no: it runs as it is, and is to be looked at now
+│    Write side:  nothing can be added. It was started with prof:true,
+│                 or nothing here works until it is started again.
+│    Read side:   systing-heap --pid PID --check                          (exp.)
+│                 It looks at what the service has and prints, whole,
+│                 the commands that will work on it. They are of these,
+│                 each after "systing-heap -o heap.duckdb":
+│                 it writes files ...... --pid PID --latest-only PREFIX
+│                 it has a responder ... --pid PID --ask responder        (exp.)
+│                 it is CPython 3.14 ... --pid PID --ask python           (exp.)
+│                 it is anything else .. --pid PID --snoop                (exp.)
+│
+└─ yes: when is a snapshot wanted?
+   │
+   ├─ all the time, to see how the heap grew             THE DEFAULT
+   │    Write side:  prof_prefix and lg_prof_interval in MALLOC_CONF
+   │    Read side:   systing-heap -o heap.duckdb PREFIX
+   │    Recipe:      Files at an interval
+   │
+   ├─ at moments the service knows of (a request, a signal)
+   │    Write side:  the service calls mallctl("prof.dump")
+   │    Read side:   systing-heap -o heap.duckdb PREFIX
+   │    Recipe:      Files when the service calls
+   │
+   └─ at a moment someone outside chooses: what may be added to it?
+      │
+      ├─ environment variables and a library, no code
+      │    Write side:  the responder preloaded,
+      │                 SYSTING_HEAP_HOOKS_LISTEN=1                       (exp.)
+      │    Read side:   systing-heap -o heap.duckdb --pid PID --ask responder  (exp.)
+      │    Recipe:      Asked, by environment
+      │
+      ├─ a call in its code
+      │    Write side:  listen()                                          (exp.)
+      │    Read side:   systing-heap -o heap.duckdb --pid PID --ask responder  (exp.)
+      │    Recipe:      Asked, by a call
+      │
+      └─ nothing
+         ├─ it is CPython 3.14, and its main thread runs Python
+         │  (an event loop, a loop over requests)
+         │    Write side:  nothing more
+         │    Read side:   systing-heap -o heap.duckdb --pid PID --ask python  (exp.)
+         │    Recipe:      Asked, a Python 3.14
+         │
+         └─ it is anything else
+              Write side:  nothing more
+              Read side:   systing-heap -o heap.duckdb --pid PID --snoop  (exp.)
+              Recipe:      Read from memory
+
+On any of these ways:
+
+  Are Python functions wanted in the stacks, where the interpreter's own would be?
+       Write side:  the hooks library, and install(backtrace="python")
+       Read side:   nothing to add. With --ask python or --snoop,
+                    add --perf-map-dir DIR
+       Recipe:      Python functions in the stacks
+
+  SQL, or flamegraphs?
+       Read side:   -o heap.duckdb for SQL,
+                    -o heap.pb for flamegraphs at ui.perfetto.dev
+```
+
+The ways add up: a service can write files at an interval, answer when asked, and name Python functions in both.
+
+What comes back is not the same on every way.
+Files and both ways of `--ask` give jemalloc's own dump, written under its locks: it is whole.
+`--snoop` reads the profile while the service changes it, so stacks can be missing, and the database says how each such read went (`heap_live_read`).
+Where there is a choice, asking comes before snooping.
+
+### The recipes
+
+In each, `PID` is the service's process as the machine the tool runs on numbers it, and `/heap-dumps/jeprof` stands for the `prof_prefix` the service is given.
+Every recipe has jemalloc preloaded and `prof:true`; a Python service also sets `PYTHONMALLOC=malloc` in every one of them, so that jemalloc sees all of Python's memory.
+A tool that runs outside the service's container adds `--pid PID --latest-only` to a command that reads files.
+
+#### Files at an interval (the default)
+
+```yaml
+# write side: the service's environment
+LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+MALLOC_CONF: prof:true,prof_prefix:/heap-dumps/jeprof,lg_prof_sample:19,lg_prof_interval:30
+```
+
+```bash
+# read side
+systing-heap -o heap.duckdb /heap-dumps/jeprof
+```
+
+`/heap-dumps` is a folder the service can write to.
+Part 1 says what each setting means and how to size the interval.
+
+#### Files when the service calls
+
+```yaml
+# write side: the service's environment
+LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+MALLOC_CONF: prof:true,prof_prefix:/heap-dumps/jeprof
+```
+
+```c
+/* write side: in the service, where it wants a snapshot */
+mallctl("prof.dump", NULL, NULL, NULL, 0);
+```
+
+```bash
+# read side
+systing-heap -o heap.duckdb /heap-dumps/jeprof
+```
+
+"Optional: a snapshot on demand" below has the call in Python.
+
+#### Asked, by environment (experimental)
+
+```yaml
+# write side: the service's environment
+LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2:/opt/systing/libsysting_heap_responder.so
+MALLOC_CONF: prof:true
+SYSTING_HEAP_HOOKS_LISTEN: "1"      # "fork" if it forks workers that are to answer too
+```
+
+```bash
+# read side
+systing-heap -o heap.duckdb --pid PID --ask responder
+```
+
+Nothing is written to disk, and the service answers whatever its threads are doing.
+Every program the service starts with that environment listens as well: [`heap/hooks`](../heap/hooks) says what that means and what else the responder does in a service.
+
+#### Asked, by a call (experimental)
+
+```yaml
+# write side: the service's environment
+LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+MALLOC_CONF: prof:true
+```
+
+```python
+# write side: in the service, once, at startup
+import systing_heap_hooks
+systing_heap_hooks.listen()
+```
+
+```bash
+# read side
+systing-heap -o heap.duckdb --pid PID --ask responder
+```
+
+A C, C++ or Rust service calls `systing_heap_hooks_listen(NULL)` from `libsysting_heap_responder.so`.
+
+#### Asked, a Python 3.14 (experimental)
+
+```yaml
+# write side: the service's environment
+LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+MALLOC_CONF: prof:true
+PYTHONMALLOC: malloc
+```
+
+```bash
+# read side
+systing-heap -o heap.duckdb --pid PID --ask python
+```
+
+The tool writes to the service's memory and the service runs a short script.
+A service whose main thread waits in one call (a sleep, a join) does not answer, and after 30 seconds the tool says so: "Read from memory" is what is left for it.
+
+#### Read from memory (experimental)
+
+```yaml
+# write side: the service's environment
+LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+MALLOC_CONF: prof:true
+```
+
+```bash
+# read side
+systing-heap -o heap.duckdb --pid PID --snoop
+```
+
+Nothing is done to the service. Stacks can be missing from what is read.
+
+#### Python functions in the stacks
+
+Added to any recipe above, for CPython 3.12 to 3.14:
+
+```python
+# write side: in the service, once, at startup
+import systing_heap_hooks
+systing_heap_hooks.install(backtrace="python")
+```
+
+```bash
+# read side: nothing to add where files are read or the responder answers.
+# With --ask python or --snoop, say where the service's code map is:
+systing-heap -o heap.duckdb --pid PID --snoop --perf-map-dir /heap-dumps
+```
+
+`libsysting_heap_hooks.so` and `systing_heap_hooks.py` are in the image, side by side.
+Part 2 has the rest, and what to do on a Python the library refuses.
 
 ## What goes into the service, for what it gets
 
+The ways above, side by side.
 Most of what is here needs nothing of systing's in the service: jemalloc and its settings are enough.
 The hooks library is for two things only, Python functions in the stacks and an answer on request, and a service takes either without the other.
 Only the first of the two needs a line of the service changed.
