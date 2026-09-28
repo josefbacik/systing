@@ -160,6 +160,7 @@ pub fn parse(text: &str) -> Result<Snapshot> {
                 live_bytes: counts[1],
                 alloc_objects: counts[2],
                 alloc_bytes: counts[3],
+                exact_estimates: None,
             }),
             None if totals.is_none() && samples.is_empty() => totals = Some(counts),
             None => bail!("line {lineno}: t* line with no stack"),
@@ -190,6 +191,7 @@ pub fn parse(text: &str) -> Result<Snapshot> {
         maps,
         perf_map: None,
         py_code: None,
+        live_read: None,
     })
 }
 
@@ -235,6 +237,7 @@ MAPPED_LIBRARIES:
                 live_bytes: 5028235,
                 alloc_objects: 7,
                 alloc_bytes: 900,
+                exact_estimates: None,
             }
         );
         assert_eq!(s.maps.mappings().len(), 2);

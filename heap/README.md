@@ -137,6 +137,45 @@ No other user in the container can then name that process's frames.
 A binary, a perf map or a code map that is on a FUSE or network filesystem beneath the root (a bucket or a file server mounted into the container) is left unread, with a warning, and its frames stay unresolved: whoever wrote the dumps chose those paths, a read there would be made with the reader's authority on storage the container only mounts, and it can stall without end.
 Beneath a root, names come from the binaries' own symbol tables and the perf map: debug information is not read there, so there are no inlined frames, no file and line, and no name that lives only in debug information. The symbolizer looks a binary's separate debug file up (its debug link, its `.dwp`) by paths of its own making, which are the reader's and not the container's, and the name it looks up is the binary's to choose.
 
+## Reading a live process (experimental)
+
+> **Very experimental.**
+> This reads jemalloc's private data structures out of a running process, and jemalloc's authors are free to change them.
+> A jemalloc it does not recognise is refused, with a reason; it is never guessed at.
+> Expect it to change, and do not build on it yet.
+
+`--snoop` takes the heap profile a process holds right now, from its memory, instead of from a snapshot file:
+
+```bash
+systing-heap -o heap.duckdb --pid 4242 --snoop
+systing-heap -o heap.pb --pid 4242 --snoop        # or a Perfetto trace
+```
+
+- **No file, no wait.** No snapshot is written by jemalloc or by the tool, so the process needs no `prof_prefix`, `lg_prof_interval` or `prof_final`, and no disk: only `prof:true` in its `MALLOC_CONF` (and a `lg_prof_sample` that suits the question, see Sampling and unbiasing). The only file the tool creates is its output.
+- **Nothing is done to the process.** It is not stopped, signalled or made to run our code, and `ptrace` is not used: nothing attaches to it. The tool reads the process's memory (`/proc/PID/mem`), which the kernel answers with an error for an address that is gone, so a read can neither fault nor crash the process; also its `maps` (to name frames), its `status` (the pid it knows itself by) and, only when the library has no `lg_prof_sample` symbol, its `environ`, for the sampling period in `MALLOC_CONF` (nothing else of it is used or written out). Each of those is size-capped.
+- **Not a still picture.** jemalloc's locks are not taken (a dump takes them while it adds up), so a stack's counts can be from slightly different moments. Memory that was freed and reused meanwhile is skipped, and a table swapped for another is read again. jemalloc also rebuilds its table while it is still meeting new stacks, storing the new table before it has put the entries in it; the entries found are compared with the table's own count for that (a few entries out is a busy process, and is let go), and a read that keeps disagreeing is used anyway, with the summary saying the profile may be missing stacks. The summary line says when a walk was redone or something skipped; run it again if it matters. It has no word for an entry jemalloc was carrying between cells, or for a subtree hidden while a tree was being rotated: a record missed that way raises no skip. A tree cut at 65,536 records is counted as a skipped record.
+- **Who may.** As for `--pid`, the tool opens the process's root; it also needs to read the process's memory, which needs no capability when the tool runs as the same user as the process, the process is dumpable (it is unless it is setuid, changed its user, or said otherwise with `prctl(PR_SET_DUMPABLE, 0)`), and `kernel.yama.ptrace_scope` permits it: at 0 nothing more is asked; at 1, the default on many distributions, only a process's ancestors may, unless the process itself allows it with `prctl(PR_SET_PTRACER, ...)`; at 2 and 3 it cannot be done without `CAP_SYS_PTRACE`, and at 3 not with it either. Any other user, root included, needs `CAP_SYS_PTRACE`. The process is pinned once, by opening `/proc/PID`, and its memory, maps, root and the rest are all opened through that handle: a pid that comes to name another process midway is never mixed in, and a process that has exited is an error.
+- **Untrusted input is bounded.** The process and its container's files are not trusted, and each of these is capped, over the whole run and not per file: the header sizes read from an ELF file (and how many symbol tables it may have); the size of the profile table; the per-thread records and the stack frames a walk holds; how much of a library's data is scanned and how much is read deciding whether something is the table; how many files are looked in; and the size of the `/proc` files read. A file that is on a FUSE or network filesystem, or is not a regular file, is left unread, and so are that file's pages in the process. The whole snoop is also given up on after 3 minutes. A hostile process can make a run fail or refuse, and can make it take up to that long, but not make it read or allocate without limit. File names from `maps` are printed with control characters escaped. One case is not closed: a page behind a FUSE server that takes the read and never answers keeps a thread in the kernel, so after the deadline's error the process may still not exit until the server does.
+- **How the read went is kept with the snapshot.** What the summary line says is also a row of `heap_live_read` in the database (see Tables): what was skipped, what was done again, whether the table held still, and what the layout checks counted. Whoever opens the database later can tell a clean read from one that was not. A Perfetto trace has no place for it, and there the summary line is the only record.
+- **The snapshot is like a dump's.** One `heap_snapshot` row with `dump_trigger` `snoop`, its `heap_sample` rows, frames named from the binaries as for a dump. The process's pid in it is the one the process knows itself by (its innermost pid namespace), as a dump's file name has.
+- **The counts are a dump's, the estimates are jemalloc's own.** `live_*` and `alloc_*` are the raw sampled counts jemalloc holds, as a dump written with `prof_unbias:false` prints them; the tests compare them one by one against such a dump of the same process, with `prof_accum` on and off. `est_*` is the estimate jemalloc keeps for each stack, summed object by object as they were sampled. A dump cannot carry that: it prints counts that are scaled back through the sampling period, so `est_*` here and the one from a dump differ by rounding (the tests check the total to 0.5%). It does not depend on the sampling period at all, so a period the tool could not learn cannot spoil it.
+
+**How it finds the profile.** The table that holds every backtrace, `bt2gctx`, is a `static` in jemalloc: it has no exported name.
+A build that keeps its `.symtab` names it. A stripped one, such as Debian's and Ubuntu's `libjemalloc2`, does not, and there the table is found by its shape instead: the only static in the library that is a hash table of jemalloc's own backtrace records, each of which points back at itself.
+Either way what is found is checked against that shape before it is used, and every structure read afterwards is checked against jemalloc's own invariants, so memory that was freed and reused meanwhile is skipped.
+The code is in `src/snoop/`, and nothing else in the crate knows how it works.
+
+**What it knows.** The structures as jemalloc 5.3.0 and the current `dev` branch lay them out, on 64-bit Linux. x86-64 is what has been run; aarch64 lays them out the same on paper, but nothing has run on it (CI's arm64 job does not run these tests). Tested against Ubuntu's `libjemalloc2` 5.3.0 (stripped), jemalloc 5.3.0 built from source, and `dev`, with `prof_accum` on and off and `prof_unbias` on and off. It has not been run on jemalloc 4 or 5.0 to 5.2, on a fork with its own changes, or on one linked statically into the program (the program itself is looked in when no jemalloc library is mapped, but that is untried).
+
+**What it refuses.** There is no version check: a version string is a label, and a fork with another one would be refused for no reason. What is checked is the data itself. Every backtrace record and every thread record must have jemalloc's own invariants (a record's key is the address of its `bt`, a thread record points back at its backtrace, its state is one of four values, its links are aligned). Over a whole walk, and refused only for a large share since a moving heap breaks each for a few records: that most records can be read at all; that the thread records are in the order jemalloc keeps them in (a left child below its parent, on the thread, then the record's id: this ties the link offsets to the key offsets); and that the counters are ones jemalloc keeps (each sampled object adds at least 8 to the shifted count and at least its size to the unbiased bytes: this pins the counters' order). The summary line prints what these checks had to go on (links and counter sets judged, and how many were out) and says of each when it had fewer than eight records to judge (a process where each stack is allocated from by one thread has no links at all). A jemalloc that differs in a way none of these sees, such as a fork that moves the counters and keeps those relations, would be read wrongly instead of refused; only the comparison with a dump on the builds above covers that. A table found by a symbol must also be one in memory (its two function pointers are in the library's code, its entries backtrace records); if the symbol does not name it, which a library replaced on disk under a running process does, the memory is looked at by its shape instead.
+
+**Limits.**
+
+- **Sample period.** The `sample_period` in the snapshot comes from the library's symbols when it has them; else from the `MALLOC_CONF` the process started with, else jemalloc's default (2^19), and the summary line says which. `mallctl("prof.reset")` can change the period afterwards. A wrong period changes only that label: the estimates do not use it, except for a stack whose counter wrapped (see `prof.reset`), which gets the pipeline's estimate at that period (a test runs a process whose period only its own program sets, so a stripped library cannot say it).
+- **`prof.reset`.** jemalloc takes a freed object's weight off at the period in force when it is freed, so after a reset to another period its unbiased counters can be off, or pass zero and wrap. A stack whose counter wrapped gets no estimate of its own, and the one its raw counts give at the snapshot's period instead; a share of records like that refuses the run, and says why. Also, a dump leaves out the counters of threads jemalloc has marked expired by a reset, and this does not look at that mark, so they may be counted; not tested.
+- **Python frames.** A Python function's name comes from the hooks' code map, which the hook writes beside where the dumps would go (the directory of `prof_prefix`), and there is no dump here to look beside: pass `--perf-map-dir` that directory, or the tool warns and the frames stay unnamed. (That map is the one file the hook writes; the tool and jemalloc write none.) A perf trampoline's map is found in the container's `/tmp` as before.
+- **A young or idle heap.** A process that has sampled nothing yet has nothing to report, and the tool says so.
+
 ## Python stacks
 
 A Python program's heap stacks can show its Python functions among the native frames, each with its file and line:
@@ -299,11 +338,11 @@ A finer period gives a closer estimate, but sampling itself costs memory: jemall
 |---|---|
 | `id` | Snapshot id, dense within the trace |
 | `format` | `jemalloc` |
-| `source_path` | The file read |
+| `source_path` | The file read; `/proc/PID/mem` for a snoop |
 | `upid` | `process.upid` of the pid in the file name, as the writing process saw it in its own pid namespace; NULL if the name has none |
 | `seq` | The allocator's dump sequence number |
-| `dump_trigger` | `interval` (every `lg_prof_interval` bytes), `manual` (`mallctl("prof.dump")`), `gdump` (new high-water mark), `final` (at exit) |
-| `dumped_at_unix_ns` | The file's modification time when read, wall-clock; a copy that does not keep times moves it |
+| `dump_trigger` | `interval` (every `lg_prof_interval` bytes), `manual` (`mallctl("prof.dump")`), `gdump` (new high-water mark), `final` (at exit), `snoop` (read from the live process, see above) |
+| `dumped_at_unix_ns` | The file's modification time when read, wall-clock; a copy that does not keep times moves it. For a snoop, the time of the read |
 | `sample_period` | Mean bytes between samples (`2^lg_prof_sample`) |
 
 `heap_sample` has one row per distinct allocation stack in a snapshot.
@@ -316,12 +355,33 @@ A finer period gives a closer estimate, but sampling itself costs memory: jemall
 | `est_alloc_objects`, `est_alloc_bytes` | Estimated cumulative allocations since start; 0 unless jemalloc ran with `prof_accum:true` |
 | `live_objects`, `live_bytes`, `alloc_objects`, `alloc_bytes` | The sampled counts as jemalloc wrote them, before unbiasing. Never add them up as totals |
 
+`heap_live_read` has one row per snapshot that was read from a live process (`--snoop`, experimental), and none for a dump: how the read went.
+
+| Column | Meaning |
+|---|---|
+| `snapshot_id` | `heap_snapshot.id` |
+| `found_by` | `symbol` (the library names the profile table) or `shape` (a stripped library: found by what it looks like) |
+| `object_path` | The file the profile was found in, as the process maps it |
+| `sample_period_from` | Where `heap_snapshot.sample_period` is from: `symbols` (read from the process), `malloc_conf` (the process's environment), or `default`, which is a guess. The estimates do not depend on it |
+| `walks_redone` | Walks of the profile done again, because the table changed under one or records were skipped |
+| `unsteady` | The table was changing during every walk, so the snapshot may be missing stacks |
+| `backtraces_read`, `backtraces_skipped` | Backtrace records read, and those skipped because they were not (or no longer) jemalloc's. Read counts every backtrace, also one with nothing live, which has no `heap_sample` row |
+| `thread_records_read`, `thread_records_skipped` | The same for the per-thread counters under them. A skipped record's counts are missing from its stack |
+| `links_checked`, `links_out_of_order` | Parent and child thread records compared for the order jemalloc keeps them in, and those out of it |
+| `counters_checked`, `counters_off` | Thread records whose counters were compared with each other, and those that cannot be jemalloc's |
+| `reads`, `bytes_read`, `duration_ms` | What the read cost: reads of the process's memory, their bytes, and the time taken |
+
+A read is clean when `unsteady` is false and the four of `backtraces_skipped`, `thread_records_skipped`, `links_out_of_order` and `counters_off` are 0 (see Queries).
+Clean means that nothing was seen to go wrong, not that the counts are exact: a stack's counters can still be from slightly different moments, and a record hidden while jemalloc rotated a tree raises no skip.
+A check with fewer than 8 records (`links_checked`, `counters_checked`) had too little to judge the layout by.
+
 A total over many rows is close; one row's estimate is only as good as the samples behind it, about ±1/√`live_objects`.
 One sampled 256-byte object at a 16 KiB period reads 16,512 bytes, give or take all of it, so check `live_objects` before trusting a small stack's estimate.
 
 Pids are the writing process's own, in its pid namespace.
 Two containers whose main process is pid 1 share one `process` row when their dumps are read into one database, and heap rows carry no host or container of their own; `source_path` says where each came from.
 A DuckDB merge keeps these tables; a schema-25 reader's merge, or an export to parquet and back, drops them without a message.
+`heap_live_read` is from schema 28: a merge by a reader older than that keeps the snapshot and drops how its read went.
 
 ## Queries
 
@@ -359,6 +419,19 @@ JOIN heap_snapshot hs ON hs.trace_id = h.trace_id AND hs.id = h.snapshot_id
 JOIN stack_frames sf ON sf.trace_id = h.trace_id AND sf.id = h.stack_id
 WHERE hs.dump_trigger = 'final'
 ORDER BY h.est_live_bytes DESC;
+```
+
+The snapshots read from a live process, and whether each read was clean (no row in `heap_live_read` is a dump):
+
+```sql
+SELECT s.trace_id, s.id, r.found_by, r.sample_period_from, r.walks_redone,
+       NOT r.unsteady
+         AND r.backtraces_skipped + r.thread_records_skipped = 0
+         AND r.links_out_of_order + r.counters_off = 0 AS clean,
+       r.backtraces_skipped, r.thread_records_skipped
+FROM heap_snapshot s
+JOIN heap_live_read r ON r.trace_id = s.trace_id AND r.snapshot_id = s.id
+ORDER BY s.trace_id, s.id;
 ```
 
 Growth between each process's first and last snapshot, by stack.

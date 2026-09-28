@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "systing"
-version = "1.24.2"
+version = "1.25.0"
 dependencies = [
  "anyhow",
  "arrow 54.3.1",

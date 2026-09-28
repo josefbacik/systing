@@ -1,0 +1,322 @@
+//! Finding a few named symbols in an ELF file's `.symtab`.
+//!
+//! A stripped library has no `.symtab`, and then nothing is found; the caller
+//! goes on to look for the data by its shape. The file may have been chosen
+//! by whoever runs in the container, so every size read from it is bounded.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::FileExt;
+
+/// The most of a symbol or string table that is read.
+const MAX_TABLE: u64 = 256 << 20;
+const MAX_SECTIONS: u64 = 65_535;
+const MAX_SEGMENTS: u64 = 4096;
+/// Real header entries are 56 and 64 bytes; the file says how big it claims.
+const MAX_HEADER_ENTRY: u64 = 128;
+
+const SHT_SYMTAB: u32 = 2;
+/// Symbol types 0 (none) and 1 (object) are data; 2 is a function, 6 a
+/// thread-local.
+const STT_OBJECT: u8 = 1;
+const PT_LOAD: u32 = 1;
+const ET_EXEC: u16 = 2;
+
+/// What was found in one file.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Symbols {
+    /// A fixed-address executable, whose symbols are addresses as they are.
+    /// Anything else (a shared object, a PIE) is loaded at some base.
+    pub fixed_address: bool,
+    /// The lowest virtual address of a loadable segment.
+    pub min_load_vaddr: u64,
+    /// The addresses of the requested symbols that the file defines.
+    pub found: HashMap<&'static str, u64>,
+}
+
+impl Symbols {
+    /// Where the file's first page is mapped, given the mapping of its start:
+    /// added to a symbol's address it gives the symbol's address in memory.
+    pub fn load_bias(&self, image_start: u64) -> u64 {
+        if self.fixed_address {
+            0
+        } else {
+            image_start.wrapping_sub(self.min_load_vaddr & !0xfff)
+        }
+    }
+}
+
+fn invalid(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("not a usable ELF file: {what}"),
+    )
+}
+
+fn u16_at(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
+}
+fn u32_at(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+}
+fn u64_at(b: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+}
+
+/// Look up `wanted` in `file`'s `.symtab`.
+pub fn find(file: &File, wanted: &[&'static str]) -> io::Result<Symbols> {
+    let mut eh = [0u8; 64];
+    file.read_exact_at(&mut eh, 0)?;
+    // ELF, 64-bit, little endian: the layouts here are those of x86-64 and
+    // aarch64 Linux.
+    if &eh[..4] != b"\x7fELF" || eh[4] != 2 || eh[5] != 1 {
+        return Err(invalid("not 64-bit little-endian ELF"));
+    }
+    let e_type = u16_at(&eh, 16);
+    let (e_phoff, e_shoff) = (u64_at(&eh, 32), u64_at(&eh, 40));
+    let (e_phentsize, e_phnum) = (u16_at(&eh, 54) as u64, u16_at(&eh, 56) as u64);
+    let (e_shentsize, e_shnum) = (u16_at(&eh, 58) as u64, u16_at(&eh, 60) as u64);
+
+    let mut out = Symbols {
+        fixed_address: e_type == ET_EXEC,
+        ..Default::default()
+    };
+
+    if !(56..=MAX_HEADER_ENTRY).contains(&e_phentsize) || e_phnum > MAX_SEGMENTS {
+        return Err(invalid("program headers"));
+    }
+    let mut min_vaddr: Option<u64> = None;
+    for i in 0..e_phnum {
+        let mut ph = [0u8; 56];
+        file.read_exact_at(&mut ph, e_phoff.saturating_add(i * e_phentsize))?;
+        if u32_at(&ph, 0) == PT_LOAD {
+            let vaddr = u64_at(&ph, 16);
+            min_vaddr = Some(min_vaddr.map_or(vaddr, |m| m.min(vaddr)));
+        }
+    }
+    out.min_load_vaddr = min_vaddr.unwrap_or(0);
+
+    // No section headers: nothing to look symbols up in.
+    if e_shnum == 0 || e_shoff == 0 {
+        return Ok(out);
+    }
+    if !(64..=MAX_HEADER_ENTRY).contains(&e_shentsize) || e_shnum > MAX_SECTIONS {
+        return Err(invalid("section headers"));
+    }
+    let mut shdrs = vec![0u8; (e_shnum * e_shentsize) as usize];
+    file.read_exact_at(&mut shdrs, e_shoff)?;
+    let sh = |i: u64| &shdrs[(i * e_shentsize) as usize..];
+
+    for i in 0..e_shnum {
+        let s = sh(i);
+        if u32_at(s, 4) != SHT_SYMTAB {
+            continue;
+        }
+        let (sym_off, sym_size) = (u64_at(s, 24), u64_at(s, 32));
+        let link = u32_at(s, 40) as u64;
+        if link >= e_shnum || sym_size > MAX_TABLE {
+            return Err(invalid("symbol table"));
+        }
+        let (str_off, str_size) = (u64_at(sh(link), 24), u64_at(sh(link), 32));
+        if str_size > MAX_TABLE {
+            return Err(invalid("string table"));
+        }
+        let mut strtab = vec![0u8; str_size as usize];
+        file.read_exact_at(&mut strtab, str_off)?;
+
+        // A name longer than every one wanted cannot be one, so no name is
+        // looked at past that: a table with no NUL in it must not cost a scan
+        // of the whole table for each of millions of symbols.
+        let window = wanted.iter().map(|w| w.len()).max().unwrap_or(0) + 1;
+        // In chunks: a large program's table has millions of entries.
+        const ENTRY: u64 = 24;
+        const CHUNK: u64 = 1 << 20;
+        let mut done = 0;
+        while done + ENTRY <= sym_size {
+            let len = CHUNK.min(sym_size - done) / ENTRY * ENTRY;
+            let mut buf = vec![0u8; len as usize];
+            let at = sym_off
+                .checked_add(done)
+                .ok_or_else(|| invalid("symbol table"))?;
+            file.read_exact_at(&mut buf, at)?;
+            for e in buf.as_chunks::<24>().0 {
+                let (name, shndx, value) = (u32_at(e, 0) as usize, u16_at(e, 6), u64_at(e, 8));
+                // What is wanted is data: an object, or a symbol with no type.
+                // A function or a thread-local of the same name is not it.
+                let kind = e[4] & 0xf;
+                if shndx == 0 || value == 0 || name >= strtab.len() || kind > STT_OBJECT {
+                    continue;
+                }
+                let tail = &strtab[name..(name + window).min(strtab.len())];
+                let Some(len) = tail.iter().position(|&c| c == 0) else {
+                    continue;
+                };
+                let name = &tail[..len];
+                if let Some(&w) = wanted.iter().find(|w| w.as_bytes() == name) {
+                    out.found.entry(w).or_insert(value);
+                }
+            }
+            done += len;
+        }
+        // A file has one symbol table. Reading another that the same bytes
+        // could be made to describe would only multiply the cost.
+        break;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[no_mangle]
+    #[used]
+    pub static HEAP_SNOOP_ELF_TEST_SYMBOL: u64 = 0x5eed;
+
+    /// This test binary's own symbol table names the static above; with the
+    /// load bias from /proc/self/maps its address is where the static is.
+    #[test]
+    fn a_symbol_is_found_at_its_address_in_memory() {
+        let exe = File::open("/proc/self/exe").unwrap();
+        let syms = find(
+            &exe,
+            &["heap_snoop_elf_test_symbol", "HEAP_SNOOP_ELF_TEST_SYMBOL"],
+        )
+        .unwrap();
+        let value = syms.found["HEAP_SNOOP_ELF_TEST_SYMBOL"];
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let exe_path = std::fs::read_link("/proc/self/exe").unwrap();
+        let image_start = crate::maps::Maps::parse(&maps)
+            .mappings()
+            .iter()
+            .filter(|m| m.path == exe_path.to_str().unwrap())
+            .map(|m| m.start - m.offset)
+            .min()
+            .unwrap();
+        let addr = value + syms.load_bias(image_start);
+        assert_eq!(addr, &HEAP_SNOOP_ELF_TEST_SYMBOL as *const u64 as u64);
+        assert!(!syms.found.contains_key("heap_snoop_elf_test_symbol"));
+    }
+
+    /// A little ELF file: a header, three section headers (null, symtab,
+    /// strtab) and the two tables.
+    fn tiny_elf(
+        dir: &std::path::Path,
+        shentsize: u16,
+        shnum: u16,
+        symtab: &[u8],
+        strtab: &[u8],
+    ) -> File {
+        let mut b = vec![0u8; 256];
+        b[..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+        b[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[40..48].copy_from_slice(&64u64.to_le_bytes()); // e_shoff
+        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[58..60].copy_from_slice(&shentsize.to_le_bytes());
+        b[60..62].copy_from_slice(&shnum.to_le_bytes());
+        let sec = |b: &mut Vec<u8>, i: usize, ty: u32, off: u64, size: u64, link: u32| {
+            let at = 64 + i * 64;
+            b[at + 4..at + 8].copy_from_slice(&ty.to_le_bytes());
+            b[at + 24..at + 32].copy_from_slice(&off.to_le_bytes());
+            b[at + 32..at + 40].copy_from_slice(&size.to_le_bytes());
+            b[at + 40..at + 44].copy_from_slice(&link.to_le_bytes());
+        };
+        sec(&mut b, 1, SHT_SYMTAB, 256, symtab.len() as u64, 2);
+        sec(
+            &mut b,
+            2,
+            3,
+            256 + symtab.len() as u64,
+            strtab.len() as u64,
+            0,
+        );
+        b.extend_from_slice(symtab);
+        b.extend_from_slice(strtab);
+        let path = dir.join("tiny.elf");
+        std::fs::write(&path, b).unwrap();
+        File::open(path).unwrap()
+    }
+
+    fn symbol(name: u32, value: u64) -> [u8; 24] {
+        let mut e = [0u8; 24];
+        e[..4].copy_from_slice(&name.to_le_bytes());
+        e[6..8].copy_from_slice(&1u16.to_le_bytes()); // defined in section 1
+        e[8..16].copy_from_slice(&value.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn a_file_that_claims_enormous_header_entries_is_refused_not_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        // 65535 sections of 65535 bytes each would be 4 GiB.
+        let f = tiny_elf(dir.path(), u16::MAX, u16::MAX, &[], b"\0");
+        let err = find(&f, &["a"]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+    }
+
+    #[test]
+    fn a_string_table_with_no_terminator_costs_no_more_than_its_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        // 200k symbols whose names all start at the front of an 8 MiB table of
+        // letters with no NUL: scanning each name to its end would be 1.6 TB.
+        let symtab: Vec<u8> = (0..200_000).flat_map(|_| symbol(0, 0x1000)).collect();
+        let strtab = vec![b'a'; 8 << 20];
+        let f = tiny_elf(dir.path(), 64, 3, &symtab, &strtab);
+        let started = std::time::Instant::now();
+        let found = find(&f, &["bt2gctx"]).unwrap();
+        assert!(found.found.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn only_data_symbols_are_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let strtab = b"\0bt2gctx\0";
+        // The same name, as a function (type 2) and then as an object (type 1):
+        // the object is the one.
+        let mut func = symbol(1, 0x5000);
+        func[4] = 2;
+        let mut object = symbol(1, 0x6000);
+        object[4] = 1;
+        let symtab: Vec<u8> = [func, object].into_iter().flatten().collect();
+        let f = tiny_elf(dir.path(), 64, 3, &symtab, strtab);
+        assert_eq!(
+            find(&f, &["bt2gctx"]).unwrap().found.get("bt2gctx"),
+            Some(&0x6000)
+        );
+        // A thread-local (type 6) alone is not taken.
+        let mut tls = symbol(1, 0x7000);
+        tls[4] = 6;
+        let f = tiny_elf(dir.path(), 64, 3, &tls, strtab);
+        assert!(find(&f, &["bt2gctx"]).unwrap().found.is_empty());
+    }
+
+    #[test]
+    fn a_wanted_symbol_is_found_among_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let strtab = b"\0other\0bt2gctx\0bt2gctx_longer\0";
+        let symtab: Vec<u8> = [symbol(1, 0x2000), symbol(7, 0x3000), symbol(15, 0x4000)]
+            .into_iter()
+            .flatten()
+            .collect();
+        let f = tiny_elf(dir.path(), 64, 3, &symtab, strtab);
+        let found = find(&f, &["bt2gctx"]).unwrap();
+        assert_eq!(found.found.get("bt2gctx"), Some(&0x3000));
+        assert_eq!(found.found.len(), 1);
+    }
+
+    #[test]
+    fn something_that_is_not_elf_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x");
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        assert!(find(&File::open(&path).unwrap(), &["a"]).is_err());
+        std::fs::write(&path, [0x7f, b'E', b'L', b'F', 2, 1, 1, 0]).unwrap();
+        assert!(find(&File::open(&path).unwrap(), &["a"]).is_err()); // truncated header
+    }
+}
