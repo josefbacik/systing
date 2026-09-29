@@ -122,8 +122,10 @@ struct Cli {
     /// memory, the script and the dump are files in a directory made for
     /// them and removed afterwards, and the script runs when the process's
     /// main thread next comes back to Python, which a thread waiting in one
-    /// long call does not. `auto`, which --ask alone means, is the responder
-    /// if the process has one, else python. The process needs `prof:true` in
+    /// long call does not. The script stays this tool's user's, for the
+    /// process to read, and does nothing once the wait is well over. --ask
+    /// alone means `responder`: what writes to a process is asked for by
+    /// name, and nothing falls back to it. The process needs `prof:true` in
     /// its MALLOC_CONF. A Python code map is the one the responder hands
     /// over, else looked for only in --perf-map-dir.
     #[arg(
@@ -131,15 +133,17 @@ struct Cli {
         value_enum,
         value_name = "HOW",
         num_args = 0..=1,
-        default_missing_value = "auto",
+        default_missing_value = "responder",
         requires = "pid",
         conflicts_with_all = ["inputs", "format", "keep_all", "latest_only", "dry_run", "snoop"]
     )]
     ask: Option<ask::How>,
 
-    /// EXPERIMENTAL. With --ask, the directory the responder's socket is in, and the one
-    /// the script's files are made in: as the process sees it, and for
-    /// `python` one the process's user may write to.
+    /// EXPERIMENTAL. With --ask, the directory the responder's socket is
+    /// in, and the one the script's files are made in: as the process sees
+    /// it. For `python`, asked by another user than the process's, it is one
+    /// like /tmp, in which the process's user cannot rename what is
+    /// another's, and neither it nor a directory above it is that user's.
     #[arg(long, value_name = "DIR", requires = "ask", default_value = ask::DEFAULT_DIR)]
     ask_dir: PathBuf,
 
@@ -187,8 +191,11 @@ fn main() -> Result<()> {
     if let (Some(process), Some(how)) = (pinned.as_ref(), cli.ask) {
         let pid = process.pid();
         eprintln!(
-            "warning: --ask is experimental: process {pid} is asked to write a heap dump, \
-             which for a Python that has no responder means writing to its memory"
+            "warning: --ask is experimental: process {pid} is asked to write a heap dump{}",
+            match how {
+                ask::How::Python => ", by a write to its memory that has it run a script",
+                ask::How::Responder => "",
+            }
         );
         let wait = std::time::Duration::from_secs(cli.ask_wait);
         let (snapshot, report) = ask::ask_within(process, how, &cli.ask_dir, wait)?;

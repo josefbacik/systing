@@ -25,7 +25,7 @@ Only the first of the two needs a line of the service changed.
 | A snapshot at a moment the service chooses | the same | jemalloc | `mallctl("prof.dump")`, the service's own | `systing-heap PREFIX` |
 | The profile as it is now, read from outside (experimental) | `prof:true` | jemalloc | none | `systing-heap --pid PID --snoop` |
 | A dump now, from a Python 3.14 service (experimental) | `prof:true` | jemalloc | none | `systing-heap --pid PID --ask python` |
-| A dump now, from any service, whatever its threads are doing (experimental) | `prof:true`, `SYSTING_HEAP_HOOKS_LISTEN=1`, and the responder in `LD_PRELOAD` after jemalloc | jemalloc, the responder | none | `systing-heap --pid PID --ask responder` |
+| A dump now, from any service, whatever its threads are doing (experimental) | `prof:true`, `SYSTING_HEAP_HOOKS_LISTEN=1`, `SYSTING_HEAP_HOOKS_LISTEN_ONLY` naming the service's program, and the responder in `LD_PRELOAD` after jemalloc | jemalloc, the responder | none | `systing-heap --pid PID --ask responder` |
 | The same, asked for by the service itself (experimental) | `prof:true` | jemalloc, the hooks library | `listen()` | `systing-heap --pid PID --ask responder` |
 | Python functions in any of the above, with file and line | as for that row | jemalloc, the hooks library | `install(backtrace="python")` | as for that row |
 | Python functions without line numbers, on a Python the library refuses | also `PYTHONPERFSUPPORT=1` | jemalloc, the hooks library, `libunwind8` | `install(backtrace="libunwind")` | as for that row |
@@ -199,9 +199,9 @@ mallctl("prof.dump", NULL, NULL, NULL, 0);
 > It relies on jemalloc's private data structures, and reads them while the process runs: the database says how each such read went (`heap_live_read`). See "Reading a live process" in [`heap/README.md`](../heap/README.md).
 
 > **Experimental: asked from outside.**
-> `systing-heap --pid PID --ask` has the process write a dump at that moment, with no code of the service's own to call `prof.dump`.
-> A service that has the responder answers on a socket, whatever its threads are doing, and nothing is written to disk: by calling `systing_heap_hooks.listen()` at startup, or with no change to it at all, from its environment (both experimental as well).
-> A Python 3.14 service that loaded nothing answers through its interpreter, once its main thread comes back to Python.
+> `systing-heap --pid PID --ask` has the process write a dump at that moment, with no code of the service's own to call `prof.dump`. Alone it asks the responder.
+> A service that has the responder answers on a socket, whatever its threads are doing, and the dump is not written to disk: by calling `systing_heap_hooks.listen()` at startup, or with no change to it at all, from its environment (both experimental as well).
+> A Python 3.14 service that loaded nothing answers through its interpreter (`--ask python`, by name: it writes to the service's memory), once its main thread comes back to Python, and that thread serves nothing while the dump is written.
 > Neither way is settled: expect both to change. See "Asking a live process" in [`heap/README.md`](../heap/README.md).
 
 ## Collect the snapshots with systing-heap

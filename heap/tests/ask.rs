@@ -60,9 +60,11 @@ time.sleep(3600)
 // milliseconds; `sleep` is in one call that does not. Its memory is opened by
 // the tool, which the tests start beside it and not above it: where
 // kernel.yama.ptrace_scope is 1 that takes the process's leave.
-const PLAIN: &str = r#"import ctypes, sys, time
+const PLAIN: &str = r#"import ctypes, signal, sys, time
 PR_SET_PTRACER, PR_SET_PTRACER_ANY = 0x59616d61, ctypes.c_ulong(-1)
 ctypes.CDLL(None).prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
+# What brings a main thread that waits back to Python, when a test says so.
+signal.signal(signal.SIGUSR1, lambda *_: None)
 keep = []
 def leak_in_python(n):
     for _ in range(n):
@@ -72,7 +74,8 @@ print("ready", flush=True)
 if sys.argv[1] == "loop":
     while True:
         time.sleep(0.01)
-time.sleep(3600)
+while True:
+    time.sleep(3600)
 "#;
 
 /// A Python and a jemalloc that loads into it.
@@ -121,16 +124,15 @@ fn pairs() -> Vec<Pair> {
     pairs
 }
 
-/// The pairs whose Python is 3.14, or none with a note. It is a note also
-/// where `common::skip` would fail the test: the runners CI has come with an
-/// older Python, so a run there says nothing of what is asked of 3.14, and
-/// the tests that need one say so in their output instead of failing.
+/// The pairs whose Python is 3.14. Where there is none the test is skipped
+/// as any other is: with a note, or in CI, where every dependency is
+/// installed, by failing, so that a green run there means the Python way ran.
 fn pairs_314() -> Vec<Pair> {
     let pairs: Vec<Pair> = pairs().into_iter().filter(|p| p.minor == 14).collect();
     if pairs.is_empty() {
-        eprintln!(
-            "skipped: needs Python 3.14 and a libjemalloc.so.2 (SYSTING_HEAP_TEST_PYTHON \
-             and SYSTING_HEAP_TEST_JEMALLOC name a pair)"
+        common::skip(
+            "needs Python 3.14 and a libjemalloc.so.2 (SYSTING_HEAP_TEST_PYTHON and \
+             SYSTING_HEAP_TEST_JEMALLOC name a pair)",
         );
     }
     pairs
@@ -173,14 +175,15 @@ fn setup(hooks: bool) -> Option<Env> {
 }
 
 /// How a target is run: the script and its arguments, options of Python's
-/// own before them, more environment, jemalloc's `prof` setting, and a
-/// library loaded into it beside jemalloc.
+/// own before them, more environment, jemalloc's `prof` setting and more
+/// of its settings, and a library loaded into it beside jemalloc.
 struct Run<'a> {
     script: &'a str,
     args: &'a [&'a str],
     options: &'a [&'a str],
     env: &'a [(&'a str, &'a str)],
     prof: bool,
+    conf: &'a str,
     preload: Option<&'a Path>,
 }
 
@@ -192,6 +195,7 @@ impl<'a> Run<'a> {
             options: &[],
             env: &[],
             prof: true,
+            conf: "",
             preload: None,
         }
     }
@@ -228,9 +232,10 @@ impl Target {
             .env(
                 "MALLOC_CONF",
                 format!(
-                    "prof:{},lg_prof_sample:16,prof_prefix:{}/jeprof",
+                    "prof:{},lg_prof_sample:16,prof_prefix:{}/jeprof{}",
                     run.prof,
-                    env.dir.path().display()
+                    env.dir.path().display(),
+                    run.conf
                 ),
             )
             .env("PYTHONPATH", env.dir.path())
@@ -543,6 +548,58 @@ fn the_processes_a_service_forks_answer_when_its_environment_says_so() {
 }
 
 #[test]
+fn only_the_program_named_listens_of_those_that_inherit_the_environment() {
+    let Some(env) = setup(true) else { return };
+    let Some(pair) = pairs().into_iter().next() else {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+        return;
+    };
+    let library = env.dir.path().join("libsysting_heap_responder.so");
+    let sockets = env.dir.path().join("only");
+    std::fs::create_dir(&sockets).unwrap();
+    // How many threads a program started with the environment has, and what
+    // it says on standard error: the program is Python, and says how many
+    // threads it finds itself with.
+    let exe = std::fs::canonicalize(
+        String::from_utf8(
+            Command::new(&pair.python)
+                .args(["-c", "import sys; print(sys.executable, end='')"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let name = exe.file_name().unwrap().to_str().unwrap();
+    for (only, prof, threads) in [
+        (name, true, "2"),
+        ("another-program", true, "1"),
+        // Nor does one that is not named say why it could not have listened.
+        ("another-program", false, "1"),
+    ] {
+        let out = Command::new(&pair.python)
+            .args([
+                "-c",
+                "import os; print(len(os.listdir('/proc/self/task')), end='')",
+            ])
+            .env(
+                "LD_PRELOAD",
+                format!("{}:{}", pair.jemalloc.display(), library.display()),
+            )
+            .env("MALLOC_CONF", format!("prof:{prof}"))
+            .env("SYSTING_HEAP_HOOKS_LISTEN", "1")
+            .env("SYSTING_HEAP_HOOKS_LISTEN_ONLY", only)
+            .env("SYSTING_HEAP_HOOKS_SOCKET_DIR", &sockets)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{only}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), threads, "{only}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{only}");
+    }
+}
+
+#[test]
 fn a_switch_that_cannot_be_followed_says_so_and_the_service_runs() {
     let Some(env) = setup(true) else { return };
     let Some(pair) = pairs().into_iter().next() else {
@@ -781,26 +838,96 @@ fn a_main_thread_that_does_not_come_back_is_given_up_on() {
 }
 
 #[test]
-fn asking_without_saying_how_falls_to_python_where_no_one_listens() {
+fn asking_without_saying_how_writes_to_no_process() {
     let Some(env) = setup(false) else { return };
     for pair in pairs_314() {
-        let target = Target::start(&env, &pair, Run::of("plain.py", &["loop"]));
-        let db = env.dir.path().join("auto-python.duckdb");
+        // A Python that could be asked through its interpreter, and that
+        // would answer at once.
+        let mut target = Target::start(&env, &pair, Run::of("plain.py", &["loop"]));
+        let db = env.dir.path().join("bare.duckdb");
+        let place = env.dir.path().join("bare");
+        std::fs::create_dir(&place).unwrap();
         let out = Command::new(BIN)
             .args(["--pid", &target.pid().to_string(), "--ask", "--ask-dir"])
-            .arg(env.dir.path())
+            .arg(&place)
             .arg("-o")
             .arg(&db)
             .env("RUST_BACKTRACE", "0")
             .output()
             .unwrap();
-        assert!(out.status.success(), "{pair:?}: {}", said(&out));
+        assert!(!out.status.success(), "{pair:?}: {}", said(&out));
+        let err = said(&out);
         assert!(
-            said(&out).contains("asked through its Python interpreter"),
-            "{pair:?}: {}",
-            said(&out)
+            err.contains("has no responder") && err.contains("nothing was asked of the process"),
+            "{pair:?}: {err}"
         );
-        assert_eq!(snapshot(&db).0, "asked", "{pair:?}");
+        // What is left is said, and was not done.
+        assert!(err.contains("--ask python"), "{pair:?}: {err}");
+        assert!(
+            !err.contains("asked through its Python interpreter"),
+            "{pair:?}: {err}"
+        );
+        assert!(!db.exists(), "{pair:?}");
+        assert_eq!(std::fs::read_dir(&place).unwrap().count(), 0, "{pair:?}");
+        assert!(target.is_running(), "{pair:?}");
+    }
+}
+
+#[test]
+fn a_dump_of_a_process_whose_sampling_is_paused_is_said_to_be_one() {
+    let Some(env) = setup(true) else { return };
+    let paused = "sampling is paused in the process";
+    // Started with sampling on and paused, and not.
+    for (conf, says) in [(",prof_active:false", true), ("", false)] {
+        for pair in pairs() {
+            let sockets = env
+                .dir
+                .path()
+                .join(format!("p{}{}", pair.minor, u8::from(says)));
+            std::fs::create_dir(&sockets).unwrap();
+            let target = Target::start(
+                &env,
+                &pair,
+                Run {
+                    conf,
+                    ..Run::of("service.py", &[sockets.to_str().unwrap(), "stay"])
+                },
+            );
+            let db = env.dir.path().join("paused.duckdb");
+            let out = ask(
+                target.pid(),
+                "responder",
+                &db,
+                &["--ask-dir", sockets.to_str().unwrap()],
+            );
+            assert!(out.status.success(), "{pair:?} {conf:?}: {}", said(&out));
+            assert_eq!(
+                said(&out).contains(paused),
+                says,
+                "{pair:?}: {}",
+                said(&out)
+            );
+        }
+        for pair in pairs_314() {
+            let target = Target::start(
+                &env,
+                &pair,
+                Run {
+                    conf,
+                    ..Run::of("plain.py", &["loop"])
+                },
+            );
+            let db = env.dir.path().join("paused-python.duckdb");
+            let place = env.dir.path().to_str().unwrap();
+            let out = ask(target.pid(), "python", &db, &["--ask-dir", place]);
+            assert!(out.status.success(), "{pair:?} {conf:?}: {}", said(&out));
+            assert_eq!(
+                said(&out).contains(paused),
+                says,
+                "{pair:?}: {}",
+                said(&out)
+            );
+        }
     }
 }
 
@@ -895,4 +1022,170 @@ fn a_process_that_is_no_python_is_refused() {
         "{}",
         said(&out)
     );
+}
+
+/// `systing-heap --pid <pid> --ask python ...` under way, in `place`.
+fn asking(pid: u32, out: &Path, place: &Path, wait: &str) -> std::process::Child {
+    Command::new(BIN)
+        .args(["--pid", &pid.to_string(), "--ask", "python", "-o"])
+        .arg(out)
+        .arg("--ask-dir")
+        .arg(place)
+        .args(["--ask-wait", wait])
+        .env("RUST_BACKTRACE", "0")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// The directory of the request that is with a process, once its script and
+/// the directory to write to are there.
+fn request_in(place: &Path) -> PathBuf {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let made = left_behind(place)
+            .into_iter()
+            .find(|d| d.join("ask.py").exists() && d.join("out").exists());
+        match made {
+            Some(dir) => {
+                // The request is written once the files are.
+                std::thread::sleep(Duration::from_millis(300));
+                return dir;
+            }
+            None => assert!(Instant::now() < until, "no request was made in {place:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn signal(pid: u32, signal: i32) {
+    // SAFETY: a signal to a process this test started.
+    unsafe { libc::kill(pid as i32, signal) };
+}
+
+/// What a program that ended said, and how it ended.
+fn ended(child: std::process::Child) -> (std::process::ExitStatus, String) {
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+#[test]
+fn an_asking_that_is_interrupted_takes_its_request_back() {
+    let Some(env) = setup(false) else { return };
+    for pair in pairs_314() {
+        for (n, by) in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            .into_iter()
+            .enumerate()
+        {
+            let mut target = Target::start(&env, &pair, Run::of("plain.py", &["sleep"]));
+            let place = env.dir.path().join(format!("interrupted-{n}"));
+            std::fs::create_dir(&place).unwrap();
+            let db = env.dir.path().join("interrupted.duckdb");
+
+            let tool = asking(target.pid(), &db, &place, "60");
+            request_in(&place);
+            let started = Instant::now();
+            signal(tool.id(), by);
+            let (status, err) = ended(tool);
+            // It ended of its own accord, and at once, having said why.
+            assert_eq!(status.code(), Some(1), "signal {by}: {status:?}: {err}");
+            assert!(started.elapsed() < Duration::from_secs(5), "signal {by}");
+            assert!(
+                err.contains("interrupted") && err.contains("the request was withdrawn"),
+                "signal {by}: {err}"
+            );
+            assert_eq!(left_behind(&place), Vec::<PathBuf>::new(), "signal {by}");
+            assert!(!db.exists(), "signal {by}");
+
+            // Nothing waits in the process: it can be asked again.
+            let again = ask(
+                target.pid(),
+                "python",
+                &db,
+                &["--ask-dir", place.to_str().unwrap(), "--ask-wait", "1"],
+            );
+            assert!(
+                said(&again).contains("the request was withdrawn")
+                    && !said(&again).contains("another request"),
+                "signal {by}: {}",
+                said(&again)
+            );
+            assert!(target.is_running(), "signal {by}");
+        }
+    }
+}
+
+#[test]
+fn a_request_left_by_a_tool_that_was_killed_does_nothing_once_it_is_late() {
+    let Some(env) = setup(false) else { return };
+    for pair in pairs_314() {
+        // Woken in time, and woken late. The script may run for the wait
+        // (1 s) and 5 s more.
+        for (n, (woken_after, runs)) in [(0, true), (8, false)].into_iter().enumerate() {
+            let mut target = Target::start(&env, &pair, Run::of("plain.py", &["sleep"]));
+            let place = env.dir.path().join(format!("killed-{n}"));
+            std::fs::create_dir(&place).unwrap();
+            let db = env.dir.path().join("killed.duckdb");
+
+            let mut tool = asking(target.pid(), &db, &place, "1");
+            let request = request_in(&place);
+            // Nothing can be done about this one.
+            signal(tool.id(), libc::SIGKILL);
+            tool.wait().unwrap();
+
+            // The process reads the script and cannot write it, nor beside
+            // it; where it writes is its own alone.
+            assert_eq!(mode_of(&request), 0o755);
+            assert_eq!(mode_of(&request.join("ask.py")), 0o444);
+            assert_eq!(mode_of(&request.join("out")), 0o700);
+
+            std::thread::sleep(Duration::from_secs(woken_after));
+            signal(target.pid(), libc::SIGUSR1);
+            std::thread::sleep(Duration::from_secs(1));
+            let wrote: Vec<bool> = ["done", "heap"]
+                .iter()
+                .map(|f| request.join("out").join(f).exists())
+                .collect();
+            assert_eq!(wrote, [runs, runs], "woken after {woken_after} s");
+            assert!(target.is_running(), "woken after {woken_after} s");
+        }
+    }
+}
+
+#[test]
+fn a_file_the_process_has_under_another_name_too_is_not_read() {
+    let Some(env) = setup(false) else { return };
+    for pair in pairs_314() {
+        let mut target = Target::start(&env, &pair, Run::of("plain.py", &["sleep"]));
+        let place = env.dir.path().join("linked");
+        std::fs::create_dir(&place).unwrap();
+        let db = env.dir.path().join("linked.duckdb");
+        // A file that says all went well, which could as well be one that
+        // this tool's user can read and the process's cannot.
+        let other = env.dir.path().join("of-another");
+        std::fs::write(&other, "ok\n").unwrap();
+
+        let tool = asking(target.pid(), &db, &place, "30");
+        let request = request_in(&place);
+        std::fs::hard_link(&other, request.join("out/done")).unwrap();
+        let (status, err) = ended(tool);
+        assert!(!status.success(), "{err}");
+        assert!(err.contains("under that name alone"), "{err}");
+        assert!(!db.exists());
+        assert_eq!(left_behind(&place), Vec::<PathBuf>::new());
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "ok\n");
+        assert!(target.is_running());
+    }
 }

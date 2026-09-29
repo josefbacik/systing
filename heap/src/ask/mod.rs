@@ -7,15 +7,18 @@
 //!
 //! - [`responder`]: the process loaded the hooks library and listens
 //!   (`systing_heap_hooks_listen`). The request goes to its Unix socket, and
-//!   the answer carries the dump as a descriptor. Nothing is written to disk,
-//!   and what the process's threads are doing does not matter.
+//!   the answer carries the dump as a descriptor. The dump is not written to
+//!   disk, nothing is written to the process, and what its threads are doing
+//!   does not matter.
 //! - [`python`]: a CPython 3.14 that loaded nothing of ours. The interpreter's
 //!   remote debugging interface (PEP 768) makes its main thread run a short
 //!   script, which calls jemalloc's `prof.dump`. It runs when that thread next
 //!   comes back to Python, which a thread that waits in one long call does
-//!   not.
+//!   not. It writes to the process's memory, so it is asked for by name:
+//!   nothing falls back to it.
 //!
-//! Either way the process needs `prof:true` in its `MALLOC_CONF`.
+//! Either way the process needs `prof:true` in its `MALLOC_CONF`, and it is
+//! said when jemalloc's sampling is paused there.
 
 pub mod python;
 pub mod responder;
@@ -34,6 +37,9 @@ use crate::Snapshot;
 /// The value `Snapshot::trigger` has for a snapshot taken this way.
 pub const TRIGGER: &str = "asked";
 
+/// How long an asking that is given up on has to take its request back.
+const GIVING_UP: Duration = Duration::from_secs(2);
+
 /// Where the responder's socket and the script's files are, in the process's
 /// own filesystem, unless told otherwise.
 pub const DEFAULT_DIR: &str = "/tmp";
@@ -44,11 +50,11 @@ pub const DEFAULT_WAIT: Duration = Duration::from_secs(30);
 /// How to ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum How {
-    /// The responder if the process has one, else Python.
-    Auto,
-    /// The hooks library's socket.
+    /// The hooks library's socket. Nothing is written to the process.
     Responder,
-    /// CPython 3.14's remote debugging interface.
+    /// CPython 3.14's remote debugging interface, which writes to the
+    /// process's memory: it is asked for by name, and nothing falls back
+    /// to it.
     Python,
 }
 
@@ -61,19 +67,29 @@ pub struct Report {
     pub through: PathBuf,
     pub dump_bytes: usize,
     pub millis: u128,
+    /// jemalloc's sampling is paused in the process (`prof.active` is
+    /// false): the dump holds what was sampled before, and no more.
+    pub paused: bool,
 }
 
 impl Report {
     pub fn summary(&self, pid: u32) -> String {
         format!(
-            "pid {pid}: asked through its {} ({}); it wrote a dump of {} bytes, {} ms after it was asked",
+            "pid {pid}: asked through its {} ({}); it wrote a dump of {} bytes, {} ms after it was asked{}",
             match self.by {
                 "responder" => "responder",
                 _ => "Python interpreter",
             },
             self.through.display(),
             self.dump_bytes,
-            self.millis
+            self.millis,
+            match self.paused {
+                true =>
+                    "\nwarning: jemalloc's sampling is paused in the process (prof.active is \
+                     false): the dump holds what was sampled before it was paused, and \
+                     nothing allocated since",
+                false => "",
+            }
         )
     }
 }
@@ -89,18 +105,18 @@ pub fn ask(
     wait: Duration,
 ) -> Result<(Snapshot, Report)> {
     match how {
-        How::Responder => responder::ask(process, root, dir, wait),
-        How::Python => python::ask(process, root, dir, wait),
-        How::Auto => match responder::ask(process, root, dir, wait) {
-            Ok(asked) => Ok(asked),
-            // No one listens there: the process may still be a Python.
-            Err(e) if e.downcast_ref::<responder::NoResponder>().is_some() => {
-                python::ask(process, root, dir, wait).with_context(|| {
-                    format!("{e:#}, and asking its Python interpreter instead did not work either")
-                })
+        How::Responder => responder::ask(process, root, dir, wait).map_err(|e| {
+            match e.downcast_ref::<responder::NoResponder>() {
+                // What is left is said, and not done: it writes to the process.
+                Some(_) => e.context(
+                    "nothing was asked of the process. A CPython 3.14 without a responder can \
+                     be asked through its interpreter with --ask python, which writes to its \
+                     memory; --snoop reads the profile and writes nothing",
+                ),
+                None => e,
             }
-            Err(e) => Err(e),
-        },
+        }),
+        How::Python => python::ask(process, root, dir, wait),
     }
 }
 
@@ -118,16 +134,33 @@ pub fn ask_within(
     // Asking waits `wait` for the request to be taken up and as long again
     // for it to be answered; the rest is for reading the answer.
     let limit = wait.saturating_mul(3) + Duration::from_secs(10);
-    match snoop::run_within(limit, move || {
-        let root = process.root()?;
-        ask(&process, &root, how, &dir, wait)
-    }) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let asked = process
+            .root()
+            .and_then(|root| ask(&process, &root, how, &dir, wait));
+        let _ = tx.send(asked);
+    });
+    use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
+    match rx.recv_timeout(limit) {
         Ok(result) => result,
-        Err(snoop::Wait::TimedOut) => bail!(
-            "gave up after {} s: reading what the process answered did not finish",
-            limit.as_secs()
-        ),
-        Err(snoop::Wait::Panicked) => bail!("asking the process failed unexpectedly"),
+        Err(Timeout) => {
+            // A request that is with the process is taken back before this
+            // program ends, if whatever holds the asking up lets it be.
+            python::give_up();
+            let taken_back = rx.recv_timeout(GIVING_UP).is_ok();
+            bail!(
+                "gave up after {} s: reading what the process answered did not finish{}",
+                limit.as_secs(),
+                match taken_back {
+                    true => "",
+                    false =>
+                        "; a request to its Python interpreter may still be with the process, \
+                         and does nothing once it is late",
+                }
+            )
+        }
+        Err(Disconnected) => bail!("asking the process failed unexpectedly"),
     }
 }
 

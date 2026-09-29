@@ -151,7 +151,8 @@ pub fn ask(
             wait.as_secs()
         )
     })?;
-    let has_map = parse_reply(&line, fds.len()).with_context(|| format!("pid {pid} answered"))?;
+    let Reply { has_map, paused } =
+        parse_reply(&line, fds.len()).with_context(|| format!("pid {pid} answered"))?;
     let map = has_map.then(|| File::from(fds.remove(1)));
     let heap = File::from(fds.remove(0));
 
@@ -171,6 +172,7 @@ pub fn ask(
         through: shown,
         dump_bytes: dump.len(),
         millis: started.elapsed().as_millis(),
+        paused,
     };
     Ok((snapshot, report))
 }
@@ -268,7 +270,17 @@ fn take_fds(msg: &libc::msghdr, fds: &mut Vec<OwnedFd>) {
 
 /// Whether the answer, which came with `fds` descriptors, says there is a
 /// code map among them; an error for an answer that is not a dump.
-fn parse_reply(line: &[u8], fds: usize) -> Result<bool> {
+/// What an answer says comes with the dump.
+#[derive(Debug, PartialEq, Eq)]
+struct Reply {
+    /// A Python code map, as a second descriptor.
+    has_map: bool,
+    /// jemalloc's sampling is paused in the process. A responder that does
+    /// not say is taken to sample.
+    paused: bool,
+}
+
+fn parse_reply(line: &[u8], fds: usize) -> Result<Reply> {
     let text = String::from_utf8_lossy(line);
     let Some(text) = text.strip_suffix('\n') else {
         bail!("nothing, or a line with no end: {text:?}");
@@ -283,6 +295,7 @@ fn parse_reply(line: &[u8], fds: usize) -> Result<bool> {
         bail!("{text:?}, which is not an answer this version knows");
     }
     let mut has_map = None;
+    let mut paused = false;
     for word in words {
         if let Some(v) = word.strip_prefix("map=") {
             has_map = match v {
@@ -291,6 +304,9 @@ fn parse_reply(line: &[u8], fds: usize) -> Result<bool> {
                 _ => None,
             };
         }
+        if let Some(v) = word.strip_prefix("active=") {
+            paused = v == "0";
+        }
     }
     let Some(has_map) = has_map else {
         bail!("{text:?}, which does not say whether a code map comes with it");
@@ -298,7 +314,7 @@ fn parse_reply(line: &[u8], fds: usize) -> Result<bool> {
     if fds != 1 + usize::from(has_map) {
         bail!("{text:?} with {fds} descriptor(s), which is not what it says");
     }
-    Ok(has_map)
+    Ok(Reply { has_map, paused })
 }
 
 /// The code map in `file`, if it is the one the dump's process wrote.
@@ -320,10 +336,19 @@ mod tests {
 
     #[test]
     fn an_answer_says_whether_a_code_map_comes_with_it() {
-        assert!(!parse_reply(b"ok 1 heap=19328 map=0\n", 1).unwrap());
-        assert!(parse_reply(b"ok 1 heap=19328 map=1\n", 2).unwrap());
+        assert!(!parse_reply(b"ok 1 heap=19328 map=0\n", 1).unwrap().has_map);
+        assert!(parse_reply(b"ok 1 heap=19328 map=1\n", 2).unwrap().has_map);
         // A field this version does not know is passed over.
-        assert!(!parse_reply(b"ok 1 heap=1 later=x map=0\n", 1).unwrap());
+        assert!(
+            !parse_reply(b"ok 1 heap=1 later=x map=0\n", 1)
+                .unwrap()
+                .has_map
+        );
+        // Whether sampling goes on is said by a responder that knows to.
+        let says = |line: &[u8]| parse_reply(line, 1).unwrap().paused;
+        assert!(!says(b"ok 1 heap=1 map=0\n"));
+        assert!(!says(b"ok 1 heap=1 map=0 active=1\n"));
+        assert!(says(b"ok 1 heap=1 map=0 active=0\n"));
     }
 
     #[test]
