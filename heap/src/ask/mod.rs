@@ -7,15 +7,18 @@
 //!
 //! - [`responder`]: the process loaded the hooks library and listens
 //!   (`systing_heap_hooks_listen`). The request goes to its Unix socket, and
-//!   the answer carries the dump as a descriptor. Nothing is written to disk,
-//!   and what the process's threads are doing does not matter.
+//!   the answer carries the dump as a descriptor. The dump is not written to
+//!   disk, nothing is written to the process, and what its threads are doing
+//!   does not matter.
 //! - [`python`]: a CPython 3.14 that loaded nothing of ours. The interpreter's
 //!   remote debugging interface (PEP 768) makes its main thread run a short
 //!   script, which calls jemalloc's `prof.dump`. It runs when that thread next
 //!   comes back to Python, which a thread that waits in one long call does
-//!   not.
+//!   not. It writes to the process's memory, so it is asked for by name:
+//!   nothing falls back to it.
 //!
-//! Either way the process needs `prof:true` in its `MALLOC_CONF`.
+//! Either way the process needs `prof:true` in its `MALLOC_CONF`, and it is
+//! said when jemalloc's sampling is paused there.
 
 pub mod python;
 pub mod responder;
@@ -34,6 +37,30 @@ use crate::Snapshot;
 /// The value `Snapshot::trigger` has for a snapshot taken this way.
 pub const TRIGGER: &str = "asked";
 
+/// How long an asking that is given up on has to take its request back.
+const GIVING_UP: Duration = Duration::from_secs(2);
+/// How often it is looked at whether the asking was interrupted.
+const LOOK: Duration = Duration::from_millis(100);
+
+/// The signal that interrupted an asking, if one did: the request has been
+/// dealt with, and the program is to end as that signal ends one
+/// ([`end_by`]).
+pub fn interrupted_by() -> Option<i32> {
+    python::interrupted_by()
+}
+
+/// End this program as `signal` ends one that does nothing about it, so
+/// that whoever started it sees that it was interrupted.
+pub fn end_by(signal: i32) -> ! {
+    // SAFETY: the default action is set for a signal this program was sent,
+    // which is then sent again.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+    std::process::exit(128 + signal)
+}
+
 /// Where the responder's socket and the script's files are, in the process's
 /// own filesystem, unless told otherwise.
 pub const DEFAULT_DIR: &str = "/tmp";
@@ -44,6 +71,9 @@ const SOCKET_DIR: &[u8] = b"SYSTING_HEAP_HOOKS_SOCKET_DIR=";
 /// The most read of a process's environment.
 const MAX_ENVIRON_BYTES: u64 = 16 << 20;
 
+/// `PATH_MAX`: no path the kernel takes is longer.
+pub(crate) const MAX_PATH_BYTES: usize = 4096;
+
 /// Where `process`'s responder may have its socket when nothing else is
 /// said, the likeliest first: where the environment it was started with
 /// says, then [`DEFAULT_DIR`]. Both, because what a process was told in a
@@ -52,22 +82,32 @@ const MAX_ENVIRON_BYTES: u64 = 16 << 20;
 /// environment names relative to the process's working directory is not
 /// looked in: that process is asked with the directory given.
 pub fn socket_dirs(process: &Process) -> Vec<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
     let named = process
         .read_capped("environ", MAX_ENVIRON_BYTES)
         .ok()
-        .and_then(|environ| {
-            environ
-                .split(|b| *b == 0)
-                .find_map(|kv| kv.strip_prefix(SOCKET_DIR))
-                .filter(|dir| dir.first() == Some(&b'/'))
-                .map(|dir| PathBuf::from(std::ffi::OsString::from_vec(dir.to_vec())))
-        });
+        .and_then(|environ| dir_in_environ(&environ));
     let mut dirs: Vec<PathBuf> = named.into_iter().collect();
     if !dirs.iter().any(|d| d == Path::new(DEFAULT_DIR)) {
         dirs.push(PathBuf::from(DEFAULT_DIR));
     }
     dirs
+}
+
+/// The directory `environ` names for the socket, if it is one to go by. The
+/// first setting of the variable counts, as it does for `getenv`.
+///
+/// The value is the process's to choose, and it goes on into every message
+/// about the socket, the snapshot's source path among them. So one that
+/// could write to a terminal, or that is no text, or is longer than a path
+/// can be, is not gone by at all, like one that is relative: that process is
+/// asked with the directory given, which is then the caller's own word.
+fn dir_in_environ(environ: &[u8]) -> Option<PathBuf> {
+    let value = environ
+        .split(|b| *b == 0)
+        .find_map(|kv| kv.strip_prefix(SOCKET_DIR))?;
+    let dir = std::str::from_utf8(value).ok()?;
+    let usable = dir.starts_with('/') && dir.len() <= MAX_PATH_BYTES && !dir.chars().any(hidden);
+    usable.then(|| PathBuf::from(dir))
 }
 
 /// The first of `dirs` in which `look` finds a responder. Where none has
@@ -95,11 +135,12 @@ pub const DEFAULT_WAIT: Duration = Duration::from_secs(30);
 /// How to ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum How {
-    /// The responder if the process has one, else Python.
-    Auto,
-    /// The hooks library's socket.
+    /// The service's socket, from the hooks library. Answers whatever the
+    /// service's threads are doing. Nothing is written to the process.
     Responder,
-    /// CPython 3.14's remote debugging interface.
+    /// CPython 3.14 only, nothing added to it. Writes to the process's memory
+    /// to make its main thread run a short script. A main thread blocked in
+    /// one long call does not answer.
     Python,
 }
 
@@ -112,19 +153,29 @@ pub struct Report {
     pub through: PathBuf,
     pub dump_bytes: usize,
     pub millis: u128,
+    /// jemalloc's sampling is paused in the process (`prof.active` is
+    /// false): the dump holds what was sampled before, and no more.
+    pub paused: bool,
 }
 
 impl Report {
     pub fn summary(&self, pid: u32) -> String {
         format!(
-            "pid {pid}: asked through its {} ({}); it wrote a dump of {} bytes, {} ms after it was asked",
+            "pid {pid}: asked through its {} ({}); it wrote a dump of {} bytes, {} ms after it was asked{}",
             match self.by {
                 "responder" => "responder",
                 _ => "Python interpreter",
             },
             self.through.display(),
             self.dump_bytes,
-            self.millis
+            self.millis,
+            match self.paused {
+                true =>
+                    "\nwarning: jemalloc's sampling is paused in the process (prof.active is \
+                     false): the dump holds what was sampled before it was paused, and \
+                     nothing allocated since",
+                false => "",
+            }
         )
     }
 }
@@ -141,22 +192,23 @@ pub fn ask(
     dir: Option<&Path>,
     wait: Duration,
 ) -> Result<(Snapshot, Report)> {
-    let sockets_in = dir.map_or_else(|| socket_dirs(process), |dir| vec![dir.to_path_buf()]);
-    let script_in = dir.unwrap_or(Path::new(DEFAULT_DIR));
-    let responder = || in_the_first_of(&sockets_in, |dir| responder::ask(process, root, dir, wait));
     match how {
-        How::Responder => responder(),
-        How::Python => python::ask(process, root, script_in, wait),
-        How::Auto => match responder() {
-            Ok(asked) => Ok(asked),
-            // No one listens there: the process may still be a Python.
-            Err(e) if e.downcast_ref::<responder::NoResponder>().is_some() => {
-                python::ask(process, root, script_in, wait).with_context(|| {
-                    format!("{e:#}, and asking its Python interpreter instead did not work either")
-                })
+        How::Responder => in_the_first_of(
+            &dir.map_or_else(|| socket_dirs(process), |dir| vec![dir.to_path_buf()]),
+            |dir| responder::ask(process, root, dir, wait),
+        )
+        .map_err(|e| {
+            match e.downcast_ref::<responder::NoResponder>() {
+                // What is left is said, and not done: it writes to the process.
+                Some(_) => e.context(
+                    "nothing was asked of the process. A CPython 3.14 without a responder can \
+                     be asked through its interpreter with --ask python, which writes to its \
+                     memory; --snoop reads the profile and writes nothing",
+                ),
+                None => e,
             }
-            Err(e) => Err(e),
-        },
+        }),
+        How::Python => python::ask(process, root, dir.unwrap_or(Path::new(DEFAULT_DIR)), wait),
     }
 }
 
@@ -174,16 +226,42 @@ pub fn ask_within(
     // Asking waits `wait` for the request to be taken up and as long again
     // for it to be answered; the rest is for reading the answer.
     let limit = wait.saturating_mul(3) + Duration::from_secs(10);
-    match snoop::run_within(limit, move || {
-        let root = process.root()?;
-        ask(&process, &root, how, dir.as_deref(), wait)
-    }) {
-        Ok(result) => result,
-        Err(snoop::Wait::TimedOut) => bail!(
-            "gave up after {} s: reading what the process answered did not finish",
-            limit.as_secs()
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let asked = process
+            .root()
+            .and_then(|root| ask(&process, &root, how, dir.as_deref(), wait));
+        let _ = tx.send(asked);
+    });
+    use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
+    let until = std::time::Instant::now() + limit;
+    // Waited for a little at a time: an interrupt is seen here as well,
+    // should the asking be held up where it does not look.
+    while interrupted_by().is_none() && std::time::Instant::now() < until {
+        match rx.recv_timeout(LOOK) {
+            Ok(result) => return result,
+            Err(Timeout) => {}
+            Err(Disconnected) => bail!("asking the process failed unexpectedly"),
+        }
+    }
+    // A request that is with the process is taken back before this program
+    // ends, if whatever holds the asking up lets it be.
+    python::give_up();
+    let ended = rx.recv_timeout(GIVING_UP);
+    let left = "a request to its Python interpreter may still be with the process, with its \
+                script and directory where they were made; the script does nothing once it \
+                is late";
+    match (interrupted_by(), ended) {
+        (Some(_), Ok(result)) => result,
+        (Some(_), Err(_)) => bail!("interrupted, and the asking did not end: {left}"),
+        (None, ended) => bail!(
+            "gave up after {} s: reading what the process answered did not finish{}",
+            limit.as_secs(),
+            match ended {
+                Ok(_) => String::new(),
+                Err(_) => format!("; {left}"),
+            }
         ),
-        Err(snoop::Wait::Panicked) => bail!("asking the process failed unexpectedly"),
     }
 }
 
@@ -231,12 +309,19 @@ fn read_handed(file: &File, what: &str, cap: u64) -> Result<Vec<u8>> {
 pub(crate) fn shown(text: &str) -> String {
     text.chars()
         .flat_map(|c| {
-            let escaped = c
-                .is_control()
-                .then(|| c.escape_default().collect::<Vec<_>>());
+            let escaped = hidden(c).then(|| c.escape_default().collect::<Vec<_>>());
             escaped.unwrap_or_else(|| vec![c])
         })
         .collect()
+}
+
+/// Whether `c` does something to a terminal, or to how the text around it
+/// is laid out, instead of being seen: a control character, or one of those
+/// that reorder or hide text (U+202E and its like).
+pub(crate) fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
 }
 
 /// The snapshot a dump's text is, taken from `process` just now.
@@ -257,7 +342,39 @@ fn snapshot_of(process: &Process, dump: &[u8], source: PathBuf) -> Result<Snapsh
 
 #[cfg(test)]
 mod tests {
-    use super::{in_the_first_of, responder, shown};
+    use super::{dir_in_environ, in_the_first_of, responder, shown};
+
+    #[test]
+    fn a_directory_the_environment_names_is_gone_by_only_if_it_is_plain() {
+        let named = |vars: &[&[u8]]| {
+            let environ: Vec<u8> = vars
+                .iter()
+                .flat_map(|v| v.iter().copied().chain(std::iter::once(0)))
+                .collect();
+            dir_in_environ(&environ)
+        };
+        let var = |value: &str| format!("SYSTING_HEAP_HOOKS_SOCKET_DIR={value}").into_bytes();
+        assert_eq!(
+            named(&[b"PATH=/bin", &var("/run/my service")]),
+            Some(PathBuf::from("/run/my service"))
+        );
+        assert_eq!(named(&[b"PATH=/bin"]), None);
+        // The first counts, as for getenv.
+        assert_eq!(
+            named(&[&var("/first"), &var("/second")]),
+            Some(PathBuf::from("/first"))
+        );
+        // Another variable that ends the same is another variable.
+        assert_eq!(named(&[b"X_SYSTING_HEAP_HOOKS_SOCKET_DIR=/x"]), None);
+        assert_eq!(named(&[&var("")]), None);
+        assert_eq!(named(&[&var("relative/dir")]), None);
+        // What would be printed to whoever asks, in every message.
+        assert_eq!(named(&[&var("/x\x1b]0;owned\x07\x1b[2J")]), None);
+        assert_eq!(named(&[&var("/x\nheap.duckdb: 1 snapshot(s)")]), None);
+        assert_eq!(named(&[&var("/x\u{202e}gnp.exe")]), None);
+        assert_eq!(named(&[b"SYSTING_HEAP_HOOKS_SOCKET_DIR=/x\xff\xfe"]), None);
+        assert_eq!(named(&[&var(&format!("/{}", "a".repeat(4096)))]), None);
+    }
     use std::path::PathBuf;
 
     #[test]

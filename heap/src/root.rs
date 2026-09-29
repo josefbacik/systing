@@ -78,13 +78,23 @@ impl Root {
     /// There is no fallback to a plain open: where the kernel has no
     /// `openat2` (before Linux 5.6) this is an error.
     pub fn open_at(&self, path: &Path, flags: libc::c_int) -> io::Result<File> {
+        self.open_how(path, flags, 0)
+    }
+
+    /// [`Root::open_at`], for a path that is to be what it says: a symlink
+    /// anywhere on the way, the last name included, is refused (`ELOOP`).
+    pub fn open_at_no_symlinks(&self, path: &Path, flags: libc::c_int) -> io::Result<File> {
+        self.open_how(path, flags, libc::RESOLVE_NO_SYMLINKS)
+    }
+
+    fn open_how(&self, path: &Path, flags: libc::c_int, resolve: u64) -> io::Result<File> {
         let c_path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
         // SAFETY: open_how is three integers, for which all zeroes is a valid
         // value; libc marks it non-exhaustive, so it cannot be built by name.
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = (flags | libc::O_CLOEXEC) as u64;
-        how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
+        how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS | resolve;
         // While it steps over a `..` the kernel answers EAGAIN, rather than
         // risk an escape, if anything on the system was renamed or mounted
         // meanwhile, and asks to be called again.

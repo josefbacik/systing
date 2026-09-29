@@ -6,7 +6,7 @@
 #   make hooks       # libsysting_heap_hooks.so: the backtraces and the responder
 #   make responder   # libsysting_heap_responder.so: the responder alone
 #
-# README.md says which a service wants.
+# README.md says which one a service needs.
 
 CC ?= cc
 CFLAGS ?= -O2 -g

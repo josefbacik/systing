@@ -14,102 +14,124 @@ use systing_heap::{
     ask, check, db, jemalloc, perfetto, retention, snoop, symbolize, Format, Snapshot,
 };
 
-/// Parse allocator heap snapshots (jemalloc prof dumps), symbolize their
-/// stacks, and write them into a systing DuckDB database.
+/// Turn heap dumps into a systing DuckDB database or a Perfetto trace.
 ///
-/// An input that is a jemalloc prof_prefix (e.g. /data/heap/jeprof, the
-/// value given to MALLOC_CONF) loads the latest snapshot of each process
-/// and deletes that process's older dumps once the database is written. A
-/// file or directory input is only loaded, never deleted.
+/// Guide: docs/HEAP_SNAPSHOTS.md. Reference: heap/README.md.
 ///
-/// With --pid or --root-fd, the inputs and every path the snapshots name are
-/// resolved beneath that root, to read a container's snapshots from outside
-/// it.
+/// Common commands:
 ///
-/// With --pid and --snoop (EXPERIMENTAL) there is no snapshot file: the
-/// process's current jemalloc heap profile is read out of its memory.
+///   systing-heap -o heap.duckdb --pid PID --ask     a dump now, over the service's socket
+///   systing-heap -o heap.duckdb PREFIX              the newest snapshot file per process
+///   systing-heap --pid PID --check                  which commands work on this process
 ///
-/// With --pid and --ask (EXPERIMENTAL) the process is asked to write a dump
-/// now, and that dump is loaded.
-///
-/// With --pid and --check (EXPERIMENTAL) nothing is loaded: what the process
-/// has is looked at, and the commands that will work on it are printed.
+/// PREFIX is the prof_prefix given to jemalloc in MALLOC_CONF, such as
+/// /heap-dumps/jeprof. A prefix input DELETES each process's older snapshot
+/// files once the output is written; see --dry-run, --latest-only and
+/// --keep-all. Files and folders given by name are only loaded.
 #[derive(Parser)]
-#[command(name = "systing-heap", version)]
+#[command(name = "systing-heap", version, verbatim_doc_comment)]
 struct Cli {
-    /// jemalloc prof_prefixes, snapshot files, or directories to load every
-    /// snapshot file in (not recursively).
+    /// jemalloc prof_prefixes, snapshot files, or folders of snapshot files
+    /// (not searched recursively).
     #[arg(required_unless_present_any = ["snoop", "ask", "check"])]
     inputs: Vec<PathBuf>,
 
-    /// The output, replaced on every run: a DuckDB database, or a Perfetto
-    /// trace of native heap profiles when it ends in .pb, .perfetto, .pftrace
-    /// or .perfetto-trace (open it at ui.perfetto.dev).
+    /// The output file, replaced on every run. A DuckDB database, or a
+    /// Perfetto trace if the name ends in .pb, .perfetto, .pftrace or
+    /// .perfetto-trace (open it at ui.perfetto.dev).
     #[arg(short, long, required_unless_present = "check")]
     output: Option<PathBuf>,
 
-    /// Read every file or directory input as this format instead of going
-    /// by its extension. Prefix inputs are always jemalloc.
+    /// Read file and folder inputs as this format instead of going by their
+    /// extension. Prefix inputs are always jemalloc.
     #[arg(long, value_enum)]
     format: Option<Format>,
 
-    /// The trace id the snapshots are stored under.
+    /// The trace id to store the snapshots under.
     #[arg(long, default_value = "heap")]
     trace_id: String,
 
-    /// With a prefix input, load every snapshot and delete nothing. (A
-    /// Perfetto output loads every snapshot anyway, for its timeline, and
-    /// without this deletes the older ones once it is written.)
+    /// With a prefix: load every snapshot and delete nothing.
     #[arg(long)]
     keep_all: bool,
 
-    /// With a prefix input, load only each process's latest snapshot, also
-    /// for a Perfetto output, and delete nothing.
+    /// With a prefix: load only the newest snapshot of each process, and
+    /// delete nothing.
     #[arg(long, conflicts_with = "keep_all")]
     latest_only: bool,
 
-    /// Print what would be loaded and deleted; write and delete nothing.
+    /// Print what would be loaded and deleted. Write and delete nothing.
     #[arg(long)]
     dry_run: bool,
 
-    /// Where to look first for the file that names each process's Python
-    /// frames: its code map (pycode-<pid>-<token>.map, the hooks' "python"
-    /// backtrace), else beside the snapshot; its perf map (perf-<pid>.map,
-    /// perf trampolines), else beside the snapshot, then /tmp. With --pid
-    /// or --root-fd all of these are beneath the root, /tmp being the
-    /// container's own.
+    /// Where to look first for the files that name Python frames:
+    /// pycode-<pid>-<token>.map and perf-<pid>.map. After it, the tool looks
+    /// beside the snapshot, and for a perf map also in /tmp. With --pid or
+    /// --root-fd these are all inside the root.
     #[arg(long)]
     perf_map_dir: Option<PathBuf>,
 
-    /// Resolve the inputs and every path the snapshots name (the binaries,
-    /// the perf maps) beneath the root of the running process PID, as the
-    /// kernel would for that process: absolute symlinks and ".." cannot leave
-    /// it. For reading a container's snapshots from outside it, PID being a
-    /// process in the container: its id as this tool sees it, which is not
-    /// the number in its dumps' names. The root, /proc/PID/root, is opened
-    /// once at start. Takes prefix inputs only, and names frames from the
-    /// binaries' symbol tables alone, without debug information. The output
-    /// is not beneath the root. Needs Linux 5.6 or later.
+    /// Resolve every path inside the root of process PID (/proc/PID/root), to
+    /// read a container from outside it. PID is the process id as seen from
+    /// where this tool runs, not the number in the dump's file name.
+    /// Symlinks and ".." cannot lead out of the root. Takes prefix inputs
+    /// only. Native frames get function names without file and line. The
+    /// output path is not inside the root. Needs Linux 5.6 or newer.
     #[arg(short, long, value_name = "PID", conflicts_with = "root_fd")]
     pid: Option<u32>,
 
-    /// As --pid, the root being a directory descriptor inherited from the
-    /// caller, by its number: any directory the caller opened and left open.
-    /// A caller that has checked which process a number names should pass
-    /// the directory it checked this way, since a number can come to name
-    /// another process.
+    /// Like --pid, but the root is a folder the caller has already opened, as
+    /// file descriptor N. For a program that has checked which process it
+    /// means: a pid can be reused, an open folder cannot.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
     root_fd: Option<i32>,
 
-    /// EXPERIMENTAL. With --pid, read the process's current jemalloc heap
-    /// profile from its memory, instead of from a snapshot file: no input, no
-    /// dump interval to wait for, and no file is written. It relies on
-    /// jemalloc's private data structures and refuses a jemalloc whose layout
-    /// it does not know. The process needs `prof:true` in its MALLOC_CONF;
-    /// reading its memory needs the same user as the process (ptrace is not used,
-    /// and CAP_SYS_PTRACE is not needed then). A Python code map
-    /// is looked for only in --perf-map-dir (there is no dump for it to be
-    /// beside).
+    /// EXPERIMENTAL. With --pid: ask the process for a heap dump now.
+    ///
+    /// The process needs prof:true in its MALLOC_CONF. --ask alone means
+    /// `responder`. It never falls back to `python`, which writes to the
+    /// process's memory and so has to be asked for by name.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "HOW",
+        num_args = 0..=1,
+        default_missing_value = "responder",
+        requires = "pid",
+        group = "asking",
+        conflicts_with_all = ["inputs", "format", "keep_all", "latest_only", "dry_run", "snoop"]
+    )]
+    ask: Option<ask::How>,
+
+    /// EXPERIMENTAL. With --ask or --check: the folder that holds the socket,
+    /// or for `--ask python` the folder to put the script in, as the process
+    /// sees it.
+    ///
+    /// Without it, the socket is looked for in the folder named by
+    /// SYSTING_HEAP_HOOKS_SOCKET_DIR in the environment the process was
+    /// started with, then in its /tmp. The script goes in its /tmp. For the
+    /// script, the folder and every folder above it must be safe from
+    /// renaming by other users, as a root-owned /tmp with the sticky bit is.
+    #[arg(long, value_name = "DIR", requires = "asking")]
+    ask_dir: Option<PathBuf>,
+
+    /// EXPERIMENTAL. With --ask: how long to wait for an answer.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "ask",
+        default_value_t = ask::DEFAULT_WAIT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    ask_wait: u64,
+
+    /// EXPERIMENTAL. With --pid: read the heap profile from the process's
+    /// memory. Nothing is added to the process or done to it.
+    ///
+    /// The process needs prof:true in its MALLOC_CONF. The profile changes
+    /// while it is read, so stacks can be missing. It depends on jemalloc's
+    /// private data structures, and refuses a jemalloc it does not recognise.
+    /// A Python code map (pycode-*.map) is looked for only in --perf-map-dir.
     #[arg(
         long,
         requires = "pid",
@@ -117,40 +139,12 @@ struct Cli {
     )]
     snoop: bool,
 
-    /// EXPERIMENTAL. With --pid, ask the process to write a dump now, and
-    /// load that: jemalloc's own dump, where --snoop reads the profile
-    /// without the process's help. `responder` asks the thread a process
-    /// starts with the hooks library's systing_heap_hooks_listen, on its
-    /// socket, and nothing is written to disk. `python` makes a CPython 3.14
-    /// that loaded nothing of ours run a short script (its remote debugging
-    /// interface, as sys.remote_exec uses it): that writes to the process's
-    /// memory, the script and the dump are files in a directory made for
-    /// them and removed afterwards, and the script runs when the process's
-    /// main thread next comes back to Python, which a thread waiting in one
-    /// long call does not. `auto`, which --ask alone means, is the responder
-    /// if the process has one, else python. The process needs `prof:true` in
-    /// its MALLOC_CONF. A Python code map is the one the responder hands
-    /// over, else looked for only in --perf-map-dir.
-    #[arg(
-        long,
-        value_enum,
-        value_name = "HOW",
-        num_args = 0..=1,
-        default_missing_value = "auto",
-        requires = "pid",
-        group = "asking",
-        conflicts_with_all = ["inputs", "format", "keep_all", "latest_only", "dry_run", "snoop"]
-    )]
-    ask: Option<ask::How>,
-
-    /// EXPERIMENTAL. With --pid, load nothing: look at what the process has
-    /// for its heap to be read, and print which of the commands will work
-    /// on it, the one to try first first, and what the service would have to
-    /// be given for more. For a service someone else set up. Nothing is
-    /// written to the process and nothing is asked of it: what it maps, the
-    /// environment it was started with and its memory are read, and its
-    /// responder's socket is connected to and let go. It gives up after 90
-    /// seconds, and ends with an error when nothing will work.
+    /// EXPERIMENTAL. With --pid: load nothing. Report what the process has,
+    /// which commands will work on it, and what a change to its setup would
+    /// add.
+    ///
+    /// Nothing is written to the process or asked of it. Gives up after 90
+    /// seconds. Exits with an error if no command will work.
     #[arg(
         long,
         requires = "pid",
@@ -161,25 +155,6 @@ struct Cli {
         ]
     )]
     check: bool,
-
-    /// EXPERIMENTAL. With --ask or --check, the directory the responder's
-    /// socket is in, and the one the script's files are made in: as the
-    /// process sees it, and for `python` one the process's user may write
-    /// to. Not given, the socket is looked for where the environment the
-    /// process was started with says (SYSTING_HEAP_HOOKS_SOCKET_DIR), then
-    /// in its /tmp, and the script's files are made in its /tmp.
-    #[arg(long, value_name = "DIR", requires = "asking")]
-    ask_dir: Option<PathBuf>,
-
-    /// EXPERIMENTAL. With --ask, how long the process is given to answer.
-    #[arg(
-        long,
-        value_name = "SECONDS",
-        requires = "ask",
-        default_value_t = ask::DEFAULT_WAIT.as_secs(),
-        value_parser = clap::value_parser!(u64).range(1..=3600)
-    )]
-    ask_wait: u64,
 }
 
 fn main() -> Result<()> {
@@ -229,11 +204,22 @@ fn main() -> Result<()> {
     if let (Some(process), Some(how)) = (pinned.as_ref(), cli.ask) {
         let pid = process.pid();
         eprintln!(
-            "warning: --ask is experimental: process {pid} is asked to write a heap dump, \
-             which for a Python that has no responder means writing to its memory"
+            "warning: --ask is experimental: process {pid} is asked to write a heap dump{}",
+            match how {
+                ask::How::Python => ", by a write to its memory that has it run a script",
+                ask::How::Responder => "",
+            }
         );
         let wait = std::time::Duration::from_secs(cli.ask_wait);
-        let (snapshot, report) = ask::ask_within(process, how, cli.ask_dir.as_deref(), wait)?;
+        let asked = ask::ask_within(process, how, cli.ask_dir.as_deref(), wait);
+        // Whatever came of it: a program that was interrupted ends so.
+        if let Some(signal) = ask::interrupted_by() {
+            if let Err(e) = &asked {
+                eprintln!("Error: {e:?}");
+            }
+            ask::end_by(signal);
+        }
+        let (snapshot, report) = asked?;
         eprintln!("{}", report.summary(pid));
         snapshots.push(snapshot);
     } else if let Some(process) = pinned.as_ref() {

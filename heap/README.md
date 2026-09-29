@@ -9,7 +9,6 @@ The tool parses each snapshot, symbolizes its stacks, and writes them into the s
 The database opens in `systing-analyze` and merges with other traces like any capture.
 
 To set a service up to write snapshots, see [`docs/HEAP_SNAPSHOTS.md`](../docs/HEAP_SNAPSHOTS.md).
-Its "Which way to go" asks, in order, what to set up in a service and which of the commands below to run.
 
 ## Formats
 
@@ -44,12 +43,9 @@ systing-heap -o heap.duckdb ./snapshots/
 systing-heap -o heap.duckdb --pid 4242 --latest-only /data/heap/jeprof
 
 # No snapshot file (both experimental, see below): the profile read out of
-# a running process, or a dump the process is asked to write now.
+# a running process, or a dump the process's responder is asked for now.
 systing-heap -o heap.duckdb --pid 4242 --snoop
 systing-heap -o heap.duckdb --pid 4242 --ask
-
-# Which of all these will work on a process (experimental, see below).
-systing-heap --pid 4242 --check
 ```
 
 An input that exists as a file or directory is only loaded.
@@ -194,10 +190,12 @@ The code is in `src/snoop/`, and nothing else in the crate knows how it works.
 `--ask` has the process write a dump now, and loads that:
 
 ```bash
-systing-heap -o heap.duckdb --pid 4242 --ask              # its responder if it has one, else its Python
-systing-heap -o heap.duckdb --pid 4242 --ask responder
-systing-heap -o heap.duckdb --pid 4242 --ask python
+systing-heap -o heap.duckdb --pid 4242 --ask              # its responder
+systing-heap -o heap.duckdb --pid 4242 --ask responder    # the same
+systing-heap -o heap.duckdb --pid 4242 --ask python       # writes to its memory
 ```
+
+`--ask` alone asks the responder. What writes to a process is asked for by name, and nothing falls back to it: a process without a responder is said to have none, with what is left to try.
 
 Where `--snoop` reads the profile without the process's help, this is jemalloc's own dump: written under jemalloc's locks, in its documented format, and parsed as any dump file is.
 All three are experimental: both ways of asking, and `--snoop`.
@@ -209,7 +207,8 @@ The process needs `prof:true` in its `MALLOC_CONF`, as for every dump.
 | The process loaded | the responder, and called `listen()` or had `SYSTING_HEAP_HOOKS_LISTEN` in its environment | nothing of ours | nothing of ours |
 | Which processes | any with jemalloc | CPython 3.14 | any with jemalloc |
 | What is done to the process | a request on its socket | three writes to its memory; it runs a script | nothing |
-| Written to disk | nothing | a script and the dump, in a directory removed afterwards | nothing |
+| Written to disk | not the dump (a forked worker's code map, see below) | a script and the dump, in a directory removed afterwards | nothing |
+| Which thread writes the dump | the responder's own | the main thread, which serves nothing meanwhile | none |
 | A process whose main thread waits in one call | answers | does not answer | is read |
 | The dump | jemalloc's own | jemalloc's own | a walk of jemalloc's private structures |
 | Python frames named | the code map comes with the dump | `--perf-map-dir` | `--perf-map-dir` |
@@ -220,73 +219,39 @@ What the process answers when it refuses is printed with its control characters 
 The answer carries the dump as a descriptor of an anonymous file that can no longer be written, and the Python code map's when the process writes one: no path is looked up for either.
 Both are read as a file of the process's is: a regular file, not on a FUSE or network filesystem, of no more than a dump's or a map's size.
 The responder answers the process's own user and root.
+What it costs a service, and where its socket belongs in production, is in [`hooks/README.md`](hooks/README.md).
 
 **Python (experimental).** CPython 3.14 lets a debugger ask an interpreter to run a script file (PEP 768; `sys.remote_exec` is Python's own way to ask).
 The tool asks the same way, from outside: it finds the interpreter in the process's memory, writes the script's path and a flag into the state of the thread that runs `__main__`, and sets the bit that makes that thread look.
 The script calls jemalloc's `prof.dump`, then writes how it went; the tool waits for that, reads the dump, and removes both.
 
-- **It writes to the process.** The path (up to 512 bytes), the flag (4 bytes) and one byte of the thread's `eval_breaker`, through `/proc/PID/mem`, in the order CPython's own writer has them. Only the state of the thread the interpreter names as running `__main__` is written to, and that it still names it is looked at before each write: in a Python started as a program it is the main thread's, which lives as long as the interpreter, where another thread's is freed when the thread ends. Of `eval_breaker` only the lowest byte is written. A bit the process sets in that byte between the tool's read and its write is lost, as it is with CPython's own writer: a request to give up the GIL is made again, but a signal's handler or a call queued for the thread then waits for the next thing that makes the thread look.
-- **It runs code in the process.** The interpreter runs the script as it runs the program's own code, on the main thread, holding the GIL. The script imports `ctypes` (the process keeps it imported), calls `mallctl`, and writes two files. It raises nothing: what goes wrong in it is written for the tool to say. The process's audit hooks see `cpython.remote_debugger_script`, and one that refuses it stops the request.
-- **Only when the main thread comes back to Python.** The interpreter looks between bytecodes and where it checks for signals. A main thread in `time.sleep()`, `Thread.join()` or a read does neither until the call returns, and nothing here wakes it: after `--ask-wait` seconds (30) the request is withdrawn, the script is removed, and the run fails saying so. A request the thread had taken up by then is not withdrawn: the script is given as long again to say how it went. A request is also taken back when the run fails for another reason. A main thread that runs an event loop, or calls into C for less than that, answers.
-- **Where the files are.** In a directory made for the one request, `.systing-heap-ask.<random>` in `--ask-dir` (the process's `/tmp`), beneath the process's root, that only the process's user can enter. The process's user must be able to write there, so a container whose `/tmp` is read-only needs `--ask-dir`, and it must not be on a FUSE or network filesystem, which is known before the process is asked. Once the directory is the process's user's, its name and what is in it are that user's to change: the tool uses it through the handle it opened, and afterwards removes the four files it knows by name and the directory itself if it is empty and its name still names it. Nothing is removed by following what the process put there; a directory that is not empty is left, with a warning, and so is one whose tool was killed.
+- **It writes to the process.** The path (up to 512 bytes), the flag (4 bytes) and one byte of the thread's `eval_breaker`, through `/proc/PID/mem`, in the order CPython's own writer has them. Only the state of the thread the interpreter names as running `__main__` is written to, and that it still names it is looked at before each of the three writes, and before the one that undoes the second should the third fail: in a Python started as a program it is the main thread's, which lives as long as the interpreter, where another thread's is freed when the thread ends. Of `eval_breaker` only the lowest byte is written. A bit the process sets in that byte between the tool's read and its write is lost, as it is with CPython's own writer: a request to give up the GIL is made again, but a signal's handler or a call queued for the thread then waits for the next thing that makes the thread look.
+- **It runs code in the process.** The interpreter runs the script as it runs the program's own code, on the main thread. **The main thread does nothing else until the dump is written**: in a service built around an event loop that is the thread that serves every request, so the service stands still for as long as the dump takes, where the responder's dump is written on a thread of its own. The call into jemalloc lets go of the GIL, as every `ctypes.CDLL` call does, so the process's other Python threads run meanwhile. The script looks at the time first, and does nothing if it is late (below). It imports `ctypes` (the process keeps it imported), calls `mallctl`, and writes three files. What goes wrong in it is written for the tool to say. What escapes it all the same (an audit hook of the process's that raises) the interpreter prints as an exception it could not raise, and goes on. The process's audit hooks see `cpython.remote_debugger_script`, and one that refuses it stops the request.
+- **Only when the main thread comes back to Python.** The interpreter looks between bytecodes and where it checks for signals. A main thread in `time.sleep()`, `Thread.join()` or a read does neither until the call returns, and nothing here wakes it: after `--ask-wait` seconds (30) the request is withdrawn, the script is removed, and the run fails saying so. A request the thread had taken up by then is not withdrawn: the script is given as long again to say how it went. That holds as well for one taken up in the instant it was being withdrawn: the first thing the script does is say that it has started, and the tool looks for that. A request is also taken back when the run fails for another reason. A main thread that runs an event loop, or calls into C for less than that, answers.
+- **Where the files are.** In a directory made for the one request, `.systing-heap-ask.<random>` in `--ask-dir` (the process's `/tmp`), beneath the process's root:
+
+  | | Whose | Who may |
+  |---|---|---|
+  | the directory | the tool's user | anyone enters and reads, its owner writes (`0755`) |
+  | `ask.py`, the script | the tool's user | anyone reads, no one writes (`0444`) |
+  | `out/`, where the script writes the dump and how it went | the process's user | that user alone (`0700`) |
+
+  The process opens the script by its path when its main thread comes to the request, which can be much later than it was asked. So the script is not given to the process's user: another process of that user could put its own code there, and the service would run it. That matters where that user's processes are closed to one another (`kernel.yama.ptrace_scope` of 1 or more), and there the script was a way in.
+- **Which directory `--ask-dir` may be**, whoever asks. One in which only root and the tool's user can change a name, and whose own path only they can change: `/tmp` is (root's, with the sticky bit). Every directory from the process's root down to it is looked at, and the request is refused, with nothing written, if one of them is neither root's nor the tool's user's, or is the process's user's own where that is another user than the tool's, or can be written by others than its owner and has no sticky bit, or is reached through a link, or is on a FUSE or network filesystem.
+- **Where no directory will do.** A container whose only writable directories are volumes that anyone writes to without a sticky bit, as a Kubernetes `emptyDir` is made (`0777`, or `2775` with an `fsGroup`): `chmod +t` on it, from the host or the container, makes it one that will do. A process in a user namespace, whose root directory belongs to the namespace's root and not the host's: nothing will do there. `--snoop` and the responder need no directory.
+- **Where the tool runs as the process's own user** every other user is kept from the script as above, and nothing keeps that user from its own files: the tool says so in a warning. That is so as well for a service that runs as root in a container without a user namespace, asked by root on the host: its root and the host's are one user. There the script can be changed by that user's processes until it has run.
+- **What the process wrote is read with care.** `out/` is the process's user's, and what is in it is that user's to have put there. Each name there is opened as a name first, and to be read only once it is known to be a regular file, that user's, under that one name (not a hard link to a file the tool could read and that user could not), and no link and no device; and the script has jemalloc write into a file it made itself, so a link put at the dump's name is followed by neither.
+- **When the tool is ended first.** An interrupt, a hangup or a request to end (`SIGINT`, `SIGHUP`, `SIGTERM`, `SIGQUIT`) has the request taken back and the files removed, and the tool then ends by that signal, so that whoever started it sees it was interrupted. That takes a moment. A second signal of the same kind ends the tool at once, as does the first after two seconds if the tool is itself held up, by a filesystem that stalls or a page of the process that does. A tool that is killed (`SIGKILL`), or ended so, can take nothing back: the request stays with the process and the files where they are. The script is then still the tool's user's, and it says until when it may run, the wait and 5 seconds more: when the main thread comes to the request after that, the script does nothing, and the process can be asked again.
+- **A directory that was left is not removed while its request may be waiting.** What makes a late request do nothing is in the script. With the directory gone its name, which anyone could read in `/tmp`, is anyone's to take who can write there, and the process would run what they put in it. It is removed once the process has ended or its main thread has been back to Python. Until then another request is refused ("another request is waiting").
+- **What is removed.** The files the tool knows, by their names, and each of the two directories if it is empty and its name still names it. Nothing is removed by following what the process put there; a directory that is not empty is left, with a warning. Nothing at all is removed, with a warning that says why, where the tool cannot know that no thread will still come for the script: the request could not be taken back from a process that lives, or it was taken up and the script has said nothing.
 - **What is refused, and said.** A process that maps no Python; a Python other than 3.14 (its own table of offsets says which it is), a pre-release, or a free-threaded build, on which this has not been tried; an interpreter with remote debugging turned off (`PYTHON_DISABLE_REMOTE_DEBUG`, `-X disable-remote-debug`); one with no main thread (an embedded interpreter that does not say which thread is); a request of someone else's still waiting. Nothing is written to any of these.
 - **Who may.** As for `--snoop`, and the process's memory is opened to write as well.
 
-**Where.** `--ask-dir` says where the responder's socket is and where the script's files are made, as the process sees it. Without it the socket is looked for where the environment the process was started with says (`SYSTING_HEAP_HOOKS_SOCKET_DIR`), then in its `/tmp`, and the script's files are made in its `/tmp`. A process that was told another directory in a call, or whose environment names one relative to its working directory, is asked with `--ask-dir`.
+**Sampling that is paused.** A service can pause jemalloc's sampling (`prof.active`, or `prof_active:false` at its start). Its dump then holds what was sampled before, nothing allocated since, and looks like any other. Both ways ask jemalloc whether sampling goes on, and the tool warns when it does not. `--snoop` does not look.
 
 **The snapshot.** One `heap_snapshot` row with `dump_trigger` `asked`; `source_path` is the socket, or the dump's file as the process saw it. There is no `heap_live_read` row: that is for a read jemalloc did not make.
 
-**What it knows.** Run on x86-64, on CPython 3.14.7 with jemalloc 5.3.1 (both ways) and CPython 3.13 with Ubuntu's `libjemalloc2` 5.3.0 (the responder, also as the library by itself and switched on from the environment). Nothing has run on aarch64, on a free-threaded Python, or across a user namespace, where the responder would see root as another user and refuse it.
-
-## Looking at what a process has (experimental)
-
-> **Very experimental.**
-> What it looks for and what it prints will change with the ways of reading a heap, which are experimental themselves.
-
-Which of the commands above works on a process depends on how the process was set up, and whoever is looking at it may not be who set it up.
-`--check` looks, and loads nothing:
-
-```bash
-systing-heap --pid 4242 --check
-```
-
-```text
-pid 4242 (python3.13, pid 7 to itself)
-
-  jemalloc............ yes: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
-  profiling........... on
-  snapshot files...... 12 under /heap-dumps/jeprof, the newest written 5 min ago; one every 1 GiB it allocates
-  hooks library....... not loaded
-  responder........... no: there is no /tmp/.systing-heap.7
-  Python.............. cannot be asked: the process is Python 3.13: asking needs CPython 3.14
-  Python functions.... not in its stacks: install(backtrace="python") was not called
-  its memory.......... read: 40 stack(s)
-
-What will work, the one to try first first:
-
-  systing-heap -o heap.duckdb --pid 4242 --latest-only /heap-dumps/jeprof
-      jemalloc's own dump, the latest of each process that writes under that prefix; this one's is from 5 min ago
-  systing-heap -o heap.duckdb --pid 4242 --snoop
-      the profile as it is in memory now; stacks can be missing (experimental)
-
-What the service would have to be given for more (the recipes are in docs/HEAP_SNAPSHOTS.md):
-
-  a dump of this moment, whatever its threads are doing: the responder (experimental)
-      recipe: Asked, by environment
-  Python functions in its stacks, with file and line: install(backtrace="python")
-      recipe: Python functions in the stacks
-```
-
-- **The commands are whole.** Each can be run as it is printed: the process's pid, the prefix its files are under, the directory its socket is in and the one its code map is in are in them. The tests run every command a check prints, on a service that has everything, and look for the Python functions in what each one loads.
-- **What the process chose cannot become a command.** The prefix and the directories are the process's to choose, in the environment it was started with, and what is printed is copied into a shell by whoever is looking, who may be root. Each is an absolute path, printed as one word of the command: as it is where a shell takes it for one, else in single quotes. One with a control character in it, or that was not text, is not printed in a command at all: the way it belongs to is still listed, with a line in place of its command that says so. Everything else the process chose is printed with its control characters escaped.
-- **A Python is asked only where profiling was seen.** `--ask python` writes to the process's memory, so it is listed only where the profile was read from memory or the responder answers. What the environment asks for is not taken for that: a process can have the variable and no jemalloc. It then says that profiling was asked for and not seen.
-- **It gives up after 90 seconds**, as a whole: the process's memory, its socket and the folder its files are in are all the process's to make slow.
-- **Nothing is done to the process.** Nothing is written to it and nothing is asked of it. What it maps, the environment it was started with and its memory are read, as `--snoop` reads them; the folder its snapshots are in is listed; and its responder's socket is connected to and let go without a word, to see that the process itself answers there.
-- **It reads the profile to say that it can be read.** That is a whole `--snoop`, whose result is not kept. It is given 30 seconds where `--snoop` itself is given three minutes, so a profile that slow to read is said not to be readable.
-- **Only files are counted as snapshots**, by their names: `PREFIX.<pid>.….heap` of this process. Whether each is a dump is for the command that loads them to say.
-- **What it cannot see.** jemalloc's settings are taken from the environment the process was started with. Settings compiled into the program or in `/etc/malloc.conf` are not looked at, so a prefix or an interval given there is not seen, and neither is a snapshot the service writes by calling jemalloc itself. A responder whose directory was given in a call, and not in the environment, is found with `--ask-dir`. Whether a Python that can be asked will answer is its main thread's to say: the check says that it can be asked, and the command that it gives up after 30 seconds.
-- **It ends with an error when nothing will work**, so a script can tell. A way whose command is not printed counts as one that works.
-- **Who may.** As for `--snoop`.
+**What it knows.** Run on x86-64, on CPython 3.14.7 with jemalloc 5.3.1 and, in CI, CPython 3.14.6 with Ubuntu's `libjemalloc2` 5.3.0 (both ways), and on CPython 3.12 and 3.13 with the latter (the responder, also as the library by itself and switched on from the environment). The Python way is run as root against a service of another user by the tests, where `sudo` asks for no password, as in CI. Nothing has run on aarch64, on a free-threaded Python, on a C library other than glibc, or across a user namespace, where the responder would see root as another user and refuse it.
 
 ## Python stacks
 
