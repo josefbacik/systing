@@ -1,17 +1,27 @@
 """Choose how jemalloc captures heap-snapshot stacks in this Python process.
 
 Nothing changes until install() is called. Then, for jemalloc's sampled
-allocations (MALLOC_CONF=prof:true,...):
+allocations (MALLOC_CONF=prof:true,...), either of:
 
     import systing_heap_hooks
+    systing_heap_hooks.install(backtrace="python")
     systing_heap_hooks.install(backtrace="libunwind", trampolines=True)
+
+backtrace="python" adds the allocating thread's Python frames to jemalloc's
+own native stack, read from the interpreter when an allocation is sampled
+(CPython 3.12 to 3.14). Python runs at full speed, and systing-heap names
+each frame with its file and line from the code map the library writes
+beside the dumps (pycode-<pid>-<token>.map). Before it is installed, what the
+library reads of this thread's stack is compared with what Python says it
+is; if they differ it is not installed.
 
 trampolines=True turns on Python's perf trampolines (3.12+), so each Python
 function gets its own native frame and systing-heap can name it from
 /tmp/perf-<pid>.map. backtrace="libunwind" makes jemalloc capture stacks
 with libunwind, which walks through those frames; jemalloc's default
 (libgcc) stops at the first one. backtrace="default" leaves or puts back
-jemalloc's own.
+jemalloc's own. Trampolines are on unless the backtrace is "python", which
+has no use for them.
 
 What cannot be done is skipped with a warning, and the result says what is
 active, so one call works on machines with and without libunwind8:
@@ -27,15 +37,34 @@ each worker after the fork, and keep_perf_map_across_fork() once in the
 parent before it: a child starts a perf map of its own, and without this the
 frames it inherited running from the parent (the parent's loop under every
 worker) are named in no map the child's dumps can use.
+
+Apart from the backtraces, listen() makes the
+process answer requests for a heap dump, so that one can be asked for at any moment from outside it:
+
+    systing_heap_hooks.listen()
+    # then, as the process's user or root:  systing-heap --pid PID --ask -o heap.duckdb
+
+One thread is started for it, which sleeps until someone asks, runs nothing
+of Python's and answers whatever the program's own threads are doing. The
+dump is handed over as a descriptor of an anonymous file, and is not written
+to disk. Each process this one forks listens for itself. In production give
+it a directory of the service's own, not /tmp.
+
+A service that is not to be changed needs no call and none of this file: with
+the library preloaded (LD_PRELOAD) and SYSTING_HEAP_HOOKS_LISTEN=1 in its
+environment it listens as if it had called listen(). So does every program it
+starts with that environment, unless SYSTING_HEAP_HOOKS_LISTEN_ONLY names the
+one that is to (README.md).
 """
 
+import atexit
 import ctypes
 import os
 import stat
 import sys
 import warnings
 
-__all__ = ["install", "keep_perf_map_across_fork"]
+__all__ = ["install", "keep_perf_map_across_fork", "listen"]
 
 _LIB_NAME = "libsysting_heap_hooks.so"
 _lib = None
@@ -50,13 +79,139 @@ def _load(path):
             or os.path.join(os.path.dirname(os.path.abspath(__file__)), _LIB_NAME)
         )
         lib = ctypes.CDLL(path)
-        lib.systing_heap_hooks_install.argtypes = [ctypes.c_char_p]
-        lib.systing_heap_hooks_install.restype = ctypes.c_int
-        lib.systing_heap_hooks_active.restype = ctypes.c_char_p
-        lib.systing_heap_hooks_strerror.argtypes = [ctypes.c_int]
-        lib.systing_heap_hooks_strerror.restype = ctypes.c_char_p
+        # The library that is the responder alone has the last three only.
+        for name, restype, argtypes in (
+            ("install", ctypes.c_int, [ctypes.c_char_p]),
+            ("active", ctypes.c_char_p, []),
+            ("prepare", ctypes.c_int, [ctypes.c_char_p]),
+            ("python_check", ctypes.c_int, [ctypes.c_char_p, ctypes.c_size_t]),
+            ("python_map", ctypes.c_char_p, []),
+            ("python_stop", None, []),
+            ("strerror", ctypes.c_char_p, [ctypes.c_int]),
+            ("listen", ctypes.c_int, [ctypes.c_char_p]),
+            ("socket", ctypes.c_char_p, []),
+        ):
+            function = getattr(lib, "systing_heap_hooks_" + name, None)
+            if function is not None:
+                function.restype = restype
+                function.argtypes = argtypes
         _lib = lib
     return _lib
+
+
+_KINDS = {"1": "latin-1", "2": "utf-16-le", "4": "utf-32-le"}
+
+
+def _text(field):
+    """A str of a code-map line: "<bytes per character>:<hex>"."""
+    kind, _, data = field.partition(":")
+    return bytes.fromhex(data).decode(_KINDS[kind], "surrogatepass")
+
+
+# The most frames one check walks (MAX_STEPS in the library).
+_MAX_WALK = 1024
+
+
+def _walk_differs(hooks):
+    """Compare the library's walk of this thread with Python's own view of
+    the same stack, frame for frame and to its end; return how they differ,
+    or None."""
+    buf = ctypes.create_string_buffer(16 << 20)
+    # ctypes releases the GIL for the call: the walk runs as it will inside
+    # malloc on a thread that does not hold it.
+    n = hooks.systing_heap_hooks_python_check(buf, len(buf))
+    if n < 0:
+        return hooks.systing_heap_hooks_strerror(-n).decode()
+    lines = buf.value.decode().splitlines()
+    got = [l.split(" ") for l in lines if l != "entry"]
+    frame = sys._getframe(0)
+    if not got:
+        return "no Python frames found"
+    whole = len(lines) < _MAX_WALK
+    # Python is entered from C through an entry frame, so a stack read to
+    # its end ends with one: without it, the frames would be misplaced
+    # among the native ones.
+    if whole and lines[-1] != "entry":
+        return "the stack does not end with an interpreter entry frame"
+    for depth, fields in enumerate(got):
+        if frame is None:
+            return f"frame {depth}: more frames than Python has"
+        code = frame.f_code
+        try:
+            address, index, _, first, qualname, filename, linetable = fields
+            seen = (
+                int(address, 16),
+                int(first),
+                _text(qualname),
+                _text(filename),
+                linetable,
+            )
+        except (ValueError, KeyError):
+            return f"frame {depth}: not read ({' '.join(fields)[:80]})"
+        want = (
+            id(code),
+            code.co_firstlineno,
+            code.co_qualname,
+            code.co_filename,
+            code.co_linetable.hex() or "-",
+        )
+        if seen != want:
+            return f"frame {depth} ({code.co_qualname}): read {seen[:4]}, expected {want[:4]}"
+        # This frame has moved on since the walk; its callers are where
+        # they were.
+        if depth and int(index) != frame.f_lasti // 2 + 1:
+            return f"frame {depth} ({code.co_qualname}): at instruction {int(index) - 1}, expected {frame.f_lasti // 2}"
+        frame = frame.f_back
+    if whole and frame is not None:
+        return f"read {len(got)} frames, Python has more (next: {frame.f_code.co_qualname})"
+    return None
+
+
+def _walk_differs_beneath_a_wide_name(hooks):
+    """_walk_differs with a function on the stack whose name is not ASCII.
+    Such a str keeps its text at another offset than an ASCII one, and the
+    names of the functions that happen to be running seldom have one: this
+    puts that offset under the check at every install."""
+
+    def probe():
+        return _walk_differs(hooks)
+
+    probe.__code__ = probe.__code__.replace(co_qualname="probe_\u00e9_\u65e5")
+    return probe()
+
+
+_stop_at_exit = False
+
+
+def _install_python(hooks):
+    """Install the "python" backtrace once it reads this thread's stack
+    right; return why not, or None."""
+    global _stop_at_exit
+    if hooks.systing_heap_hooks_active() == b"python":
+        # Installed and checked already, here or in the process this one
+        # was forked from: its code map is in use.
+        return None
+    rc = hooks.systing_heap_hooks_prepare(b"python")
+    if rc != 0:
+        return hooks.systing_heap_hooks_strerror(rc).decode()
+    why = _walk_differs_beneath_a_wide_name(hooks)
+    if why is not None:
+        unused = hooks.systing_heap_hooks_python_map()
+        hooks.systing_heap_hooks_python_stop()
+        try:
+            os.unlink(unused)
+        except OSError:
+            pass
+        return f"python frames: this interpreter is not laid out as expected ({why})"
+    rc = hooks.systing_heap_hooks_install(b"python")
+    if rc != 0:
+        return hooks.systing_heap_hooks_strerror(rc).decode()
+    if not _stop_at_exit:
+        # As it exits, the interpreter frees the state of threads that are
+        # still running: no walk may read it after that.
+        atexit.register(hooks.systing_heap_hooks_python_stop)
+        _stop_at_exit = True
+    return None
 
 
 def _enable_trampolines():
@@ -71,12 +226,15 @@ def _enable_trampolines():
     return None
 
 
-def install(backtrace="libunwind", trampolines=True, strict=False, lib=None):
-    """Install `backtrace` ("libunwind" or "default") and, with
-    `trampolines`, Python's perf trampolines. Returns what is active."""
+def install(backtrace="libunwind", trampolines=None, strict=False, lib=None):
+    """Install `backtrace` ("python", "libunwind" or "default") and, with
+    `trampolines`, Python's perf trampolines (on by default unless the
+    backtrace is "python"). Returns what is active."""
     reasons = []
     active_trampolines = False
 
+    if trampolines is None:
+        trampolines = backtrace != "python"
     if trampolines:
         why = _enable_trampolines()
         if why is None:
@@ -84,15 +242,26 @@ def install(backtrace="libunwind", trampolines=True, strict=False, lib=None):
         else:
             reasons.append(why)
 
+    hooks = None
     try:
         hooks = _load(lib)
     except OSError as e:
         reasons.append(f"{_LIB_NAME}: {e}")
+    if hooks is not None and not hasattr(hooks, "systing_heap_hooks_install"):
+        reasons.append("the library loaded is the responder alone, and has no backtraces")
+        hooks = None
+
+    if hooks is None:
         active_backtrace = "default"
     else:
-        rc = hooks.systing_heap_hooks_install(backtrace.encode())
-        if rc != 0:
-            reasons.append(hooks.systing_heap_hooks_strerror(rc).decode())
+        if backtrace == "python":
+            why = _install_python(hooks)
+            if why is not None:
+                reasons.append(why)
+        else:
+            rc = hooks.systing_heap_hooks_install(backtrace.encode())
+            if rc != 0:
+                reasons.append(hooks.systing_heap_hooks_strerror(rc).decode())
         active_backtrace = hooks.systing_heap_hooks_active().decode()
 
     result = {
@@ -163,3 +332,39 @@ def keep_perf_map_across_fork(strict=False):
         raise RuntimeError(message)
     warnings.warn(message, RuntimeWarning, stacklevel=2)
     return False
+
+
+_listen_in_children = False
+
+
+def listen(dir=None, strict=False, lib=None):
+    """Answer requests for a heap dump (`systing-heap --pid PID --ask`) on a
+    Unix socket in `dir`: by default the directory SYSTING_HEAP_HOOKS_SOCKET_DIR
+    names, else /tmp. The socket is this process's user's alone, and root's.
+    Returns the socket's path, or None with a warning when the process cannot
+    listen (strict=True raises instead)."""
+    global _listen_in_children
+    why = None
+    try:
+        hooks = _load(lib)
+    except OSError as e:
+        why = f"{_LIB_NAME}: {e}"
+    else:
+        rc = hooks.systing_heap_hooks_listen(None if dir is None else os.fsencode(dir))
+        if rc != 0:
+            why = hooks.systing_heap_hooks_strerror(rc).decode()
+    if why is None:
+        if not _listen_in_children:
+            # The thread that answers is not in a forked child, which is
+            # another process with another socket: it starts its own.
+            def listen_again():
+                hooks.systing_heap_hooks_listen(None if dir is None else os.fsencode(dir))
+
+            os.register_at_fork(after_in_child=listen_again)
+            _listen_in_children = True
+        return os.fsdecode(hooks.systing_heap_hooks_socket())
+    message = "systing_heap_hooks: " + why
+    if strict:
+        raise RuntimeError(message)
+    warnings.warn(message, RuntimeWarning, stacklevel=2)
+    return None

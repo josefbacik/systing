@@ -11,13 +11,20 @@
 //! same `frame` / `stack` tables every systing recorder uses plus
 //! `heap_snapshot` / `heap_sample`.
 
+pub mod ask;
+pub mod check;
 pub mod db;
 pub mod format;
+#[cfg(test)]
+mod hook_offsets;
 pub mod jemalloc;
 pub mod maps;
 pub mod perfetto;
 pub mod perfmap;
+pub mod pycode;
 pub mod retention;
+pub mod root;
+pub mod snoop;
 pub mod symbolize;
 
 use std::path::PathBuf;
@@ -38,6 +45,8 @@ pub struct Snapshot {
     /// `final`).
     pub trigger: Option<&'static str>,
     pub dumped_at_unix_ns: Option<i64>,
+    /// The user who owns the dump file, when it was found under a prefix.
+    pub owner_uid: Option<u32>,
     /// Mean bytes between samples, as the dump states it.
     pub sample_period: u64,
     pub samples: Vec<Sample>,
@@ -46,6 +55,64 @@ pub struct Snapshot {
     /// The process's perf map (`perf-<pid>.map`), naming code it generated
     /// at runtime such as Python's perf trampolines; None if not found.
     pub perf_map: Option<std::sync::Arc<perfmap::PerfMap>>,
+    /// The process's code map (`pycode-<pid>-<token>.map`), naming the
+    /// Python frames the hooks' "python" backtrace stored; None if not
+    /// found.
+    pub py_code: Option<std::sync::Arc<pycode::CodeMap>>,
+    /// How the read went, for a snapshot read out of a running process
+    /// (`--snoop`); None for a dump, which the allocator wrote under its own
+    /// locks.
+    pub live_read: Option<LiveRead>,
+}
+
+/// How reading a snapshot out of a running process's memory went
+/// ([`snoop`]). The process runs meanwhile and nothing of it is locked, so
+/// records that changed under the read are skipped and a walk the table
+/// changed under is done again; and the layout is judged by what was read.
+/// These are the counts, kept with the snapshot (`heap_live_read`) so that a
+/// reader of the database can tell a clean read from one that was not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRead {
+    /// How the profile was found: `symbol` or `shape`.
+    pub found_by: &'static str,
+    /// The file it was found in, as the process maps it.
+    pub object_path: String,
+    /// Where the sample period is from: `symbols`, `malloc_conf`, or
+    /// `default`, which is a guess.
+    pub sample_period_from: &'static str,
+    /// Walks done again.
+    pub walks_redone: u32,
+    /// The profile was changing during every walk: stacks may be missing.
+    pub unsteady: bool,
+    pub backtraces_read: u64,
+    pub backtraces_skipped: u64,
+    pub thread_records_read: u64,
+    pub thread_records_skipped: u64,
+    /// Parent and child thread records compared for jemalloc's order, and
+    /// those out of it.
+    pub links_checked: u64,
+    pub links_out_of_order: u64,
+    /// Thread records whose counters were compared with each other, and
+    /// those that cannot be jemalloc's.
+    pub counters_checked: u64,
+    pub counters_off: u64,
+    /// Reads of the process's memory, and the bytes read.
+    pub reads: u64,
+    pub bytes_read: u64,
+    pub duration_ms: u64,
+}
+
+impl LiveRead {
+    /// Nothing was skipped, nothing was out of place, and the profile held
+    /// still for the walk that was kept. A walk done again is not held
+    /// against it: the one kept is what is judged.
+    pub fn is_clean(&self) -> bool {
+        !self.unsteady
+            && self.backtraces_skipped == 0
+            && self.thread_records_skipped == 0
+            && self.links_out_of_order == 0
+            && self.counters_off == 0
+    }
 }
 
 /// One allocation stack and what is allocated from it.
@@ -58,6 +125,11 @@ pub struct Sample {
     /// Cumulative since start; 0 unless the allocator tracked them.
     pub alloc_objects: u64,
     pub alloc_bytes: u64,
+    /// The allocator's own estimate for this stack (live bytes, live
+    /// objects, alloc bytes, alloc objects), for a source that has one:
+    /// [`Sample::estimates`] gives it as it is. A dump has none, and its
+    /// counts are scaled at the sample period instead.
+    pub exact_estimates: Option<[u64; 4]>,
 }
 
 impl Sample {
@@ -72,6 +144,9 @@ impl Sample {
     /// done after unbiasing samples"). jemalloc 5.3 writes each stack's pair
     /// so that this per-stack step gives its own estimate.
     pub fn estimates(&self, sample_period: u64) -> [u64; 4] {
+        if let Some(exact) = self.exact_estimates {
+            return exact;
+        }
         let (live_bytes, live_objects) = unbias(self.live_bytes, self.live_objects, sample_period);
         let (alloc_bytes, alloc_objects) =
             unbias(self.alloc_bytes, self.alloc_objects, sample_period);
@@ -108,6 +183,7 @@ mod tests {
             live_bytes: bytes,
             alloc_objects: 0,
             alloc_bytes: 0,
+            exact_estimates: None,
         };
         // 256-byte objects at a 16 KiB period: each is sampled with
         // probability about 1/64.5.
@@ -123,5 +199,12 @@ mod tests {
         assert_eq!(sample(1, 1).estimates(u64::MAX), [1, 1, 0, 0]);
         let [b, n, _, _] = sample(u64::MAX, 1 << 40).estimates(1);
         assert!(b <= i64::MAX as u64 && n <= i64::MAX as u64);
+        // An allocator's own estimate is not scaled again, whatever the period.
+        let exact = Sample {
+            exact_estimates: Some([7, 6, 5, 4]),
+            ..sample(256, 1)
+        };
+        assert_eq!(exact.estimates(16384), [7, 6, 5, 4]);
+        assert_eq!(exact.estimates(1), [7, 6, 5, 4]);
     }
 }

@@ -43,8 +43,8 @@ impl PyLineTable {
         })
     }
 
-    /// Create a line table from an existing data buffer (for testing).
-    #[cfg(test)]
+    /// Create a line table from its bytes, for a reader that has them
+    /// already (`systing-heap`, from a code map).
     pub fn from_data(data: Vec<u8>, first_line: i32, py_major_ver: i32, py_minor_ver: i32) -> Self {
         Self {
             data,

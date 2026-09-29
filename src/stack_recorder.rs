@@ -2187,7 +2187,10 @@ fn is_interpreter_loop(frame: &str) -> bool {
 /// entry returns, the interpreter is for a few instructions on the entry
 /// frame alone (a C thread calling into Python passes through it once per
 /// call). No Python function is running, and the native frames say the rest.
-fn interleave_python_frames(python: Vec<PythonFrame>, user: Vec<String>) -> Vec<String> {
+///
+/// Public so `systing-heap` places the Python frames of a heap snapshot's
+/// stacks the same way.
+pub fn interleave_python_frames(python: Vec<PythonFrame>, user: Vec<String>) -> Vec<String> {
     if python.iter().all(|f| f.entry) {
         return user;
     }

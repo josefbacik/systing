@@ -6339,14 +6339,23 @@ pub fn systing(
                     crate::task_stacks_recorder::TaskContextMode { restricted },
                 )
             });
-            Some(crate::task_stacks_recorder::TaskStacksIter::load(
+            let iter = crate::task_stacks_recorder::TaskStacksIter::load(
                 &target_filter,
                 &target_filter_maps(&skel),
                 &shared_pystacks_maps(&skel),
                 task_context,
                 task_stack_mode,
                 &cgroup_dirs,
-            )?)
+            )?;
+            // Recorded for every capture the recorder was asked for: nothing
+            // in its rows says whether other tasks' memory was read
+            // (sysinfo.task_stacks_remote_reads). No iterator comes back only
+            // where it would record nothing because that memory is not read,
+            // and then the value is what explains the empty table.
+            let _ = recorder
+                .task_stacks_remote_reads
+                .set(iter.as_ref().is_some_and(|iter| iter.remote_reads()));
+            iter
         } else {
             None
         };

@@ -205,9 +205,22 @@ def get_offset_program(cpython_path, version):
         )
         emit("PY_GEN_OBJECT_GI_IFRAME", "offsetof(PyGenObject, gi_iframe)")
 
-    # --- Reading objects out of a process: dicts, instances, modules, ints,
-    # strings (the thread-name lookup). 3.13+ for now; an older version needs
-    # its own block here, as its dict and managed-dict layouts differ.
+    # --- 3.12+: what the heap hooks read in-process: where a code object's
+    # traceable instructions start (a frame that has not got there is one the
+    # interpreter is still setting up, and hides), and a str's text (code and
+    # file names; the thread-name lookup reads it too) ---
+    if minor >= 12:
+        emit(
+            "PY_CODE_OBJECT_CO_FIRSTTRACEABLE",
+            "offsetof(PyCodeObject, _co_firsttraceable)",
+        )
+        emit("PY_ASCII_OBJECT_LENGTH", "offsetof(PyASCIIObject, length)")
+        emit("PY_ASCII_OBJECT_STATE", "offsetof(PyASCIIObject, state)")
+        emit("PY_COMPACT_UNICODE_OBJECT_SIZE", "sizeof(PyCompactUnicodeObject)")
+
+    # --- Reading objects out of a process: dicts, instances, modules, ints
+    # (the thread-name lookup). 3.13+ for now; an older version needs its own
+    # block here, as its dict and managed-dict layouts differ.
     if minor >= 13:
         # PyDictObject and what ma_keys / ma_values point to
         emit("PY_DICT_OBJECT_MA_USED", "offsetof(PyDictObject, ma_used)")
@@ -247,10 +260,6 @@ def get_offset_program(cpython_path, version):
 
         emit("PY_LONG_OBJECT_LV_TAG", "offsetof(PyLongObject, long_value.lv_tag)")
         emit("PY_LONG_OBJECT_OB_DIGIT", "offsetof(PyLongObject, long_value.ob_digit)")
-
-        emit("PY_ASCII_OBJECT_LENGTH", "offsetof(PyASCIIObject, length)")
-        emit("PY_ASCII_OBJECT_STATE", "offsetof(PyASCIIObject, state)")
-        emit("PY_COMPACT_UNICODE_OBJECT_SIZE", "sizeof(PyCompactUnicodeObject)")
 
         # _Py_DebugOffsets, the table at the start of _PyRuntime that a process
         # publishes for readers like this one (3.13+). PyInterpreterState grows

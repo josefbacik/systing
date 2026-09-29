@@ -27,6 +27,7 @@ const NOT_ONE_PARQUET_FILE: &[&str] = &[
     "frame_file",
     "heap_snapshot",
     "heap_sample",
+    "heap_live_read",
 ];
 
 #[test]

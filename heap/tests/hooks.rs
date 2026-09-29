@@ -1,7 +1,7 @@
 //! The hooks library and its Python helper, for real: Python under jemalloc
 //! with perf trampolines, then systing-heap on the dump. Skipped (with a
 //! note) where there is no jemalloc, C compiler, or Python 3.12+; see
-//! `common::skip`.
+//! `common::skip`. The "python" backtrace has its own file, `python_hook.rs`.
 
 mod common;
 
@@ -11,7 +11,7 @@ use std::process::Command;
 use duckdb::Connection;
 
 const BIN: &str = env!("CARGO_BIN_EXE_systing-heap");
-const HOOKS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks");
+use common::HOOKS;
 
 const APP: &str = r#"
 import sys
@@ -66,21 +66,7 @@ fn setup() -> Option<Env> {
     };
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("libsysting_heap_hooks.so");
-    let built = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
-        .args([
-            "-O2",
-            "-Wall",
-            "-fPIC",
-            "-shared",
-            "-fno-omit-frame-pointer",
-            "-o",
-        ])
-        .arg(&lib)
-        .arg(Path::new(HOOKS).join("systing_heap_hooks.c"))
-        .args(["-ldl", "-lpthread"])
-        .status();
-    if !built.is_ok_and(|s| s.success()) {
-        common::skip("no C compiler to build the hooks library");
+    if !common::make_hooks(Path::new(HOOKS), dir.path()) {
         return None;
     }
     std::fs::write(dir.path().join("app.py"), APP).unwrap();

@@ -18,6 +18,9 @@
 //! in between that check and the unlink is still removed, and only someone
 //! who can write the directory can do that.
 //!
+//! Given a [`Root`], the prefix's directory is reached beneath it, so no
+//! symlink on the way there leads outside the root either.
+//!
 //! One pid is one process: two processes that wrote the same pid into the
 //! same directory (a restart that got its pid back, pid 1 in several
 //! containers) count as one, and the higher sequence numbers win.
@@ -35,6 +38,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+use crate::root::Root;
 use crate::{jemalloc, Snapshot};
 
 /// A dump file found under the prefix, identified by pid and sequence.
@@ -47,6 +51,7 @@ pub struct Dump {
     dev: u64,
     ino: u64,
     mtime_ns: i64,
+    uid: u32,
 }
 
 /// A file that starts with the prefix but was left alone, and why.
@@ -74,7 +79,13 @@ pub struct Plan {
 /// Scan `prefix` (a jemalloc `prof_prefix`, e.g. `/data/heap/jeprof`).
 /// Each pid's newest dump that parses is loaded; `load_all` loads the older
 /// ones too, and `delete_older` deletes them once the output is written.
-pub fn scan(prefix: &Path, load_all: bool, delete_older: bool) -> Result<Plan> {
+/// With a `root`, `prefix` is a path beneath it.
+pub fn scan(
+    prefix: &Path,
+    load_all: bool,
+    delete_older: bool,
+    root: Option<&Root>,
+) -> Result<Plan> {
     let name_prefix = prefix
         .file_name()
         .with_context(|| format!("{}: a prefix needs a file-name part", prefix.display()))?
@@ -84,11 +95,14 @@ pub fn scan(prefix: &Path, load_all: bool, delete_older: bool) -> Result<Plan> {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let dir = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open(&dir_path)
-        .with_context(|| format!("opening directory {}", dir_path.display()))?;
+    let dir = match root {
+        Some(root) => root.open_at(&dir_path, libc::O_RDONLY | libc::O_DIRECTORY),
+        None => std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(&dir_path),
+    }
+    .with_context(|| format!("opening directory {}", dir_path.display()))?;
 
     let mut by_pid: BTreeMap<i32, Vec<Dump>> = BTreeMap::new();
     let mut skipped = Vec::new();
@@ -143,6 +157,7 @@ pub fn scan(prefix: &Path, load_all: bool, delete_older: bool) -> Result<Plan> {
             dev: st.st_dev,
             ino: st.st_ino,
             mtime_ns: st.st_mtime * 1_000_000_000 + st.st_mtime_nsec,
+            uid: st.st_uid,
         });
     }
 
@@ -265,6 +280,7 @@ fn load(dir: &File, d: &Dump) -> Result<Snapshot> {
     s.seq = d.seq;
     s.trigger = kind_letter(&d.name).and_then(jemalloc::trigger_for_kind);
     s.dumped_at_unix_ns = Some(d.mtime_ns);
+    s.owner_uid = Some(d.uid);
     Ok(s)
 }
 
