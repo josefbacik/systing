@@ -1,121 +1,326 @@
 # systing-heap hooks
 
-What a service loads to get more than jemalloc gives by itself. There are two pieces, and a service takes either without the other:
+The small library a service loads to get more than jemalloc gives on its own.
 
-- **the backtraces**: other ways of capturing a sampled allocation's stack, which put Python functions in the stacks;
-- **the responder** (experimental): a thread that answers requests for a dump.
+**New here? Start with the guide: [`docs/HEAP_SNAPSHOTS.md`](../../docs/HEAP_SNAPSHOTS.md).**
+This page is the reference for the library.
 
-See "Python stacks" and "Asking a live process" in [`../README.md`](../README.md) for when to use them.
-A service that wants neither loads nothing of this: jemalloc's own snapshots, `--snoop` and `--ask python` need none of it.
+It has two independent parts. A service can use either without the other, and a service that needs neither loads nothing: snapshot files, `--snoop` and `--ask python` work without it.
 
-## What to take, for what
+| Part | What it does | Status |
+|---|---|---|
+| **The responder** | One thread that answers `systing-heap --ask` on a Unix socket | Experimental |
+| **The backtraces** | Change how jemalloc captures the stack of a sampled allocation, so stacks show Python functions | Supported |
 
-| To get | The library | In the service | What else must be in the image |
-|---|---|---|---|
-| Python functions in the stacks, with file and line | `libsysting_heap_hooks.so`, with `systing_heap_hooks.py` | `install(backtrace="python")` | nothing |
-| Stacks walked through Python's perf trampolines | the same | `install(backtrace="libunwind")` | `libunwind.so.8`, opened when asked for |
-| An answer to `systing-heap --ask`, from a Python service (experimental) | the same | `listen()` | nothing |
-| The same, from a service that is not changed (experimental) | `libsysting_heap_responder.so`, preloaded | nothing: `SYSTING_HEAP_HOOKS_LISTEN=1` in its environment | nothing |
-| The same, from a C, C++ or Rust service that calls it (experimental) | `libsysting_heap_responder.so` | `systing_heap_hooks_listen(NULL)` | nothing |
+## What to build and load
 
-`libsysting_heap_hooks.so` has both pieces, and is what a Python service loads.
-`libsysting_heap_responder.so` is the responder alone: nothing in it knows of Python or of the backtraces, and it is about a twentieth of the other's size (14 KB against 276 KB, nearly all of the difference the `"python"` backtrace's tables).
-Either does nothing when it is loaded and not asked: no thread, no file, no socket.
-
-## What is where
-
-```
-heap/hooks/
-  systing_heap_hooks.h    what a C program includes: both pieces' functions
-  systing_heap_hooks.py   what a Python program imports
-  Makefile                builds the libraries
-  common/                 what the pieces share: finding jemalloc, fork, what the errors mean
-  backtrace/              the backtraces: backtrace.c, and python.c with py_offsets.h
-  responder/              the responder: responder.c
+```bash
+make -C heap/hooks              # both libraries, in heap/hooks/
+make -C heap/hooks OUT=/dir     # somewhere else
+make -C heap/hooks responder    # only one: "responder" or "hooks"
 ```
 
-Each piece is built from its own folder and `common/`, and calls nothing of the other piece.
-The one thing that passes between them is the code map: the `"python"` backtrace says how it is asked for, through `common/`, and the responder hands over what it is given, which in the library without the backtraces is nothing.
+It needs a C compiler and `make`. No Python headers, no libunwind. Both libraries link only `libdl` and `libpthread`.
 
-- `make` builds both libraries here; `make OUT=/dir` puts them elsewhere. `make hooks` and `make responder` build one. It needs a C compiler only: no Python headers, no libunwind. Both link only libdl and libpthread.
-- `backtrace/py_offsets.h`: the CPython struct offsets the `"python"` backtrace reads, by version. Rendered from systing's pystacks offsets; `cargo test -p systing-heap hook_offsets` fails when the two differ, and rewrites the header when run with `SYSTING_HEAP_UPDATE_OFFSETS=1`.
-- `systing_heap_hooks.py` loads the library with `ctypes`, checks the `"python"` backtrace against Python's own view of the stack before installing it, can turn on perf trampolines, and starts the responder (`listen()`, experimental). It finds the library through its `lib` argument, then `SYSTING_HEAP_HOOKS_LIB`, then next to the `.py` file. Given the library that is the responder alone, `listen()` works and `install()` says why it cannot.
-- `SYSTING_HEAP_HOOKS_LIBUNWIND` names the libunwind to load instead of `libunwind.so.8`.
+| File | Contains | Load it into |
+|---|---|---|
+| `libsysting_heap_responder.so` | The responder. Nothing about Python. About a twentieth of the other's size in memory (14 KB against 276 KB). | Native services |
+| `libsysting_heap_hooks.so` | The responder and the backtraces | Python services |
+| `systing_heap_hooks.py` | The Python helper. Keep it next to `libsysting_heap_hooks.so`. | Python services |
+| `systing_heap_hooks.h` | The C API | C, C++ and Rust services that call the library |
 
-Backtraces: `"default"` (jemalloc's own), `"libunwind"` and `"python"`.
-Each is one entry in `systing_heap_hooks_install()`.
+**A library that is loaded but not asked does nothing:** no thread, no file, no socket.
 
-## What the `"python"` backtrace may and may not do
+| To get | Library | In the service |
+|---|---|---|
+| The socket, no code change | `libsysting_heap_responder.so`, preloaded | `SYSTING_HEAP_HOOKS_LISTEN=1` in the environment |
+| The socket, from Python | `libsysting_heap_hooks.so` and the helper | `listen()` |
+| The socket, from C, C++ or Rust | `libsysting_heap_responder.so`, linked | `systing_heap_hooks_listen(NULL)` |
+| Python functions with file and line | `libsysting_heap_hooks.so` and the helper | `install(backtrace="python")` |
+| Python functions through perf trampolines | The same, and `libunwind.so.8` in the image | `install(backtrace="libunwind")` |
 
-It runs inside malloc, in the service's process, mostly on threads that do not hold the GIL, so:
+## Reference
 
-- A thread walks only its own frames.
-- No pointer that came from Python is dereferenced. Everything Python owns is read with `process_vm_readv` on the process itself (`/proc/self/mem` where seccomp refuses that), so a bad address is an error, not a fault. If neither works, the backtrace is not installed.
-- It calls nothing of Python's but the two functions that return the thread's state and the one that says the interpreter is exiting. It never takes the GIL, touches a reference count, or allocates.
-- Every loop and length is bounded, and what is read is checked for its type before it is used.
-- It keeps no file descriptor open: the code map is opened for each line and closed again, so a program that closes descriptors it did not open never has a line of ours written to a file of its own.
-- The folder the dumps are in may be one others can write. The code map is opened without waiting, so a FIFO put at its path does not hold the allocation, and a line is written only to the regular file that was made, as the last line left it: the same device and number, the same size, and the same time of last change. What has taken its place since is left alone, and so is the map itself once something else has changed it (a `chmod`, a line added by hand); the map then names nothing more.
-- Where reads go through `/proc/self/mem`, a forked child closes its parent's descriptor and opens its own.
-- jemalloc's own backtrace is called exactly as jemalloc calls it, with the whole array.
-- A forked child keeps the ids it was forked with, and its code map begins with its parent's lines: jemalloc keeps the stacks sampled before the fork, and the child's dumps hold them.
+### Environment variables
+
+| Variable | Read by | Meaning |
+|---|---|---|
+| `SYSTING_HEAP_HOOKS_LISTEN` (experimental) | Either library, when it loads | `1`: start the socket. `fork`: also in every process this one forks. Unset, empty or `0`: do nothing. Anything else: one line on stderr, and no socket. |
+| `SYSTING_HEAP_HOOKS_LISTEN_ONLY` (experimental) | The same | Only the program whose executable has this file name listens. For a Python service that is the interpreter's, such as `python3.13`; `readlink /proc/PID/exe` shows it. |
+| `SYSTING_HEAP_HOOKS_SOCKET_DIR` (experimental) | The responder, and `systing-heap --ask` | The folder for the socket file. Default `/tmp`. |
+| `SYSTING_HEAP_HOOKS_LIB` | The Python helper | The path of the library, when it is not next to the `.py` file |
+| `SYSTING_HEAP_HOOKS_LIBUNWIND` | `backtrace="libunwind"` | The libunwind to load in place of `libunwind.so.8` |
+
+All but `SYSTING_HEAP_HOOKS_LIB` are ignored in a setuid or file-capability program (`secure_getenv`).
+
+### Python
+
+```python
+import systing_heap_hooks
+```
+
+| Call | Does | Returns |
+|---|---|---|
+| `install(backtrace="python")` | Puts Python functions in the stacks | `{'backtrace': …, 'trampolines': …, 'reasons': […]}`: what is active now, and why anything was skipped |
+| `install(backtrace="libunwind")` | Turns on perf trampolines and walks through them | The same |
+| `install(backtrace="default", trampolines=False)` | Puts jemalloc's own backtrace back | The same |
+| `listen(dir=None)` (experimental) | Starts the socket, here and in every process forked from here | The socket's path, or `None` with a warning |
+| `keep_perf_map_across_fork()` | Trampolines only, Python 3.13+: each forked child adds the parent's perf map to its own | Whether it is on |
+
+- **Always pass `backtrace=`.** The default is `"libunwind"`, not `"python"`.
+- **`trampolines=`** turns Python's perf trampolines on or off. Left out, they are turned **on** for every backtrace except `"python"`, `"default"` included, and they slow every Python call.
+- **Nothing here stops the service.** What cannot be done is skipped with a warning, and `reasons` says why. Pass `strict=True` to raise instead.
+- **`install()` applies from then on.** Allocations sampled before it have native stacks.
+- **A second `listen()` changes nothing.** A process that already listens keeps its socket, whatever folder is passed.
+- `lib=` names the library file. With the responder-only library, `listen()` works and `install()` explains why it cannot.
+
+### C
+
+```c
+#include "systing_heap_hooks.h"
+```
+
+| Function | Does |
+|---|---|
+| `int systing_heap_hooks_listen(const char *dir)` (experimental) | Starts the socket. `NULL`: the variable, then `/tmp`. |
+| `const char *systing_heap_hooks_socket(void)` (experimental) | The socket's path, or `""` |
+| `int systing_heap_hooks_install(const char *backtrace)` | `"python"`, `"libunwind"` or `"default"` |
+| `int systing_heap_hooks_prepare(const char *backtrace)` | Gets ready without installing, so the walk can be checked first |
+| `const char *systing_heap_hooks_active(void)` | The backtrace in use |
+| `const char *systing_heap_hooks_strerror(int code)` | What a return code means. `SHH_OK` is 0. |
+
+The responder-only library has `listen`, `socket` and `strerror`.
+
+**Installing `"python"` from C skips a safety check.** The Python helper compares the library's walk with Python's own view of the stack before it installs, and only Python can supply that view.
+From C the library goes by the interpreter's version alone. On a Python of a listed version that is laid out differently, every object is still checked for its type and every read is still made by the kernel, so stacks come out short or unnamed. Nothing faults.
+A C caller that wants the check calls `prepare("python")`, compares `systing_heap_hooks_python_check()` with what it knows the stack to be, and then installs.
 
 ## The responder (experimental)
 
-> **Very experimental.**
-> It puts a thread and a socket of ours in the service, and what it is asked and answers may change, as may `systing-heap --ask` with it.
-> Expect it to change, and do not build on it yet.
+> **Experimental.** Its variables, functions and protocol may still change, along with `systing-heap --ask`. Do not build automation on it yet.
 
-`systing_heap_hooks.listen()`, or `systing_heap_hooks_listen(dir)` from C, makes the process answer requests for a heap dump: `systing-heap --pid PID --ask` asks (see "Asking a live process" in [`../README.md`](../README.md)).
-It is apart from the backtraces: a process can have either without the other.
+### What it does in a service
 
-- One thread is started, named `heap-responder`. It waits in `accept()` until someone asks, and costs nothing until then.
-- The socket is a file, `.systing-heap.<pid>`, in `dir`, else in the directory `SYSTING_HEAP_HOOKS_SOCKET_DIR` names, else in `/tmp`. Its path must fit a Unix socket's address (107 bytes).
-- **In production, give it a directory of the service's own**, one that only the service's user writes to. In `/tmp` anyone can take the name first. That denies the service its responder and redirects nothing: `listen()` fails, and the tool checks that what answers is the process it asked about before it says anything. The name has the pid as the process itself sees it, so two containers that share a directory collide on small pids, and the second one's `listen()` fails.
-- It answers the process's own user and root: the file is made for its owner alone, and the peer's credentials are checked as well, before a byte of the request is read. Where that user's processes are closed to one another (`kernel.yama.ptrace_scope` of 1 or more) this opens a little: another process of that user gets the heap profile (sampled stacks and sizes, the paths of mapped files) and the Python code map (function names, files, lines). It gets no contents of memory.
-- A socket already at that path is taken over if no one answers there. Whether someone does is asked without waiting, so a socket put in the way cannot hold the program that calls `listen()`; the call then fails.
-- The socket is known by what it is, not by its number alone. A program that closes descriptors it did not open may give the number to a socket of its own: the thread then ends instead of answering there, and `listen()` can be called again.
-- jemalloc writes the dump into an anonymous file (`memfd_create`), which is then sealed and handed over as a descriptor, with the code map's when the `"python"` backtrace writes one. The dump is not written to disk. With the `"python"` backtrace on, the first request to a forked worker makes that worker's code map file, beside the dumps, as its first new function would have; the library that is the responder alone writes no file but its socket.
-- **The dump is the service's memory until it is read.** The anonymous file's pages count against the service's own memory limit until the tool has read it and closed it. A dump is small beside a heap (tens of kilobytes to a few megabytes), and a service at the edge of its limit is the one that is asked.
-- **Nothing limits how often it is asked.** Each request is a whole `prof.dump`, on the responder's thread. Whoever may ask can already stop the service, so this gives no one a new power; it is a cost.
-- The answer says whether jemalloc's sampling goes on (`prof.active`): a dump of a service that has paused it holds what was sampled before, and the tool warns.
-- Every signal is blocked on the thread, so no handler of the program's runs there. It calls nothing of Python's, and takes no lock of the program's own. With the `"python"` backtrace on it takes that backtrace's lock while a forked worker's code map is made, for as long as the inherited lines take to copy: a thread of the program whose allocation is sampled meanwhile waits for it.
-- Requests are answered one at a time, and a peer that says or reads nothing is given up on after 5 seconds.
-- A process that is killed, or that ends with `_exit()` as a worker forked by Python's `multiprocessing` does, or that goes on to run another program (`execve`), leaves its socket's file behind. The next process to listen under that name takes it over, and a process that exits removes its own. A server that replaces its workers leaves one such file for each until then.
-- **fork.** The thread is not in a forked child, which lets go of its parent's socket; a child that is to answer calls `listen()` itself. The Python helper does that in every child, in the directory its first `listen()` was given: each has a thread and a socket file of its own from the start. No child is forked between the socket's making and its being on record, so none is left with a copy of it that it cannot let go of. Python 3.12 and later warn (`DeprecationWarning`) when a process with more than one thread forks, and the responder is a thread.
+| Topic | Behaviour |
+|---|---|
+| Thread | One, named `heap-responder`. It sleeps in `accept()` until someone asks. Every signal is blocked on it, so none of the program's handlers run there. |
+| Socket | A file named `.systing-heap.<pid>`, mode `0600`. The pid is the process's own view of itself. The whole path must fit in 107 bytes. |
+| Who may ask | The process's own user, and root. The caller's credentials are checked before a byte of the request is read. |
+| The dump | jemalloc writes it into an in-memory file (`memfd_create`), which is sealed and handed over as a file descriptor. It is never written to disk. |
+| The code map | Handed over with the dump when `backtrace="python"` is on, so the tool needs no path for it |
+| Requests | One at a time. A caller that says or reads nothing is dropped after 5 seconds. |
+| Paused sampling | The answer says whether jemalloc's `prof.active` is on, and the tool warns when it is not |
+| At exit | The process removes its socket file |
 
-### A service that is not changed
+### In production
 
-A service listens without a line of it being changed when the library is loaded into it and its environment says so:
+| Do | Why |
+|---|---|
+| **Give the socket a folder of the service's own** (`SYSTING_HEAP_HOOKS_SOCKET_DIR`) | In `/tmp` any user can create the name first. That blocks the socket. It cannot redirect anything: `listen()` fails, and the tool checks that whoever answers is the process it asked about. |
+| **Set `SYSTING_HEAP_HOOKS_LISTEN_ONLY`** with the environment switch | See below |
+| **One folder per container** | The name has the pid as the process sees it. Two containers that share a folder collide on small pids, and the second `listen()` fails. |
+
+### The environment switch
 
 ```yaml
 env:
-  - name: LD_PRELOAD
+  - name: LD_PRELOAD              # jemalloc first: the library looks for it as it loads
     value: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2:/opt/systing/libsysting_heap_responder.so
   - name: MALLOC_CONF
     value: prof:true
   - name: SYSTING_HEAP_HOOKS_LISTEN
     value: "1"
-  - name: SYSTING_HEAP_HOOKS_LISTEN_ONLY   # not the programs it starts
-    value: python3.13
-  - name: SYSTING_HEAP_HOOKS_SOCKET_DIR    # the service's own, not /tmp
+  - name: SYSTING_HEAP_HOOKS_LISTEN_ONLY
+    value: my-service
+  - name: SYSTING_HEAP_HOOKS_SOCKET_DIR
     value: /run/my-service
 ```
 
-- `SYSTING_HEAP_HOOKS_LISTEN=1` is `systing_heap_hooks_listen(NULL)`, called as the library is loaded: the socket is in the directory `SYSTING_HEAP_HOOKS_SOCKET_DIR` names, else in `/tmp`. Unset, empty or `0`, nothing is done.
-- `SYSTING_HEAP_HOOKS_LISTEN=fork` has the processes this one forks listen as well, each on a socket of its own, as a server's workers must if they are to be asked. The child's thread is started inside `fork()`, before it returns in the child. The manual allows the forked child of a program with threads only a short list of simple calls, and starting a thread is not one of them. What makes it work is glibc's own order, which is no promise: the child puts its locks back before it runs any library's fork handler (read in glibc 2.39). The library calls jemalloc before it takes its own part in `fork()`, so that jemalloc's locks too are the child's again by then. It has run on glibc alone: on another C library, musl above all, nothing is known. It is asked for by name for that reason.
-- There is no caller to tell what came of it. A request that cannot be followed (no jemalloc, profiling off, a directory that is not there, a value that is neither) is said in one line on standard error, and the service runs as it would have. So is a forked worker's that cannot listen, with its pid.
-- **Every program started with that environment listens**, not the service alone: a shell command it runs, a helper it starts. Each has a thread and a socket of its own for as long as it runs, and one without jemalloc or profiling says so on its standard error.
-- **That can break a program.** It has a second thread before its own code begins, and Linux refuses a program with more than one thread a new user namespace: `unshare --user`, and a sandbox launcher that does the same, fail with `Invalid argument`. This was run, and is so.
-- **`SYSTING_HEAP_HOOKS_LISTEN_ONLY` names the one program that is to listen**, by the file name of its executable, which for a Python service is the interpreter's (`python3.13`; `readlink /proc/PID/exe` says). Every other program that inherits the environment does nothing and says nothing. So does the service itself once the name is no longer its own: an image that goes from `python3.13` to `python3.14` stops listening without a word, and the variable goes with it. Set it in production. The other ways out are for the service to take the variables out of the environment it gives the programs it starts, or to call `listen()` itself and leave the environment alone.
-- "Not changed" is the service's code. Its environment has three changes: `prof:true`, which cannot be turned on after the start, the preloaded library, and the variable.
-- jemalloc comes first in `LD_PRELOAD`: the library looks for it as it is loaded.
+The service's code is unchanged. Its environment has three changes: `prof:true`, which cannot be turned on later, the preloaded library, and the switch.
 
+**The environment is inherited.** Without `LISTEN_ONLY`, every program the service starts also listens: a shell command, a helper.
 
-## Installing from C
+| Consequence | Detail |
+|---|---|
+| Extra threads and sockets | One of each per program, for as long as it runs |
+| Noise | A program without jemalloc or profiling prints one line on its stderr |
+| **Some programs break** | The program has a second thread before its own code starts. Linux refuses a new user namespace to a program with more than one thread, so `unshare --user` and sandbox launchers that do the same fail with `Invalid argument`. This was reproduced. |
 
-`systing_heap_hooks.py` checks the walk against Python's own view of the stack before it installs, and that check is in the helper alone: Python's view is asked of Python.
-`systing_heap_hooks_install("python")` called from C installs on the interpreter's version.
-On a Python of a listed version that is laid out otherwise (a free-threaded or a patched build), every object the walk reads is still checked for its type and every read is still made by the kernel, so the stacks are short or unnamed; nothing faults.
-A C caller that wants the check calls `systing_heap_hooks_prepare("python")`, compares `systing_heap_hooks_python_check()` with what it knows the stack to be, and installs after.
+With `LISTEN_ONLY` set, every other program does nothing and prints nothing.
+**So does the service itself if the name stops matching.** An image that moves from `python3.13` to `python3.14` stops listening without a message.
+The other ways out: the service removes the variables from the environment it gives its children, or calls `listen()` itself.
 
-A new Python minor version needs its offsets added to systing's pystacks bindings (`scripts/generate_python_bindings.py`) and to `MINORS` in `heap/src/hook_offsets.rs`.
+**When it cannot listen** there is no caller to tell, so it prints one line on stderr and the service runs on:
+
+```text
+systing_heap_hooks: SYSTING_HEAP_HOOKS_LISTEN=1 (pid 4242): jemalloc profiling is off (MALLOC_CONF has no prof:true)
+```
+
+### Fork
+
+The thread does not exist in a forked child, and the child closes its copy of the parent's socket.
+
+| How the socket was started | In a forked child |
+|---|---|
+| `listen()` from Python | Starts again by itself, in the folder given to the first `listen()` |
+| `SYSTING_HEAP_HOOKS_LISTEN=fork` | Starts again by itself |
+| `SYSTING_HEAP_HOOKS_LISTEN=1`, or the C function | No socket, until the child calls `listen` itself |
+
+- **A warning from Python.** Python 3.12 and later print a `DeprecationWarning` when a process with more than one thread forks, and the responder is a thread.
+- **`=fork` relies on glibc.** The child's thread is started inside `fork()`. The manual allows the forked child of a threaded program only a short list of simple calls, and starting a thread is not one of them. It works because glibc restores its own locks before it runs any library's fork handler (read in glibc 2.39), and because this library calls jemalloc before registering its handler, so jemalloc's locks are restored by then too. That is an implementation's order, not a promise. Nothing is known about musl.
+- **A worker that cannot listen.** With `=fork` it prints the same one line on stderr, with its pid. A child of Python's `listen()` fails silently.
+
+### Costs and limits
+
+| Topic | Detail |
+|---|---|
+| Memory | The dump's pages count against the service's own memory limit until the tool has read and closed it. A dump is a few KB to a few MB, and the service most likely to be asked is one near its limit. |
+| No rate limit | Each request is a whole `prof.dump` on the responder's thread. Whoever may ask can already stop the service, so this gives nobody new power. It is a cost. |
+| A small widening | Where `kernel.yama.ptrace_scope` is 1 or more, one process cannot read another of the same user. Through the socket such a process can get the heap profile (stacks, sizes, mapped file paths) and the Python code map (function names, files, lines). It gets no memory contents. |
+| One file may be written | With `backtrace="python"`, the first request to a forked worker creates that worker's code map file, as its first new function would have. The responder-only library writes nothing but its socket. |
+| One lock is shared | While that file is made, the responder holds the Python backtrace's lock. A thread whose allocation is sampled at that moment waits for it. |
+| Files left behind | A process that is killed, leaves through `_exit()` (as `multiprocessing` workers do) or goes on to `execve` another program leaves its socket file. The next process to listen under that name takes it over. |
+| Closed descriptors | If the program closes descriptors it did not open, the number may be reused. The thread notices that it is no longer its socket and ends, and `listen()` can be called again. |
+
+## Python functions in the stacks
+
+```text
+_start → … → outer (python) [app.py:12] → leak_in_python (python) [app.py:10] → PyByteArray… → malloc
+```
+
+**Use `backtrace="python"`.** Use trampolines with `backtrace="libunwind"` only for a Python it refuses: newer than 3.14, free-threaded or otherwise built differently, or a process that may not read its own memory through the kernel.
+
+| Setup | Stacks show | Cost |
+|---|---|---|
+| `backtrace="python"` | Every Python function with file and line, among the native frames | Per sampled allocation only |
+| Trampolines and `backtrace="libunwind"` | Every Python function with its file, no line | Every Python call, and per sampled allocation |
+| Trampolines and a jemalloc built with `--enable-prof-libunwind`, no hook | The same, expected. Not tested. | The same |
+| Trampolines and jemalloc's default | Only the innermost Python function | Every Python call |
+| Neither | Native frames only: the interpreter's C functions | None |
+
+### How `backtrace="python"` works
+
+When jemalloc samples an allocation, the hook takes jemalloc's own native stack and adds the Python frames of the thread that allocated, read from the interpreter's frame chain.
+Nothing happens between samples, so Python runs at full speed.
+It also works on threads that have released the GIL: an allocation inside numpy or torch shows its Python callers.
+
+```mermaid
+flowchart LR
+    A["Sampled<br/>allocation"] --> B["jemalloc's own<br/>native stack"]
+    A --> C["Python frames of<br/>this thread"]
+    B --> D["One stack, kept<br/>by jemalloc"]
+    C -- "each frame stored as<br/>code id + position" --> D
+    C -- "first time a function is seen" --> M[("Code map<br/>pycode-PID-TOKEN.map<br/>id → name, file, lines")]
+    D --> E["Dump"]
+    E --> T["systing-heap"]
+    M --> T
+```
+
+| Topic | Detail |
+|---|---|
+| **The code map** | jemalloc keeps a stack as addresses, so each Python frame is stored as a 64-bit value that no address can equal: a code id and an instruction index. The ids are named in `pycode-<pid>-<token>.map`, one line per Python function. |
+| **Where it is written** | In the folder of jemalloc's `prof_prefix`, or the working directory if there is none. **It must be writable**, or the backtrace is not installed. |
+| **Keep it with the dumps** | Without it, Python frames read `unknown (python) [unknown]`. The socket sends it along with the dump. |
+| **A dump names its own map** | The token is also the name of a mapping in the process, which the dump records. A later process with the same pid cannot name another's frames. |
+| **Checked before use** | `install()` compares what the hook reads with what Python says the stack is: every frame's code object, position, names and line table. If they differ, it is not installed and `reasons` says so. |
+| **Forked workers** | Nothing to do. Each child writes its own map, which starts with the parent's lines, so what the parent allocated before the fork is named too. The map is made when the worker's first allocation is sampled, or at the first request on its socket. A worker that writes a dump **file** before either has no map yet, and its Python frames read `unknown (python) [unknown]`. |
+| **At exit** | The helper turns the walk off as the interpreter exits. Allocations sampled after that have native stacks. |
+| **Threads Python never saw** | A native thread pool has no Python frames. Its stacks are native. |
+| **Depth** | jemalloc 5.3 keeps 128 frames. Python frames get at most 64 of them, the innermost, and the native stack gets the rest: past 128 in all it loses its outermost frames. On such a truncated stack the Python frames may not pair up with the interpreter's native frames, and are then placed in front of them as one block. |
+| **Which frames** | The ones Python shows in a traceback |
+| **Cleanup** | Code maps are not deleted. Each process leaves one, created like the dumps: mode `0644` less the umask. Whoever can read the dumps can read the function names and source paths in it. |
+| **Ceilings** | 128 MiB per map and 98,304 functions, fewer if many land in the same part of the hook's table. Functions first met past these read `unknown (python) [unknown]`. `systing-heap` skips a line with a name over 1,024 characters, a file over 4,096 or a line table over 64 KiB, and prints U+FFFD in place of a control character in a name. |
+
+### Safety rules of `backtrace="python"`
+
+It runs inside `malloc`, in the service's process, mostly on threads that do not hold the GIL. So:
+
+| Rule | Why it matters |
+|---|---|
+| A thread walks only its own frames | No other thread's state is touched |
+| No pointer from Python is dereferenced. Everything is read with `process_vm_readv` on the process itself, or `/proc/self/mem` where seccomp refuses that. | A bad address is an error, not a crash. If neither works, the backtrace is not installed. |
+| It calls only three Python functions: two that return the thread's state, one that says the interpreter is exiting | It never takes the GIL, touches a reference count or allocates |
+| Every loop and length is bounded, and each object's type is checked before use | Garbage gives a short or unnamed stack |
+| It keeps no descriptor open for the code map, which is opened for each line and closed | A program that closes descriptors it did not open never gets our line in its own file |
+| Where reads have to go through `/proc/self/mem`, that one descriptor stays open. A forked child closes its parent's and opens its own. | A child never reads its parent's memory |
+| The code map is opened without blocking, and written only if it is still the regular file that was made, unchanged since the last line | Someone else with write access to the folder cannot stall an allocation or redirect the write. A map that was touched by anything else stops growing. |
+| jemalloc's own backtrace is called exactly as jemalloc calls it | The native stack is what it would have been |
+
+### Perf trampolines
+
+For a Python that `backtrace="python"` refuses. Two things make it work:
+
+- **Perf trampolines** (Python 3.12+). Python gives each function a small piece of generated code, so a native stack shows one frame per Python function, and names that code in `/tmp/perf-<pid>.map`.
+- **A backtrace that walks through them.** The distro's jemalloc uses libgcc's unwinder, which stops at the first trampoline. libunwind walks through, and the hook makes jemalloc use it.
+
+```python
+print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
+# {'backtrace': 'libunwind', 'trampolines': True, 'reasons': []}
+```
+
+| Topic | Detail |
+|---|---|
+| **Turn them on early** | Trampolines wrap only functions called after they are on. A frame that is already running, such as a long-lived main loop, has none in any later snapshot. `PYTHONPERFSUPPORT=1` turns them on at startup. |
+| **Forked workers** | Each worker starts its own perf map, so frames inherited from the parent are unnamed. On 3.13+, call `keep_perf_map_across_fork()` once in the parent, before it forks. |
+| **No line numbers** | A trampoline is per function. Frames name the function and file. Application code has no module prefix, so two functions with the same qualified name in files with the same base name count as one frame. |
+| **Keep the perf map** | In a container `/tmp` is the container's own, so copy the map out with the dumps or use `--pid`. Without it frames read `unknown ([anon:exec])`. |
+| **Which maps are trusted** | A regular file of at most 256 MiB. In a world-writable folder, only one that you or root own, as `perf` requires. A refused candidate falls through to the next place. A map is consulted only for addresses in anonymous executable memory, so a stale one cannot name data. |
+| **Joining with captures** | Names match systing's pystacks apart from the line. Drop it to join: `regexp_replace(name, ':\d+\]$', ']')`. |
+
+### The two compared
+
+**What the stacks show**
+
+| | `backtrace="python"` | Trampolines and `backtrace="libunwind"` |
+|---|---|---|
+| A Python frame | Function, file and line | Function and file |
+| Frames already running when it is turned on | Shown | Unnamed, unless `PYTHONPERFSUPPORT=1` was set at startup |
+| A deep stack (jemalloc keeps 128 frames) | The innermost 64 Python frames | About 40 Python frames, since each takes three of the 128. Past about 36 deep, the outermost frames are lost. |
+| An allocation made with the GIL released | Python callers shown | Python callers shown |
+| A thread Python never saw | Native frames only | Native frames only |
+| A forked worker | Nothing to do | One more call on 3.13+. On 3.12 inherited frames are unnamed. |
+
+**What it costs.** Measured on CPython 3.12.3 and 3.13.15, x86-64, one core, the distro's jemalloc 5.3 at `lg_prof_sample:19`.
+
+| | `backtrace="python"` | Trampolines and `backtrace="libunwind"` |
+|---|---|---|
+| Python function calls, on a benchmark made only of calls | No change | 40% to 65% slower, about 16 ns a call. Far less for code that spends its time in C. |
+| A sampled allocation at 30 Python frames, on top of jemalloc's own 4 µs | 25 to 26 µs | 9 µs on 3.12, 20 µs on 3.13 |
+| The same, per GiB allocated | About 50 ms | 19 to 41 ms, plus the cost on every call |
+| System calls per sampled allocation | About 37 (`process_vm_readv`) | About 39 (libunwind checks each address) |
+| Threads sampled at the same moment | Walk side by side | One at a time: a lock is held for the whole unwind |
+| A mixed workload (tokenize, parse and compile 150 files) | No difference above noise | No difference above noise |
+| Memory | A 5 MiB table is mapped. Only the pages used are resident. | 64 KiB of generated code for 1,300 functions |
+| Files | About 1 KiB per function that was in a sampled stack | About 90 bytes per function that was ever called |
+
+`python` costs more per sample and nothing per call. It is the cheaper of the two once a program makes more than about 300 (3.13) to 1,000 (3.12) Python calls per sampled allocation, which at the default period is per 512 KiB allocated.
+
+**What can go wrong**
+
+| | `backtrace="python"` | Trampolines and `backtrace="libunwind"` |
+|---|---|---|
+| Depends on | CPython's private structures, by offsets kept per minor version | A feature CPython supports, and libunwind8 in the image |
+| A new Python version | Refused until its offsets are added. Stacks are native until then. | Nothing depends on the version |
+| A Python laid out differently | Refused by the check in `install()` | Nothing depends on the layout |
+| A bad pointer | Cannot fault | libunwind checks each address before reading it |
+| Changes in the process | Nothing between samples | How every Python function is called, for the life of the process. It also maps executable memory at run time. |
+| Needs from the environment | `process_vm_readv` on itself, or `/proc/self/mem` | `libunwind.so.8`, and a writable `/tmp` |
+| Which process a map belongs to | The dump names its map by a token | By pid alone: a map left by an earlier process with the same pid is not told apart |
+| Where the map is | Beside the dumps | In the container's `/tmp` |
+
+## For maintainers
+
+```text
+heap/hooks/
+  systing_heap_hooks.h    the C API, both parts
+  systing_heap_hooks.py   the Python helper
+  Makefile
+  common/                 shared: finding jemalloc, fork handling, error texts
+  backtrace/              backtrace.c, python.c, py_offsets.h
+  responder/              responder.c
+```
+
+- **The two parts do not call each other.** Each is built from its own folder and `common/`. The one thing that passes between them is the code map: the Python backtrace registers how to ask for it, through `common/`, and the responder hands over what it is given.
+- **`backtrace/py_offsets.h`** holds the CPython struct offsets, by version. It is rendered from systing's pystacks offsets. `cargo test -p systing-heap hook_offsets` fails when the two differ, and rewrites the header when run with `SYSTING_HEAP_UPDATE_OFFSETS=1`.
+- **A new Python minor version** needs its offsets added to systing's pystacks bindings (`scripts/generate_python_bindings.py`) and to `MINORS` in `heap/src/hook_offsets.rs`.
+- **The socket's protocol** is described at the top of `responder/responder.c`.
