@@ -18,7 +18,7 @@ use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
 use crate::systing_core::types::task_info;
 use crate::systing_core::SystingRecordEvent;
-use crate::task_stacks_recorder::TaskStacksRecorder;
+use crate::task_stacks_recorder::{remote_reads_sysinfo_value, TaskStacksRecorder};
 use crate::tpu::metrics_recorder::TpuMetricsRecorder;
 use crate::trace::{
     ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ProcessRecord, ThreadRecord,
@@ -287,6 +287,10 @@ pub struct SessionRecorder {
     /// attached. Unset when the network recorder is not enabled (the sysinfo
     /// column is then NULL).
     pub network_recorder_config: OnceLock<NetworkRecorderConfig>,
+    /// Whether the task-stacks recorder reads other tasks' user memory
+    /// (`sysinfo.task_stacks_remote_reads`), set once its iterator is loaded.
+    /// Unset when the recorder is not enabled (the column is then NULL).
+    pub task_stacks_remote_reads: OnceLock<bool>,
 }
 
 pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -1020,6 +1024,7 @@ impl SessionRecorder {
             memory_recorder_config: OnceLock::new(),
             memory_recorder_end: OnceLock::new(),
             network_recorder_config: OnceLock::new(),
+            task_stacks_remote_reads: OnceLock::new(),
         }
     }
 
@@ -1706,6 +1711,10 @@ impl SessionRecorder {
                 network_packet_sample_rate: network
                     .and_then(|n| n.packet_sample_rate)
                     .map(i64::from),
+                task_stacks_remote_reads: self
+                    .task_stacks_remote_reads
+                    .get()
+                    .map(|&remote| remote_reads_sysinfo_value(remote).to_string()),
             })?;
         }
 
@@ -2217,6 +2226,7 @@ mod tests {
             memory_recorder_config: OnceLock::new(),
             memory_recorder_end: OnceLock::new(),
             network_recorder_config: OnceLock::new(),
+            task_stacks_remote_reads: OnceLock::new(),
         }
     }
 

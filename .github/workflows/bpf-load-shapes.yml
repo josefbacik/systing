@@ -4,6 +4,10 @@ name: bpf-load-shapes
 # shape that ships, on the kernels the object runs on — in a guest per kernel,
 # before any tag. `every_shape_loads` (tests/bpf_load_shapes.rs) is the gate;
 # the object is built here with the same BPF compiler the release build uses.
+# `closed_task_stacks_rows_call_nothing_that_reads_another_task` runs after it: the
+# task-stacks rows that may not read other tasks' memory are loaded with the
+# verifier's log, which has to name no call that does (an open row, loaded first
+# and attached nowhere, has to name them: the read can see such a call).
 #
 # Kernel images are executed, so each one is pinned by its sha256 in the matrix
 # below and verified after the download; the download is cached by that digest.
@@ -20,7 +24,11 @@ name: bpf-load-shapes
 # must carry nothing. The same three programs are traced once more through the
 # task-stacks recorder with the CPU sampler off (`task_stack_event.task_context_id`),
 # so that its iterator, which reads other threads' memory from another CPU, is the
-# only reader of the values; and in the confidentiality mode it reads nothing. Those cases are `#[ignore]`d for an unprivileged
+# only reader of the values; and in the confidentiality mode it reads nothing. Where
+# that recorder does not read other tasks' memory at all (an aarch64 kernel not known
+# to carry the fix its unwinder's mapping lookup needs) its captures say so themselves,
+# and the script holds them to that instead: events with no context id, an empty table,
+# and a reader that counted nothing. Those cases are `#[ignore]`d for an unprivileged
 # `cargo test` and return early without a C compiler;
 # scripts/ci/vmtest-task-context-e2e.sh decides by the lines the cases and the
 # tracer print, so a green row means every case ran to its end and the reader's own
@@ -29,7 +37,12 @@ name: bpf-load-shapes
 # The same cases also run on native arm64, with no guest: the runner's own CPUs and
 # its own kernel (the arm64 job at the end). That is the only place the writer
 # library's ordering test meets weakly ordered hardware, and the only place the
-# reader's aarch64 thread-pointer and DTV reads are exercised.
+# reader's aarch64 thread-pointer and DTV reads are exercised. It is also the only
+# place the unwinder's mapping lookup (bpf_find_vma on the walked task) is compiled
+# in, so the closed task-stacks rows are loaded there too; and its kernel is whatever
+# GitHub ships, so where its release is on no line known to carry the fix that makes
+# that lookup safe, the task-stacks cases run closed by the recorder's own decision.
+# The job says which contract they were held to, as an annotation on the run.
 #
 # Each guest job also boots its kernel a third time and runs the task-stacks
 # end-to-end cases (`test_e2e_task_stacks_scoped_walk*`, tests/trace_validation.rs)
@@ -370,6 +383,31 @@ jobs:
           cp "$BIN" gate/task_context_record
           cp libduckdb/libduckdb.so gate/
           ls -l gate
+      - name: Build the bpf_load_shapes test binary (the task-stacks rows that may not read other tasks' memory)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo test --test bpf_load_shapes --no-run --no-default-features --message-format=json > /tmp/build-load-shapes.json
+          BIN="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "bpf_load_shapes") | .executable' /tmp/build-load-shapes.json | tail -1)"
+          test -x "$BIN"
+          cp "$BIN" gate/bpf_load_shapes
+          ls -l gate
+      - name: Load the task-stacks rows that may not read other tasks' memory, and read what they call
+        # This is the one architecture whose unwinder looks a frame's mapping up
+        # (bpf_find_vma on the walked task) before it reads it, so the one place those
+        # rows are loaded with the lookup compiled in. None may hold the call, nor the
+        # remote copy (the runner's kernel drops the global functions nothing calls). The
+        # open row the test loads first, and attaches nowhere, has to show both.
+        run: |
+          chmod +x gate/bpf_load_shapes
+          echo "kernel release: $(uname -r)"
+          sudo -E env LD_LIBRARY_PATH="$GITHUB_WORKSPACE/gate" "$GITHUB_WORKSPACE/gate/bpf_load_shapes" \
+            --ignored --test-threads=1 --nocapture closed_task_stacks_rows_call_nothing_that_reads_another_task
       - name: Run the task_context end-to-end cases as root
         # The script decides by what the cases and the tracer print, as in the
         # guests; run outside a guest it mounts nothing and the cases use /tmp.
@@ -385,6 +423,33 @@ jobs:
           cat "$OUT" || cat "$OUT.raw" || true
           echo "::endgroup::"
           grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      - name: Say which task-stacks contract this runner's kernel was held to
+        # The recorder decides by the kernel's release, with nothing forcing it either way.
+        # A runner image on a release known to carry the fix runs the cases open, and the
+        # cases for a kernel without it then did NOT run here: said as a warning on the run,
+        # never passed over in silence. A runner on a stable line newer than every line the
+        # recorder's table lists reads closed only because the table is behind, and the
+        # recorder says so in fixed words: that is an error here, naming the table, so that
+        # a new line is added when it appears and not when someone misses their stacks.
+        if: always()
+        run: |
+          OUT="$GITHUB_WORKSPACE/task-context-e2e-arm64.log"
+          if [ ! -s "$OUT" ]; then
+            echo "::warning::no task_context end-to-end log was written: an earlier step ended before the cases ran, and its failure is the one to read"
+            exit 0
+          fi
+          if grep -q -F 'TASK-STACKS-CONTRACT closed' "$OUT"; then
+            if grep -q -F 'a stable line newer than every line this build lists' "$OUT"; then
+              echo "::error::kernel $(uname -r) is on a stable line newer than every line the task-stacks recorder lists, so it read as not fixed: add the line to FIND_VMA_FIXED_FROM in src/task_stacks_recorder.rs"
+              exit 1
+            fi
+            echo "::notice::kernel $(uname -r): the task-stacks recorder did not read other tasks' memory here, by its own decision at load, and its cases were held to that"
+          elif grep -q -F 'TASK-STACKS-CONTRACT open' "$OUT"; then
+            echo "::warning::kernel $(uname -r) reads as carrying the fix for the unwinder's mapping lookup: the task-stacks recorder read other tasks' memory, so the cases for a kernel without the fix did NOT run on this runner"
+          else
+            echo "::error::the task_context end-to-end log names no task-stacks contract"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

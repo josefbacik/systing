@@ -2695,6 +2695,7 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     let mut memory_syscall_leg_builder = StringBuilder::with_capacity(1, 24);
     let mut network_tw_leg_builder = StringBuilder::with_capacity(1, 16);
     let mut network_packet_sample_rate_builder = Int64Builder::with_capacity(1);
+    let mut task_stacks_remote_reads_builder = StringBuilder::with_capacity(1, 24);
 
     sysname_builder.append_value(&record.sysname);
     release_builder.append_value(&record.release);
@@ -2718,6 +2719,7 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     memory_syscall_leg_builder.append_option(record.memory_syscall_leg.as_deref());
     network_tw_leg_builder.append_option(record.network_tw_leg.as_deref());
     network_packet_sample_rate_builder.append_option(record.network_packet_sample_rate);
+    task_stacks_remote_reads_builder.append_option(record.task_stacks_remote_reads.as_deref());
 
     Ok(RecordBatch::try_new(
         schema.clone(),
@@ -2744,6 +2746,7 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
             Arc::new(memory_syscall_leg_builder.finish()),
             Arc::new(network_tw_leg_builder.finish()),
             Arc::new(network_packet_sample_rate_builder.finish()),
+            Arc::new(task_stacks_remote_reads_builder.finish()),
         ],
     )?)
 }
@@ -3884,6 +3887,7 @@ mod tests {
                 memory_syscall_leg: Some("tracepoint:notramp".to_string()),
                 network_tw_leg: Some("kprobe:notramp".to_string()),
                 network_packet_sample_rate: Some(8),
+                task_stacks_remote_reads: Some("off:kernel-release".to_string()),
             })
             .unwrap();
         writer.finish().unwrap();
@@ -3913,6 +3917,7 @@ mod tests {
             Option<String>,
             Option<String>,
             Option<i64>,
+            Option<String>,
         );
 
         let conn = Connection::open(&db_path).unwrap();
@@ -3923,7 +3928,7 @@ mod tests {
                  memory_map_sample_rate, memory_alloc_sample_rate, memory_vfio_leg, \
                  memory_thp_leg, memory_thp_sample_rate, memory_iommu_overflow, \
                  memory_anon_huge_walk, memory_syscall_leg, network_tw_leg, \
-                 network_packet_sample_rate FROM sysinfo",
+                 network_packet_sample_rate, task_stacks_remote_reads FROM sysinfo",
                 [],
                 |row| {
                     Ok((
@@ -3947,6 +3952,7 @@ mod tests {
                         row.get(17)?,
                         row.get(18)?,
                         row.get(19)?,
+                        row.get(20)?,
                     ))
                 },
             )
@@ -3978,6 +3984,7 @@ mod tests {
         assert_eq!(row.17, Some("tracepoint:notramp".to_string()));
         assert_eq!(row.18, Some("kprobe:notramp".to_string()));
         assert_eq!(row.19, Some(8));
+        assert_eq!(row.20, Some("off:kernel-release".to_string()));
     }
 
     /// A sysinfo.parquet written before the memory columns existed (systing
