@@ -85,7 +85,9 @@ void systing_heap_hooks_python_backtrace(void **vec, unsigned *len, unsigned max
  * A program that is not changed listens when the library is loaded into it
  * (LD_PRELOAD) with SYSTING_HEAP_HOOKS_LISTEN=1 in its environment, as if it
  * had called this with NULL; with SYSTING_HEAP_HOOKS_LISTEN=fork the
- * processes it forks listen as well.
+ * processes it forks listen as well. Every program started with that
+ * environment listens, unless SYSTING_HEAP_HOOKS_LISTEN_ONLY names the one
+ * that is to, by its executable's file name ("python3.13").
  */
 int systing_heap_hooks_listen(const char *dir);
 

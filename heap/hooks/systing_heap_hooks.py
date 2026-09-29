@@ -46,12 +46,15 @@ process answer requests for a heap dump, so that one can be asked for at any mom
 
 One thread is started for it, which sleeps until someone asks, runs nothing
 of Python's and answers whatever the program's own threads are doing. The
-dump is handed over as a descriptor of an anonymous file: nothing is written
-to disk. Each process this one forks listens for itself.
+dump is handed over as a descriptor of an anonymous file, and is not written
+to disk. Each process this one forks listens for itself. In production give
+it a directory of the service's own, not /tmp.
 
 A service that is not to be changed needs no call and none of this file: with
 the library preloaded (LD_PRELOAD) and SYSTING_HEAP_HOOKS_LISTEN=1 in its
-environment it listens as if it had called listen().
+environment it listens as if it had called listen(). So does every program it
+starts with that environment, unless SYSTING_HEAP_HOOKS_LISTEN_ONLY names the
+one that is to (README.md).
 """
 
 import atexit

@@ -3,8 +3,8 @@
  *
  * systing-heap hooks: the responder. One thread that answers requests for a
  * heap dump on a Unix socket, so that a dump can be asked for from outside
- * the process (systing-heap --pid PID --ask) at any moment, and nothing is
- * written to disk: jemalloc writes the dump into an anonymous file, and the
+ * the process (systing-heap --pid PID --ask) at any moment, and the dump is
+ * not written to disk: jemalloc writes it into an anonymous file, and the
  * answer carries that file's descriptor.
  *
  * The socket is a file in the process's own filesystem,
@@ -14,9 +14,13 @@
  * A request is one line, and so is the answer:
  *
  *   -> "systing-heap 1 dump\n"
- *   <- "ok 1 heap=<bytes> map=<0|1>\n"   with the descriptors, in one message:
+ *   <- "ok 1 heap=<bytes> map=<0|1> active=<0|1>\n"
+ *                                        with the descriptors, in one message:
  *                                        the dump, then the Python code map
- *                                        when the process writes one
+ *                                        when the process writes one. active
+ *                                        is jemalloc's "prof.active": 0 where
+ *                                        sampling is paused, and the dump
+ *                                        holds what was sampled before
  *   <- "error <why>\n"
  *
  * What the thread may and may not do:
@@ -26,8 +30,10 @@
  * - The socket is known by what it is, not by its number alone: a program
  *   that closes descriptors it did not open may give the number to a socket
  *   of its own, and the thread then ends instead of answering there.
- * - It runs nothing of the program's and takes none of its locks. Every
- *   signal is blocked on it, so no handler of the program's runs there.
+ * - It runs nothing of the program's and takes none of its own locks; of
+ *   this library's it takes the "python" backtrace's while a forked child's
+ *   code map is made. Every signal is blocked on it, so no handler of the
+ *   program's runs there.
  * - It is an ordinary thread outside malloc: jemalloc's "prof.dump" is called
  *   as any thread of the program may call it.
  * - A peer that says nothing, or reads nothing, is given up after
@@ -39,7 +45,9 @@
  * A program that is not changed at all listens when the library is loaded
  * into it with SYSTING_HEAP_HOOKS_LISTEN set in its environment: to 1, or to
  * fork for the processes it forks to listen as well. The socket is where
- * systing_heap_hooks_listen(NULL) puts it.
+ * systing_heap_hooks_listen(NULL) puts it. SYSTING_HEAP_HOOKS_LISTEN_ONLY
+ * names the one program that is to: the others that inherit the environment
+ * then do nothing.
  *
  * This file and common.c are all the responder is: the library that is only
  * those two, libsysting_heap_responder.so, has nothing in it of Python or
@@ -211,8 +219,14 @@ static void answer(int c)
 	struct stat st;
 	long long size = fstat(fds[0], &st) == 0 ? (long long)st.st_size : 0;
 	fds[1] = code_map();
+	/* A dump of a process whose sampling is paused looks like any other. */
+	bool active = true;
+	size_t active_len = sizeof(active);
+	if (mallctl_p("prof.active", &active, &active_len, NULL, 0) != 0)
+		active = true;
 	char line[96];
-	snprintf(line, sizeof(line), "ok 1 heap=%lld map=%d\n", size, fds[1] >= 0);
+	snprintf(line, sizeof(line), "ok 1 heap=%lld map=%d active=%d\n", size,
+		 fds[1] >= 0, (int)active);
 	say(c, line, fds, fds[1] >= 0 ? 2 : 1);
 	close(fds[0]);
 	if (fds[1] >= 0)
@@ -294,11 +308,47 @@ static void register_at_exit(void)
 
 static int listen_locked(const char *dir);
 
+/* Why the process does not listen, in one line on standard error, where
+ * there is no caller to tell: what the environment asked for, and what a
+ * forked child was to do. Built here and written in one call. */
+static void complain(const char *how, int rc)
+{
+	char line[256];
+	int n = snprintf(line, sizeof(line),
+			 "systing_heap_hooks: SYSTING_HEAP_HOOKS_LISTEN=%.16s (pid %ld): %s\n",
+			 how, (long)getpid(), systing_heap_hooks_strerror(rc));
+	if (n > 0) {
+		size_t len = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1;
+		ssize_t written = write(STDERR_FILENO, line, len);
+		(void)written;
+	}
+}
+
+/*
+ * Held from before the socket is made until it is on record, and across
+ * every fork: a child is not forked with a socket that is listened on and
+ * that nothing names, which it could not let go of. Nothing is done under
+ * it but system calls: it is taken before a fork, when other locks are held
+ * by whoever forks.
+ */
+static pthread_mutex_t making_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void before_fork(void)
+{
+	pthread_mutex_lock(&making_lock);
+}
+
+static void after_fork_in_parent(void)
+{
+	pthread_mutex_unlock(&making_lock);
+}
+
 static void after_fork_in_child(void)
 {
 	/* The thread is not in the child, and the socket is the parent's: the
 	 * child lets go of its copy, and listens once it asks to. */
 	pthread_mutex_init(&listen_lock, NULL);
+	pthread_mutex_init(&making_lock, NULL);
 	int listened = listen_fd >= 0;
 	if (listened && is_the_socket(listen_fd))
 		close(listen_fd);
@@ -306,11 +356,15 @@ static void after_fork_in_child(void)
 	socket_path[0] = '\0';
 	/* Asked for in the environment: the child has a socket and a thread
 	 * of its own before fork() returns in it. */
-	if (listened && listen_in_children)
-		listen_locked(listen_dir);
+	if (listened && listen_in_children) {
+		int rc = listen_locked(listen_dir);
+		if (rc != SHH_OK)
+			complain("fork", rc);
+	}
 }
 
-static const struct shh_fork_part fork_part = {NULL, NULL, after_fork_in_child};
+static const struct shh_fork_part fork_part = {before_fork, after_fork_in_parent,
+					       after_fork_in_child};
 
 /* Whether something answers at `addr`. It is asked without waiting: a
  * socket whose queue is full is one that someone listens on, and whoever
@@ -354,11 +408,9 @@ fail:
 	return -1;
 }
 
-static int listen_locked(const char *dir)
+/* Whether jemalloc is here and profiles: SHH_OK, or why not. */
+static int profiles_locked(void)
 {
-	if (listen_fd >= 0)
-		return SHH_OK;
-
 	if (!mallctl_p)
 		mallctl_p = shh_find_mallctl();
 	if (!mallctl_p)
@@ -367,6 +419,17 @@ static int listen_locked(const char *dir)
 	size_t prof_len = sizeof(prof);
 	if (mallctl_p("opt.prof", &prof, &prof_len, NULL, 0) != 0 || !prof)
 		return SHH_ERR_PROF_OFF;
+	return SHH_OK;
+}
+
+static int listen_locked(const char *dir)
+{
+	if (listen_fd >= 0)
+		return SHH_OK;
+
+	int profiles = profiles_locked();
+	if (profiles != SHH_OK)
+		return profiles;
 
 	if (!dir)
 		dir = secure_getenv("SYSTING_HEAP_HOOKS_SOCKET_DIR");
@@ -378,24 +441,30 @@ static int listen_locked(const char *dir)
 	if (n < 0 || (size_t)n >= sizeof(addr.sun_path))
 		return SHH_ERR_SOCKET_PATH;
 
+	if (dir != listen_dir)
+		snprintf(listen_dir, sizeof(listen_dir), "%s", dir);
+
+	/* No fork between the socket's making and its being on record. */
+	pthread_mutex_lock(&making_lock);
 	int fd = bind_and_listen(&addr);
-	if (fd < 0)
-		return SHH_ERR_SOCKET;
 	struct stat st;
-	if (fstat(fd, &st) != 0) {
+	if (fd >= 0 && fstat(fd, &st) != 0) {
 		unlink(addr.sun_path);
 		close(fd);
+		fd = -1;
+	}
+	if (fd < 0) {
+		pthread_mutex_unlock(&making_lock);
 		return SHH_ERR_SOCKET;
 	}
 	/* Known from here on, before there is a thread: a child forked by
-	 * another thread meanwhile lets go of it like any other. */
+	 * another thread from now on lets go of it like any other. */
 	listen_dev = st.st_dev;
 	listen_ino = st.st_ino;
 	listen_pid = getpid();
 	memcpy(socket_path, addr.sun_path, sizeof(socket_path));
-	if (dir != listen_dir)
-		snprintf(listen_dir, sizeof(listen_dir), "%s", dir);
 	listen_fd = fd;
+	pthread_mutex_unlock(&making_lock);
 
 	/* The thread starts with every signal blocked, as the thread that
 	 * makes it has them for that moment. */
@@ -421,7 +490,17 @@ static int listen_locked(const char *dir)
 
 int systing_heap_hooks_listen(const char *dir)
 {
+	/* jemalloc is called before this library takes its part in fork():
+	 * jemalloc takes its own part when it is first called, and whoever
+	 * took part first is first in a forked child. There the child's
+	 * handler of this library may start a thread, and jemalloc's locks
+	 * are its own again by then. */
+	pthread_mutex_lock(&listen_lock);
+	int profiles = profiles_locked();
+	pthread_mutex_unlock(&listen_lock);
 	shh_at_fork(&fork_part);
+	if (profiles != SHH_OK)
+		return profiles;
 	pthread_once(&at_exit_once, register_at_exit);
 	pthread_mutex_lock(&listen_lock);
 	int rc = listen_locked(dir);
@@ -438,6 +517,19 @@ const char *systing_heap_hooks_socket(void)
 	return path;
 }
 
+/* Whether this program is the one named `only`: the last part of what
+ * /proc/self/exe names, which for a Python service is the interpreter. */
+static bool this_program_is(const char *only)
+{
+	char exe[4096];
+	ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+	if (n <= 0)
+		return false;
+	exe[n] = '\0';
+	const char *slash = strrchr(exe, '/');
+	return strcmp(slash ? slash + 1 : exe, only) == 0;
+}
+
 /* What the environment asks for, when the library is loaded. There is no
  * caller to tell what came of it, so a request that fails is said once, on
  * standard error. */
@@ -445,6 +537,13 @@ __attribute__((constructor)) static void listen_as_the_environment_says(void)
 {
 	const char *how = secure_getenv("SYSTING_HEAP_HOOKS_LISTEN");
 	if (!how || !how[0] || strcmp(how, "0") == 0)
+		return;
+	/* The environment is inherited by every program the service starts.
+	 * One that is not the program named does nothing and says nothing: it
+	 * has no thread that it did not start, which some programs cannot
+	 * have (one that makes a user namespace is refused with any). */
+	const char *only = secure_getenv("SYSTING_HEAP_HOOKS_LISTEN_ONLY");
+	if (only && only[0] && !this_program_is(only))
 		return;
 	bool children = strcmp(how, "fork") == 0;
 	int rc = SHH_ERR_LISTEN_HOW;
@@ -456,6 +555,5 @@ __attribute__((constructor)) static void listen_as_the_environment_says(void)
 		pthread_mutex_unlock(&listen_lock);
 		return;
 	}
-	dprintf(STDERR_FILENO, "systing_heap_hooks: SYSTING_HEAP_HOOKS_LISTEN=%.16s: %s\n",
-		how, systing_heap_hooks_strerror(rc));
+	complain(how, rc);
 }

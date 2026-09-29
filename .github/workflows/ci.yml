@@ -21,6 +21,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2 libunwind8
+      # The heap tests that ask a Python through its interpreter need a 3.14,
+      # and the test that an older one is refused needs the runner's own: the
+      # 3.14 is installed beside it, as python3.14, and python3 stays what it
+      # was. Both are printed, so the log says what a green run ran.
+      - name: Install Python 3.14 beside the runner's Python
+        run: |
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt-get update
+          sudo apt-get install -y python3.14
+          python3 --version
+          python3.14 --version
       - name: Install clang 21 (the release build's BPF compiler)
         run: |
           wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh

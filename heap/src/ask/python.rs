@@ -26,7 +26,7 @@
 //!   interpreter does; another thread's is freed when the thread ends, and a
 //!   write to one that has ended would land in whatever has the memory now.
 //!   That the interpreter still names the same state is looked at again
-//!   before each write.
+//!   before each of the three writes.
 //! - Of `eval_breaker` only the lowest byte is written, the one the bit is
 //!   in. The process sets and clears bits there itself, and the rest of the
 //!   word is not this tool's to put back as it was a moment ago. Within that
@@ -34,11 +34,22 @@
 //!   it is with CPython's own writer: a request to give up the GIL is made
 //!   again by whoever wants it, but a signal's handler, or a call queued for
 //!   the thread, then waits for the next thing that makes the thread look.
-//! - The script and what it writes are in a directory of their own, made for
-//!   the one request in the process's filesystem, which the process's user
-//!   alone can enter. Afterwards the files are removed by their names in
-//!   that directory, and the directory if it is empty and still the one that
-//!   was made: nothing is removed by following what the process put there.
+//! - The script is in a directory of its own, made for the one request in
+//!   the process's filesystem. Both stay this tool's user's: the process
+//!   reads the script and cannot change it, nor put another in its place.
+//!   What the script writes goes into a directory in there that is given to
+//!   the process's user. Afterwards the files are removed by their names,
+//!   and the directories if they are empty and still the ones that were
+//!   made: nothing is removed by following what the process put there.
+//! - The script says until when it may run. A request that is still waiting
+//!   after that, because this tool was killed before it could take it back,
+//!   does nothing when the thread comes to it.
+//! - A signal that would end this tool (an interrupt, a hangup) has the
+//!   request taken back and the files removed first, and the tool then ends
+//!   by that signal. A second one ends it at once.
+//! - The script is removed only when no request can still be waiting for
+//!   it. What makes a late request do nothing is in the script: with the
+//!   script gone, its name would be anyone's to take who can write there.
 //! - The script is run by the interpreter as the process's own code is: it
 //!   imports `ctypes` there, if the process had not.
 //!
@@ -46,13 +57,15 @@
 //! far as it holds together: the cookie, the version, the size of the path's
 //! buffer, and a thread state that points back at its interpreter.
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
@@ -109,8 +122,22 @@ const POLL: Duration = Duration::from_millis(20);
 /// How long a request that was withdrawn is given, in case the thread took
 /// it between the look and the write.
 const GRACE: Duration = Duration::from_millis(300);
-/// The files of a request, which are all that is removed of it.
-const FILES: [&str; 4] = ["ask.py", "done", "done.new", "heap"];
+/// The script, in the request's directory.
+const SCRIPT: &str = "ask.py";
+/// The directory in there that the process writes to.
+const OUT: &str = "out";
+/// What the process writes there. With the two above, all that is removed
+/// of a request.
+const OUT_FILES: [&str; 4] = ["started", "done", "done.new", "heap"];
+/// What the script says when the dump is written and sampling goes on, and
+/// when it is written and sampling is paused.
+const SAID_OK: &str = "ok";
+const SAID_PAUSED: &str = "ok paused";
+/// How long after the wait a script may still run: what the request's
+/// writing and the thread's taking it up may take between them.
+const LATE: Duration = Duration::from_secs(5);
+/// The directories from the root down to the one a request is made in.
+const MAX_DEPTH: usize = 64;
 /// The most read of what the script says of how it went.
 const MAX_SAID_BYTES: u64 = 4096;
 
@@ -403,23 +430,33 @@ fn request(mem: &impl Memory, interp: u64, thread: u64, o: &Offsets, path: &[u8]
     {
         bail!("another request is waiting for the process's main thread to run it");
     }
-    if !still_runs_main(mem, interp, thread, o) {
-        bail!("the interpreter's main thread changed while it was looked at");
-    }
+    // Looked at before each of the three writes: a state the interpreter no
+    // longer names may have been freed.
+    let still = || match still_runs_main(mem, interp, thread, o) {
+        true => Ok(()),
+        false => Err(io::Error::other(
+            "the interpreter's main thread changed while it was looked at",
+        )),
+    };
     let mut with_end = path.to_vec();
     with_end.push(0);
+    still()?;
     mem.write(support + o.script_path, &with_end)
         .context("writing the script's path into the process")?;
+    still()?;
     mem.write(support + o.pending_call, &1i32.to_le_bytes())
         .context("writing the request into the process")?;
     let breaker = thread + o.eval_breaker;
     let mut low = [0u8; 1];
-    let woken = mem
-        .read(breaker, &mut low)
+    let woken = still()
+        .and_then(|()| mem.read(breaker, &mut low))
         .and_then(|()| mem.write(breaker, &[low[0] | PLEASE_STOP]));
     if let Err(e) = woken {
-        // Not left half made, for the thread to find whenever it looks.
-        let _ = mem.write(support + o.pending_call, &0i32.to_le_bytes());
+        // Not left half made, for the thread to find whenever it looks:
+        // a fourth write, with the same look before it.
+        if still().is_ok() {
+            let _ = mem.write(support + o.pending_call, &0i32.to_le_bytes());
+        }
         return Err(e).context("writing the request into the process");
     }
     Ok(())
@@ -451,21 +488,70 @@ fn withdraw(mem: &impl Memory, interp: u64, thread: u64, o: &Offsets) -> io::Res
     Ok(Left::Withdrawn)
 }
 
+/// Whether the process is gone: ended, or ended and not yet waited for.
+fn is_gone(process: &Process) -> bool {
+    match process.read_capped("stat", 4096) {
+        Err(_) => true,
+        // The state is the first word after the name, which is in brackets
+        // and is the process's to choose.
+        Ok(stat) => stat
+            .iter()
+            .rposition(|b| *b == b')')
+            .and_then(|end| stat.get(end + 2))
+            .is_none_or(|state| matches!(state, b'Z' | b'X')),
+    }
+}
+
+/// Whether the script may be removed, its request having been left as
+/// `left`: whether it is sure that no thread will still come to open it.
+fn may_remove(left: &io::Result<Left>, place: &Place, process: &Process) -> bool {
+    match left {
+        Ok(Left::Withdrawn) => true,
+        // Opened, once the script has said anything: between taking a
+        // request up and opening its script a thread can be held.
+        Ok(Left::TakenUp) => ["started", "done"]
+            .iter()
+            .any(|said| matches!(place.open(said), Ok(Some(_)))),
+        Ok(Left::Gone) | Err(_) => is_gone(process),
+    }
+}
+
 /// A request that has been made. One that is dropped unanswered is taken
 /// back, so that however the asking ends the thread does not look, long
-/// afterwards, for a script that is gone.
+/// afterwards, for a script that is gone; and where it cannot be known to
+/// have been, the script is left.
 struct Asked<'a, M: Memory> {
     mem: &'a M,
     interp: u64,
     thread: u64,
     offsets: &'a Offsets,
+    place: &'a Place,
+    process: &'a Process,
     answered: bool,
+}
+
+impl<M: Memory> Asked<'_, M> {
+    /// Take the request back for good: what became of it. The script is
+    /// kept where that leaves a thread that may still come for it.
+    fn take_back(&mut self) -> io::Result<Left> {
+        let left = withdraw(self.mem, self.interp, self.thread, self.offsets);
+        self.settle(&left);
+        left
+    }
+
+    /// The request has been left as `left`, and no more is done about it.
+    fn settle(&mut self, left: &io::Result<Left>) {
+        self.answered = true;
+        if !may_remove(left, self.place, self.process) {
+            self.place.keep.set(true);
+        }
+    }
 }
 
 impl<M: Memory> Drop for Asked<'_, M> {
     fn drop(&mut self) {
         if !self.answered {
-            let _ = withdraw(self.mem, self.interp, self.thread, self.offsets);
+            let _ = self.take_back();
         }
     }
 }
@@ -487,12 +573,22 @@ fn bytes_literal(bytes: &[u8]) -> String {
 /// sees it), then how it went into `done`, which is put in place whole. It
 /// leaves nothing in the process but the modules it imported, and raises
 /// nothing.
-fn script(dir: &[u8]) -> String {
+fn script(out: &[u8], until: u64) -> String {
     format!(
         r#"# Written by systing-heap --ask, and run once by this process at its request:
 # a heap dump from jemalloc, for systing-heap to read. Removed afterwards.
-def _systing_heap_ask(d):
+def _systing_heap_ask(d, until):
+    import time
+    # Whoever asked has given up by now, and looks for no answer.
+    if time.time() > until:
+        return
     import os
+    # Said first: whoever asked then knows the request was taken up, however
+    # long the dump takes.
+    try:
+        os.close(os.open(d + b"/started", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except OSError:
+        pass
     said = b"error the script did not finish"
     try:
         import ctypes
@@ -505,11 +601,25 @@ def _systing_heap_ask(d):
         if mallctl is None:
             said = b"error jemalloc is not the process's allocator (no mallctl)"
         else:
-            path = ctypes.c_char_p(d + b"/heap")
-            rc = mallctl(b"prof.dump", None, None, ctypes.byref(path),
-                         ctypes.c_size_t(ctypes.sizeof(path)))
+            # The file is made here, and jemalloc is given what was made: a
+            # link put at the name is not followed, by this or by jemalloc.
+            fd = os.open(d + b"/heap",
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                path = ctypes.c_char_p(b"/proc/self/fd/%d" % fd)
+                rc = mallctl(b"prof.dump", None, None, ctypes.byref(path),
+                             ctypes.c_size_t(ctypes.sizeof(path)))
+            finally:
+                os.close(fd)
             if rc == 0:
                 said = b"ok"
+                # A dump of a process whose sampling is paused holds what was
+                # sampled before, and looks like any other.
+                active = ctypes.c_bool(True)
+                size = ctypes.c_size_t(ctypes.sizeof(active))
+                if (mallctl(b"prof.active", ctypes.byref(active), ctypes.byref(size),
+                            None, ctypes.c_size_t(0)) == 0 and not active.value):
+                    said = b"ok paused"
             else:
                 said = (b"error jemalloc's prof.dump failed (%d): is profiling on "
                         b"(prof:true in MALLOC_CONF)?" % rc)
@@ -526,10 +636,187 @@ def _systing_heap_ask(d):
         pass
 
 
-_systing_heap_ask({dir})
+_systing_heap_ask({out}, {until})
 "#,
-        dir = bytes_literal(dir)
+        out = bytes_literal(out)
     )
+}
+
+/// Nothing while the asking goes on. Set, once and for the rest of the
+/// program, by a signal that would end this tool (the signal's number) and
+/// by whoever gives the asking up from outside: the request is then taken
+/// back before anything else.
+static STOP: AtomicI32 = AtomicI32::new(0);
+const OUT_OF_TIME: i32 = -1;
+
+/// Have an asking that is under way take its request back and end.
+pub(crate) fn give_up() {
+    let _ = STOP.compare_exchange(0, OUT_OF_TIME, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// The signal that has interrupted an asking, if one has.
+pub(crate) fn interrupted_by() -> Option<i32> {
+    Some(STOP.load(Ordering::SeqCst)).filter(|signal| *signal > 0)
+}
+
+fn stopped() -> bool {
+    STOP.load(Ordering::SeqCst) != 0
+}
+
+extern "C" fn on_signal(signal: libc::c_int) {
+    // All a handler may do: one store.
+    STOP.store(signal, Ordering::SeqCst);
+}
+
+/// The signals that end a program that does nothing about them, held while
+/// a request is with the process: the program would end with the request
+/// still waiting and its files where they are. Each is held once: the
+/// second of a kind does what it does to any program, so that a tool that is
+/// itself held up can still be ended. What was ignored stays ignored.
+/// Dropped, the signals are what they were.
+struct Signals(Vec<(libc::c_int, libc::sigaction)>);
+
+impl Signals {
+    fn hold() -> Signals {
+        let mut held = Vec::new();
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+            // SAFETY: both structs are this function's, zeroed is a valid
+            // sigaction, and the handler does nothing but a store.
+            unsafe {
+                let mut was: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(signal, std::ptr::null(), &mut was) != 0
+                    || was.sa_sigaction == libc::SIG_IGN
+                {
+                    continue;
+                }
+                let mut now: libc::sigaction = std::mem::zeroed();
+                now.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
+                libc::sigemptyset(&mut now.sa_mask);
+                now.sa_flags = libc::SA_RESTART | libc::SA_RESETHAND;
+                if libc::sigaction(signal, &now, std::ptr::null_mut()) == 0 {
+                    held.push((signal, was));
+                }
+            }
+        }
+        Signals(held)
+    }
+}
+
+impl Drop for Signals {
+    fn drop(&mut self) {
+        for (signal, was) in &self.0 {
+            // SAFETY: `was` is what the kernel gave for this signal.
+            unsafe { libc::sigaction(*signal, was, std::ptr::null_mut()) };
+        }
+    }
+}
+
+/// Why someone else than this tool's user and root could take a directory,
+/// or what is in it, out from under its name; None when no one can. `uid`
+/// and `mode` are the directory's, `user` is the process's and `me` this
+/// tool's.
+fn loose(uid: u32, mode: u32, user: u32, me: u32) -> Option<&'static str> {
+    if uid == user && user != me {
+        return Some("it is the process's user's own");
+    }
+    if uid != 0 && uid != me {
+        return Some("it is neither root's nor this tool's user's");
+    }
+    // In a directory with the sticky bit a name is its owner's to remove or
+    // rename, and the directory's owner's, whoever else may write there.
+    if mode & 0o022 != 0 && mode & libc::S_ISVTX == 0 {
+        return Some("others than its owner may write to it, and it has no sticky bit");
+    }
+    None
+}
+
+/// That `dir`, and every directory above it up to the process's root, is
+/// one that only root and this tool's user can change the names in: the
+/// script is opened by the process by its path, and the path must go on
+/// naming what this tool wrote. Each is looked at for what it is, without a
+/// link followed, and none may be on a filesystem whose files, and whose
+/// owners, are what a program says they are.
+fn held_against(root: &Root, dir: &Path, user: u32, me: u32) -> Result<()> {
+    let mut above = PathBuf::from("/");
+    let mut names = dir.components().peekable();
+    for _ in 0..MAX_DEPTH {
+        let here = root
+            .open_at_no_symlinks(&above, libc::O_PATH | libc::O_DIRECTORY)
+            .with_context(|| {
+                format!(
+                    "opening {}: a directory the script is put beneath is named by the \
+                     path it has, with no link on the way",
+                    shown(&above.display().to_string())
+                )
+            })?;
+        // Which filesystem it is on is asked of the kernel; what it is like
+        // is asked of the filesystem, which such a one can be slow to say.
+        if root::on_remote_fs(&here) {
+            bail!(
+                "{} is on a FUSE or network filesystem: name another directory with --ask-dir",
+                shown(&above.display().to_string())
+            );
+        }
+        let meta = here
+            .metadata()
+            .with_context(|| format!("examining {}", shown(&above.display().to_string())))?;
+        if let Some(why) = loose(meta.uid(), meta.mode(), user, me) {
+            bail!(
+                "{}: {why}, so another script could be put where this one is looked for. \
+                 Name with --ask-dir a directory like /tmp (root's, and with the sticky bit \
+                 a name in it is its owner's alone to change), with none but such above it. \
+                 --snoop and the responder need no directory",
+                shown(&above.display().to_string())
+            );
+        }
+        loop {
+            match names.next() {
+                None => return Ok(()),
+                Some(std::path::Component::Normal(name)) => {
+                    above.push(name);
+                    break;
+                }
+                Some(std::path::Component::ParentDir) => {
+                    bail!("{}: the directory is named without ..", dir.display())
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    bail!(
+        "{}: the directory is too far beneath the root",
+        dir.display()
+    )
+}
+
+/// A directory named `name` in `parent`, made, and open: what was opened is
+/// what was made, this user's, a directory, empty, and on the filesystem
+/// its parent is on. Whoever can write `parent` could have put another there.
+fn made_in(parent: &File, name: &str, mode: u32) -> Result<File> {
+    let path = format!("/proc/self/fd/{}/{name}", parent.as_raw_fd());
+    std::fs::DirBuilder::new()
+        .mode(mode)
+        .create(&path)
+        .context("making it")?;
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&path)
+        .context("opening what was made")?;
+    let meta = handle.metadata().context("examining what was made")?;
+    // SAFETY: geteuid has no failure and no arguments.
+    let me = unsafe { libc::geteuid() };
+    let empty = std::fs::read_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+        .is_ok_and(|mut entries| entries.next().is_none());
+    let beside = parent.metadata().is_ok_and(|p| p.dev() == meta.dev());
+    if !meta.is_dir() || meta.uid() != me || !empty || !beside || root::on_remote_fs(&handle) {
+        bail!("it is not the directory that was just made there");
+    }
+    // Whatever the umask made of the mode.
+    handle
+        .set_permissions(std::fs::Permissions::from_mode(mode))
+        .context("setting who may enter it")?;
+    Ok(handle)
 }
 
 /// Eight bytes no one can guess, as hex.
@@ -546,26 +833,50 @@ fn random_name() -> io::Result<String> {
     ))
 }
 
-/// The directory made for one request, in the process's filesystem. Once it
-/// is the process's user's, what is in it and what its name names are that
-/// user's to change: it is used through its handle, and what is removed when
-/// it is dropped is the files of [`FILES`] in it, by name, and the directory
-/// itself if its name still names it and it is empty.
+/// The directory made for one request, in the process's filesystem, with
+/// the script in it and the directory the process writes to. The script and
+/// its directory stay this user's. What the process's user is given, the
+/// inner directory, is used through its handle, and what is in it is that
+/// user's to have put there. What is removed when this is dropped is the
+/// files by their names, and each directory if its name still names it and
+/// it is empty.
 struct Place {
     base: File,
     name: String,
     handle: File,
+    /// Where the process writes, once it is made.
+    out: Option<File>,
+    /// The process's user, whose the files in `out` are.
+    user: u32,
     /// As the process sees it.
     seen: PathBuf,
+    /// Nothing is removed: a thread may still come for the script.
+    keep: Cell<bool>,
 }
 
 impl Place {
-    /// A directory in `dir` that the process's user alone can enter, with
-    /// the script in it.
-    fn make(process: &Process, root: &Root, dir: &Path) -> Result<Place> {
+    /// A directory in `dir` with the script in it, which may run until
+    /// `until`.
+    fn make(process: &Process, root: &Root, dir: &Path, until: u64) -> Result<Place> {
         let pid = process.pid();
         if !dir.is_absolute() {
             bail!("{}: the directory must be an absolute path", dir.display());
+        }
+        // SAFETY: geteuid has no failure and no arguments.
+        let me = unsafe { libc::geteuid() };
+        let (user, group) = process
+            .owner()
+            .with_context(|| format!("finding whose process pid {pid} is"))?;
+        held_against(root, dir, user, me)
+            .with_context(|| format!("{} of pid {pid}", dir.display()))?;
+        if user == me {
+            // Others are kept from the script. Nothing keeps a user from
+            // what is its own.
+            eprintln!(
+                "warning: pid {pid} runs as this tool's own user (uid {user}): the script is \
+                 that user's, and until it has run any process of that user can change what \
+                 pid {pid} runs"
+            );
         }
         let base = root
             .open_at(dir, libc::O_RDONLY | libc::O_DIRECTORY)
@@ -579,60 +890,42 @@ impl Place {
             );
         }
         let name = random_name().context("making a name for the directory")?;
-        let path = format!("/proc/self/fd/{}/{name}", base.as_raw_fd());
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .with_context(|| format!("making a directory in {} of pid {pid}", dir.display()))?;
-        let handle = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(&path)
-            .context("opening the directory just made")?;
-        // What was opened is what was made: this user's, a directory, and
-        // empty. Whoever can write `dir` could have put another there.
-        let meta = handle
-            .metadata()
-            .context("examining the directory just made")?;
-        // SAFETY: geteuid has no failure and no arguments.
-        let me = unsafe { libc::geteuid() };
-        let empty = std::fs::read_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()))
-            .is_ok_and(|mut entries| entries.next().is_none());
-        if !meta.is_dir() || meta.uid() != me || !empty {
-            bail!(
-                "{}/{name} of pid {pid} is not the directory that was just made there",
-                dir.display()
-            );
-        }
-        let place = Place {
-            seen: dir.join(&name),
+        // The process enters it and reads in it, and writes nothing there.
+        let handle = made_in(&base, &name, 0o755)
+            .with_context(|| format!("a directory in {} of pid {pid}", dir.display()))?;
+        let seen = dir.join(&name);
+        // From here on what was made is removed again, however this ends.
+        let mut place = Place {
             base,
             name,
+            out: None,
             handle,
+            user,
+            seen,
+            keep: Cell::new(false),
         };
-        place
-            .handle
-            .set_permissions(std::fs::Permissions::from_mode(0o700))
-            .context("closing the directory to other users")?;
+        let out = made_in(&place.handle, OUT, 0o700).context("the directory to write to")?;
+        // The process writes as its own user, and where it writes is given
+        // to that user. The script and its directory are not.
+        if user != me {
+            std::os::unix::fs::fchown(&out, Some(user), Some(group)).with_context(|| {
+                format!("giving the directory to write to to the process's user ({user}:{group})")
+            })?;
+        }
+        place.out = Some(out);
 
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(place.inside("ask.py"))
+            .open(place.inside(SCRIPT))
             .context("writing the script")?;
-        file.write_all(script(place.seen.as_os_str().as_bytes()).as_bytes())
+        let out = place.seen.join(OUT);
+        file.write_all(script(out.as_os_str().as_bytes(), until).as_bytes())
             .context("writing the script")?;
-        // The process reads the script and writes beside it as its own
-        // user: both are given to that user, the file first.
-        if let Some((uid, gid)) = process.owner() {
-            for (what, f) in [("the script", &file), ("its directory", &place.handle)] {
-                std::os::unix::fs::fchown(f, Some(uid), Some(gid)).with_context(|| {
-                    format!("giving {what} to the process's user ({uid}:{gid})")
-                })?;
-            }
-        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o444))
+            .context("letting the process read the script")?;
         Ok(place)
     }
 
@@ -641,17 +934,41 @@ impl Place {
         PathBuf::from(format!("/proc/self/fd/{}/{name}", self.handle.as_raw_fd()))
     }
 
-    /// `name` in the directory, open to read, if it is there.
-    fn open(&self, name: &str) -> io::Result<Option<File>> {
-        match std::fs::OpenOptions::new()
+    /// `name` of what the process wrote, open to read, if it is there: a
+    /// file the process's user made, under that one name. That user could
+    /// have put a name there for a file of another's, which this tool's user
+    /// may be able to read and that user is not. It is opened as a name
+    /// first and to be read once it is known what it is: opening a device
+    /// is already something done to it.
+    fn open(&self, name: &str) -> Result<Option<File>> {
+        let Some(out) = &self.out else {
+            return Ok(None);
+        };
+        let named = match std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.inside(name))
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(format!("/proc/self/fd/{}/{name}", out.as_raw_fd()))
         {
-            Ok(f) => Ok(Some(f)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("opening {name}")),
+        };
+        let meta = named
+            .metadata()
+            .with_context(|| format!("examining {name}"))?;
+        if !meta.is_file() || meta.uid() != self.user || meta.nlink() != 1 {
+            bail!(
+                "{name} is not a file that the process's user (uid {}) made there, under \
+                 that name alone",
+                self.user
+            );
         }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(format!("/proc/self/fd/{}", named.as_raw_fd()))
+            .map(Some)
+            .with_context(|| format!("opening {name}"))
     }
 
     /// What the script said of how it went, once it has.
@@ -666,10 +983,10 @@ impl Place {
         Ok(Some(String::from_utf8_lossy(&bytes).trim_end().to_string()))
     }
 
-    /// Whether the directory's name, in the directory it was made in, still
-    /// names it.
-    fn is_still_named(&self) -> bool {
-        let Ok(name) = std::ffi::CString::new(self.name.as_str()) else {
+    /// Whether `name`, in the directory `parent`, still names the directory
+    /// `made` there.
+    fn is_still_named(parent: &File, name: &str, made: &File) -> bool {
+        let Ok(name) = std::ffi::CString::new(name) else {
             return false;
         };
         // SAFETY: `st` is a plain struct the kernel fills, `name` a C string
@@ -677,15 +994,14 @@ impl Place {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe {
             libc::fstatat(
-                self.base.as_raw_fd(),
+                parent.as_raw_fd(),
                 name.as_ptr(),
                 &mut st,
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         };
         rc == 0
-            && self
-                .handle
+            && made
                 .metadata()
                 .is_ok_and(|m| (m.dev(), m.ino()) == (st.st_dev, st.st_ino))
     }
@@ -706,10 +1022,27 @@ impl Place {
 
 impl Drop for Place {
     fn drop(&mut self) {
-        for file in FILES {
-            let _ = Place::remove(&self.handle, file, 0);
+        if self.keep.get() {
+            eprintln!(
+                "warning: {} is left where it is: the request may still be with the process, \
+                 whose main thread would then come for the script in there. The script does \
+                 nothing once it is late. Remove the directory when the process has ended or \
+                 its main thread has been back to Python, and not before: its name would be \
+                 anyone's to take who can write there",
+                shown(&self.seen.display().to_string())
+            );
+            return;
         }
-        let removed = self.is_still_named()
+        if let Some(out) = &self.out {
+            for file in OUT_FILES {
+                let _ = Place::remove(out, file, 0);
+            }
+            if Place::is_still_named(&self.handle, OUT, out) {
+                let _ = Place::remove(&self.handle, OUT, libc::AT_REMOVEDIR);
+            }
+        }
+        let _ = Place::remove(&self.handle, SCRIPT, 0);
+        let removed = Place::is_still_named(&self.base, &self.name, &self.handle)
             && Place::remove(&self.base, &self.name, libc::AT_REMOVEDIR).is_ok();
         if !removed {
             eprintln!(
@@ -756,8 +1089,18 @@ pub fn ask(
     let (interp, thread) = main_thread(&mem, runtime, &offsets)
         .with_context(|| format!("pid {pid} cannot be asked through its Python interpreter"))?;
 
-    let place = Place::make(process, root, dir)?;
-    let script_path = place.seen.join("ask.py");
+    // After this the script does nothing: the wait, and a little for the
+    // request to be written and the thread to get to it.
+    let until = (SystemTime::now() + wait + LATE)
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    // Held before anything is made, and let go after it is all removed.
+    let _signals = Signals::hold();
+    if stopped() {
+        bail!("given up on before anything was asked of pid {pid}");
+    }
+    let place = Place::make(process, root, dir, until)?;
+    let script_path = place.seen.join(SCRIPT);
     request(
         &mem,
         interp,
@@ -771,6 +1114,8 @@ pub fn ask(
         interp,
         thread,
         offsets: &offsets,
+        place: &place,
+        process,
         answered: false,
     };
 
@@ -782,6 +1127,23 @@ pub fn ask(
         if let Some(said) = place.said()? {
             break said;
         }
+        if stopped() {
+            // Taken back here and not left to the end of the function: what
+            // came of it is said.
+            bail!(
+                "{} while pid {pid} had the request: {}",
+                match interrupted_by() {
+                    Some(_) => "interrupted",
+                    None => "out of time",
+                },
+                match asked.take_back() {
+                    Ok(Left::Withdrawn) => "the request was withdrawn",
+                    Ok(Left::TakenUp) =>
+                        "the process had taken the request up, and its answer is not waited for",
+                    Ok(Left::Gone) | Err(_) => "the request could not be withdrawn",
+                }
+            );
+        }
         if Instant::now() >= until {
             if taken_up {
                 bail!(
@@ -790,27 +1152,45 @@ pub fn ask(
                     wait.as_secs()
                 );
             }
-            match withdraw(&mem, interp, thread, &offsets) {
-                Ok(Left::TakenUp) => {
+            let left = withdraw(&mem, interp, thread, &offsets);
+            if let Ok(Left::TakenUp) = left {
+                taken_up = true;
+                until = Instant::now() + wait;
+                continue;
+            }
+            // Taken back, or not to be reached: either way it may have been
+            // taken up between the look and the write.
+            std::thread::sleep(GRACE);
+            match place.said()? {
+                Some(said) => break said,
+                // Taken up between the look and the write, and the dump is
+                // not written yet: the script is waited for as one that was
+                // seen to be taken up is.
+                None if place.open("started")?.is_some() => {
                     taken_up = true;
                     until = Instant::now() + wait;
                     continue;
                 }
-                // Taken back, or not to be reached: either way it may have
-                // been taken up between the look and the write.
-                Ok(Left::Withdrawn | Left::Gone) | Err(_) => {}
-            }
-            std::thread::sleep(GRACE);
-            match place.said()? {
-                Some(said) => break said,
-                None => bail!(
-                    "pid {pid}'s main thread did not run the request within {} s, and the \
-                     request was withdrawn: the thread is in a call that does not come back \
-                     to Python (a sleep, a join, a read). --snoop reads the profile without \
-                     the process's help, and a process that loads the hooks library can \
-                     answer whatever its threads do (systing_heap_hooks_listen)",
-                    wait.as_secs()
-                ),
+                None => {
+                    asked.settle(&left);
+                    let Ok(Left::Withdrawn) = left else {
+                        bail!(
+                            "pid {pid}'s main thread did not run the request within {} s, and \
+                             the request could not be withdrawn: the process has ended, or its \
+                             interpreter names another main thread now",
+                            wait.as_secs()
+                        );
+                    };
+                    bail!(
+                        "pid {pid}'s main thread did not run the request within {} s, and the \
+                         request was withdrawn: the thread is in a call that does not come \
+                         back to Python (a sleep, a join, a read). --snoop reads the profile \
+                         without the process's help, and a process that loads the hooks \
+                         library can answer whatever its threads do \
+                         (systing_heap_hooks_listen)",
+                        wait.as_secs()
+                    )
+                }
             }
         }
         std::thread::sleep(POLL);
@@ -821,19 +1201,20 @@ pub fn ask(
     if let Some(why) = said.strip_prefix("error ") {
         bail!("pid {pid} ran the request, and it failed: {}", shown(why));
     }
-    if said != "ok" {
+    if said != SAID_OK && said != SAID_PAUSED {
         bail!("pid {pid} ran the request, and answered {said:?}");
     }
     let Some(heap) = place.open("heap").context("opening the dump")? else {
         bail!("pid {pid} says it wrote a dump, and there is none");
     };
     let dump = read_handed(&heap, "the dump the process wrote", MAX_DUMP_BYTES)?;
-    let snapshot = snapshot_of(process, &dump, place.seen.join("heap"))?;
+    let snapshot = snapshot_of(process, &dump, place.seen.join(OUT).join("heap"))?;
     let report = Report {
         by: "python",
         through: script_path,
         dump_bytes: dump.len(),
         millis: started.elapsed().as_millis(),
+        paused: said == SAID_PAUSED,
     };
     Ok((snapshot, report))
 }
@@ -1020,29 +1401,84 @@ mod tests {
         assert_eq!(mem.writes.borrow().len(), before);
     }
 
+    /// A request's directory in `top`, as [`Place::make`] leaves one, for a
+    /// process of this user's.
+    fn a_place(top: &Path) -> Place {
+        let base = File::open(top).unwrap();
+        let handle = made_in(&base, "request", 0o755).unwrap();
+        let out = made_in(&handle, OUT, 0o700).unwrap();
+        std::fs::write(top.join("request").join(SCRIPT), "").unwrap();
+        Place {
+            base,
+            name: "request".into(),
+            handle,
+            out: Some(out),
+            // SAFETY: geteuid has no failure and no arguments.
+            user: unsafe { libc::geteuid() },
+            seen: top.join("request"),
+            keep: Cell::new(false),
+        }
+    }
+
     #[test]
     fn a_request_that_is_dropped_unanswered_is_taken_back() {
         let mem = process(table());
         let (_, offsets) = find_runtime(&mem, MAPS).unwrap();
-        request(&mem, INTERP, THREAD, &offsets, b"/tmp/x/ask.py").unwrap();
-        drop(Asked {
+        let top = tempfile::tempdir().unwrap();
+        let place = a_place(top.path());
+        let this = Process::open(std::process::id()).unwrap();
+        let asked = |answered| Asked {
             mem: &mem,
             interp: INTERP,
             thread: THREAD,
             offsets: &offsets,
-            answered: false,
-        });
+            place: &place,
+            process: &this,
+            answered,
+        };
+        request(&mem, INTERP, THREAD, &offsets, b"/tmp/x/ask.py").unwrap();
+        drop(asked(false));
         assert_eq!(mem.i32_at(THREAD + 1000).unwrap(), 0);
+        assert!(!place.keep.get());
 
         request(&mem, INTERP, THREAD, &offsets, b"/tmp/x/ask.py").unwrap();
-        drop(Asked {
-            mem: &mem,
-            interp: INTERP,
-            thread: THREAD,
-            offsets: &offsets,
-            answered: true,
-        });
+        drop(asked(true));
         assert_eq!(mem.i32_at(THREAD + 1000).unwrap(), 1);
+        assert!(!place.keep.get());
+        drop(place);
+        assert!(!top.path().join("request").exists());
+    }
+
+    #[test]
+    fn the_script_is_left_where_a_thread_may_still_come_for_it() {
+        let this = Process::open(std::process::id()).unwrap();
+        let top = tempfile::tempdir().unwrap();
+        let place = a_place(top.path());
+        assert!(may_remove(&Ok(Left::Withdrawn), &place, &this));
+        // The process lives, and what became of the request is not known.
+        assert!(!may_remove(&Ok(Left::Gone), &place, &this));
+        assert!(!may_remove(&Err(io::Error::other("no")), &place, &this));
+        // Taken up: opened for sure once the script has said something.
+        assert!(!may_remove(&Ok(Left::TakenUp), &place, &this));
+        std::fs::write(top.path().join("request/out/started"), "").unwrap();
+        assert!(may_remove(&Ok(Left::TakenUp), &place, &this));
+
+        // A process that has ended comes for nothing.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let ended = Process::open(child.id()).unwrap();
+        // Ended and not waited for, then waited for.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(is_gone(&ended));
+        child.wait().unwrap();
+        assert!(is_gone(&ended));
+        assert!(may_remove(&Ok(Left::Gone), &place, &ended));
+        assert!(!is_gone(&this));
+
+        // Kept, nothing of it is removed.
+        place.keep.set(true);
+        drop(place);
+        assert!(top.path().join("request").join(SCRIPT).exists());
+        assert!(top.path().join("request/out/started").exists());
     }
 
     #[test]
@@ -1167,8 +1603,106 @@ mod tests {
     #[test]
     fn a_path_is_written_into_the_script_byte_for_byte() {
         assert_eq!(bytes_literal(b"/t\"\\\n"), r#"b"\x2f\x74\x22\x5c\x0a""#);
-        let s = script(b"/tmp/a b");
-        assert!(s.ends_with("_systing_heap_ask(b\"\\x2f\\x74\\x6d\\x70\\x2f\\x61\\x20\\x62\")\n"));
+        let s = script(b"/tmp/a b", 1_790_000_000);
+        assert!(s.ends_with(
+            "_systing_heap_ask(b\"\\x2f\\x74\\x6d\\x70\\x2f\\x61\\x20\\x62\", 1790000000)\n"
+        ));
+    }
+
+    #[test]
+    fn a_script_that_is_late_does_nothing_before_it_has_looked_at_the_time() {
+        let s = script(b"/tmp/x/out", 1_790_000_000);
+        let body = s
+            .split_once("def _systing_heap_ask(d, until):\n")
+            .unwrap()
+            .1;
+        let first: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .take(3)
+            .collect();
+        // Nothing is imported but the clock, and nothing is written, before.
+        assert_eq!(first, ["import time", "if time.time() > until:", "return"]);
+    }
+
+    #[test]
+    fn a_directory_the_processs_user_could_rename_in_is_not_held() {
+        const USER: u32 = 1000;
+        const ROOT: u32 = 0;
+        // /tmp: root's, anyone writes, and a name is its owner's to change.
+        assert_eq!(loose(0, 0o041777, USER, ROOT), None);
+        assert_eq!(loose(0, 0o040755, USER, ROOT), None);
+        // The user's own, whatever its mode: sticky or not, it renames there.
+        assert!(loose(USER, 0o040700, USER, ROOT).is_some());
+        assert!(loose(USER, 0o041777, USER, ROOT).is_some());
+        // A third user's: that user renames there.
+        assert!(loose(1001, 0o040700, USER, ROOT).is_some());
+        // Anyone writes, or a group does, and nothing keeps a name its owner's.
+        assert!(loose(0, 0o040777, USER, ROOT).is_some());
+        assert!(loose(0, 0o040775, USER, ROOT).is_some());
+
+        // Asked by the process's own user, what is that user's is this
+        // tool's, and everyone else is kept out as before.
+        assert_eq!(loose(USER, 0o040700, USER, USER), None);
+        assert_eq!(loose(0, 0o041777, USER, USER), None);
+        assert!(loose(USER, 0o040777, USER, USER).is_some());
+        assert!(loose(0, 0o040777, USER, USER).is_some());
+        assert!(loose(1001, 0o040755, USER, USER).is_some());
+        // A root that is asked by another user with the means to.
+        assert!(loose(0, 0o040755, ROOT, USER).is_some());
+    }
+
+    #[test]
+    fn every_directory_down_to_the_one_named_is_looked_at() {
+        use std::os::unix::fs::PermissionsExt;
+        let top = tempfile::tempdir().unwrap();
+        let root = Root::open(top.path()).unwrap();
+        let mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        std::fs::create_dir_all(top.path().join("a/b")).unwrap();
+        for dir in ["", "a", "a/b"] {
+            mode(&top.path().join(dir), 0o755);
+        }
+        // SAFETY: geteuid has no failure and no arguments.
+        let me = unsafe { libc::geteuid() };
+        let another = me + 1;
+        // All of them this user's, whether the process is another's or not.
+        for user in [another, me] {
+            held_against(&root, Path::new("/a/b"), user, me).unwrap();
+            held_against(&root, Path::new("/"), user, me).unwrap();
+        }
+        // All of them the process's user's, and this tool another's.
+        let own = held_against(&root, Path::new("/a/b"), me, another).unwrap_err();
+        assert!(
+            format!("{own:#}").contains("the process's user's own"),
+            "{own:#}"
+        );
+
+        // One above the one named that anyone writes to: refused also where
+        // the process is this user's, since anyone is more than that user.
+        mode(&top.path().join("a"), 0o777);
+        for user in [another, me] {
+            let open = held_against(&root, Path::new("/a/b"), user, me).unwrap_err();
+            assert!(
+                format!("{open:#}").starts_with("/a: others than its owner"),
+                "{open:#}"
+            );
+        }
+        // With the sticky bit it is as /tmp is.
+        mode(&top.path().join("a"), 0o1777);
+        held_against(&root, Path::new("/a/b"), another, me).unwrap();
+
+        // A link on the way is not followed to what it names.
+        std::os::unix::fs::symlink("a", top.path().join("link")).unwrap();
+        let link = held_against(&root, Path::new("/link/b"), another, me).unwrap_err();
+        assert!(
+            format!("{link:#}").contains("with no link on the way"),
+            "{link:#}"
+        );
+        let up = held_against(&root, Path::new("/a/../a"), another, me).unwrap_err();
+        assert!(format!("{up:#}").contains("without .."), "{up:#}");
     }
 
     #[test]
