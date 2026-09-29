@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 28;
+pub const SCHEMA_VERSION: u32 = 29;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -950,7 +950,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- Python frames and no task context, by design; those rows read
             -- exactly like rows of threads whose walk stopped at once, so
             -- this column is the only marker. NULL when the task-stacks
-            -- recorder was not asked for, and in traces from before schema 28,
+            -- recorder was not asked for, and in traces from before schema 29,
             -- where it means unknown and never 'on'.
             task_stacks_remote_reads VARCHAR
         );

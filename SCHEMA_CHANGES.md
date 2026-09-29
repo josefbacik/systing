@@ -445,7 +445,7 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
-## Schema Version 28 (systing 1.25.0) — 2026-09-25
+## Schema Version 29 (systing 1.26.0) — 2026-09-25
 
 A capture says whether its task-stacks recorder read other tasks' user memory.
 On aarch64 the recorder does that only on a kernel whose release is known to
@@ -464,7 +464,7 @@ records it once, on `sysinfo`.
   read other tasks' memory loads no task-stacks iterator and runs on: its
   `task_stack_event` is empty and this value, `off:kernel-release`, is what
   says why. NULL when the task-stacks recorder was not asked for, and in
-  traces recorded before schema 28, where it means unknown: a one-frame user
+  traces recorded before schema 29, where it means unknown: a one-frame user
   stack there may be a thread whose walk stopped at once, or a capture that
   could not read further.
 
