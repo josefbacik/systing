@@ -116,7 +116,7 @@ struct Cli {
     /// load that: jemalloc's own dump, where --snoop reads the profile
     /// without the process's help. `responder` asks the thread a process
     /// starts with the hooks library's systing_heap_hooks_listen, on its
-    /// socket, and nothing is written to disk. `python` makes a CPython 3.14
+    /// socket, and the dump is not written to disk. `python` makes a CPython 3.14
     /// that loaded nothing of ours run a short script (its remote debugging
     /// interface, as sys.remote_exec uses it): that writes to the process's
     /// memory, the script and the dump are files in a directory made for
@@ -141,9 +141,9 @@ struct Cli {
 
     /// EXPERIMENTAL. With --ask, the directory the responder's socket is
     /// in, and the one the script's files are made in: as the process sees
-    /// it. For `python`, asked by another user than the process's, it is one
-    /// like /tmp, in which the process's user cannot rename what is
-    /// another's, and neither it nor a directory above it is that user's.
+    /// it. For `python` it is one like /tmp, in which only root and this
+    /// tool's user can change the name of what this tool makes, and so is
+    /// every directory above it.
     #[arg(long, value_name = "DIR", requires = "ask", default_value = ask::DEFAULT_DIR)]
     ask_dir: PathBuf,
 
@@ -198,7 +198,15 @@ fn main() -> Result<()> {
             }
         );
         let wait = std::time::Duration::from_secs(cli.ask_wait);
-        let (snapshot, report) = ask::ask_within(process, how, &cli.ask_dir, wait)?;
+        let asked = ask::ask_within(process, how, &cli.ask_dir, wait);
+        // Whatever came of it: a program that was interrupted ends so.
+        if let Some(signal) = ask::interrupted_by() {
+            if let Err(e) = &asked {
+                eprintln!("Error: {e:?}");
+            }
+            ask::end_by(signal);
+        }
+        let (snapshot, report) = asked?;
         eprintln!("{}", report.summary(pid));
         snapshots.push(snapshot);
     } else if let Some(process) = pinned.as_ref() {

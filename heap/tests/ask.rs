@@ -1099,8 +1099,10 @@ fn an_asking_that_is_interrupted_takes_its_request_back() {
             let started = Instant::now();
             signal(tool.id(), by);
             let (status, err) = ended(tool);
-            // It ended of its own accord, and at once, having said why.
-            assert_eq!(status.code(), Some(1), "signal {by}: {status:?}: {err}");
+            // It ended at once, having said why, and as the signal ends a
+            // program: whoever started it sees that it was interrupted.
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(by), "signal {by}: {status:?}: {err}");
             assert!(started.elapsed() < Duration::from_secs(5), "signal {by}");
             assert!(
                 err.contains("interrupted") && err.contains("the request was withdrawn"),
@@ -1132,14 +1134,14 @@ fn a_request_left_by_a_tool_that_was_killed_does_nothing_once_it_is_late() {
     let Some(env) = setup(false) else { return };
     for pair in pairs_314() {
         // Woken in time, and woken late. The script may run for the wait
-        // (1 s) and 5 s more.
-        for (n, (woken_after, runs)) in [(0, true), (8, false)].into_iter().enumerate() {
+        // (3 s, within which the tool is killed) and 5 s more.
+        for (n, (woken_after, runs)) in [(0, true), (10, false)].into_iter().enumerate() {
             let mut target = Target::start(&env, &pair, Run::of("plain.py", &["sleep"]));
             let place = env.dir.path().join(format!("killed-{n}"));
             std::fs::create_dir(&place).unwrap();
             let db = env.dir.path().join("killed.duckdb");
 
-            let mut tool = asking(target.pid(), &db, &place, "1");
+            let mut tool = asking(target.pid(), &db, &place, "3");
             let request = request_in(&place);
             // Nothing can be done about this one.
             signal(tool.id(), libc::SIGKILL);
@@ -1153,14 +1155,201 @@ fn a_request_left_by_a_tool_that_was_killed_does_nothing_once_it_is_late() {
 
             std::thread::sleep(Duration::from_secs(woken_after));
             signal(target.pid(), libc::SIGUSR1);
-            std::thread::sleep(Duration::from_secs(1));
-            let wrote: Vec<bool> = ["done", "heap"]
-                .iter()
-                .map(|f| request.join("out").join(f).exists())
-                .collect();
-            assert_eq!(wrote, [runs, runs], "woken after {woken_after} s");
+            // A script that runs is given a while; one that is not to is
+            // given as long to show that it does not.
+            let wrote = |f: &str| request.join("out").join(f).exists();
+            let until = Instant::now() + Duration::from_secs(if runs { 10 } else { 2 });
+            while Instant::now() < until && !wrote("done") {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert_eq!(
+                [wrote("started"), wrote("done"), wrote("heap")],
+                [runs; 3],
+                "woken after {woken_after} s"
+            );
             assert!(target.is_running(), "woken after {woken_after} s");
         }
+    }
+}
+
+#[test]
+fn a_directory_that_anyone_can_rename_in_is_refused_whoever_asks() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(env) = setup(false) else { return };
+    for pair in pairs_314() {
+        // The process is this user's, as the tool is: anyone is more.
+        let mut target = Target::start(&env, &pair, Run::of("plain.py", &["loop"]));
+        let db = env.dir.path().join("open.duckdb");
+        let place = env.dir.path().join("open");
+        std::fs::create_dir(&place).unwrap();
+        let mode =
+            |mode| std::fs::set_permissions(&place, std::fs::Permissions::from_mode(mode)).unwrap();
+        mode(0o777);
+        let args = ["--ask-dir", place.to_str().unwrap()];
+        let out = ask(target.pid(), "python", &db, &args);
+        assert!(!out.status.success(), "{pair:?}: {}", said(&out));
+        assert!(
+            said(&out).contains("it has no sticky bit"),
+            "{pair:?}: {}",
+            said(&out)
+        );
+        assert_eq!(std::fs::read_dir(&place).unwrap().count(), 0, "{pair:?}");
+        assert!(!db.exists(), "{pair:?}");
+
+        // As /tmp is, it will do.
+        mode(0o1777);
+        let out = ask(target.pid(), "python", &db, &args);
+        assert!(out.status.success(), "{pair:?}: {}", said(&out));
+        assert!(target.is_running(), "{pair:?}");
+    }
+}
+
+/// `program` run as root, with what this test's own programs need of the
+/// environment; None, with a note, where root is not to be had for the asking.
+fn as_root(program: &str) -> Option<Command> {
+    let sudo = Command::new("sudo")
+        .args(["-n", "true"])
+        .stderr(Stdio::null())
+        .status();
+    // SAFETY: geteuid has no failure and no arguments.
+    if !sudo.is_ok_and(|s| s.success()) || unsafe { libc::geteuid() } == 0 {
+        common::skip("needs sudo without a password, and not to be root itself");
+        return None;
+    }
+    let mut cmd = Command::new("sudo");
+    cmd.args(["-n", "env", "RUST_BACKTRACE=0"]);
+    if let Ok(path) = std::env::var("LD_LIBRARY_PATH") {
+        cmd.arg(format!("LD_LIBRARY_PATH={path}"));
+    }
+    cmd.arg(program);
+    Some(cmd)
+}
+
+/// A directory of root's in /tmp, as /tmp is, removed when dropped.
+struct RootsOwn(PathBuf);
+
+impl RootsOwn {
+    fn make() -> Option<RootsOwn> {
+        let made = as_root("mktemp")?
+            .args(["-d", "/tmp/ask-root.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", said(&made));
+        let dir = PathBuf::from(String::from_utf8(made.stdout).unwrap().trim_end());
+        let dir = RootsOwn(dir);
+        assert!(as_root("chmod")?
+            .arg("1777")
+            .arg(&dir.0)
+            .status()
+            .unwrap()
+            .success());
+        Some(dir)
+    }
+}
+
+impl Drop for RootsOwn {
+    fn drop(&mut self) {
+        // What a test that failed left in it goes with it: the name is one
+        // this test was given by mktemp, in a directory of root's.
+        if let Some(mut rm) = as_root("rm") {
+            let _ = rm.arg("-rf").arg("--").arg(&self.0).status();
+        }
+    }
+}
+
+#[test]
+fn the_script_root_writes_is_not_the_processs_users_to_change() {
+    use std::os::unix::fs::MetadataExt;
+    let Some(env) = setup(false) else { return };
+    for pair in pairs_314() {
+        let Some(place) = RootsOwn::make() else {
+            return;
+        };
+        let place = &place.0;
+        // SAFETY: geteuid has no failure and no arguments.
+        let me = unsafe { libc::geteuid() };
+        // The process is this test's user's, and the tool root's.
+        let mut target = Target::start(&env, &pair, Run::of("plain.py", &["sleep"]));
+        let pid = target.pid().to_string();
+        let db = place.join("asked.duckdb");
+        let tool = |dir: &Path, wait: &str| {
+            let mut cmd = as_root(BIN).unwrap();
+            cmd.args(["--pid", &pid, "--ask", "python", "--ask-wait", wait, "-o"])
+                .arg(&db)
+                .arg("--ask-dir")
+                .arg(dir)
+                .stderr(Stdio::piped());
+            cmd
+        };
+
+        // A directory of that user's own, or beneath one, is refused.
+        let own = env.dir.path().join("own");
+        std::fs::create_dir(&own).unwrap();
+        let out = tool(&own, "1").output().unwrap();
+        assert!(!out.status.success(), "{pair:?}: {}", said(&out));
+        assert!(
+            said(&out).contains("the process's user's own"),
+            "{pair:?}: {}",
+            said(&out)
+        );
+        assert_eq!(std::fs::read_dir(&own).unwrap().count(), 0, "{pair:?}");
+
+        // In one of root's the request waits, and this user tries.
+        let asking = tool(place, "60").spawn().unwrap();
+        let request = request_in(place);
+        let owner = |p: &Path| std::fs::symlink_metadata(p).unwrap().uid();
+        assert_eq!(
+            [
+                owner(&request),
+                owner(&request.join("ask.py")),
+                owner(&request.join("out"))
+            ],
+            [0, 0, me],
+            "{pair:?}"
+        );
+        let script = request.join("ask.py");
+        let written = std::fs::read(&script).unwrap();
+        let denied = |what: &str, tried: std::io::Result<()>| {
+            let e = tried.expect_err(what);
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{what}: {e}"
+            );
+        };
+        denied("writing the script", std::fs::write(&script, "import os\n"));
+        denied("removing the script", std::fs::remove_file(&script));
+        denied(
+            "putting another in its place",
+            std::fs::rename(env.dir.path().join("plain.py"), &script),
+        );
+        denied("writing beside it", std::fs::write(request.join("x"), ""));
+        denied(
+            "renaming where it writes",
+            std::fs::rename(request.join("out"), request.join("out2")),
+        );
+        denied(
+            "renaming its directory",
+            std::fs::rename(&request, place.join("aside")),
+        );
+        assert_eq!(std::fs::read(&script).unwrap(), written, "{pair:?}");
+
+        // The process comes back to Python, runs what root wrote, and
+        // writes where it may; root reads that and removes it all.
+        signal(target.pid(), libc::SIGUSR1);
+        let (status, err) = ended(asking);
+        assert!(status.success(), "{pair:?}: {err}");
+        assert!(
+            err.contains("asked through its Python interpreter"),
+            "{pair:?}: {err}"
+        );
+        assert!(!err.contains("this tool's own user"), "{pair:?}: {err}");
+        assert_eq!(left_behind(place), Vec::<PathBuf>::new(), "{pair:?}");
+        // The database is root's: a copy is this user's to open.
+        let copy = env.dir.path().join("asked-by-root.duckdb");
+        std::fs::copy(&db, &copy).unwrap();
+        assert_eq!(snapshot(&copy).0, "asked", "{pair:?}");
+        assert!(target.is_running(), "{pair:?}");
     }
 }
 

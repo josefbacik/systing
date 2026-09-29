@@ -39,6 +39,27 @@ pub const TRIGGER: &str = "asked";
 
 /// How long an asking that is given up on has to take its request back.
 const GIVING_UP: Duration = Duration::from_secs(2);
+/// How often it is looked at whether the asking was interrupted.
+const LOOK: Duration = Duration::from_millis(100);
+
+/// The signal that interrupted an asking, if one did: the request has been
+/// dealt with, and the program is to end as that signal ends one
+/// ([`end_by`]).
+pub fn interrupted_by() -> Option<i32> {
+    python::interrupted_by()
+}
+
+/// End this program as `signal` ends one that does nothing about it, so
+/// that whoever started it sees that it was interrupted.
+pub fn end_by(signal: i32) -> ! {
+    // SAFETY: the default action is set for a signal this program was sent,
+    // which is then sent again.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+    std::process::exit(128 + signal)
+}
 
 /// Where the responder's socket and the script's files are, in the process's
 /// own filesystem, unless told otherwise.
@@ -142,25 +163,34 @@ pub fn ask_within(
         let _ = tx.send(asked);
     });
     use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
-    match rx.recv_timeout(limit) {
-        Ok(result) => result,
-        Err(Timeout) => {
-            // A request that is with the process is taken back before this
-            // program ends, if whatever holds the asking up lets it be.
-            python::give_up();
-            let taken_back = rx.recv_timeout(GIVING_UP).is_ok();
-            bail!(
-                "gave up after {} s: reading what the process answered did not finish{}",
-                limit.as_secs(),
-                match taken_back {
-                    true => "",
-                    false =>
-                        "; a request to its Python interpreter may still be with the process, \
-                         and does nothing once it is late",
-                }
-            )
+    let until = std::time::Instant::now() + limit;
+    // Waited for a little at a time: an interrupt is seen here as well,
+    // should the asking be held up where it does not look.
+    while interrupted_by().is_none() && std::time::Instant::now() < until {
+        match rx.recv_timeout(LOOK) {
+            Ok(result) => return result,
+            Err(Timeout) => {}
+            Err(Disconnected) => bail!("asking the process failed unexpectedly"),
         }
-        Err(Disconnected) => bail!("asking the process failed unexpectedly"),
+    }
+    // A request that is with the process is taken back before this program
+    // ends, if whatever holds the asking up lets it be.
+    python::give_up();
+    let ended = rx.recv_timeout(GIVING_UP);
+    let left = "a request to its Python interpreter may still be with the process, with its \
+                script and directory where they were made; the script does nothing once it \
+                is late";
+    match (interrupted_by(), ended) {
+        (Some(_), Ok(result)) => result,
+        (Some(_), Err(_)) => bail!("interrupted, and the asking did not end: {left}"),
+        (None, ended) => bail!(
+            "gave up after {} s: reading what the process answered did not finish{}",
+            limit.as_secs(),
+            match ended {
+                Ok(_) => String::new(),
+                Err(_) => format!("; {left}"),
+            }
+        ),
     }
 }
 

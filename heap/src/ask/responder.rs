@@ -9,7 +9,7 @@
 //!
 //! ```text
 //!   -> "systing-heap 1 dump\n"
-//!   <- "ok 1 heap=<bytes> map=<0|1>\n"
+//!   <- "ok 1 heap=<bytes> map=<0|1> active=<0|1>\n"
 //!   <- "error <why>\n"
 //! ```
 //!
@@ -268,8 +268,6 @@ fn take_fds(msg: &libc::msghdr, fds: &mut Vec<OwnedFd>) {
     }
 }
 
-/// Whether the answer, which came with `fds` descriptors, says there is a
-/// code map among them; an error for an answer that is not a dump.
 /// What an answer says comes with the dump.
 #[derive(Debug, PartialEq, Eq)]
 struct Reply {
@@ -280,6 +278,8 @@ struct Reply {
     paused: bool,
 }
 
+/// What the answer says, which came with `fds` descriptors; an error for an
+/// answer that is not a dump.
 fn parse_reply(line: &[u8], fds: usize) -> Result<Reply> {
     let text = String::from_utf8_lossy(line);
     let Some(text) = text.strip_suffix('\n') else {
