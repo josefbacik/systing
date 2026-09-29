@@ -1,6 +1,6 @@
 # systing-heap
 
-`systing-heap` reads heap snapshots into a systing DuckDB database.
+`systing-heap` reads heap snapshots into a systing DuckDB database or a perfetto file.
 
 A heap snapshot is a file an allocator writes on its own: for each allocation stack, the objects and bytes the process still had allocated from it at that moment.
 It is not a recording of malloc and free calls; systing's `memory-alloc` recorder does that.
