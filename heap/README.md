@@ -33,10 +33,14 @@ cargo build --release -p systing-heap
 systing-heap -o heap.duckdb /data/heap/jeprof
 systing-heap -o heap.duckdb /data/heap/jeprof --dry-run   # show, change nothing
 systing-heap -o heap.duckdb /data/heap/jeprof --keep-all  # every snapshot, delete nothing
+systing-heap -o heap.duckdb /data/heap/jeprof --latest-only  # the latest of each process, delete nothing
 
 # Files or directories: loaded, never deleted.
 systing-heap -o heap.duckdb a.heap b.heap
 systing-heap -o heap.duckdb ./snapshots/
+
+# A container's snapshots, read from outside it (see below).
+systing-heap -o heap.duckdb --pid 4242 --latest-only /data/heap/jeprof
 ```
 
 An input that exists as a file or directory is only loaded.
@@ -59,11 +63,11 @@ systing-heap -o heap.pb /data/heap/jeprof
 
 Open it at [ui.perfetto.dev](https://ui.perfetto.dev): each process gets a heap-profile track with a marker per snapshot, and clicking a marker shows its flamegraph.
 
-- **Frames are split like task stacks'.** A frame is named after the function alone, its module is the frame's mapping, and the source file and line are its symbols (Python frames: the file and line 0, since a trampoline names a function and its file but not a line). Python frames' mapping is `[python]`. Mappings carry a `systing-heap:<module>` build id, which Perfetto needs to attach the symbols; it is not an ELF build id.
+- **Frames are split like task stacks'.** A frame is named after the function alone, its module is the frame's mapping, and the source file and line are its symbols (a Python frame named from a perf map: the file and line 0, since a trampoline names a function and its file but not a line). Python frames' mapping is `[python]`. Mappings carry a `systing-heap:<module>` build id, which Perfetto needs to attach the symbols; it is not an ELF build id.
 - **The numbers are estimates.** Each stack's sampled counts are unbiased before anything is added up (see Sampling and unbiasing), the same `est_*` values the DuckDB tables hold.
 - **Each snapshot holds its increase since the previous one,** and Perfetto adds them up, so the flamegraph at a marker shows the state at that snapshot. "Unreleased" is the live estimate. "Total allocated" is jemalloc's cumulative total when it ran with `prof_accum:true`; otherwise it is the smallest total consistent with the live counts seen, which is a lower bound.
 - **Times are the dumps' own.** A marker's time is its dump file's modification time, wall-clock, and the trace declares every clock equal to it, so markers sit at the right distances from each other; opened beside a systing capture, whose times are on the boot clock, they land far from its events.
-- **Every snapshot is loaded.** A timeline is for history, so with a prefix input a Perfetto output loads every snapshot on disk, then, once the trace is written, deletes each process's older ones as the DuckDB output does. The history is in the trace; each run's trace covers the snapshots written since the last run. `--keep-all` deletes nothing.
+- **Every snapshot is loaded.** A timeline is for history, so with a prefix input a Perfetto output loads every snapshot on disk, then, once the trace is written, deletes each process's older ones as the DuckDB output does. The history is in the trace; each run's trace covers the snapshots written since the last run. `--keep-all` deletes nothing. `--latest-only` loads only each process's latest snapshot, as for a DuckDB output, and deletes nothing.
 
 ## One snapshot per process
 
@@ -75,6 +79,7 @@ Users usually care about the current state, so with a prefix input the tool keep
 - **Loaded.** Each pid's latest snapshot. If the latest does not parse (jemalloc may still be writing it), the newest one that parses is loaded, and the unparsed newer file is kept. A Perfetto output loads the older ones too (see Perfetto output).
 - **Deleted.** That pid's files older than the loaded one, and only after the new output is in place and synced. Each deletion is printed. With a DuckDB output their contents are in no database: only the latest is loaded.
 - **Kept.** The loaded file itself, and any newer unparsed file.
+- **Reading without deleting.** `--latest-only` loads the same one snapshot per process and deletes nothing, for a reader that does not own the directory. `--keep-all` also deletes nothing, and loads every snapshot.
 
 A file is never read or deleted unless it is a regular file (symlinks are not followed) and its first line is `heap_v2/`.
 Files that start with the prefix but fail these checks, or have no pid after the prefix, are left alone with a warning.
@@ -102,43 +107,189 @@ A frame in a known file with no symbol is `unknown (module) <0xaddr>`.
 Stripped system libraries (libc, the distro's libjemalloc) have no symbols for their internal functions, so those frames stay `unknown`.
 Every frame except the innermost is a return address, so the tool looks up the byte before it to land on the call itself.
 
+## Reading a container's snapshots from outside it
+
+A collector on the host can read one container's snapshots without a shell in the container, given the container's root directory: `--pid PID`, where PID is a process in the container as the host numbers it, which is not the number in its dumps' names, that being the process's own view of its id; or `--root-fd N`, where N is a descriptor for that directory the caller opened and left open for the tool to inherit.
+`--pid PID` reads beneath `/proc/PID/root`; `--root-fd` takes any directory, so a kept copy of a container's files with no process left is read the same way.
+
+```bash
+systing-heap -o heap.pb --pid 4242 --latest-only /data/heap/jeprof
+systing-heap -o heap.pb --root-fd 3 --latest-only /data/heap/jeprof 3< /mnt/kept-root
+```
+
+The tool opens the root once, at start, and a process id can come to name another process between a caller's look at it and that open.
+A person at a shell need not care; a program that has checked which process a number names passes the directory it checked, with `--root-fd`, and what it checked is then what is read.
+
+Every path the tool did not choose itself is then looked up beneath that directory: the inputs, the binaries each dump names, and the places a perf map or a code map is looked for, `--perf-map-dir` included.
+So they mean what they meant to the process: `/tmp` is the container's `/tmp`, and the binaries are the image's own.
+The output path is the caller's and is never beneath the root.
+
+The kernel does the looking up (`openat2` with `RESOLVE_IN_ROOT`), as it would for a process whose root is that directory.
+An absolute symlink inside the container, a `..` at the top of a path, or a path a dump was made to name cannot lead outside it: joining the path onto the root by hand would follow such a link into the host's files.
+Links in `/proc` that jump elsewhere (`/proc/<pid>/exe`, `/proc/<pid>/fd/N`) are refused, and mounts beneath the root, such as the volume the dumps are on, are crossed.
+It needs Linux 5.6 or later; on an older kernel the run fails rather than fall back to plain opens.
+
+Only prefix inputs are taken beneath a root; a file or directory input is refused.
+The paths printed, and those stored in the output, are the container's.
+A prefix input still deletes older dumps unless told otherwise, so a reader that does not own the container's files passes `--latest-only` or `--keep-all`.
+One of the rules a perf map or a code map is read by changes beneath a root, because the reader is outside the container and is not the user its processes run as: a map in a world-writable directory such as the container's `/tmp` is used only if root or the user who owns that process's dump owns it, the same process having written both.
+No other user in the container can then name that process's frames.
+A binary, a perf map or a code map that is on a FUSE or network filesystem beneath the root (a bucket or a file server mounted into the container) is left unread, with a warning, and its frames stay unresolved: whoever wrote the dumps chose those paths, a read there would be made with the reader's authority on storage the container only mounts, and it can stall without end.
+Beneath a root, names come from the binaries' own symbol tables and the perf map: debug information is not read there, so there are no inlined frames, no file and line, and no name that lives only in debug information. The symbolizer looks a binary's separate debug file up (its debug link, its `.dwp`) by paths of its own making, which are the reader's and not the container's, and the name it looks up is the binary's to choose.
+
+## Reading a live process (experimental)
+
+> **Very experimental.**
+> This reads jemalloc's private data structures out of a running process, and jemalloc's authors are free to change them.
+> A jemalloc it does not recognise is refused, with a reason; it is never guessed at.
+> Expect it to change, and do not build on it yet.
+
+`--snoop` takes the heap profile a process holds right now, from its memory, instead of from a snapshot file:
+
+```bash
+systing-heap -o heap.duckdb --pid 4242 --snoop
+systing-heap -o heap.pb --pid 4242 --snoop        # or a Perfetto trace
+```
+
+- **No file, no wait.** No snapshot is written by jemalloc or by the tool, so the process needs no `prof_prefix`, `lg_prof_interval` or `prof_final`, and no disk: only `prof:true` in its `MALLOC_CONF` (and a `lg_prof_sample` that suits the question, see Sampling and unbiasing). The only file the tool creates is its output.
+- **Nothing is done to the process.** It is not stopped, signalled or made to run our code, and `ptrace` is not used: nothing attaches to it. The tool reads the process's memory (`/proc/PID/mem`), which the kernel answers with an error for an address that is gone, so a read can neither fault nor crash the process; also its `maps` (to name frames), its `status` (the pid it knows itself by) and, only when the library has no `lg_prof_sample` symbol, its `environ`, for the sampling period in `MALLOC_CONF` (nothing else of it is used or written out). Each of those is size-capped.
+- **Not a still picture.** jemalloc's locks are not taken (a dump takes them while it adds up), so a stack's counts can be from slightly different moments. Memory that was freed and reused meanwhile is skipped, and a table swapped for another is read again. jemalloc also rebuilds its table while it is still meeting new stacks, storing the new table before it has put the entries in it; the entries found are compared with the table's own count for that (a few entries out is a busy process, and is let go), and a read that keeps disagreeing is used anyway, with the summary saying the profile may be missing stacks. The summary line says when a walk was redone or something skipped; run it again if it matters. It has no word for an entry jemalloc was carrying between cells, or for a subtree hidden while a tree was being rotated: a record missed that way raises no skip. A tree cut at 65,536 records is counted as a skipped record.
+- **Who may.** As for `--pid`, the tool opens the process's root; it also needs to read the process's memory, which needs no capability when the tool runs as the same user as the process, the process is dumpable (it is unless it is setuid, changed its user, or said otherwise with `prctl(PR_SET_DUMPABLE, 0)`), and `kernel.yama.ptrace_scope` permits it: at 0 nothing more is asked; at 1, the default on many distributions, only a process's ancestors may, unless the process itself allows it with `prctl(PR_SET_PTRACER, ...)`; at 2 and 3 it cannot be done without `CAP_SYS_PTRACE`, and at 3 not with it either. Any other user, root included, needs `CAP_SYS_PTRACE`. The process is pinned once, by opening `/proc/PID`, and its memory, maps, root and the rest are all opened through that handle: a pid that comes to name another process midway is never mixed in, and a process that has exited is an error.
+- **Untrusted input is bounded.** The process and its container's files are not trusted, and each of these is capped, over the whole run and not per file: the header sizes read from an ELF file (and how many symbol tables it may have); the size of the profile table; the per-thread records and the stack frames a walk holds; how much of a library's data is scanned and how much is read deciding whether something is the table; how many files are looked in; and the size of the `/proc` files read. A file that is on a FUSE or network filesystem, or is not a regular file, is left unread, and so are that file's pages in the process. The whole snoop is also given up on after 3 minutes. A hostile process can make a run fail or refuse, and can make it take up to that long, but not make it read or allocate without limit. File names from `maps` are printed with control characters escaped. One case is not closed: a page behind a FUSE server that takes the read and never answers keeps a thread in the kernel, so after the deadline's error the process may still not exit until the server does.
+- **How the read went is kept with the snapshot.** What the summary line says is also a row of `heap_live_read` in the database (see Tables): what was skipped, what was done again, whether the table held still, and what the layout checks counted. Whoever opens the database later can tell a clean read from one that was not. A Perfetto trace has no place for it, and there the summary line is the only record.
+- **The snapshot is like a dump's.** One `heap_snapshot` row with `dump_trigger` `snoop`, its `heap_sample` rows, frames named from the binaries as for a dump. The process's pid in it is the one the process knows itself by (its innermost pid namespace), as a dump's file name has.
+- **The counts are a dump's, the estimates are jemalloc's own.** `live_*` and `alloc_*` are the raw sampled counts jemalloc holds, as a dump written with `prof_unbias:false` prints them; the tests compare them one by one against such a dump of the same process, with `prof_accum` on and off. `est_*` is the estimate jemalloc keeps for each stack, summed object by object as they were sampled. A dump cannot carry that: it prints counts that are scaled back through the sampling period, so `est_*` here and the one from a dump differ by rounding (the tests check the total to 0.5%). It does not depend on the sampling period at all, so a period the tool could not learn cannot spoil it.
+
+**How it finds the profile.** The table that holds every backtrace, `bt2gctx`, is a `static` in jemalloc: it has no exported name.
+A build that keeps its `.symtab` names it. A stripped one, such as Debian's and Ubuntu's `libjemalloc2`, does not, and there the table is found by its shape instead: the only static in the library that is a hash table of jemalloc's own backtrace records, each of which points back at itself.
+Either way what is found is checked against that shape before it is used, and every structure read afterwards is checked against jemalloc's own invariants, so memory that was freed and reused meanwhile is skipped.
+The code is in `src/snoop/`, and nothing else in the crate knows how it works.
+
+**What it knows.** The structures as jemalloc 5.3.0 and the current `dev` branch lay them out, on 64-bit Linux. x86-64 is what has been run; aarch64 lays them out the same on paper, but nothing has run on it (CI's arm64 job does not run these tests). Tested against Ubuntu's `libjemalloc2` 5.3.0 (stripped), jemalloc 5.3.0 built from source, and `dev`, with `prof_accum` on and off and `prof_unbias` on and off. It has not been run on jemalloc 4 or 5.0 to 5.2, on a fork with its own changes, or on one linked statically into the program (the program itself is looked in when no jemalloc library is mapped, but that is untried).
+
+**What it refuses.** There is no version check: a version string is a label, and a fork with another one would be refused for no reason. What is checked is the data itself. Every backtrace record and every thread record must have jemalloc's own invariants (a record's key is the address of its `bt`, a thread record points back at its backtrace, its state is one of four values, its links are aligned). Over a whole walk, and refused only for a large share since a moving heap breaks each for a few records: that most records can be read at all; that the thread records are in the order jemalloc keeps them in (a left child below its parent, on the thread, then the record's id: this ties the link offsets to the key offsets); and that the counters are ones jemalloc keeps (each sampled object adds at least 8 to the shifted count and at least its size to the unbiased bytes: this pins the counters' order). The summary line prints what these checks had to go on (links and counter sets judged, and how many were out) and says of each when it had fewer than eight records to judge (a process where each stack is allocated from by one thread has no links at all). A jemalloc that differs in a way none of these sees, such as a fork that moves the counters and keeps those relations, would be read wrongly instead of refused; only the comparison with a dump on the builds above covers that. A table found by a symbol must also be one in memory (its two function pointers are in the library's code, its entries backtrace records); if the symbol does not name it, which a library replaced on disk under a running process does, the memory is looked at by its shape instead.
+
+**Limits.**
+
+- **Sample period.** The `sample_period` in the snapshot comes from the library's symbols when it has them; else from the `MALLOC_CONF` the process started with, else jemalloc's default (2^19), and the summary line says which. `mallctl("prof.reset")` can change the period afterwards. A wrong period changes only that label: the estimates do not use it, except for a stack whose counter wrapped (see `prof.reset`), which gets the pipeline's estimate at that period (a test runs a process whose period only its own program sets, so a stripped library cannot say it).
+- **`prof.reset`.** jemalloc takes a freed object's weight off at the period in force when it is freed, so after a reset to another period its unbiased counters can be off, or pass zero and wrap. A stack whose counter wrapped gets no estimate of its own, and the one its raw counts give at the snapshot's period instead; a share of records like that refuses the run, and says why. Also, a dump leaves out the counters of threads jemalloc has marked expired by a reset, and this does not look at that mark, so they may be counted; not tested.
+- **Python frames.** A Python function's name comes from the hooks' code map, which the hook writes beside where the dumps would go (the directory of `prof_prefix`), and there is no dump here to look beside: pass `--perf-map-dir` that directory, or the tool warns and the frames stay unnamed. (That map is the one file the hook writes; the tool and jemalloc write none.) A perf trampoline's map is found in the container's `/tmp` as before.
+- **A young or idle heap.** A process that has sampled nothing yet has nothing to report, and the tool says so.
+
 ## Python stacks
 
-A Python program's heap stacks can show its Python functions among the native frames:
+A Python program's heap stacks can show its Python functions among the native frames, each with its file and line:
 
 ```
-_start → … → outer (python) [app.py] → leak_in_python (python) [app.py] → PyByteArray… → malloc
+_start → … → outer (python) [app.py:12] → leak_in_python (python) [app.py:10] → PyByteArray… → malloc
 ```
 
-Two things make this work, and the program chooses both at runtime with the helper in `hooks/`:
-
-- **Perf trampolines** (Python 3.12+). Python gives each Python function a small piece of generated code of its own, so a native stack shows one frame per Python function, and names that code in `/tmp/perf-<pid>.map`.
-- **A backtrace that walks through them.** The distro jemalloc captures stacks with libgcc's unwinder, which stops at the first trampoline, so only the innermost Python function shows. libunwind walks through them. The hook makes jemalloc use libunwind (`libunwind.so.8`, loaded at runtime).
+The program chooses how at runtime, with the helper in `hooks/`.
+There are two ways; the first is the one to use on CPython 3.12 to 3.14.
 
 ```bash
 make -C heap/hooks          # builds heap/hooks/libsysting_heap_hooks.so
 ```
 
+| Setup | Stacks show | Cost |
+|---|---|---|
+| `backtrace="python"` | Every Python function with file and line, among the native frames | Per sampled allocation only |
+| Trampolines + `backtrace="libunwind"` | Every Python function with its file, no line | Every Python call, and per sampled allocation |
+| Trampolines + a jemalloc built with `--enable-prof-libunwind` (no hook) | The same, expected: jemalloc's libunwind backend makes the same call as the hook; not tested here | The same |
+| Trampolines + jemalloc's default | Only the innermost Python function | Every Python call |
+| Neither | Native frames only (the interpreter's C functions) | None |
+
+### Choosing between the two
+
+Use `backtrace="python"`.
+Use trampolines with `backtrace="libunwind"` for a Python that `python` refuses: one newer than 3.14, a free-threaded or otherwise differently built one, or a process that may not read its own memory through the kernel.
+
+**What the stacks show**
+
+| | `backtrace="python"` | Trampolines + `backtrace="libunwind"` |
+|---|---|---|
+| A Python frame | Function, file and line | Function and file |
+| Frames already running when it is turned on | Shown | Unnamed, unless `PYTHONPERFSUPPORT=1` was set at startup |
+| A deep stack (jemalloc keeps 128 frames) | The innermost 64 Python frames. The native stack keeps the program's entry while the two fit in 128 together; past that it loses its outermost frames | About 40 Python frames: each takes three of the 128. Past about 36 Python frames deep, the stack loses its outermost frames, the program's entry first |
+| An allocation made with the GIL released | Python callers shown | Python callers shown |
+| A thread Python never saw | Native frames only | Native frames only |
+| A forked worker | Nothing to do | One more call in the parent on 3.13+; on 3.12 the frames inherited from the parent are unnamed |
+
+**What it costs**
+
+Measured on CPython 3.12.3 and 3.13.15, x86-64, one core, the distro's jemalloc 5.3 at the default sample period (`lg_prof_sample:19`).
+
+| | `backtrace="python"` | Trampolines + `backtrace="libunwind"` |
+|---|---|---|
+| Python function calls (a benchmark made only of calls) | No change | 40% to 65% slower; 63% in these runs, about 16 ns a call |
+| A sampled allocation at 30 Python frames, on top of jemalloc's own 4 µs | 25 to 26 µs | 9 µs on 3.12, 20 µs on 3.13 |
+| The same per GiB allocated | About 50 ms | 19 to 41 ms, plus the cost on every call |
+| System calls per sampled allocation, at that depth | About 37 (`process_vm_readv`, a little over one a frame) | About 39 (libunwind checks each address it reads: `mincore`, and a write to and a read from a pipe) |
+| Threads sampled at the same moment | Walk side by side; a short lock per frame to look its function up | One at a time: a lock is held for the whole unwind |
+| A mixed workload (tokenize, parse and compile 150 files) | No difference above run-to-run noise | No difference above run-to-run noise |
+| Memory | A 5 MiB table mapped at install, of which only the pages used are resident | 64 KiB of generated code for 1,300 functions |
+| Files | The code map: about 1 KiB per function that was in a sampled stack | The perf map: about 90 bytes per function that was ever called |
+
+`python` costs more per sample and nothing per call, so it is the cheaper of the two once a program makes more than about 300 (3.13) to 1,000 (3.12) Python calls per sampled allocation, which at the default period is per 512 KiB allocated.
+A program that allocates a great deal from very little Python is the one case where trampolines cost less.
+
+**What can go wrong**
+
+| | `backtrace="python"` | Trampolines + `backtrace="libunwind"` |
+|---|---|---|
+| What it depends on | CPython's private structures, by offsets kept per minor version | A feature CPython supports (3.12+, Linux), and libunwind8 in the image |
+| A new Python version | Refused until its offsets are added; stacks are native until then | Nothing here depends on the version |
+| A Python laid out otherwise (free-threaded, a debug or patched build) | Refused: `install()` compares its walk with Python's own view of the stack first | Nothing here depends on the layout |
+| A bad pointer | Cannot fault: every read of Python's memory is made by the kernel, and a refused read shortens the stack | libunwind checks each address before it reads it |
+| What it changes in the process | Nothing between samples. It never takes the GIL, touches a reference count or allocates | How every Python function is called, for the life of the process, and it maps executable memory at runtime |
+| What it needs from the environment | `process_vm_readv` on itself, or `/proc/self/mem`; refused if the process may use neither | `libunwind.so.8`, and `/tmp` writable |
+| Which process a map belongs to | The dump names its own map by a token, so a recycled pid cannot name another's frames | By pid alone: a map an earlier process left under the same pid is not told apart |
+| Where the map is | Beside the dumps | In `/tmp`, the container's own: copy it out with the dumps |
+
+### The `python` backtrace
+
 ```python
 import systing_heap_hooks   # heap/hooks on PYTHONPATH, or copy the .py and .so together
+print(systing_heap_hooks.install(backtrace="python"))
+# {'backtrace': 'python', 'trampolines': False, 'reasons': []}
+```
+
+When jemalloc samples an allocation, the hook takes jemalloc's own native stack and adds the Python frames of the thread that allocated, read from the interpreter's frame chain.
+Python runs at full speed: nothing happens between samples.
+It works on threads that have released the GIL (an allocation inside numpy or torch has its Python callers) and needs no libunwind.
+
+- **How a Python frame is stored.** jemalloc keeps a stack as addresses, so each Python frame is a 64-bit value no address can equal, holding a code id and an instruction index. The ids are named in a **code map**, `pycode-<pid>-<token>.map`, which the hook writes beside the dumps: one line per Python function the first time a sampled stack meets it, with its qualified name, file, first line and line table. `systing-heap` decodes them, so frames read `function (python) [file.py:42]`, the same as in a capture's stacks.
+- **Keep the code map with the dumps.** It is in the dumps' folder already; copy both together, or read the container's own files with `--pid`. `systing-heap` looks in `--perf-map-dir`, then beside the snapshot. Without it, Python frames show as `unknown (python) [unknown]` and the tool warns. A dump names its own map: the token is also the name of a mapping in the process (`systing-pycode-<token>`), which the dump's memory map records, so a later process with the same pid cannot name another's frames.
+- **Checked before it is used.** `install()` compares what the hook reads of the calling thread's stack with what Python says it is (every frame's code object, position, names and line table), with the GIL released. If they differ, the Python is not laid out as expected (a free-threaded or otherwise different build): the backtrace is not installed, and `reasons` says so.
+- **It cannot crash the program on a bad pointer.** Every read of Python's memory goes through the kernel (`process_vm_readv` on the process itself, or `/proc/self/mem`), so a bad address ends the walk and the native stack is still recorded. If the process may use neither, the backtrace is not installed. See [`hooks/README.md`](hooks/README.md) for the full list of what the hook may and may not do.
+- **Forking processes.** Nothing to do: the hook is inherited, and each child writes a code map of its own. A worker's heap holds what its parent allocated before the fork, so its map begins with the parent's lines and its ids go on from the parent's: those stacks are named in the worker's dumps as they are in the parent's. The map is made when the worker's first allocation is sampled; a worker that dumps before that has no map yet, and its Python frames are `unknown (python) [unknown]`.
+- **At exit.** The helper turns the Python walk off as the interpreter exits (`atexit`), before the interpreter frees the state of threads that are still running. Allocations sampled after that have native stacks.
+- **Threads Python never saw** (a native thread pool doing work on a Python thread's behalf) have no Python frames to read: their stacks are native.
+- **Depth.** jemalloc 5.3 keeps 128 frames per stack. Python frames get at most 64 of them, the innermost; the native stack gets the rest. Where the Python frames and the native bytecode-loop frames do not pair up (a truncated stack), the Python frames are placed in front of the native ones as one block.
+- **Cost.** About 25 µs per sampled allocation at 30 Python frames, on top of the 4 µs jemalloc's own native stack takes. At the default sample period that is about 50 ms per GiB allocated: under 1% of one core for a service allocating 100 MB/s. A finer sample period runs it more often.
+- **The frames are the ones Python shows.** A frame the interpreter is still setting up, or one it makes for itself around a call (3.13's frame under a class's `__init__`), is in no traceback, and in no stack here.
+- **Code maps are not deleted.** `systing-heap` deletes old dumps, not code maps: each process leaves one, a line per Python function its sampled stacks went through. It is created as jemalloc creates the dumps beside it, mode 0644 less the umask: whoever can read the dumps can read the names and source paths in it.
+- **Limits.** A process stops adding to its map at 128 MiB, and records at most 98,304 functions, fewer where many of them land in the same part of the hook's table (it looks in 64 places for each). Functions first met past these are `unknown (python) [unknown]`. `systing-heap` reads no line with a name of more than 1,024 characters, a file of more than 4,096 or a line table of more than 64 KiB, since the hook writes none, and prints U+FFFD in place of a control character in a name.
+
+What can't be done is skipped with a warning, and the result says what is active: `{'backtrace': 'default', ..., 'reasons': ['python frames need CPython 3.12, 3.13 or 3.14']}`.
+Pass `strict=True` to raise instead.
+`backtrace="default"` puts jemalloc's own back.
+
+### Perf trampolines
+
+For a Python the `python` backtrace refuses.
+Two things make it work:
+
+- **Perf trampolines** (Python 3.12+). Python gives each Python function a small piece of generated code of its own, so a native stack shows one frame per Python function, and names that code in `/tmp/perf-<pid>.map`.
+- **A backtrace that walks through them.** The distro jemalloc captures stacks with libgcc's unwinder, which stops at the first trampoline, so only the innermost Python function shows. libunwind walks through them. The hook makes jemalloc use libunwind (`libunwind.so.8`, loaded at runtime).
+
+```python
 print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
 # {'backtrace': 'libunwind', 'trampolines': True, 'reasons': []}
 ```
 
-What can't be done is skipped with a warning, and the result says what is active.
-For example, without libunwind8 you get `{'backtrace': 'default', ..., 'reasons': ['libunwind.so.8 not found']}`, and stacks keep only the innermost Python function.
+Without libunwind8 you get `{'backtrace': 'default', ..., 'reasons': ['libunwind.so.8 not found']}`, and stacks keep only the innermost Python function.
 It also reports when jemalloc isn't the process's allocator, when profiling is off (`MALLOC_CONF` without `prof:true`), and when jemalloc is older than 5.3.
-Pass `strict=True` to raise instead.
-`backtrace="default"` puts jemalloc's own back.
-
-The options, from most to least complete:
-
-| Setup | Stacks show |
-|---|---|
-| Trampolines + `backtrace="libunwind"` | Every Python function, among the native frames |
-| Trampolines + a jemalloc built with `--enable-prof-libunwind` (no hook) | The same, expected: jemalloc's libunwind backend makes the same call as the hook; not tested here |
-| Trampolines + jemalloc's default | Only the innermost Python function |
-| No trampolines | Native frames only (the interpreter's C functions) |
 
 Things to know:
 
@@ -146,8 +297,8 @@ Things to know:
 - **Forking processes.** Each worker starts a perf map of its own, so the frames it inherited already running from the parent (a pre-fork server's loop, under every worker's stacks) are named in none the worker's dumps can use. On Python 3.13+, call `systing_heap_hooks.keep_perf_map_across_fork()` once in the parent, with trampolines on, before it forks: each child then adds the parent's map to its own. (CPython's own persist-after-fork setting is not used: it stops the child making trampolines, so what the worker runs afterwards goes unnamed.) The hook itself is fork-safe: unwinds take one lock, and a fork waits for any unwind in progress, since libunwind's cache lock has no fork handler of its own.
 - **Function granularity.** A trampoline is per function, so Python frames name the function and file (full path in `frame_file`), not the line. Library code gets pystacks' module prefix (`pkg.mod:Cls.run (python) [mod.py]`), so the same function has the same name as in a capture's stacks, apart from the line: pystacks writes `[mod.py:42]`, so drop the `:<line>` (`regexp_replace(name, ':\d+\]$', ']')`) to join the two by name.
 Application code has no module prefix, so two functions with the same qualified name in files with the same base name are one frame.
-- **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps. Without it, Python frames show as `unknown ([anon:exec])` and the tool warns. It prints which map named each process's frames, and a map is consulted only for addresses the dump's own memory map puts in anonymous executable memory, so a stale map cannot name data. A refused candidate falls through to the next. A map is read only if it is a regular file (symlinks are not followed) of at most 256 MiB, and one in a world-writable directory such as `/tmp` only if you or root own it, as perf requires: otherwise another user could name your frames.
-- **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran about 40% slower. Code that spends its time in C pays far less. The hook runs only for sampled allocations, so a finer sample period runs it more often (32 times as often per byte at a 16 KiB period as at the 512 KiB default), and threads unwinding at the same moment wait for one another.
+- **Keep the perf map.** `systing-heap` looks for `perf-<pid>.map` in `--perf-map-dir`, then beside the snapshot, then `/tmp`. In a container, `/tmp` is the container's, so copy the map out with the dumps, or read the container's own files with `--pid`. Without the map, Python frames show as `unknown ([anon:exec])` and the tool warns. It prints which map named each process's frames, and a map is consulted only for addresses the dump's own memory map puts in anonymous executable memory, so a stale map cannot name data. A refused candidate falls through to the next. A map is read only if it is a regular file (symlinks are not followed) of at most 256 MiB, and one in a world-writable directory such as `/tmp` only if you or root own it, as perf requires: otherwise another user could name your frames.
+- **Cost.** Trampolines add a native call to every Python call: a benchmark made only of function calls ran 40% to 65% slower. Code that spends its time in C pays far less. The hook runs only for sampled allocations (9 to 20 µs each at 30 Python frames), so a finer sample period runs it more often (32 times as often per byte at a 16 KiB period as at the 512 KiB default), and threads unwinding at the same moment wait for one another.
 
 ## Sampling and unbiasing
 
@@ -187,11 +338,11 @@ A finer period gives a closer estimate, but sampling itself costs memory: jemall
 |---|---|
 | `id` | Snapshot id, dense within the trace |
 | `format` | `jemalloc` |
-| `source_path` | The file read |
+| `source_path` | The file read; `/proc/PID/mem` for a snoop |
 | `upid` | `process.upid` of the pid in the file name, as the writing process saw it in its own pid namespace; NULL if the name has none |
 | `seq` | The allocator's dump sequence number |
-| `dump_trigger` | `interval` (every `lg_prof_interval` bytes), `manual` (`mallctl("prof.dump")`), `gdump` (new high-water mark), `final` (at exit) |
-| `dumped_at_unix_ns` | The file's modification time when read, wall-clock; a copy that does not keep times moves it |
+| `dump_trigger` | `interval` (every `lg_prof_interval` bytes), `manual` (`mallctl("prof.dump")`), `gdump` (new high-water mark), `final` (at exit), `snoop` (read from the live process, see above) |
+| `dumped_at_unix_ns` | The file's modification time when read, wall-clock; a copy that does not keep times moves it. For a snoop, the time of the read |
 | `sample_period` | Mean bytes between samples (`2^lg_prof_sample`) |
 
 `heap_sample` has one row per distinct allocation stack in a snapshot.
@@ -204,12 +355,33 @@ A finer period gives a closer estimate, but sampling itself costs memory: jemall
 | `est_alloc_objects`, `est_alloc_bytes` | Estimated cumulative allocations since start; 0 unless jemalloc ran with `prof_accum:true` |
 | `live_objects`, `live_bytes`, `alloc_objects`, `alloc_bytes` | The sampled counts as jemalloc wrote them, before unbiasing. Never add them up as totals |
 
+`heap_live_read` has one row per snapshot that was read from a live process (`--snoop`, experimental), and none for a dump: how the read went.
+
+| Column | Meaning |
+|---|---|
+| `snapshot_id` | `heap_snapshot.id` |
+| `found_by` | `symbol` (the library names the profile table) or `shape` (a stripped library: found by what it looks like) |
+| `object_path` | The file the profile was found in, as the process maps it |
+| `sample_period_from` | Where `heap_snapshot.sample_period` is from: `symbols` (read from the process), `malloc_conf` (the process's environment), or `default`, which is a guess. The estimates do not depend on it |
+| `walks_redone` | Walks of the profile done again, because the table changed under one or records were skipped |
+| `unsteady` | The table was changing during every walk, so the snapshot may be missing stacks |
+| `backtraces_read`, `backtraces_skipped` | Backtrace records read, and those skipped because they were not (or no longer) jemalloc's. Read counts every backtrace, also one with nothing live, which has no `heap_sample` row |
+| `thread_records_read`, `thread_records_skipped` | The same for the per-thread counters under them. A skipped record's counts are missing from its stack |
+| `links_checked`, `links_out_of_order` | Parent and child thread records compared for the order jemalloc keeps them in, and those out of it |
+| `counters_checked`, `counters_off` | Thread records whose counters were compared with each other, and those that cannot be jemalloc's |
+| `reads`, `bytes_read`, `duration_ms` | What the read cost: reads of the process's memory, their bytes, and the time taken |
+
+A read is clean when `unsteady` is false and the four of `backtraces_skipped`, `thread_records_skipped`, `links_out_of_order` and `counters_off` are 0 (see Queries).
+Clean means that nothing was seen to go wrong, not that the counts are exact: a stack's counters can still be from slightly different moments, and a record hidden while jemalloc rotated a tree raises no skip.
+A check with fewer than 8 records (`links_checked`, `counters_checked`) had too little to judge the layout by.
+
 A total over many rows is close; one row's estimate is only as good as the samples behind it, about ±1/√`live_objects`.
 One sampled 256-byte object at a 16 KiB period reads 16,512 bytes, give or take all of it, so check `live_objects` before trusting a small stack's estimate.
 
 Pids are the writing process's own, in its pid namespace.
 Two containers whose main process is pid 1 share one `process` row when their dumps are read into one database, and heap rows carry no host or container of their own; `source_path` says where each came from.
 A DuckDB merge keeps these tables; a schema-25 reader's merge, or an export to parquet and back, drops them without a message.
+`heap_live_read` is from schema 28: a merge by a reader older than that keeps the snapshot and drops how its read went.
 
 ## Queries
 
@@ -247,6 +419,19 @@ JOIN heap_snapshot hs ON hs.trace_id = h.trace_id AND hs.id = h.snapshot_id
 JOIN stack_frames sf ON sf.trace_id = h.trace_id AND sf.id = h.stack_id
 WHERE hs.dump_trigger = 'final'
 ORDER BY h.est_live_bytes DESC;
+```
+
+The snapshots read from a live process, and whether each read was clean (no row in `heap_live_read` is a dump):
+
+```sql
+SELECT s.trace_id, s.id, r.found_by, r.sample_period_from, r.walks_redone,
+       NOT r.unsteady
+         AND r.backtraces_skipped + r.thread_records_skipped = 0
+         AND r.links_out_of_order + r.counters_off = 0 AS clean,
+       r.backtraces_skipped, r.thread_records_skipped
+FROM heap_snapshot s
+JOIN heap_live_read r ON r.trace_id = s.trace_id AND r.snapshot_id = s.id
+ORDER BY s.trace_id, s.id;
 ```
 
 Growth between each process's first and last snapshot, by stack.

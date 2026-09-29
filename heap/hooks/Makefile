@@ -12,9 +12,12 @@ LIB := $(OUT)/libsysting_heap_hooks.so
 
 all: $(LIB)
 
-$(LIB): systing_heap_hooks.c systing_heap_hooks.h
+SRC := systing_heap_hooks.c systing_heap_hooks_python.c
+HDR := systing_heap_hooks.h systing_heap_hooks_python.h py_offsets.h
+
+$(LIB): $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -Wall -Wextra -fPIC -shared -fno-omit-frame-pointer \
-		-o $@ systing_heap_hooks.c -ldl -lpthread
+		-o $@ $(SRC) -ldl -lpthread
 
 clean:
 	rm -f $(LIB)

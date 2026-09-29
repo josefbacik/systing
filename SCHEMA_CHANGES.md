@@ -483,6 +483,62 @@ records it once, on `sysinfo`.
   reader older than 1.18.2 fails the import of it whole. So readers move to
   this version before writers do.
 
+## Schema Version 28 (systing 1.25.0) — 2026-09-27
+
+How a heap snapshot that was read out of a running process's memory went.
+`systing-heap --pid PID --snoop` (experimental) reads jemalloc's live profile
+from the process instead of from a dump file. The process runs while it is
+read and none of its locks are taken, so a record that changed under the read
+is skipped and a walk the table changed under is done again. Until now that was
+only printed; a database did not say which of its snapshots were read cleanly.
+
+### New tables
+- `heap_live_read` — one row per snapshot read from a live process
+  (`heap_snapshot.dump_trigger` = `snoop`), none for a dump (snapshot_id,
+  found_by, object_path, sample_period_from, walks_redone, unsteady,
+  backtraces_read, backtraces_skipped, thread_records_read,
+  thread_records_skipped, links_checked, links_out_of_order, counters_checked,
+  counters_off, reads, bytes_read, duration_ms).
+  - `found_by` is `symbol` or `shape`: whether the library named jemalloc's
+    table of backtraces or it was found by what it looks like (a stripped
+    library). `object_path` is the file it was in, as the process maps it.
+  - `sample_period_from` says where `heap_snapshot.sample_period` is from:
+    `symbols` (read from the process), `malloc_conf` (its environment), or
+    `default`, which is a guess. `heap_sample.est_*` of such a snapshot are
+    jemalloc's own per-stack estimates and do not depend on the period.
+  - `walks_redone` counts walks done again. `unsteady` is true when the table
+    was changing during every walk: the snapshot is the best of them and may be
+    missing stacks.
+  - `backtraces_*` and `thread_records_*` count the records read and those
+    skipped because they were not, or were no longer, jemalloc's. A skipped
+    thread record's counts are missing from its stack's row.
+  - `links_*` and `counters_*` are the two checks of the layout made over a
+    whole walk: thread records compared for the order jemalloc keeps them in,
+    and counters compared with each other. A snapshot is refused, and nothing
+    written, when more than a quarter of eight or more are out; fewer than
+    eight checked is too few to judge by.
+  - `reads`, `bytes_read` and `duration_ms` are what the read cost.
+
+  A read is clean when `unsteady` is false and `backtraces_skipped`,
+  `thread_records_skipped`, `links_out_of_order` and `counters_off` are all 0.
+  Clean means nothing was seen to go wrong, not that the counts are exact: the
+  counters of one stack can be from slightly different moments.
+
+  ```sql
+  SELECT s.id, NOT r.unsteady
+           AND r.backtraces_skipped + r.thread_records_skipped = 0
+           AND r.links_out_of_order + r.counters_off = 0 AS clean
+  FROM heap_snapshot s
+  JOIN heap_live_read r ON r.trace_id = s.trace_id AND r.snapshot_id = s.id;
+  ```
+
+### Compatibility
+- No existing table changes. A database written before this version has no
+  `heap_live_read` rows, and had no snapshots read from a live process.
+- A DuckDB merge by a reader at this version keeps the table. A merge by an
+  older reader keeps the snapshot and its samples and drops this table without
+  a message, as an export to parquet and back drops every heap table.
+
 ## Schema Version 27 (systing 1.24.0) — 2026-09-24
 
 The task-stacks recorder carries a thread's task_context. With

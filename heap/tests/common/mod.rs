@@ -31,15 +31,22 @@ pub fn jemalloc() -> Option<PathBuf> {
 
 /// A Python with perf trampolines (3.12+), and its minor version.
 pub fn python() -> Option<(String, u32)> {
+    pythons().into_iter().next()
+}
+
+/// Every Python the hooks support that is installed, newest first: what
+/// reads the interpreter's own structures is run on each.
+pub fn pythons() -> Vec<(String, u32)> {
     ["python3.14", "python3.13", "python3.12"]
         .into_iter()
-        .find(|p| {
+        .filter(|p| {
             Command::new(p)
                 .arg("-V")
                 .output()
                 .is_ok_and(|o| o.status.success())
         })
         .map(|p| (p.to_string(), p["python3.".len()..].parse().unwrap()))
+        .collect()
 }
 
 pub fn have_libunwind() -> bool {

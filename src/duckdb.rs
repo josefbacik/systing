@@ -187,6 +187,7 @@ pub const DATA_TABLES: &[&str] = &[
     "task_context",
     "heap_snapshot",
     "heap_sample",
+    "heap_live_read",
     "clock_snapshot",
     "sysinfo",
     "cpu_info",
@@ -812,6 +813,33 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             est_live_bytes BIGINT,
             est_alloc_objects BIGINT,
             est_alloc_bytes BIGINT
+        );
+
+        -- How a snapshot that systing-heap read out of a running process's
+        -- memory (`--snoop`, heap_snapshot.dump_trigger 'snoop') went: one row
+        -- for each such snapshot, none for a dump. The process runs while it
+        -- is read and nothing of it is locked, so records can be skipped and
+        -- walks done again; these are the counts (see SCHEMA_CHANGES.md,
+        -- schema 28, for what a clean read is).
+        CREATE TABLE IF NOT EXISTS heap_live_read (
+            trace_id VARCHAR,
+            snapshot_id BIGINT, -- heap_snapshot.id
+            found_by VARCHAR, -- 'symbol' or 'shape': how the profile was found
+            object_path VARCHAR, -- the file it was found in, as the process maps it
+            sample_period_from VARCHAR, -- 'symbols', 'malloc_conf' or 'default' (a guess)
+            walks_redone INTEGER, -- walks of the profile done again
+            unsteady BOOLEAN, -- changing during every walk: stacks may be missing
+            backtraces_read BIGINT,
+            backtraces_skipped BIGINT,
+            thread_records_read BIGINT,
+            thread_records_skipped BIGINT,
+            links_checked BIGINT,
+            links_out_of_order BIGINT,
+            counters_checked BIGINT,
+            counters_off BIGINT,
+            reads BIGINT, -- reads of the process's memory
+            bytes_read BIGINT,
+            duration_ms BIGINT
         );
 
         -- /proc/vmstat counters (THP, compaction, direct reclaim families)

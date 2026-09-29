@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use systing_heap::perfmap::{self, PerfMap};
-use systing_heap::{db, jemalloc, perfetto, retention, symbolize, Format, Snapshot};
+use systing_heap::pycode::{self, CodeMap};
+use systing_heap::root::Root;
+use systing_heap::{db, jemalloc, perfetto, retention, snoop, symbolize, Format, Snapshot};
 
 /// Parse allocator heap snapshots (jemalloc prof dumps), symbolize their
 /// stacks, and write them into a systing DuckDB database.
@@ -17,12 +19,19 @@ use systing_heap::{db, jemalloc, perfetto, retention, symbolize, Format, Snapsho
 /// value given to MALLOC_CONF) loads the latest snapshot of each process
 /// and deletes that process's older dumps once the database is written. A
 /// file or directory input is only loaded, never deleted.
+///
+/// With --pid or --root-fd, the inputs and every path the snapshots name are
+/// resolved beneath that root, to read a container's snapshots from outside
+/// it.
+///
+/// With --pid and --snoop (EXPERIMENTAL) there is no snapshot file: the
+/// process's current jemalloc heap profile is read out of its memory.
 #[derive(Parser)]
 #[command(name = "systing-heap", version)]
 struct Cli {
     /// jemalloc prof_prefixes, snapshot files, or directories to load every
     /// snapshot file in (not recursively).
-    #[arg(required = true)]
+    #[arg(required_unless_present = "snoop")]
     inputs: Vec<PathBuf>,
 
     /// The output, replaced on every run: a DuckDB database, or a Perfetto
@@ -46,30 +55,114 @@ struct Cli {
     #[arg(long)]
     keep_all: bool,
 
+    /// With a prefix input, load only each process's latest snapshot, also
+    /// for a Perfetto output, and delete nothing.
+    #[arg(long, conflicts_with = "keep_all")]
+    latest_only: bool,
+
     /// Print what would be loaded and deleted; write and delete nothing.
     #[arg(long)]
     dry_run: bool,
 
-    /// Where to look first for each process's perf-<pid>.map, which names
-    /// Python functions when it ran with perf trampolines
-    /// (PYTHONPERFSUPPORT=1). Then beside the snapshot, then /tmp.
+    /// Where to look first for the file that names each process's Python
+    /// frames: its code map (pycode-<pid>-<token>.map, the hooks' "python"
+    /// backtrace), else beside the snapshot; its perf map (perf-<pid>.map,
+    /// perf trampolines), else beside the snapshot, then /tmp. With --pid
+    /// or --root-fd all of these are beneath the root, /tmp being the
+    /// container's own.
     #[arg(long)]
     perf_map_dir: Option<PathBuf>,
+
+    /// Resolve the inputs and every path the snapshots name (the binaries,
+    /// the perf maps) beneath the root of the running process PID, as the
+    /// kernel would for that process: absolute symlinks and ".." cannot leave
+    /// it. For reading a container's snapshots from outside it, PID being a
+    /// process in the container: its id as this tool sees it, which is not
+    /// the number in its dumps' names. The root, /proc/PID/root, is opened
+    /// once at start. Takes prefix inputs only, and names frames from the
+    /// binaries' symbol tables alone, without debug information. The output
+    /// is not beneath the root. Needs Linux 5.6 or later.
+    #[arg(short, long, value_name = "PID", conflicts_with = "root_fd")]
+    pid: Option<u32>,
+
+    /// As --pid, the root being a directory descriptor inherited from the
+    /// caller, by its number: any directory the caller opened and left open.
+    /// A caller that has checked which process a number names should pass
+    /// the directory it checked this way, since a number can come to name
+    /// another process.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
+    root_fd: Option<i32>,
+
+    /// EXPERIMENTAL. With --pid, read the process's current jemalloc heap
+    /// profile from its memory, instead of from a snapshot file: no input, no
+    /// dump interval to wait for, and no file is written. It relies on
+    /// jemalloc's private data structures and refuses a jemalloc whose layout
+    /// it does not know. The process needs `prof:true` in its MALLOC_CONF;
+    /// reading its memory needs the same user as the process (ptrace is not used,
+    /// and CAP_SYS_PTRACE is not needed then). A Python code map
+    /// is looked for only in --perf-map-dir (there is no dump for it to be
+    /// beside).
+    #[arg(
+        long,
+        requires = "pid",
+        conflicts_with_all = ["inputs", "format", "keep_all", "latest_only", "dry_run"]
+    )]
+    snoop: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // A snoop pins the process once, and takes the root from that handle, so
+    // its memory and its root are surely one process.
+    let pinned = match (cli.snoop, cli.pid) {
+        (true, Some(pid)) => Some(snoop::Process::open(pid)?),
+        _ => None,
+    };
+    let pid_root = cli
+        .pid
+        .filter(|_| pinned.is_none())
+        .map(|pid| PathBuf::from(format!("/proc/{pid}/root")));
+    let root = match (pinned.as_ref(), pid_root.as_ref(), cli.root_fd) {
+        (Some(process), _, _) => Some(process.root()?),
+        (None, Some(dir), _) => {
+            Some(Root::open(dir).with_context(|| format!("opening the root {}", dir.display()))?)
+        }
+        (None, None, Some(fd)) => {
+            Some(Root::from_fd(fd).with_context(|| format!("taking descriptor {fd} as the root"))?)
+        }
+        (None, None, None) => None,
+    };
+    let root = root.as_ref();
+
     let as_perfetto = perfetto::is_perfetto_output(&cli.output);
+    let load_all = !cli.latest_only && (cli.keep_all || as_perfetto);
+    let delete_older = !cli.keep_all && !cli.latest_only;
     let mut snapshots: Vec<Snapshot> = Vec::new();
     let mut plans: Vec<retention::Plan> = Vec::new();
+    if let Some(process) = pinned.as_ref() {
+        let pid = process.pid();
+        eprintln!(
+            "warning: --snoop is experimental: it reads jemalloc's private data structures \
+             out of process {pid}'s memory, and may fail or refuse on a jemalloc it does not know"
+        );
+        let (snapshot, report) = snoop::read_within(process, snoop::TIMEOUT)?;
+        eprintln!("{}", report.summary(pid));
+        snapshots.push(snapshot);
+    }
     for input in &cli.inputs {
-        if input.is_file() || input.is_dir() {
+        if is_file_or_dir(input, root)? {
+            if root.is_some() {
+                bail!(
+                    "{}: beneath a root an input must be a jemalloc prof_prefix, not a file or directory",
+                    input.display()
+                );
+            }
             for (path, format) in collect_inputs(input, cli.format)? {
                 snapshots.push(read(&path, format)?);
             }
         } else {
-            let mut plan = retention::scan(input, cli.keep_all || as_perfetto, !cli.keep_all)?;
+            let mut plan = retention::scan(input, load_all, delete_older, root)?;
             snapshots.append(&mut plan.load);
             plans.push(plan);
         }
@@ -85,7 +178,8 @@ fn main() -> Result<()> {
     if snapshots.is_empty() {
         bail!("no snapshots found in {:?}", cli.inputs);
     }
-    attach_perf_maps(&mut snapshots, cli.perf_map_dir.as_deref());
+    attach_perf_maps(&mut snapshots, cli.perf_map_dir.as_deref(), root);
+    attach_code_maps(&mut snapshots, cli.perf_map_dir.as_deref(), root);
     // Ids follow dump order: by process, then the allocator's sequence.
     snapshots.sort_by(|a, b| (a.pid, a.seq, &a.source_path).cmp(&(b.pid, b.seq, &b.source_path)));
 
@@ -101,7 +195,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let symbolized = symbolize::symbolize(&snapshots);
+    let symbolized = symbolize::symbolize_in(&snapshots, root);
     let stats = &symbolized.stats;
     for f in &stats.missing_files {
         eprintln!(
@@ -115,10 +209,23 @@ fn main() -> Result<()> {
             f.display()
         );
     }
+    for f in &stats.remote_files {
+        eprintln!(
+            "warning: {} is on a FUSE or network filesystem; not opened beneath a root, its frames stay unresolved",
+            f.display()
+        );
+    }
     for f in &stats.unnamed_generated {
         eprintln!(
             "warning: {} has frames in generated code (Python perf trampolines?) that no perf-<pid>.map names; \
              keep the process's /tmp/perf-<pid>.map beside the snapshot or pass --perf-map-dir",
+            f.display()
+        );
+    }
+    for f in &stats.unnamed_python {
+        eprintln!(
+            "warning: {} has Python frames that no code map names; \
+             keep the process's pycode-<pid>-<token>.map beside the snapshot or pass --perf-map-dir",
             f.display()
         );
     }
@@ -129,12 +236,15 @@ fn main() -> Result<()> {
         );
     }
 
-    let source = cli
-        .inputs
-        .iter()
-        .map(|p| p.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(",");
+    let source = match (cli.snoop, cli.pid) {
+        (true, Some(pid)) => format!("snoop:{pid}"),
+        _ => cli
+            .inputs
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(","),
+    };
     let written = write_replacing(&cli.output, !as_perfetto, |tmp| {
         if as_perfetto {
             perfetto::write(tmp, &snapshots, &symbolized)
@@ -143,7 +253,8 @@ fn main() -> Result<()> {
         }
     })?;
     println!(
-        "{}: {} snapshot(s), {} sample(s), {} stack(s), {} frame(s); {}/{} addresses symbolized, {} Python function(s) from perf maps",
+        "{}: {} snapshot(s), {} sample(s), {} stack(s), {} frame(s); {}/{} addresses symbolized, \
+         {} Python function(s) from perf maps, {} Python frame(s) from code maps",
         cli.output.display(),
         written.snapshots,
         written.samples,
@@ -151,7 +262,8 @@ fn main() -> Result<()> {
         written.frames,
         stats.resolved,
         stats.lookups,
-        stats.perf_map_frames
+        stats.perf_map_frames,
+        stats.code_map_frames
     );
 
     // Only now that the output is in place do older dumps go.
@@ -167,23 +279,54 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Whether `input` exists as a file or a directory, beneath `root` when
+/// there is one; anything else is taken as a prefix.
+fn is_file_or_dir(input: &Path, root: Option<&Root>) -> Result<bool> {
+    let Some(root) = root else {
+        return Ok(input.is_file() || input.is_dir());
+    };
+    match root.open_at(input, libc::O_PATH) {
+        Ok(handle) => {
+            let meta = handle
+                .metadata()
+                .with_context(|| format!("examining {}", input.display()))?;
+            Ok(meta.is_file() || meta.is_dir())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("looking up {}", input.display()))),
+    }
+}
+
 /// Give each snapshot its process's perf map: the first candidate that may
 /// be read, a refused one falling through to the next. A map is read once
 /// however many snapshots share it, and the one used is printed, so a wrong
 /// or stale map is visible.
-fn attach_perf_maps(snapshots: &mut [Snapshot], dir: Option<&Path>) {
-    let mut cache: HashMap<PathBuf, Option<Arc<PerfMap>>> = HashMap::new();
+fn attach_perf_maps(snapshots: &mut [Snapshot], dir: Option<&Path>, root: Option<&Root>) {
+    // Beneath a root, whether a map may be used turns on who owns the dump
+    // whose frames it would name, so a map is cached for that owner.
+    let mut cache: HashMap<(PathBuf, Option<u32>), Option<Arc<PerfMap>>> = HashMap::new();
     let mut announced: std::collections::HashSet<PathBuf> = Default::default();
     for s in snapshots {
         let Some(pid) = s.pid else { continue };
-        for path in perfmap::candidates(pid, &s.source_path, dir) {
+        let paths = match root {
+            Some(_) => perfmap::places(pid, &s.source_path, dir),
+            None => perfmap::candidates(pid, &s.source_path, dir),
+        };
+        let dump_owner = root.and(s.owner_uid);
+        for path in paths {
             let map = cache
-                .entry(path.clone())
-                .or_insert_with_key(|path| match perfmap::read(path) {
-                    Ok(map) => Some(Arc::new(map)),
-                    Err(e) => {
-                        eprintln!("warning: not using {}: {e}", path.display());
-                        None
+                .entry((path.clone(), dump_owner))
+                .or_insert_with_key(|(path, owner)| {
+                    match perfmap::read_in(root, path, *owner) {
+                        Ok(map) => Some(Arc::new(map)),
+                        // Beneath a root nothing has yet said the place holds a map.
+                        Err(e) if root.is_some() && e.kind() == std::io::ErrorKind::NotFound => {
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!("warning: not using {}: {e}", path.display());
+                            None
+                        }
                     }
                 })
                 .clone();
@@ -192,6 +335,50 @@ fn attach_perf_maps(snapshots: &mut [Snapshot], dir: Option<&Path>) {
                     eprintln!("pid {pid}: Python frames named from {}", path.display());
                 }
                 s.perf_map = Some(map);
+                break;
+            }
+        }
+    }
+}
+
+/// Give each snapshot with Python frames of the hooks' own its process's
+/// code map: the one whose token the dump's maps name, so a process that
+/// got a recycled pid cannot name another's frames.
+fn attach_code_maps(snapshots: &mut [Snapshot], dir: Option<&Path>, root: Option<&Root>) {
+    // As for a perf map: beneath a root a map is judged by who owns the dump,
+    // so it is cached for that owner.
+    let mut cache: HashMap<(PathBuf, Option<u32>), Option<Arc<CodeMap>>> = HashMap::new();
+    for s in snapshots {
+        let (Some(pid), Some(token)) = (s.pid, pycode::token_of(&s.maps)) else {
+            continue;
+        };
+        let paths = match root {
+            Some(_) => pycode::places(pid, token, &s.source_path, dir),
+            None => pycode::candidates(pid, token, &s.source_path, dir),
+        };
+        let dump_owner = root.and(s.owner_uid);
+        for path in paths {
+            let map = cache
+                .entry((path.clone(), dump_owner))
+                .or_insert_with_key(|(path, owner)| {
+                    match pycode::read_in(root, path, token, *owner) {
+                        Ok(map) => {
+                            eprintln!("pid {pid}: Python frames named from {}", path.display());
+                            Some(Arc::new(map))
+                        }
+                        // Beneath a root nothing has yet said the place holds a map.
+                        Err(e) if root.is_some() && e.kind() == std::io::ErrorKind::NotFound => {
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!("warning: not using {}: {e}", path.display());
+                            None
+                        }
+                    }
+                })
+                .clone();
+            if map.is_some() {
+                s.py_code = map;
                 break;
             }
         }
