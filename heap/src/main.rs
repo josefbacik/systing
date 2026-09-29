@@ -10,7 +10,7 @@ use std::sync::Arc;
 use systing_heap::perfmap::{self, PerfMap};
 use systing_heap::pycode::{self, CodeMap};
 use systing_heap::root::Root;
-use systing_heap::{db, jemalloc, perfetto, retention, snoop, symbolize, Format, Snapshot};
+use systing_heap::{ask, db, jemalloc, perfetto, retention, snoop, symbolize, Format, Snapshot};
 
 /// Parse allocator heap snapshots (jemalloc prof dumps), symbolize their
 /// stacks, and write them into a systing DuckDB database.
@@ -26,12 +26,15 @@ use systing_heap::{db, jemalloc, perfetto, retention, snoop, symbolize, Format, 
 ///
 /// With --pid and --snoop (EXPERIMENTAL) there is no snapshot file: the
 /// process's current jemalloc heap profile is read out of its memory.
+///
+/// With --pid and --ask (EXPERIMENTAL) the process is asked to write a dump
+/// now, and that dump is loaded.
 #[derive(Parser)]
 #[command(name = "systing-heap", version)]
 struct Cli {
     /// jemalloc prof_prefixes, snapshot files, or directories to load every
     /// snapshot file in (not recursively).
-    #[arg(required_unless_present = "snoop")]
+    #[arg(required_unless_present_any = ["snoop", "ask"])]
     inputs: Vec<PathBuf>,
 
     /// The output, replaced on every run: a DuckDB database, or a Perfetto
@@ -108,14 +111,55 @@ struct Cli {
         conflicts_with_all = ["inputs", "format", "keep_all", "latest_only", "dry_run"]
     )]
     snoop: bool,
+
+    /// EXPERIMENTAL. With --pid, ask the process to write a dump now, and
+    /// load that: jemalloc's own dump, where --snoop reads the profile
+    /// without the process's help. `responder` asks the thread a process
+    /// starts with the hooks library's systing_heap_hooks_listen, on its
+    /// socket, and nothing is written to disk. `python` makes a CPython 3.14
+    /// that loaded nothing of ours run a short script (its remote debugging
+    /// interface, as sys.remote_exec uses it): that writes to the process's
+    /// memory, the script and the dump are files in a directory made for
+    /// them and removed afterwards, and the script runs when the process's
+    /// main thread next comes back to Python, which a thread waiting in one
+    /// long call does not. `auto`, which --ask alone means, is the responder
+    /// if the process has one, else python. The process needs `prof:true` in
+    /// its MALLOC_CONF. A Python code map is the one the responder hands
+    /// over, else looked for only in --perf-map-dir.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "HOW",
+        num_args = 0..=1,
+        default_missing_value = "auto",
+        requires = "pid",
+        conflicts_with_all = ["inputs", "format", "keep_all", "latest_only", "dry_run", "snoop"]
+    )]
+    ask: Option<ask::How>,
+
+    /// EXPERIMENTAL. With --ask, the directory the responder's socket is in, and the one
+    /// the script's files are made in: as the process sees it, and for
+    /// `python` one the process's user may write to.
+    #[arg(long, value_name = "DIR", requires = "ask", default_value = ask::DEFAULT_DIR)]
+    ask_dir: PathBuf,
+
+    /// EXPERIMENTAL. With --ask, how long the process is given to answer.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "ask",
+        default_value_t = ask::DEFAULT_WAIT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    ask_wait: u64,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // A snoop pins the process once, and takes the root from that handle, so
-    // its memory and its root are surely one process.
-    let pinned = match (cli.snoop, cli.pid) {
+    // its memory and its root are surely one process. So does asking.
+    let pinned = match (cli.snoop || cli.ask.is_some(), cli.pid) {
         (true, Some(pid)) => Some(snoop::Process::open(pid)?),
         _ => None,
     };
@@ -140,7 +184,17 @@ fn main() -> Result<()> {
     let delete_older = !cli.keep_all && !cli.latest_only;
     let mut snapshots: Vec<Snapshot> = Vec::new();
     let mut plans: Vec<retention::Plan> = Vec::new();
-    if let Some(process) = pinned.as_ref() {
+    if let (Some(process), Some(how)) = (pinned.as_ref(), cli.ask) {
+        let pid = process.pid();
+        eprintln!(
+            "warning: --ask is experimental: process {pid} is asked to write a heap dump, \
+             which for a Python that has no responder means writing to its memory"
+        );
+        let wait = std::time::Duration::from_secs(cli.ask_wait);
+        let (snapshot, report) = ask::ask_within(process, how, &cli.ask_dir, wait)?;
+        eprintln!("{}", report.summary(pid));
+        snapshots.push(snapshot);
+    } else if let Some(process) = pinned.as_ref() {
         let pid = process.pid();
         eprintln!(
             "warning: --snoop is experimental: it reads jemalloc's private data structures \
@@ -236,8 +290,9 @@ fn main() -> Result<()> {
         );
     }
 
-    let source = match (cli.snoop, cli.pid) {
-        (true, Some(pid)) => format!("snoop:{pid}"),
+    let source = match (cli.snoop, cli.ask, cli.pid) {
+        (true, _, Some(pid)) => format!("snoop:{pid}"),
+        (_, Some(_), Some(pid)) => format!("ask:{pid}"),
         _ => cli
             .inputs
             .iter()
@@ -349,6 +404,10 @@ fn attach_code_maps(snapshots: &mut [Snapshot], dir: Option<&Path>, root: Option
     // so it is cached for that owner.
     let mut cache: HashMap<(PathBuf, Option<u32>), Option<Arc<CodeMap>>> = HashMap::new();
     for s in snapshots {
+        // A process that was asked may have handed its map over.
+        if s.py_code.is_some() {
+            continue;
+        }
         let (Some(pid), Some(token)) = (s.pid, pycode::token_of(&s.maps)) else {
             continue;
         };

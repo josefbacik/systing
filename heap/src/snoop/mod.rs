@@ -130,7 +130,7 @@ impl Process {
     }
 
     /// `name` in the process's `/proc` directory, through the handle.
-    fn file(&self, name: &str) -> PathBuf {
+    pub(crate) fn file(&self, name: &str) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}/{name}", self.dir.as_raw_fd()))
     }
 
@@ -153,7 +153,7 @@ impl Process {
 
     /// A file of the process's, no more than `cap` bytes of it: what a process
     /// can be made to hold there is not the tool's to hold.
-    fn read_capped(&self, name: &str, cap: u64) -> Result<Vec<u8>> {
+    pub(crate) fn read_capped(&self, name: &str, cap: u64) -> Result<Vec<u8>> {
         use std::io::Read;
         let mut buf = Vec::new();
         File::open(self.file(name))
@@ -167,6 +167,17 @@ impl Process {
 
     fn read_text(&self, name: &str, cap: u64) -> Result<String> {
         Ok(String::from_utf8_lossy(&self.read_capped(name, cap)?).into_owned())
+    }
+
+    /// What the process maps, as text.
+    pub(crate) fn maps_text(&self) -> Result<String> {
+        self.read_text("maps", MAX_MAPS_BYTES)
+    }
+
+    /// The user and group a file the process wrote would belong to.
+    pub(crate) fn owner(&self) -> Option<(u32, u32)> {
+        use std::os::unix::fs::MetadataExt;
+        self.dir.metadata().ok().map(|m| (m.uid(), m.gid()))
     }
 }
 
@@ -190,13 +201,13 @@ pub fn read_within(process: &Process, limit: std::time::Duration) -> Result<(Sna
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Wait {
+pub(crate) enum Wait {
     TimedOut,
     Panicked,
 }
 
 /// Run `f` on a thread and wait for it, no longer than `limit`.
-fn run_within<T: Send + 'static>(
+pub(crate) fn run_within<T: Send + 'static>(
     limit: std::time::Duration,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> std::result::Result<T, Wait> {
@@ -407,7 +418,7 @@ fn lg_prof_sample_in(conf: &str) -> Option<u32> {
 
 /// The pid the process knows itself by: the innermost one of `NSpid` in
 /// `/proc/<pid>/status`, which is `pid` itself outside a pid namespace.
-fn own_pid(process: &Process) -> u32 {
+pub(crate) fn own_pid(process: &Process) -> u32 {
     process
         .read_text("status", MAX_STATUS_BYTES)
         .ok()

@@ -13,6 +13,26 @@ For every column of the tables and more queries, see the tool's README, [`heap/R
 - **To see Python functions in the stacks** (part 2): one call at startup. Each Python function then shows with its file and line.
 - **To collect them**: run `systing-heap` on the snapshot folder, for a DuckDB database or a Perfetto trace.
 
+## What goes into the service, for what it gets
+
+Most of what is here needs nothing of systing's in the service: jemalloc and its settings are enough.
+The hooks library is for two things only, Python functions in the stacks and an answer on request, and a service takes either without the other.
+Only the first of the two needs a line of the service changed.
+
+| To get | In the environment | In the image | A call in the service | Collected with |
+|---|---|---|---|---|
+| Snapshots at a regular interval, native stacks | `prof:true`, `prof_prefix`, `lg_prof_interval` in `MALLOC_CONF`; for Python also `PYTHONMALLOC=malloc` | jemalloc | none | `systing-heap PREFIX` |
+| A snapshot at a moment the service chooses | the same | jemalloc | `mallctl("prof.dump")`, the service's own | `systing-heap PREFIX` |
+| The profile as it is now, read from outside (experimental) | `prof:true` | jemalloc | none | `systing-heap --pid PID --snoop` |
+| A dump now, from a Python 3.14 service (experimental) | `prof:true` | jemalloc | none | `systing-heap --pid PID --ask python` |
+| A dump now, from any service, whatever its threads are doing (experimental) | `prof:true`, `SYSTING_HEAP_HOOKS_LISTEN=1`, and the responder in `LD_PRELOAD` after jemalloc | jemalloc, the responder | none | `systing-heap --pid PID --ask responder` |
+| The same, asked for by the service itself (experimental) | `prof:true` | jemalloc, the hooks library | `listen()` | `systing-heap --pid PID --ask responder` |
+| Python functions in any of the above, with file and line | as for that row | jemalloc, the hooks library | `install(backtrace="python")` | as for that row |
+| Python functions without line numbers, on a Python the library refuses | also `PYTHONPERFSUPPORT=1` | jemalloc, the hooks library, `libunwind8` | `install(backtrace="libunwind")` | as for that row |
+
+The hooks library is `libsysting_heap_hooks.so`, with `systing_heap_hooks.py` beside it in a Python service. The responder is also a library by itself, `libsysting_heap_responder.so`, a twentieth of the size, with nothing of Python in it. `make -C heap/hooks` builds both, and [`heap/hooks`](../heap/hooks) says what each is made of and what the responder does in a service.
+A service that loads either and asks nothing of it has changed nothing: no thread, no file, no socket.
+
 ## What a heap snapshot is
 
 A snapshot is a file jemalloc writes on its own, listing the memory the process has allocated and not yet freed at that moment, grouped by the call stack that allocated it.
@@ -177,6 +197,12 @@ mallctl("prof.dump", NULL, NULL, NULL, 0);
 > **Experimental: no file at all.**
 > `systing-heap --pid PID --snoop` reads the profile jemalloc holds at that moment straight from the running process, so there is no interval to wait for and no snapshot file (or `lg_prof_interval`, or disk) needed; the process only needs `prof:true`.
 > It relies on jemalloc's private data structures, and reads them while the process runs: the database says how each such read went (`heap_live_read`). See "Reading a live process" in [`heap/README.md`](../heap/README.md).
+
+> **Experimental: asked from outside.**
+> `systing-heap --pid PID --ask` has the process write a dump at that moment, with no code of the service's own to call `prof.dump`.
+> A service that has the responder answers on a socket, whatever its threads are doing, and nothing is written to disk: by calling `systing_heap_hooks.listen()` at startup, or with no change to it at all, from its environment (both experimental as well).
+> A Python 3.14 service that loaded nothing answers through its interpreter, once its main thread comes back to Python.
+> Neither way is settled: expect both to change. See "Asking a live process" in [`heap/README.md`](../heap/README.md).
 
 ## Collect the snapshots with systing-heap
 

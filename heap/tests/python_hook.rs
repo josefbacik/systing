@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 use duckdb::Connection;
 
 const BIN: &str = env!("CARGO_BIN_EXE_systing-heap");
-const HOOKS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks");
+use common::HOOKS;
 
 // Line numbers below are this file's: the first line is line 1.
 const APP: &str = r#"import ctypes, sys, threading
@@ -430,24 +430,7 @@ fn setup() -> Option<Env> {
     }
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("libsysting_heap_hooks.so");
-    let built = cc()
-        .args([
-            "-O2",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-fPIC",
-            "-shared",
-            "-fno-omit-frame-pointer",
-            "-o",
-        ])
-        .arg(&lib)
-        .arg(Path::new(HOOKS).join("systing_heap_hooks.c"))
-        .arg(Path::new(HOOKS).join("systing_heap_hooks_python.c"))
-        .args(["-ldl", "-lpthread"])
-        .status();
-    if !built.is_ok_and(|s| s.success()) {
-        common::skip("no C compiler to build the hooks library");
+    if !common::make_hooks(Path::new(HOOKS), dir.path()) {
         return None;
     }
     Some(Env {
@@ -914,14 +897,8 @@ fn installing_again_keeps_the_code_map() {
 /// `value`.
 fn built_with(env: &Env, field: &str, value: u32) -> PathBuf {
     let dir = env.dir.path().join(format!("src-{field}"));
-    std::fs::create_dir(&dir).unwrap();
-    for file in std::fs::read_dir(HOOKS).unwrap() {
-        let file = file.unwrap().path();
-        if file.extension().is_some_and(|e| e == "c" || e == "h") {
-            std::fs::copy(&file, dir.join(file.file_name().unwrap())).unwrap();
-        }
-    }
-    let header = dir.join("py_offsets.h");
+    common::copy_hooks(&dir);
+    let header = dir.join("backtrace/py_offsets.h");
     let text = std::fs::read_to_string(&header).unwrap();
     let changed: String = text
         .lines()
@@ -932,17 +909,8 @@ fn built_with(env: &Env, field: &str, value: u32) -> PathBuf {
         .collect();
     assert_ne!(changed, text, "no {field} in py_offsets.h");
     std::fs::write(&header, changed).unwrap();
-    let lib = dir.join("libsysting_heap_hooks.so");
-    let built = cc()
-        .args(["-O2", "-fPIC", "-shared", "-o"])
-        .arg(&lib)
-        .arg(dir.join("systing_heap_hooks.c"))
-        .arg(dir.join("systing_heap_hooks_python.c"))
-        .args(["-ldl", "-lpthread"])
-        .status()
-        .unwrap();
-    assert!(built.success());
-    lib
+    assert!(common::make_hooks(&dir, &dir));
+    dir.join("libsysting_heap_hooks.so")
 }
 
 #[test]

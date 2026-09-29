@@ -41,6 +41,11 @@ systing-heap -o heap.duckdb ./snapshots/
 
 # A container's snapshots, read from outside it (see below).
 systing-heap -o heap.duckdb --pid 4242 --latest-only /data/heap/jeprof
+
+# No snapshot file (both experimental, see below): the profile read out of
+# a running process, or a dump the process is asked to write now.
+systing-heap -o heap.duckdb --pid 4242 --snoop
+systing-heap -o heap.duckdb --pid 4242 --ask
 ```
 
 An input that exists as a file or directory is only loaded.
@@ -176,6 +181,57 @@ The code is in `src/snoop/`, and nothing else in the crate knows how it works.
 - **Python frames.** A Python function's name comes from the hooks' code map, which the hook writes beside where the dumps would go (the directory of `prof_prefix`), and there is no dump here to look beside: pass `--perf-map-dir` that directory, or the tool warns and the frames stay unnamed. (That map is the one file the hook writes; the tool and jemalloc write none.) A perf trampoline's map is found in the container's `/tmp` as before.
 - **A young or idle heap.** A process that has sampled nothing yet has nothing to report, and the tool says so.
 
+## Asking a live process (experimental)
+
+> **Very experimental.**
+> One of the two ways below writes into the process's memory, and the other needs a thread of ours in it.
+> Expect it to change, and do not build on it yet.
+
+`--ask` has the process write a dump now, and loads that:
+
+```bash
+systing-heap -o heap.duckdb --pid 4242 --ask              # its responder if it has one, else its Python
+systing-heap -o heap.duckdb --pid 4242 --ask responder
+systing-heap -o heap.duckdb --pid 4242 --ask python
+```
+
+Where `--snoop` reads the profile without the process's help, this is jemalloc's own dump: written under jemalloc's locks, in its documented format, and parsed as any dump file is.
+All three are experimental: both ways of asking, and `--snoop`.
+The process needs `prof:true` in its `MALLOC_CONF`, as for every dump.
+
+| | `--ask responder` | `--ask python` | `--snoop` |
+|---|---|---|---|
+| Status | experimental | experimental | experimental |
+| The process loaded | the responder, and called `listen()` or had `SYSTING_HEAP_HOOKS_LISTEN` in its environment | nothing of ours | nothing of ours |
+| Which processes | any with jemalloc | CPython 3.14 | any with jemalloc |
+| What is done to the process | a request on its socket | three writes to its memory; it runs a script | nothing |
+| Written to disk | nothing | a script and the dump, in a directory removed afterwards | nothing |
+| A process whose main thread waits in one call | answers | does not answer | is read |
+| The dump | jemalloc's own | jemalloc's own | a walk of jemalloc's private structures |
+| Python frames named | the code map comes with the dump | `--perf-map-dir` | `--perf-map-dir` |
+
+**The responder (experimental).** A process that called `systing_heap_hooks.listen()`, or that was started with the responder preloaded and `SYSTING_HEAP_HOOKS_LISTEN=1` and is otherwise unchanged (see [`hooks/README.md`](hooks/README.md)), has one thread that waits on a Unix socket, `.systing-heap.<pid>` in its `/tmp` or the directory it was given; `--ask-dir` says which, as the process sees it.
+The tool opens that directory beneath the process's root, opens the name as a socket and no link, connects through that handle, and checks that what answers is the process it was asked about (the peer's pid) before it says anything.
+What the process answers when it refuses is printed with its control characters escaped.
+The answer carries the dump as a descriptor of an anonymous file that can no longer be written, and the Python code map's when the process writes one: no path is looked up for either.
+Both are read as a file of the process's is: a regular file, not on a FUSE or network filesystem, of no more than a dump's or a map's size.
+The responder answers the process's own user and root.
+
+**Python (experimental).** CPython 3.14 lets a debugger ask an interpreter to run a script file (PEP 768; `sys.remote_exec` is Python's own way to ask).
+The tool asks the same way, from outside: it finds the interpreter in the process's memory, writes the script's path and a flag into the state of the thread that runs `__main__`, and sets the bit that makes that thread look.
+The script calls jemalloc's `prof.dump`, then writes how it went; the tool waits for that, reads the dump, and removes both.
+
+- **It writes to the process.** The path (up to 512 bytes), the flag (4 bytes) and one byte of the thread's `eval_breaker`, through `/proc/PID/mem`, in the order CPython's own writer has them. Only the state of the thread the interpreter names as running `__main__` is written to, and that it still names it is looked at before each write: in a Python started as a program it is the main thread's, which lives as long as the interpreter, where another thread's is freed when the thread ends. Of `eval_breaker` only the lowest byte is written. A bit the process sets in that byte between the tool's read and its write is lost, as it is with CPython's own writer: a request to give up the GIL is made again, but a signal's handler or a call queued for the thread then waits for the next thing that makes the thread look.
+- **It runs code in the process.** The interpreter runs the script as it runs the program's own code, on the main thread, holding the GIL. The script imports `ctypes` (the process keeps it imported), calls `mallctl`, and writes two files. It raises nothing: what goes wrong in it is written for the tool to say. The process's audit hooks see `cpython.remote_debugger_script`, and one that refuses it stops the request.
+- **Only when the main thread comes back to Python.** The interpreter looks between bytecodes and where it checks for signals. A main thread in `time.sleep()`, `Thread.join()` or a read does neither until the call returns, and nothing here wakes it: after `--ask-wait` seconds (30) the request is withdrawn, the script is removed, and the run fails saying so. A request the thread had taken up by then is not withdrawn: the script is given as long again to say how it went. A request is also taken back when the run fails for another reason. A main thread that runs an event loop, or calls into C for less than that, answers.
+- **Where the files are.** In a directory made for the one request, `.systing-heap-ask.<random>` in `--ask-dir` (the process's `/tmp`), beneath the process's root, that only the process's user can enter. The process's user must be able to write there, so a container whose `/tmp` is read-only needs `--ask-dir`, and it must not be on a FUSE or network filesystem, which is known before the process is asked. Once the directory is the process's user's, its name and what is in it are that user's to change: the tool uses it through the handle it opened, and afterwards removes the four files it knows by name and the directory itself if it is empty and its name still names it. Nothing is removed by following what the process put there; a directory that is not empty is left, with a warning, and so is one whose tool was killed.
+- **What is refused, and said.** A process that maps no Python; a Python other than 3.14 (its own table of offsets says which it is), a pre-release, or a free-threaded build, on which this has not been tried; an interpreter with remote debugging turned off (`PYTHON_DISABLE_REMOTE_DEBUG`, `-X disable-remote-debug`); one with no main thread (an embedded interpreter that does not say which thread is); a request of someone else's still waiting. Nothing is written to any of these.
+- **Who may.** As for `--snoop`, and the process's memory is opened to write as well.
+
+**The snapshot.** One `heap_snapshot` row with `dump_trigger` `asked`; `source_path` is the socket, or the dump's file as the process saw it. There is no `heap_live_read` row: that is for a read jemalloc did not make.
+
+**What it knows.** Run on x86-64, on CPython 3.14.7 with jemalloc 5.3.1 (both ways) and CPython 3.13 with Ubuntu's `libjemalloc2` 5.3.0 (the responder, also as the library by itself and switched on from the environment). Nothing has run on aarch64, on a free-threaded Python, or across a user namespace, where the responder would see root as another user and refuse it.
+
 ## Python stacks
 
 A Python program's heap stacks can show its Python functions among the native frames, each with its file and line:
@@ -188,7 +244,7 @@ The program chooses how at runtime, with the helper in `hooks/`.
 There are two ways; the first is the one to use on CPython 3.12 to 3.14.
 
 ```bash
-make -C heap/hooks          # builds heap/hooks/libsysting_heap_hooks.so
+make -C heap/hooks          # builds heap/hooks/libsysting_heap_hooks.so (and the responder alone, beside it)
 ```
 
 | Setup | Stacks show | Cost |
@@ -338,11 +394,11 @@ A finer period gives a closer estimate, but sampling itself costs memory: jemall
 |---|---|
 | `id` | Snapshot id, dense within the trace |
 | `format` | `jemalloc` |
-| `source_path` | The file read; `/proc/PID/mem` for a snoop |
+| `source_path` | The file read; `/proc/PID/mem` for a snoop; for a process that was asked, its socket, or the dump's file as the process saw it |
 | `upid` | `process.upid` of the pid in the file name, as the writing process saw it in its own pid namespace; NULL if the name has none |
 | `seq` | The allocator's dump sequence number |
-| `dump_trigger` | `interval` (every `lg_prof_interval` bytes), `manual` (`mallctl("prof.dump")`), `gdump` (new high-water mark), `final` (at exit), `snoop` (read from the live process, see above) |
-| `dumped_at_unix_ns` | The file's modification time when read, wall-clock; a copy that does not keep times moves it. For a snoop, the time of the read |
+| `dump_trigger` | `interval` (every `lg_prof_interval` bytes), `manual` (`mallctl("prof.dump")`), `gdump` (new high-water mark), `final` (at exit), `snoop` (read from the live process, see above), `asked` (the process wrote it when `--ask` asked; experimental, see above) |
+| `dumped_at_unix_ns` | The file's modification time when read, wall-clock; a copy that does not keep times moves it. For a snoop, the time of the read; for a process that was asked, the time its answer was read |
 | `sample_period` | Mean bytes between samples (`2^lg_prof_sample`) |
 
 `heap_sample` has one row per distinct allocation stack in a snapshot.

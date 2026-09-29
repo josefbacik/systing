@@ -1,6 +1,14 @@
 /*
- * systing-heap hooks: replace how jemalloc captures a sampled allocation's
- * stack. See systing_heap_hooks.c.
+ * systing-heap hooks: what a program calls. Two pieces, and a program takes
+ * either without the other:
+ *
+ *   the backtraces   replace how jemalloc captures a sampled allocation's
+ *                    stack (backtrace/): install, prepare, active, python_*
+ *   the responder    answers requests for a heap dump (responder/,
+ *                    EXPERIMENTAL): listen, socket
+ *
+ * libsysting_heap_hooks.so has both. libsysting_heap_responder.so has the
+ * responder alone, and none of the backtraces' functions.
  */
 #ifndef SYSTING_HEAP_HOOKS_H
 #define SYSTING_HEAP_HOOKS_H
@@ -15,6 +23,9 @@
 #define SHH_ERR_PY_VERSION 7
 #define SHH_ERR_PY_READ 8
 #define SHH_ERR_PY_MAP 9
+#define SHH_ERR_SOCKET_PATH 10
+#define SHH_ERR_SOCKET 11
+#define SHH_ERR_LISTEN_HOW 12
 
 #include <stddef.h>
 
@@ -58,6 +69,28 @@ void systing_heap_hooks_python_stop(void);
 
 /* The "python" backtrace itself, as jemalloc calls it. */
 void systing_heap_hooks_python_backtrace(void **vec, unsigned *len, unsigned max_len);
+
+/*
+ * EXPERIMENTAL: what is asked and answered may change.
+ *
+ * Answer requests for a heap dump on a Unix socket, from this process's own
+ * user and from root: the file .systing-heap.<pid> in `dir`, or when that is
+ * NULL in the directory SYSTING_HEAP_HOOKS_SOCKET_DIR names, else in /tmp.
+ * `systing-heap --pid PID --ask` is what asks. One thread is started for it,
+ * which sleeps until someone does. Returns SHH_OK, also when this process
+ * listens already (wherever that is), or an SHH_ERR_* code.
+ *
+ * A forked child listens nowhere until it calls this itself.
+ *
+ * A program that is not changed listens when the library is loaded into it
+ * (LD_PRELOAD) with SYSTING_HEAP_HOOKS_LISTEN=1 in its environment, as if it
+ * had called this with NULL; with SYSTING_HEAP_HOOKS_LISTEN=fork the
+ * processes it forks listen as well.
+ */
+int systing_heap_hooks_listen(const char *dir);
+
+/* EXPERIMENTAL. The socket this process answers on; "" when it does not. */
+const char *systing_heap_hooks_socket(void);
 
 /* What an SHH_* code means. */
 const char *systing_heap_hooks_strerror(int code);
