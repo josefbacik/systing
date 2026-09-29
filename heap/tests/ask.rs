@@ -1,4 +1,4 @@
-//! `--ask` (experimental): a running process asked for a heap dump, for
+//! `--ask`: a running process asked for a heap dump, for
 //! real. The responder on each installed Python (3.12 to 3.14) under jemalloc
 //! with the hooks library; the interpreter's remote debugging interface on
 //! Python 3.14. Skipped (with a note) where there is no jemalloc, C compiler

@@ -1,4 +1,4 @@
-//! **Experimental.** Read a running process's jemalloc heap profile straight
+//! Read a running process's jemalloc heap profile straight
 //! out of its memory, instead of from a `.heap` file jemalloc wrote.
 //!
 //! `systing-heap --pid PID --snoop` takes the profile the process holds at

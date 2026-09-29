@@ -1,4 +1,4 @@
-//! EXPERIMENTAL. Asking a running process for a heap dump of its own.
+//! Asking a running process for a heap dump of its own.
 //!
 //! [`crate::snoop`] reads jemalloc's profile out of a process's memory,
 //! without its help. Here the process is asked, and the dump is jemalloc's

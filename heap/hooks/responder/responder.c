@@ -1,6 +1,4 @@
 /*
- * EXPERIMENTAL: what is asked and answered here may change.
- *
  * systing-heap hooks: the responder. One thread that answers requests for a
  * heap dump on a Unix socket, so that a dump can be asked for from outside
  * the process (systing-heap --pid PID --ask) at any moment, and the dump is

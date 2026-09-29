@@ -449,11 +449,12 @@ rows (`./scripts/run-integration-tests.sh task_context_record`).
 
 `systing-heap` shows which code holds a service's memory, by call stack.
 It loads heap dumps from jemalloc's own profiler into a systing DuckDB database or a Perfetto trace.
+Heap profiling is still experimental: flags, variables and tables may change between releases.
 A dump shows the memory a process had allocated at one moment. It is not a recording of malloc calls; the `memory-alloc` recorder does that.
 
 ```bash
 cargo build --release -p systing-heap
-systing-heap -o heap.duckdb --pid PID --ask       # a dump now, over the service's socket (experimental)
+systing-heap -o heap.duckdb --pid PID --ask       # a dump now, over the service's socket
 systing-heap -o heap.duckdb /heap-dumps/jeprof    # snapshot files: newest per process, older ones deleted
 ```
 

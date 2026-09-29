@@ -5,12 +5,14 @@ The small library a service loads to get more than jemalloc gives on its own.
 **New here? Start with the guide: [`docs/HEAP_SNAPSHOTS.md`](../../docs/HEAP_SNAPSHOTS.md).**
 This page is the reference for the library.
 
+> Heap profiling in systing is still experimental. See the note at the top of [the guide](../../docs/HEAP_SNAPSHOTS.md).
+
 It has two independent parts. A service can use either without the other, and a service that needs neither loads nothing: snapshot files, `--snoop` and `--ask python` work without it.
 
-| Part | What it does | Status |
-|---|---|---|
-| **The responder** | One thread that answers `systing-heap --ask` on a Unix socket | Experimental |
-| **The backtraces** | Change how jemalloc captures the stack of a sampled allocation, so stacks show Python functions | Supported |
+| Part | What it does |
+|---|---|
+| **The responder** | One thread that answers `systing-heap --ask` on a Unix socket |
+| **The backtraces** | Change how jemalloc captures the stack of a sampled allocation, so stacks show Python functions |
 
 ## What to build and load
 
@@ -45,9 +47,9 @@ It needs a C compiler and `make`. No Python headers, no libunwind. Both librarie
 
 | Variable | Read by | Meaning |
 |---|---|---|
-| `SYSTING_HEAP_HOOKS_LISTEN` (experimental) | Either library, when it loads | `1`: start the socket. `fork`: also in every process this one forks. Unset, empty or `0`: do nothing. Anything else: one line on stderr, and no socket. |
-| `SYSTING_HEAP_HOOKS_LISTEN_ONLY` (experimental) | The same | Only the program whose executable has this file name listens. For a Python service that is the interpreter's, such as `python3.13`; `readlink /proc/PID/exe` shows it. |
-| `SYSTING_HEAP_HOOKS_SOCKET_DIR` (experimental) | The responder, and `systing-heap --ask` | The folder for the socket file. Default `/tmp`. |
+| `SYSTING_HEAP_HOOKS_LISTEN` | Either library, when it loads | `1`: start the socket. `fork`: also in every process this one forks. Unset, empty or `0`: do nothing. Anything else: one line on stderr, and no socket. |
+| `SYSTING_HEAP_HOOKS_LISTEN_ONLY` | The same | Only the program whose executable has this file name listens. For a Python service that is the interpreter's, such as `python3.13`; `readlink /proc/PID/exe` shows it. |
+| `SYSTING_HEAP_HOOKS_SOCKET_DIR` | The responder, and `systing-heap --ask` | The folder for the socket file. Default `/tmp`. |
 | `SYSTING_HEAP_HOOKS_LIB` | The Python helper | The path of the library, when it is not next to the `.py` file |
 | `SYSTING_HEAP_HOOKS_LIBUNWIND` | `backtrace="libunwind"` | The libunwind to load in place of `libunwind.so.8` |
 
@@ -64,7 +66,7 @@ import systing_heap_hooks
 | `install(backtrace="python")` | Puts Python functions in the stacks | `{'backtrace': …, 'trampolines': …, 'reasons': […]}`: what is active now, and why anything was skipped |
 | `install(backtrace="libunwind")` | Turns on perf trampolines and walks through them | The same |
 | `install(backtrace="default", trampolines=False)` | Puts jemalloc's own backtrace back | The same |
-| `listen(dir=None)` (experimental) | Starts the socket, here and in every process forked from here | The socket's path, or `None` with a warning |
+| `listen(dir=None)` | Starts the socket, here and in every process forked from here | The socket's path, or `None` with a warning |
 | `keep_perf_map_across_fork()` | Trampolines only, Python 3.13+: each forked child adds the parent's perf map to its own | Whether it is on |
 
 - **Always pass `backtrace=`.** The default is `"libunwind"`, not `"python"`.
@@ -82,8 +84,8 @@ import systing_heap_hooks
 
 | Function | Does |
 |---|---|
-| `int systing_heap_hooks_listen(const char *dir)` (experimental) | Starts the socket. `NULL`: the variable, then `/tmp`. |
-| `const char *systing_heap_hooks_socket(void)` (experimental) | The socket's path, or `""` |
+| `int systing_heap_hooks_listen(const char *dir)` | Starts the socket. `NULL`: the variable, then `/tmp`. |
+| `const char *systing_heap_hooks_socket(void)` | The socket's path, or `""` |
 | `int systing_heap_hooks_install(const char *backtrace)` | `"python"`, `"libunwind"` or `"default"` |
 | `int systing_heap_hooks_prepare(const char *backtrace)` | Gets ready without installing, so the walk can be checked first |
 | `const char *systing_heap_hooks_active(void)` | The backtrace in use |
@@ -95,9 +97,7 @@ The responder-only library has `listen`, `socket` and `strerror`.
 From C the library goes by the interpreter's version alone. On a Python of a listed version that is laid out differently, every object is still checked for its type and every read is still made by the kernel, so stacks come out short or unnamed. Nothing faults.
 A C caller that wants the check calls `prepare("python")`, compares `systing_heap_hooks_python_check()` with what it knows the stack to be, and then installs.
 
-## The responder (experimental)
-
-> **Experimental.** Its variables, functions and protocol may still change, along with `systing-heap --ask`. Do not build automation on it yet.
+## The responder
 
 ### What it does in a service
 

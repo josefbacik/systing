@@ -5,6 +5,8 @@ How each way of collecting a heap dump works inside, which safety rules it follo
 This page is for reviewers, maintainers, and anyone deciding whether a mode is safe for their service.
 **To set a service up, read the guide instead: [`HEAP_SNAPSHOTS.md`](HEAP_SNAPSHOTS.md).**
 
+> Heap profiling in systing is still experimental. See the note at the top of [the guide](HEAP_SNAPSHOTS.md).
+
 | Section | What is in it |
 |---|---|
 | [Threat model](#threat-model) | What is trusted and what is not |
@@ -101,7 +103,7 @@ With `--pid` or `--root-fd`, every path the tool did not choose itself is looked
 
 ## The socket (`--ask`)
 
-Experimental. The service's side is described in [`heap/hooks/README.md`](../heap/hooks/README.md). This is the tool's side.
+The service's side is described in [`heap/hooks/README.md`](../heap/hooks/README.md). This is the tool's side.
 
 ```mermaid
 sequenceDiagram
@@ -134,7 +136,7 @@ sequenceDiagram
 
 ## The Python way (`--ask python`)
 
-Experimental. CPython 3.14 lets a debugger ask an interpreter to run a script file (PEP 768; `sys.remote_exec` is Python's own way to ask). The tool asks the same way, from outside.
+CPython 3.14 lets a debugger ask an interpreter to run a script file (PEP 768; `sys.remote_exec` is Python's own way to ask). The tool asks the same way, from outside.
 
 ```mermaid
 sequenceDiagram
@@ -280,7 +282,7 @@ stateDiagram-v2
 
 ## Reading memory (`--snoop`)
 
-Experimental. It reads the profile jemalloc holds, from `/proc/PID/mem`, with no help from the process.
+It reads the profile jemalloc holds, from `/proc/PID/mem`, with no help from the process.
 
 ### What is read
 
@@ -363,7 +365,7 @@ The code is in `heap/src/snoop/`. Nothing else in the crate knows how it works.
 
 ## The check (`--check`)
 
-Experimental. It reports what a process has, and which commands will work.
+It reports what a process has, and which commands will work.
 
 **It is read-only.** Nothing is written to the process, and nothing is asked of it.
 

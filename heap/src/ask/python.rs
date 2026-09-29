@@ -1,4 +1,4 @@
-//! EXPERIMENTAL. Asking a CPython 3.14 through its remote debugging interface
+//! Asking a CPython 3.14 through its remote debugging interface
 //! (PEP 768, what `sys.remote_exec` does): the interpreter is made to run a
 //! short script, which calls jemalloc's `prof.dump`. The process loaded
 //! nothing of ours.

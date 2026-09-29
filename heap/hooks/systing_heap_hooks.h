@@ -4,11 +4,13 @@
  *
  *   the backtraces   replace how jemalloc captures a sampled allocation's
  *                    stack (backtrace/): install, prepare, active, python_*
- *   the responder    answers requests for a heap dump (responder/,
- *                    EXPERIMENTAL): listen, socket
+ *   the responder    answers requests for a heap dump (responder/):
+ *                    listen, socket
  *
  * libsysting_heap_hooks.so has both. libsysting_heap_responder.so has the
  * responder alone, and none of the backtraces' functions.
+ *
+ * Heap profiling in systing is still experimental: all of this may change.
  */
 #ifndef SYSTING_HEAP_HOOKS_H
 #define SYSTING_HEAP_HOOKS_H
@@ -71,8 +73,6 @@ void systing_heap_hooks_python_stop(void);
 void systing_heap_hooks_python_backtrace(void **vec, unsigned *len, unsigned max_len);
 
 /*
- * EXPERIMENTAL: what is asked and answered may change.
- *
  * Answer requests for a heap dump on a Unix socket, from this process's own
  * user and from root: the file .systing-heap.<pid> in `dir`, or when that is
  * NULL in the directory SYSTING_HEAP_HOOKS_SOCKET_DIR names, else in /tmp.
@@ -91,7 +91,7 @@ void systing_heap_hooks_python_backtrace(void **vec, unsigned *len, unsigned max
  */
 int systing_heap_hooks_listen(const char *dir);
 
-/* EXPERIMENTAL. The socket this process answers on; "" when it does not. */
+/* The socket this process answers on; "" when it does not. */
 const char *systing_heap_hooks_socket(void);
 
 /* What an SHH_* code means. */

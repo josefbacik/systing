@@ -17,6 +17,7 @@ use systing_heap::{
 /// Turn heap dumps into a systing DuckDB database or a Perfetto trace.
 ///
 /// Guide: docs/HEAP_SNAPSHOTS.md. Reference: heap/README.md.
+/// Heap profiling is still experimental: flags and formats may change.
 ///
 /// Common commands:
 ///
@@ -86,7 +87,7 @@ struct Cli {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
     root_fd: Option<i32>,
 
-    /// EXPERIMENTAL. With --pid: ask the process for a heap dump now.
+    /// With --pid: ask the process for a heap dump now.
     ///
     /// The process needs prof:true in its MALLOC_CONF. --ask alone means
     /// `responder`. It never falls back to `python`, which writes to the
@@ -103,7 +104,7 @@ struct Cli {
     )]
     ask: Option<ask::How>,
 
-    /// EXPERIMENTAL. With --ask or --check: the folder that holds the socket,
+    /// With --ask or --check: the folder that holds the socket,
     /// or for `--ask python` the folder to put the script in, as the process
     /// sees it.
     ///
@@ -115,7 +116,7 @@ struct Cli {
     #[arg(long, value_name = "DIR", requires = "asking")]
     ask_dir: Option<PathBuf>,
 
-    /// EXPERIMENTAL. With --ask: how long to wait for an answer.
+    /// With --ask: how long to wait for an answer.
     #[arg(
         long,
         value_name = "SECONDS",
@@ -125,7 +126,7 @@ struct Cli {
     )]
     ask_wait: u64,
 
-    /// EXPERIMENTAL. With --pid: read the heap profile from the process's
+    /// With --pid: read the heap profile from the process's
     /// memory. Nothing is added to the process or done to it.
     ///
     /// The process needs prof:true in its MALLOC_CONF. The profile changes
@@ -139,7 +140,7 @@ struct Cli {
     )]
     snoop: bool,
 
-    /// EXPERIMENTAL. With --pid: load nothing. Report what the process has,
+    /// With --pid: load nothing. Report what the process has,
     /// which commands will work on it, and what a change to its setup would
     /// add.
     ///
@@ -203,13 +204,12 @@ fn main() -> Result<()> {
     let mut plans: Vec<retention::Plan> = Vec::new();
     if let (Some(process), Some(how)) = (pinned.as_ref(), cli.ask) {
         let pid = process.pid();
-        eprintln!(
-            "warning: --ask is experimental: process {pid} is asked to write a heap dump{}",
-            match how {
-                ask::How::Python => ", by a write to its memory that has it run a script",
-                ask::How::Responder => "",
-            }
-        );
+        if how == ask::How::Python {
+            eprintln!(
+                "warning: --ask python writes to process {pid}'s memory, and has its main \
+                 thread run a short script"
+            );
+        }
         let wait = std::time::Duration::from_secs(cli.ask_wait);
         let asked = ask::ask_within(process, how, cli.ask_dir.as_deref(), wait);
         // Whatever came of it: a program that was interrupted ends so.
@@ -225,8 +225,8 @@ fn main() -> Result<()> {
     } else if let Some(process) = pinned.as_ref() {
         let pid = process.pid();
         eprintln!(
-            "warning: --snoop is experimental: it reads jemalloc's private data structures \
-             out of process {pid}'s memory, and may fail or refuse on a jemalloc it does not know"
+            "warning: --snoop reads jemalloc's private data structures out of process {pid}'s \
+             memory, and may fail or refuse on a jemalloc it does not know"
         );
         let (snapshot, report) = snoop::read_within(process, snoop::TIMEOUT)?;
         eprintln!("{}", report.summary(pid));

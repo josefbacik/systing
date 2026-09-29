@@ -1,4 +1,4 @@
-//! EXPERIMENTAL. Asking the hooks library's responder
+//! Asking the hooks library's responder
 //! (`systing_heap_hooks_listen`).
 //!
 //! The responder is a thread of the process that listens on a Unix socket in

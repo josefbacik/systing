@@ -38,7 +38,7 @@ parent before it: a child starts a perf map of its own, and without this the
 frames it inherited running from the parent (the parent's loop under every
 worker) are named in no map the child's dumps can use.
 
-Apart from the backtraces, listen() (EXPERIMENTAL: it may change) makes the
+Apart from the backtraces, listen() makes the
 process answer requests for a heap dump, so that one can be asked for at any moment from outside it:
 
     systing_heap_hooks.listen()
@@ -338,9 +338,7 @@ _listen_in_children = False
 
 
 def listen(dir=None, strict=False, lib=None):
-    """EXPERIMENTAL: this and what asks may change.
-
-    Answer requests for a heap dump (`systing-heap --pid PID --ask`) on a
+    """Answer requests for a heap dump (`systing-heap --pid PID --ask`) on a
     Unix socket in `dir`: by default the directory SYSTING_HEAP_HOOKS_SOCKET_DIR
     names, else /tmp. The socket is this process's user's alone, and root's.
     Returns the socket's path, or None with a warning when the process cannot

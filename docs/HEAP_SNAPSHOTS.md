@@ -2,6 +2,9 @@
 
 Find out **which code holds a service's memory**, by call stack, while the service runs.
 
+> **Heap profiling in systing is still experimental.**
+> Flags, environment variables, function names, the socket's protocol and the database tables may change between releases. Pin a version if you build automation on it.
+
 ```text
 est. live      call stack
  14.5 MiB      main → serve → leak_buffers → malloc
@@ -19,17 +22,6 @@ Read "How it works" and "Prerequisites", then follow "Start here". The rest is f
 | [Other ways to collect](#other-ways-to-collect) | The socket does not fit, or you cannot change the service. |
 | [Advanced](#advanced) | Tuning, forked workers, containers, C API. |
 | [Costs](#costs), [Limits](#limits), [Troubleshooting](#troubleshooting) | Before production, and when something is off. |
-
-**What is stable and what is not**
-
-| Piece | Status |
-|---|---|
-| jemalloc snapshot files, and loading them with `systing-heap` | Supported |
-| Python functions in the stacks (`install(backtrace="python")`) | Supported |
-| The socket (`--ask`) | **Experimental.** It is the recommended way, but its flags, variables and protocol may still change. |
-| `--ask python`, `--snoop`, `--check` | **Experimental.** |
-
-Experimental means: expect it to change, and do not build automation on it yet. Sections about experimental pieces say so in their heading or first line.
 
 ## How it works
 
@@ -118,8 +110,6 @@ make -C heap/hooks                       # the write side
 | `heap/hooks/systing_heap_hooks.py` | The Python helper | Next to `libsysting_heap_hooks.so` |
 
 ## Start here: collect over the socket
-
-> **Experimental**, and the recommended way.
 
 The service gets one small library. It starts one thread, which sleeps on a Unix socket until someone asks.
 When you ask, that thread has jemalloc write a dump into memory and hands it over.
@@ -286,7 +276,6 @@ systing-heap -o heap.pb     --pid PID --ask     # for flamegraphs
 **How the socket is found.** The tool reads `SYSTING_HEAP_HOOKS_SOCKET_DIR` from the environment the service was started with, then looks in the service's `/tmp`. So there is normally no folder to pass.
 
 ```text
-warning: --ask is experimental: process 4242 is asked to write a heap dump
 pid 4242: asked through its responder (/run/my-service/.systing-heap.7); it wrote a dump of 5834 bytes, 2 ms after it was asked
 heap.duckdb: 1 snapshot(s), 2 sample(s), 2 stack(s), 15 frame(s); …
 ```
@@ -346,7 +335,6 @@ flowchart TD
 | **Disk** | None for the dump | Grows until collected | Grows until collected | Temporary files in `/tmp` | None |
 | **Native file and line** | No | Yes, when read without `--pid` | Yes, when read without `--pid` | No | No |
 | **Python frames** (if the service called `install()`) | Named. The code map comes with the dump. | Named. The code map is beside the files. | The same | Named, with `--perf-map-dir` | Named, with `--perf-map-dir` |
-| **Status** | Experimental | Supported | Supported | Experimental | Experimental |
 
 All of them need [Step 1](#step-1-turn-on-heap-profiling), and Python services need `PYTHONMALLOC=malloc`.
 
@@ -354,7 +342,7 @@ All of them need [Step 1](#step-1-turn-on-heap-profiling), and Python services n
 
 ### Snapshot files at an interval
 
-**Why.** To see how the heap grew over time. To keep a record when nobody is watching. To have something left after the service is killed for using too much memory. It needs nothing from systing in the service, and it is the only way where nothing at all is experimental.
+**Why.** To see how the heap grew over time. To keep a record when nobody is watching. To have something left after the service is killed for using too much memory. It needs nothing from systing in the service.
 
 **Write side**
 
@@ -405,7 +393,7 @@ mallctl("prof.dump", NULL, NULL, NULL, 0);
 
 **Watch out.** Do not rely on jemalloc's dump at exit (`prof_final:true`) for Python. Python frees its objects during shutdown, before jemalloc writes it, so it shows almost nothing.
 
-### `--ask python`: a Python 3.14 service, nothing added (experimental)
+### `--ask python`: a Python 3.14 service, nothing added
 
 **Why.** The service runs CPython 3.14 with profiling on, has no socket, and you cannot add one.
 
@@ -427,7 +415,7 @@ systing-heap -o heap.duckdb --pid PID --ask python
 - **The folder must be safe.** `/tmp` is fine when it is owned by root and has the sticky bit. A Kubernetes `emptyDir` is refused until you `chmod +t` it.
 - **Python frames** show only if the service called `install(backtrace="python")`. Then pass `--perf-map-dir` with the folder that holds its `pycode-*.map` file, which is the folder of its `prof_prefix`.
 
-### `--snoop`: any service, nothing added, nothing done to it (experimental)
+### `--snoop`: any service, nothing added, nothing done to it
 
 **Why.** Profiling is on, nothing else can be added, and nothing may be done to the process. This is also the fallback when `--ask python` gets no answer.
 
@@ -451,7 +439,7 @@ systing-heap -o heap.duckdb --pid PID --snoop
   systing-heap -o heap.duckdb --pid PID --snoop --perf-map-dir /run/my-service
   ```
 
-### `--check`: what does this service have? (experimental)
+### `--check`: what does this service have?
 
 **Why.** You are looking at a service someone else set up, and do not know which command applies.
 
@@ -521,7 +509,7 @@ For a quick test, 25 (32 MiB) gives files sooner.
 
 ### Services that fork workers
 
-gunicorn, `multiprocessing` with fork, and other pre-fork servers. Each worker is its own process with its own heap, so **ask the worker's pid**. The rows about the socket are experimental, like the socket.
+gunicorn, `multiprocessing` with fork, and other pre-fork servers. Each worker is its own process with its own heap, so **ask the worker's pid**.
 
 | Setup | What to do | What happens |
 |---|---|---|
@@ -546,7 +534,7 @@ Where to run the tool, and which pid to give it, is in [Step 3](#step-3-collect)
 
 How paths are kept inside the container is in [`HEAP_INTERNALS.md`](HEAP_INTERNALS.md#resolving-paths-inside-a-container).
 
-### Starting the socket from C, C++ or Rust (experimental)
+### Starting the socket from C, C++ or Rust
 
 In place of the environment variables, link `libsysting_heap_responder.so` and call it:
 

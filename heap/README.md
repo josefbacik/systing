@@ -5,6 +5,8 @@
 **New here? Start with the guide: [`docs/HEAP_SNAPSHOTS.md`](../docs/HEAP_SNAPSHOTS.md).**
 It explains how heap profiling works and how to set a service up. This page is the reference for the tool itself.
 
+> Heap profiling in systing is still experimental. See the note at the top of [the guide](../docs/HEAP_SNAPSHOTS.md).
+
 | Section | What is in it |
 |---|---|
 | [What it does](#what-it-does) | Inputs and outputs at a glance |
@@ -52,18 +54,18 @@ gperftools (tcmalloc) also writes `.heap` files. The parser checks the first lin
 cargo build --release -p systing-heap
 ```
 
-| Goal | Command | Status |
-|---|---|---|
-| A dump now, over the service's socket | `systing-heap -o heap.duckdb --pid PID --ask` | Experimental |
-| The newest snapshot file of each process. **Deletes the older ones.** | `systing-heap -o heap.duckdb PREFIX` | Supported |
-| The same, but only show what would happen | `systing-heap -o heap.duckdb PREFIX --dry-run` | Supported |
-| The newest of each process, delete nothing | `systing-heap -o heap.duckdb PREFIX --latest-only` | Supported |
-| Every snapshot file, delete nothing | `systing-heap -o heap.duckdb PREFIX --keep-all` | Supported |
-| Named files or a folder. Never deletes. | `systing-heap -o heap.duckdb a.heap b.heap ./snapshots/` | Supported |
-| A container's files, read from the host | `systing-heap -o heap.duckdb --pid PID --latest-only PREFIX` | Supported |
-| A dump now from CPython 3.14, nothing added to it | `systing-heap -o heap.duckdb --pid PID --ask python` | Experimental |
-| The profile read from memory | `systing-heap -o heap.duckdb --pid PID --snoop` | Experimental |
-| Which of these will work on a process | `systing-heap --pid PID --check` | Experimental |
+| Goal | Command |
+|---|---|
+| A dump now, over the service's socket | `systing-heap -o heap.duckdb --pid PID --ask` |
+| The newest snapshot file of each process. **Deletes the older ones.** | `systing-heap -o heap.duckdb PREFIX` |
+| The same, but only show what would happen | `systing-heap -o heap.duckdb PREFIX --dry-run` |
+| The newest of each process, delete nothing | `systing-heap -o heap.duckdb PREFIX --latest-only` |
+| Every snapshot file, delete nothing | `systing-heap -o heap.duckdb PREFIX --keep-all` |
+| Named files or a folder. Never deletes. | `systing-heap -o heap.duckdb a.heap b.heap ./snapshots/` |
+| A container's files, read from the host | `systing-heap -o heap.duckdb --pid PID --latest-only PREFIX` |
+| A dump now from CPython 3.14, nothing added to it | `systing-heap -o heap.duckdb --pid PID --ask python` |
+| The profile read from memory | `systing-heap -o heap.duckdb --pid PID --snoop` |
+| Which of these will work on a process | `systing-heap --pid PID --check` |
 
 `PREFIX` is the `prof_prefix` given to jemalloc, such as `/heap-dumps/jeprof`.
 `PID` is the process id as seen from where the tool runs.
@@ -87,14 +89,13 @@ cargo build --release -p systing-heap
 | `--perf-map-dir DIR` | Where to look first for the files that name Python frames: `pycode-<pid>-<token>.map` and `perf-<pid>.map` | Anything but `--check` |
 | `-p, --pid PID` | Resolve every path inside this process's root (`/proc/PID/root`) | Required by `--ask`, `--snoop` and `--check`. Not with `--root-fd`. |
 | `--root-fd N` | Like `--pid`, with a folder the caller has already opened as descriptor `N` | A prefix. Not with `--pid`. |
-| `--ask [responder\|python]` (experimental) | Ask the process for a dump now. Alone it means `responder`, the socket. | `--pid`. No inputs. |
-| `--ask-dir DIR` (experimental) | The folder with the socket, or for `python` the folder to put the script in, as the process sees it. See below for the default. | `--ask` or `--check` |
-| `--ask-wait SECONDS` (experimental) | How long to wait for an answer, 1 to 3600. Default 30. | `--ask` |
-| `--snoop` (experimental) | Read the profile from the process's memory | `--pid`. No inputs. |
-| `--check` (experimental) | Load nothing. Report what the process has and which commands will work. | `--pid`. No inputs, no `-o`. |
+| `--ask [responder\|python]` | Ask the process for a dump now. Alone it means `responder`, the socket. | `--pid`. No inputs. |
+| `--ask-dir DIR` | The folder with the socket, or for `python` the folder to put the script in, as the process sees it. See below for the default. | `--ask` or `--check` |
+| `--ask-wait SECONDS` | How long to wait for an answer, 1 to 3600. Default 30. | `--ask` |
+| `--snoop` | Read the profile from the process's memory | `--pid`. No inputs. |
+| `--check` | Load nothing. Report what the process has and which commands will work. | `--pid`. No inputs, no `-o`. |
 
 `--ask`, `--snoop` and `--check` exclude one another, and none of them takes `--format`, `--dry-run`, `--latest-only` or `--keep-all`.
-Experimental means: expect it to change, and do not build automation on it yet.
 
 **Where `--ask` looks without `--ask-dir`**
 
@@ -273,8 +274,8 @@ One sampled 256-byte object at a 16 KiB period reads as 16,512 bytes, give or ta
 | `manual` | A file, from `mallctl("prof.dump")` | The file | The same |
 | `gdump` | A file, at a new high-water mark | The file | The same |
 | `final` | A file, at exit | The file | The same |
-| `asked` | `--ask` (experimental) | The socket, or the dump's file as the process saw it | When the answer was read |
-| `snoop` | `--snoop` (experimental) | `/proc/PID/mem` | When the memory was read |
+| `asked` | `--ask` | The socket, or the dump's file as the process saw it | When the answer was read |
+| `snoop` | `--snoop` | `/proc/PID/mem` | When the memory was read |
 
 ### `heap_sample`: one row per call stack in a snapshot
 
@@ -288,7 +289,7 @@ One sampled 256-byte object at a 16 KiB period reads as 16,512 bytes, give or ta
 
 ### `heap_live_read`: how a `--snoop` read went
 
-One row per snapshot read with `--snoop` (experimental). None for a dump.
+One row per snapshot read with `--snoop`. None for a dump.
 
 | Column | Meaning |
 |---|---|

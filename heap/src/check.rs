@@ -1,4 +1,4 @@
-//! EXPERIMENTAL. What a running process has for its heap to be looked at,
+//! What a running process has for its heap to be looked at,
 //! and which command will do it.
 //!
 //! Which way a service's heap can be read depends on how the service was set
