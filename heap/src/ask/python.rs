@@ -1,4 +1,4 @@
-//! EXPERIMENTAL. Asking a CPython 3.14 through its remote debugging interface
+//! Asking a CPython 3.14 through its remote debugging interface
 //! (PEP 768, what `sys.remote_exec` does): the interpreter is made to run a
 //! short script, which calls jemalloc's `prof.dump`. The process loaded
 //! nothing of ours.
@@ -172,9 +172,25 @@ impl Memory for ProcMem {
     }
 }
 
+/// `/proc/<pid>/mem`, open to read: what is only looked at is not opened to
+/// be written.
+struct ReadOnly(File);
+
+impl Memory for ReadOnly {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.0.read_exact_at(buf, addr)
+    }
+
+    fn write(&self, _: u64, _: &[u8]) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    }
+}
+
 /// The offsets a request needs, out of the process's own table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Offsets {
+    /// `PY_VERSION_HEX`, as the interpreter says it.
+    version: u64,
     interpreters_head: u64,
     interpreter_id: u64,
     interpreter_next: u64,
@@ -226,6 +242,7 @@ impl Offsets {
             );
         }
         let offsets = Offsets {
+            version,
             interpreters_head: word(at::INTERPRETERS_HEAD),
             interpreter_id: word(at::INTERPRETER_ID),
             interpreter_next: word(at::INTERPRETER_NEXT),
@@ -1052,6 +1069,68 @@ impl Drop for Place {
             );
         }
     }
+}
+
+/// What asking a process through its interpreter would come to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Would {
+    /// The process maps no Python.
+    NotPython,
+    /// It is a Python that cannot be asked, and why.
+    Cannot(String),
+    /// It is a CPython 3.14 that can be: its version. Whether it answers
+    /// is then its main thread's to say, by coming back to Python.
+    Answer(String),
+}
+
+/// What asking `process` would come to, as far as looking can tell: nothing
+/// is written to the process, and its memory is opened to read alone.
+pub fn would(process: &Process, root: &Root, dir: &Path) -> Result<Would> {
+    let pid = process.pid();
+    let maps_text = process.maps_text()?;
+    if !maps_a_python(&maps_text) {
+        return Ok(Would::NotPython);
+    }
+    let mem = ReadOnly(
+        File::open(process.file("mem")).with_context(|| format!("opening /proc/{pid}/mem"))?,
+    );
+    let found = find_runtime(&mem, &maps_text)
+        .and_then(|(runtime, offsets)| main_thread(&mem, runtime, &offsets).map(|_| offsets))
+        // What the asking itself would refuse `dir` for, or fail on.
+        .and_then(|offsets| {
+            // SAFETY: geteuid has no failure and no arguments.
+            let me = unsafe { libc::geteuid() };
+            let (user, _) = process.owner().context("finding whose process it is")?;
+            held_against(root, dir, user, me)?;
+            let handle = root
+                .open_at(dir, libc::O_PATH | libc::O_DIRECTORY)
+                .with_context(|| format!("opening {}", shown(&dir.display().to_string())))?;
+            if read_only(&handle) {
+                bail!(
+                    "{} is on a read-only filesystem: name another directory with --ask-dir",
+                    shown(&dir.display().to_string())
+                );
+            }
+            Ok(offsets)
+        });
+    Ok(match found {
+        Ok(offsets) => Would::Answer(format!(
+            "{}.{}.{}",
+            offsets.version >> 24 & 0xff,
+            offsets.version >> 16 & 0xff,
+            offsets.version >> 8 & 0xff
+        )),
+        Err(why) => Would::Cannot(format!("{why:#}")),
+    })
+}
+
+/// Whether the filesystem `dir` is on is mounted read-only. Asked of the
+/// kernel: nothing is tried.
+fn read_only(dir: &File) -> bool {
+    // SAFETY: `st` is a plain struct the kernel fills, and the descriptor is
+    // open.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    unsafe { libc::fstatvfs(dir.as_raw_fd(), &mut st) == 0 && st.f_flag & libc::ST_RDONLY != 0 }
 }
 
 pub fn ask(

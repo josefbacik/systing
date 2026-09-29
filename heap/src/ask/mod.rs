@@ -1,4 +1,4 @@
-//! EXPERIMENTAL. Asking a running process for a heap dump of its own.
+//! Asking a running process for a heap dump of its own.
 //!
 //! [`crate::snoop`] reads jemalloc's profile out of a process's memory,
 //! without its help. Here the process is asked, and the dump is jemalloc's
@@ -65,17 +65,82 @@ pub fn end_by(signal: i32) -> ! {
 /// own filesystem, unless told otherwise.
 pub const DEFAULT_DIR: &str = "/tmp";
 
+/// The variable a process's environment names its responder's directory with.
+const SOCKET_DIR: &[u8] = b"SYSTING_HEAP_HOOKS_SOCKET_DIR=";
+
+/// The most read of a process's environment.
+const MAX_ENVIRON_BYTES: u64 = 16 << 20;
+
+/// `PATH_MAX`: no path the kernel takes is longer.
+pub(crate) const MAX_PATH_BYTES: usize = 4096;
+
+/// Where `process`'s responder may have its socket when nothing else is
+/// said, the likeliest first: where the environment it was started with
+/// says, then [`DEFAULT_DIR`]. Both, because what a process was told in a
+/// call stands over what its environment says, and a call that says nothing
+/// means [`DEFAULT_DIR`] where the environment says nothing. A directory the
+/// environment names relative to the process's working directory is not
+/// looked in: that process is asked with the directory given.
+pub fn socket_dirs(process: &Process) -> Vec<PathBuf> {
+    let named = process
+        .read_capped("environ", MAX_ENVIRON_BYTES)
+        .ok()
+        .and_then(|environ| dir_in_environ(&environ));
+    let mut dirs: Vec<PathBuf> = named.into_iter().collect();
+    if !dirs.iter().any(|d| d == Path::new(DEFAULT_DIR)) {
+        dirs.push(PathBuf::from(DEFAULT_DIR));
+    }
+    dirs
+}
+
+/// The directory `environ` names for the socket, if it is one to go by. The
+/// first setting of the variable counts, as it does for `getenv`.
+///
+/// The value is the process's to choose, and it goes on into every message
+/// about the socket, the snapshot's source path among them. So one that
+/// could write to a terminal, or that is no text, or is longer than a path
+/// can be, is not gone by at all, like one that is relative: that process is
+/// asked with the directory given, which is then the caller's own word.
+fn dir_in_environ(environ: &[u8]) -> Option<PathBuf> {
+    let value = environ
+        .split(|b| *b == 0)
+        .find_map(|kv| kv.strip_prefix(SOCKET_DIR))?;
+    let dir = std::str::from_utf8(value).ok()?;
+    let usable = dir.starts_with('/') && dir.len() <= MAX_PATH_BYTES && !dir.chars().any(hidden);
+    usable.then(|| PathBuf::from(dir))
+}
+
+/// The first of `dirs` in which `look` finds a responder. Where none has
+/// one, what the first said; any other failure ends the looking, since it is
+/// of a socket that is there.
+pub(crate) fn in_the_first_of<T>(
+    dirs: &[PathBuf],
+    mut look: impl FnMut(&Path) -> Result<T>,
+) -> Result<T> {
+    let mut first: Option<anyhow::Error> = None;
+    for dir in dirs {
+        match look(dir) {
+            Err(e) if e.downcast_ref::<responder::NoResponder>().is_some() => {
+                first.get_or_insert(e);
+            }
+            found_or_failed => return found_or_failed,
+        }
+    }
+    Err(first.unwrap_or_else(|| anyhow::anyhow!("no directory to look for a responder in")))
+}
+
 /// How long the process is given to answer, unless told otherwise.
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(30);
 
 /// How to ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum How {
-    /// The hooks library's socket. Nothing is written to the process.
+    /// The service's socket, from the hooks library. Answers whatever the
+    /// service's threads are doing. Nothing is written to the process.
     Responder,
-    /// CPython 3.14's remote debugging interface, which writes to the
-    /// process's memory: it is asked for by name, and nothing falls back
-    /// to it.
+    /// CPython 3.14 only, nothing added to it. Writes to the process's memory
+    /// to make its main thread run a short script. A main thread blocked in
+    /// one long call does not answer.
     Python,
 }
 
@@ -116,17 +181,23 @@ impl Report {
 }
 
 /// Ask `process` for a dump, `how`, and wait for it no longer than `wait`.
-/// `dir` is where the socket or the script is, as the process sees it;
-/// `root` must be the process's own ([`Process::root`]).
+/// `dir` is where the socket or the script is, as the process sees it: when
+/// it is not given, the socket is looked for where the process's environment
+/// says and in [`DEFAULT_DIR`] ([`socket_dirs`]), and the script is put in
+/// [`DEFAULT_DIR`]. `root` must be the process's own ([`Process::root`]).
 pub fn ask(
     process: &Process,
     root: &Root,
     how: How,
-    dir: &Path,
+    dir: Option<&Path>,
     wait: Duration,
 ) -> Result<(Snapshot, Report)> {
     match how {
-        How::Responder => responder::ask(process, root, dir, wait).map_err(|e| {
+        How::Responder => in_the_first_of(
+            &dir.map_or_else(|| socket_dirs(process), |dir| vec![dir.to_path_buf()]),
+            |dir| responder::ask(process, root, dir, wait),
+        )
+        .map_err(|e| {
             match e.downcast_ref::<responder::NoResponder>() {
                 // What is left is said, and not done: it writes to the process.
                 Some(_) => e.context(
@@ -137,7 +208,7 @@ pub fn ask(
                 None => e,
             }
         }),
-        How::Python => python::ask(process, root, dir, wait),
+        How::Python => python::ask(process, root, dir.unwrap_or(Path::new(DEFAULT_DIR)), wait),
     }
 }
 
@@ -147,11 +218,11 @@ pub fn ask(
 pub fn ask_within(
     process: &Process,
     how: How,
-    dir: &Path,
+    dir: Option<&Path>,
     wait: Duration,
 ) -> Result<(Snapshot, Report)> {
     let process = process.try_clone()?;
-    let dir = dir.to_path_buf();
+    let dir = dir.map(Path::to_path_buf);
     // Asking waits `wait` for the request to be taken up and as long again
     // for it to be answered; the rest is for reading the answer.
     let limit = wait.saturating_mul(3) + Duration::from_secs(10);
@@ -159,7 +230,7 @@ pub fn ask_within(
     std::thread::spawn(move || {
         let asked = process
             .root()
-            .and_then(|root| ask(&process, &root, how, &dir, wait));
+            .and_then(|root| ask(&process, &root, how, dir.as_deref(), wait));
         let _ = tx.send(asked);
     });
     use std::sync::mpsc::RecvTimeoutError::{Disconnected, Timeout};
@@ -235,15 +306,22 @@ fn read_handed(file: &File, what: &str, cap: u64) -> Result<Vec<u8>> {
 /// Text of the process's choosing, as it is shown: with its control
 /// characters escaped, so that it cannot write to the terminal of whoever
 /// runs the tool.
-fn shown(text: &str) -> String {
+pub(crate) fn shown(text: &str) -> String {
     text.chars()
         .flat_map(|c| {
-            let escaped = c
-                .is_control()
-                .then(|| c.escape_default().collect::<Vec<_>>());
+            let escaped = hidden(c).then(|| c.escape_default().collect::<Vec<_>>());
             escaped.unwrap_or_else(|| vec![c])
         })
         .collect()
+}
+
+/// Whether `c` does something to a terminal, or to how the text around it
+/// is laid out, instead of being seen: a control character, or one of those
+/// that reorder or hide text (U+202E and its like).
+pub(crate) fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
 }
 
 /// The snapshot a dump's text is, taken from `process` just now.
@@ -264,7 +342,72 @@ fn snapshot_of(process: &Process, dump: &[u8], source: PathBuf) -> Result<Snapsh
 
 #[cfg(test)]
 mod tests {
-    use super::shown;
+    use super::{dir_in_environ, in_the_first_of, responder, shown};
+
+    #[test]
+    fn a_directory_the_environment_names_is_gone_by_only_if_it_is_plain() {
+        let named = |vars: &[&[u8]]| {
+            let environ: Vec<u8> = vars
+                .iter()
+                .flat_map(|v| v.iter().copied().chain(std::iter::once(0)))
+                .collect();
+            dir_in_environ(&environ)
+        };
+        let var = |value: &str| format!("SYSTING_HEAP_HOOKS_SOCKET_DIR={value}").into_bytes();
+        assert_eq!(
+            named(&[b"PATH=/bin", &var("/run/my service")]),
+            Some(PathBuf::from("/run/my service"))
+        );
+        assert_eq!(named(&[b"PATH=/bin"]), None);
+        // The first counts, as for getenv.
+        assert_eq!(
+            named(&[&var("/first"), &var("/second")]),
+            Some(PathBuf::from("/first"))
+        );
+        // Another variable that ends the same is another variable.
+        assert_eq!(named(&[b"X_SYSTING_HEAP_HOOKS_SOCKET_DIR=/x"]), None);
+        assert_eq!(named(&[&var("")]), None);
+        assert_eq!(named(&[&var("relative/dir")]), None);
+        // What would be printed to whoever asks, in every message.
+        assert_eq!(named(&[&var("/x\x1b]0;owned\x07\x1b[2J")]), None);
+        assert_eq!(named(&[&var("/x\nheap.duckdb: 1 snapshot(s)")]), None);
+        assert_eq!(named(&[&var("/x\u{202e}gnp.exe")]), None);
+        assert_eq!(named(&[b"SYSTING_HEAP_HOOKS_SOCKET_DIR=/x\xff\xfe"]), None);
+        assert_eq!(named(&[&var(&format!("/{}", "a".repeat(4096)))]), None);
+    }
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_responder_is_looked_for_in_each_directory_until_one_has_it() {
+        let dirs = [PathBuf::from("/run/x"), PathBuf::from("/tmp")];
+        let none = |dir: &std::path::Path| -> anyhow::Result<&'static str> {
+            Err(responder::NoResponder::new(format!("none in {}", dir.display())).into())
+        };
+        let mut looked = Vec::new();
+        let found = in_the_first_of(&dirs, |dir| {
+            looked.push(dir.to_path_buf());
+            match dir.ends_with("tmp") {
+                true => Ok("answered"),
+                false => none(dir),
+            }
+        });
+        assert_eq!(found.unwrap(), "answered");
+        assert_eq!(looked, dirs);
+        // Where none has one, what is said is of the likeliest.
+        let e = in_the_first_of(&dirs, none).unwrap_err();
+        assert_eq!(e.to_string(), "none in /run/x");
+        // A socket that is there and fails is not looked past.
+        let mut looked = 0;
+        let e = in_the_first_of(&dirs, |_| -> anyhow::Result<()> {
+            looked += 1;
+            anyhow::bail!("answered by another process")
+        })
+        .unwrap_err();
+        assert_eq!(
+            (looked, e.to_string().as_str()),
+            (1, "answered by another process")
+        );
+    }
 
     #[test]
     fn what_a_process_says_cannot_write_to_the_terminal() {

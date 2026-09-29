@@ -1,4 +1,4 @@
-//! `--ask` (experimental): a running process asked for a heap dump, for
+//! `--ask`: a running process asked for a heap dump, for
 //! real. The responder on each installed Python (3.12 to 3.14) under jemalloc
 //! with the hooks library; the interpreter's remote debugging interface on
 //! Python 3.14. Skipped (with a note) where there is no jemalloc, C compiler
@@ -23,8 +23,11 @@ use common::HOOKS;
 // A service with the hooks: Python frames in its stacks, and a responder.
 // Its main thread then waits in one call, as a service's does that leaves
 // the work to other threads.
-const SERVICE: &str = r#"import os, sys, time
+const SERVICE: &str = r#"import ctypes, os, sys, time
 import systing_heap_hooks
+# Its memory is read by a tool that the tests start beside it and not above
+# it: where kernel.yama.ptrace_scope is 1 that takes the process's leave.
+ctypes.CDLL(None).prctl(0x59616d61, ctypes.c_ulong(-1), 0, 0, 0)
 systing_heap_hooks.install(backtrace="python", strict=True)
 print("listening", systing_heap_hooks.listen(sys.argv[1], strict=True), flush=True)
 keep = []
@@ -40,6 +43,8 @@ if sys.argv[2] == "fork":
         print("child", os.getpid(), flush=True)
         time.sleep(3600)
 print("ready", flush=True)
+while sys.argv[2] == "loop":
+    time.sleep(0.01)
 time.sleep(3600)
 "#;
 
@@ -1377,4 +1382,557 @@ fn a_file_the_process_has_under_another_name_too_is_not_read() {
         assert_eq!(std::fs::read_to_string(&other).unwrap(), "ok\n");
         assert!(target.is_running());
     }
+}
+
+/// `systing-heap --pid <pid> --check ...`.
+fn check(pid: u32, more: &[&str]) -> Output {
+    Command::new(BIN)
+        .args(["--pid", &pid.to_string(), "--check"])
+        .args(more)
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .unwrap()
+}
+
+/// The commands a report says will work.
+fn commands_in(report: &str) -> Vec<String> {
+    report
+        .lines()
+        .filter_map(|l| l.strip_prefix("  systing-heap "))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn what_a_check_says_will_work_works() {
+    let Some(env) = setup(true) else { return };
+    let pairs = pairs();
+    if pairs.is_empty() {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+    }
+    for pair in pairs {
+        // The socket's folder is one a shell would make several words of,
+        // and more: the commands are run by a shell, as they are printed.
+        let sockets = env.dir.path().join(format!("s {};$x", pair.minor));
+        std::fs::create_dir(&sockets).unwrap();
+        // A service that has everything: files at an interval, a responder,
+        // Python functions in its stacks, and a main thread that comes back
+        // to Python.
+        let target = Target::start(
+            &env,
+            &pair,
+            Run {
+                conf: ",lg_prof_interval:22",
+                env: &[("SYSTING_HEAP_HOOKS_SOCKET_DIR", sockets.to_str().unwrap())],
+                ..Run::of("service.py", &[sockets.to_str().unwrap(), "loop"])
+            },
+        );
+        // /tmp is the whole machine's: what another run left there is not
+        // this one's.
+        let there_before = left_behind(Path::new("/tmp"));
+        let out = check(target.pid(), &[]);
+        let report = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{pair:?}: {report}{}", said(&out));
+        let commands = commands_in(&report);
+        let ways = |what: &str| commands.iter().filter(|c| c.contains(what)).count();
+        assert_eq!(
+            (
+                ways("--latest-only"),
+                ways("--ask --ask-dir"),
+                ways("--ask python"),
+                ways("--snoop"),
+            ),
+            (1, 1, usize::from(pair.minor == 14), 1),
+            "{pair:?}: {report}"
+        );
+        // The socket is found where the service's environment says, and the
+        // command has the folder in it, as one word.
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.ends_with(&format!("--ask-dir '{}'", sockets.display()))),
+            "{pair:?}: {report}"
+        );
+        for (n, command) in commands.iter().enumerate() {
+            let db = env
+                .dir
+                .path()
+                .join(format!("check-{}-{n}.duckdb", pair.minor));
+            let ran = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "\"$BIN\" {}",
+                    command.replace("-o heap.duckdb", "-o \"$DB\"")
+                ))
+                .env("BIN", BIN)
+                .env("DB", &db)
+                .env("RUST_BACKTRACE", "0")
+                .output()
+                .unwrap();
+            assert!(ran.status.success(), "{pair:?}: {command}: {}", said(&ran));
+            // Its stacks name Python functions, whichever way they were read.
+            let frames = frames(&db);
+            assert!(
+                names_python_function(&frames, "leak_in_python"),
+                "{pair:?}: {command}: {frames:#?}"
+            );
+        }
+        // The Python was asked with its files in its /tmp, and they are gone.
+        let new: Vec<PathBuf> = left_behind(Path::new("/tmp"))
+            .into_iter()
+            .filter(|p| !there_before.contains(p))
+            .collect();
+        assert_eq!(new, Vec::<PathBuf>::new(), "{pair:?}");
+    }
+}
+
+#[test]
+fn a_check_writes_no_request_into_a_python() {
+    let Some(env) = setup(false) else { return };
+    for pair in pairs_314() {
+        // Its main thread does not come back to Python: a request that was
+        // written would still be waiting.
+        let mut target = Target::start(&env, &pair, Run::of("plain.py", &["sleep"]));
+        let out = check(target.pid(), &[]);
+        let report = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{pair:?}: {report}{}", said(&out));
+        assert!(
+            report.contains("--ask python can be used"),
+            "{pair:?}: {report}"
+        );
+
+        let db = env.dir.path().join("after-check.duckdb");
+        let place = env.dir.path().to_str().unwrap();
+        let asked = ask(
+            target.pid(),
+            "python",
+            &db,
+            &["--ask-dir", place, "--ask-wait", "1"],
+        );
+        assert!(
+            said(&asked).contains("the request was withdrawn"),
+            "{pair:?}: {}",
+            said(&asked)
+        );
+        assert!(target.is_running(), "{pair:?}");
+    }
+}
+
+#[test]
+fn a_check_of_a_service_with_jemalloc_alone_says_what_is_left_and_what_more_there_is() {
+    let Some(env) = setup(false) else { return };
+    let older: Vec<Pair> = pairs().into_iter().filter(|p| p.minor < 14).collect();
+    if older.is_empty() {
+        common::skip("needs Python 3.12 or 3.13 and a libjemalloc.so.2");
+    }
+    for pair in older {
+        let mut target = Target::start(&env, &pair, Run::of("plain.py", &["sleep"]));
+        let threads = |pid: u32| {
+            std::fs::read_dir(format!("/proc/{pid}/task"))
+                .unwrap()
+                .count()
+        };
+        let before = threads(target.pid());
+        let out = check(target.pid(), &[]);
+        let report = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{pair:?}: {report}{}", said(&out));
+        let commands = commands_in(&report);
+        assert_eq!(commands.len(), 1, "{pair:?}: {report}");
+        assert!(commands[0].ends_with("--snoop"), "{pair:?}: {report}");
+        for section in [
+            "Snapshot files at an interval",
+            "Start here: collect over the socket",
+        ] {
+            assert!(
+                report.contains(&format!("See \"{section}\".")),
+                "{pair:?}: {report}"
+            );
+        }
+        // Looking changed nothing.
+        assert_eq!(threads(target.pid()), before, "{pair:?}");
+        assert!(target.is_running(), "{pair:?}");
+    }
+}
+
+#[test]
+fn a_check_of_a_service_without_profiling_ends_with_an_error() {
+    let Some(env) = setup(false) else { return };
+    let Some(pair) = pairs().into_iter().next() else {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+        return;
+    };
+    let target = Target::start(
+        &env,
+        &pair,
+        Run {
+            prof: false,
+            ..Run::of("plain.py", &["loop"])
+        },
+    );
+    let out = check(target.pid(), &[]);
+    let report = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!out.status.success(), "{report}");
+    assert!(commands_in(&report).is_empty(), "{report}");
+    assert!(
+        report.contains("off: MALLOC_CONF has prof:false"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Start the service on jemalloc with prof:true"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_socket_is_found_where_the_services_environment_says() {
+    let Some(env) = setup(true) else { return };
+    let Some(pair) = pairs().into_iter().next() else {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+        return;
+    };
+    let library = env.dir.path().join("libsysting_heap_responder.so");
+    let sockets = env.dir.path().join("named in the environment");
+    std::fs::create_dir(&sockets).unwrap();
+    let target = Target::start(
+        &env,
+        &pair,
+        Run {
+            env: &[
+                ("SYSTING_HEAP_HOOKS_LISTEN", "1"),
+                ("SYSTING_HEAP_HOOKS_SOCKET_DIR", sockets.to_str().unwrap()),
+            ],
+            preload: Some(&library),
+            ..Run::of("unchanged.py", &["stay"])
+        },
+    );
+    // The first command of the guide and of --help: no directory is given.
+    let db = env.dir.path().join("found.duckdb");
+    let out = Command::new(BIN)
+        .args(["--pid", &target.pid().to_string(), "--ask", "-o"])
+        .arg(&db)
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(
+        said(&out).contains(&format!("{}/.systing-heap.", sockets.display())),
+        "{}",
+        said(&out)
+    );
+    assert_eq!(snapshot(&db).0, "asked");
+}
+
+#[test]
+fn what_a_services_environment_names_cannot_write_to_the_terminal() {
+    let Some(env) = setup(false) else { return };
+    let Some(pair) = pairs().into_iter().next() else {
+        common::skip("needs libjemalloc.so.2 and Python 3.12+");
+        return;
+    };
+    // A directory that need not exist: it is printed when it is not found.
+    let hostile = "/x\x1b]0;owned\x07\x1b[2J\nheap.duckdb: 1 snapshot(s)";
+    let target = Target::start(
+        &env,
+        &pair,
+        Run {
+            env: &[("SYSTING_HEAP_HOOKS_SOCKET_DIR", hostile)],
+            ..Run::of("plain.py", &["loop"])
+        },
+    );
+    let pid = target.pid().to_string();
+    let db = env.dir.path().join("hostile.duckdb");
+    let asked = Command::new(BIN)
+        .args(["--pid", &pid, "--ask", "-o"])
+        .arg(&db)
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .unwrap();
+    assert!(!asked.status.success());
+    let checked = check(target.pid(), &[]);
+    for out in [&asked, &checked] {
+        let all = format!("{}{}", String::from_utf8_lossy(&out.stdout), said(out));
+        assert!(!all.contains('\x1b') && !all.contains('\x07'), "{all:?}");
+        assert!(!all.contains("\nheap.duckdb: 1 snapshot(s)"), "{all:?}");
+    }
+    // It is not gone by at all: the socket was looked for in /tmp.
+    assert!(
+        said(&asked).contains(&format!("there is no /tmp/.systing-heap.{pid}")),
+        "{}",
+        said(&asked)
+    );
+}
+
+#[test]
+fn a_check_says_of_the_directory_named_what_asking_would() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(env) = setup(false) else { return };
+    for pair in pairs_314() {
+        let target = Target::start(&env, &pair, Run::of("plain.py", &["loop"]));
+        let place = env.dir.path().join("for the script");
+        std::fs::create_dir(&place).unwrap();
+        let mode =
+            |mode| std::fs::set_permissions(&place, std::fs::Permissions::from_mode(mode)).unwrap();
+        let report = || {
+            let out = check(target.pid(), &["--ask-dir", place.to_str().unwrap()]);
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // One that anyone can rename in: asking would refuse it.
+        mode(0o777);
+        let refused = report();
+        assert!(
+            refused.contains("--ask python cannot be used") && refused.contains("no sticky bit"),
+            "{pair:?}: {refused}"
+        );
+        assert!(
+            !commands_in(&refused)
+                .iter()
+                .any(|c| c.contains("--ask python")),
+            "{pair:?}: {refused}"
+        );
+
+        // As /tmp is: the command names it, and works.
+        mode(0o1777);
+        let allowed = report();
+        let commands = commands_in(&allowed);
+        let command = commands
+            .iter()
+            .find(|c| c.contains("--ask python"))
+            .unwrap_or_else(|| panic!("{pair:?}: {allowed}"));
+        assert!(
+            command.contains(&format!("--ask-dir '{}'", place.display())),
+            "{pair:?}: {command}"
+        );
+        let db = env.dir.path().join("named.duckdb");
+        let ran = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "\"$BIN\" {}",
+                command.replace("-o heap.duckdb", "-o \"$DB\"")
+            ))
+            .env("BIN", BIN)
+            .env("DB", &db)
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .unwrap();
+        assert!(ran.status.success(), "{pair:?}: {command}: {}", said(&ran));
+        assert_eq!(std::fs::read_dir(&place).unwrap().count(), 0, "{pair:?}");
+    }
+}
+
+// A native service: it knows nothing of jemalloc or of the hooks.
+const NATIVE: &str = r#"
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static void *keep[4096];
+static int n;
+__attribute__((noinline)) static void leak_buffers(int k)
+{
+    for (int i = 0; i < k; i++) {
+        keep[n] = malloc(64 * 1024);
+        memset(keep[n++], 1, 64 * 1024);
+    }
+}
+int main(void)
+{
+    leak_buffers(256);
+    for (;;)
+        pause();
+}
+"#;
+
+/// [`NATIVE`] built as `name` in the test's directory, and the system's
+/// jemalloc to load into it.
+fn native_service(env: &Env, name: &str) -> Option<(PathBuf, PathBuf)> {
+    let Some(jemalloc) = common::jemalloc() else {
+        common::skip("needs libjemalloc.so.2");
+        return None;
+    };
+    let source = env.dir.path().join(format!("{name}.c"));
+    std::fs::write(&source, NATIVE).unwrap();
+    let program = env.dir.path().join(name);
+    let built = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args(["-O1", "-g", "-fno-omit-frame-pointer", "-o"])
+        .arg(&program)
+        .arg(&source)
+        .status();
+    if !built.is_ok_and(|s| s.success()) {
+        common::skip("no C compiler to build a native service with");
+        return None;
+    }
+    Some((program, jemalloc))
+}
+
+/// The environment the guide gives a native service.
+fn as_the_guide_says(cmd: &mut Command, env: &Env, jemalloc: &Path, name: &str, sockets: &str) {
+    let library = env.dir.path().join("libsysting_heap_responder.so");
+    cmd.env(
+        "LD_PRELOAD",
+        format!("{}:{}", jemalloc.display(), library.display()),
+    )
+    .env("MALLOC_CONF", "prof:true")
+    .env("SYSTING_HEAP_HOOKS_LISTEN", "1")
+    .env("SYSTING_HEAP_HOOKS_LISTEN_ONLY", name)
+    .env("SYSTING_HEAP_HOOKS_SOCKET_DIR", sockets);
+}
+
+/// Wait for `ready` to give something, no longer than 10 s.
+fn wait_until<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(found) = ready() {
+            return found;
+        }
+        assert!(Instant::now() < until, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_native_service_answers_its_own_user_and_root() {
+    let Some(env) = setup(true) else { return };
+    let Some((program, jemalloc)) = native_service(&env, "native-svc") else {
+        return;
+    };
+    let sockets = env.sockets();
+    let mut cmd = Command::new(&program);
+    as_the_guide_says(
+        &mut cmd,
+        &env,
+        &jemalloc,
+        "native-svc",
+        sockets.to_str().unwrap(),
+    );
+    let mut service = cmd.spawn().unwrap();
+    let pid = service.id();
+    wait_until("the service did not listen", || {
+        sockets_in(&sockets).contains(&pid).then_some(())
+    });
+
+    // The guide's command, as the service's own user.
+    let db = env.dir.path().join("native.duckdb");
+    let out = Command::new(BIN)
+        .args(["--pid", &pid.to_string(), "--ask", "-o"])
+        .arg(&db)
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .unwrap();
+    let named = out.status.success() && frames(&db).iter().any(|f| f.starts_with("leak_buffers ("));
+
+    // And as root.
+    let by_root = as_root(BIN).map(|mut tool| {
+        let db = env.dir.path().join("native-by-root.duckdb");
+        tool.args(["--pid", &pid.to_string(), "--ask", "-o"])
+            .arg(&db)
+            .output()
+            .unwrap()
+    });
+    let _ = service.kill();
+    let _ = service.wait();
+    assert!(named, "{}", said(&out));
+    if let Some(out) = by_root {
+        assert!(out.status.success(), "{}", said(&out));
+        assert!(
+            said(&out).contains("asked through its responder"),
+            "{}",
+            said(&out)
+        );
+    }
+}
+
+#[test]
+fn root_outside_asks_a_service_in_pid_and_mount_namespaces_of_its_own() {
+    use std::os::unix::fs::MetadataExt;
+    let Some(env) = setup(true) else { return };
+    // Its name is looked for among all the machine's processes.
+    let name = format!("ns-svc-{:x}", std::process::id() & 0xffff);
+    let Some((program, jemalloc)) = native_service(&env, &name) else {
+        return;
+    };
+    let Some(mut container) = as_root("unshare") else {
+        return;
+    };
+    // Others must be able to reach the program and the library.
+    let meta = std::fs::metadata(env.dir.path()).unwrap();
+    std::fs::set_permissions(
+        env.dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    // As a container is: pid 1 to itself, and a /run of its own, which
+    // nothing outside can see. It runs as this test's user, not as root.
+    let library = env.dir.path().join("libsysting_heap_responder.so");
+    let inside = format!(
+        "mount -t tmpfs tmpfs /run && mkdir -m 0777 /run/my-service && \
+         exec setpriv --reuid {} --regid {} --clear-groups env \
+         LD_PRELOAD={}:{} MALLOC_CONF=prof:true SYSTING_HEAP_HOOKS_LISTEN=1 \
+         SYSTING_HEAP_HOOKS_LISTEN_ONLY={name} SYSTING_HEAP_HOOKS_SOCKET_DIR=/run/my-service {}",
+        meta.uid(),
+        meta.gid(),
+        jemalloc.display(),
+        library.display(),
+        program.display()
+    );
+    let mut container = container
+        .args([
+            "--pid",
+            "--fork",
+            "--mount",
+            "--mount-proc",
+            "sh",
+            "-c",
+            &inside,
+        ])
+        .spawn()
+        .unwrap();
+    let pid_of = || {
+        std::fs::read_dir("/proc").unwrap().find_map(|e| {
+            let pid: u32 = e.ok()?.file_name().to_str()?.parse().ok()?;
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+            (comm.trim_end() == name).then_some(pid)
+        })
+    };
+    let pid = wait_until("the service did not start", pid_of);
+    // Given a moment to listen: its socket cannot be seen from here.
+    std::thread::sleep(Duration::from_millis(500));
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let db = env.dir.path().join("namespaces.duckdb");
+    let out = as_root(BIN)
+        .unwrap()
+        .args(["--pid", &pid.to_string(), "--ask", "-o"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    // Nothing less ends it: a process that is pid 1 to itself gets only the
+    // signals it has a handler for, from outside as well.
+    let _ = as_root("kill")
+        .unwrap()
+        .args(["-KILL", &pid.to_string()])
+        .status();
+    let _ = container.wait();
+
+    // It is pid 1 to itself, and the socket is named so, in its own /run.
+    assert!(
+        status
+            .lines()
+            .any(|l| l.starts_with("NSpid:") && l.ends_with("\t1")),
+        "{status}"
+    );
+    assert!(!Path::new("/run/my-service").exists());
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(
+        said(&out).contains("(/run/my-service/.systing-heap.1)"),
+        "{}",
+        said(&out)
+    );
+    // Its frames are named from the binaries as it sees them.
+    let copy = env.dir.path().join("namespaces-copy.duckdb");
+    std::fs::copy(&db, &copy).unwrap();
+    assert!(
+        frames(&copy)
+            .iter()
+            .any(|f| f.starts_with("leak_buffers (")),
+        "{:#?}",
+        frames(&copy)
+    );
 }

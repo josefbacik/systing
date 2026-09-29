@@ -447,16 +447,23 @@ rows (`./scripts/run-integration-tests.sh task_context_record`).
 
 ### Heap Snapshots
 
-`systing-heap` reads heap snapshots that an allocator wrote itself (jemalloc profile dumps for now) into a systing DuckDB database.
-A snapshot shows the memory a process had allocated when it wrote the file, by allocation stack; it is not a recording of malloc calls (that is the `memory-alloc` recorder).
+`systing-heap` shows which code holds a service's memory, by call stack.
+It loads heap dumps from jemalloc's own profiler into a systing DuckDB database or a Perfetto trace.
+Heap profiling is still experimental: flags, variables and tables may change between releases.
+A dump shows the memory a process had allocated at one moment. It is not a recording of malloc calls; the `memory-alloc` recorder does that.
 
 ```bash
 cargo build --release -p systing-heap
-systing-heap -o heap.duckdb /data/heap/jeprof   # jemalloc's prof_prefix: latest snapshot per process, older dumps deleted
+systing-heap -o heap.duckdb --pid PID --ask       # a dump now, over the service's socket
+systing-heap -o heap.duckdb /heap-dumps/jeprof    # snapshot files: newest per process, older ones deleted
 ```
 
-To set a service up to write snapshots (native stacks for any service, Python frames for Python services) and collect them, see [`docs/HEAP_SNAPSHOTS.md`](docs/HEAP_SNAPSHOTS.md).
-For the tool's options, the tables, and queries, see [`heap/README.md`](heap/README.md).
+| Document | What is in it |
+|---|---|
+| [`docs/HEAP_SNAPSHOTS.md`](docs/HEAP_SNAPSHOTS.md) | **Start here.** How it works, prerequisites, and setup for native and Python services |
+| [`heap/README.md`](heap/README.md) | The tool: options, tables, queries |
+| [`heap/hooks/README.md`](heap/hooks/README.md) | The library a service loads |
+| [`docs/HEAP_INTERNALS.md`](docs/HEAP_INTERNALS.md) | How each way works inside, and its safety rules |
 
 ### Debugging and Verbosity
 

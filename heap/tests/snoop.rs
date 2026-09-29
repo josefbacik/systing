@@ -1,4 +1,4 @@
-//! `--snoop` (experimental): the heap profile read from a running process's
+//! `--snoop`: the heap profile read from a running process's
 //! memory, against real jemalloc. Needs libjemalloc.so.2 and a C compiler; see
 //! `common::skip`.
 //!
@@ -150,7 +150,7 @@ fn the_live_profile_is_read_and_no_file_is_written() {
         let run = snoop_cli(target.pid(), &out, cwd.path());
         let stderr = String::from_utf8_lossy(&run.stderr);
         assert!(run.status.success(), "{lib:?}: {stderr}");
-        assert!(stderr.contains("experimental"), "{stderr}");
+        assert!(stderr.contains("private data structures"), "{stderr}");
 
         let conn = Connection::open(&out).unwrap();
         let (n, trigger, format, period): (i64, String, String, i64) = conn
