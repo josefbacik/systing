@@ -40,6 +40,12 @@ static pthread_mutex_t install_lock = PTHREAD_MUTEX_INITIALIZER;
  * registers no fork handler, so a fork while another thread unwinds would
  * leave that lock held in the child; the fork handlers below wait on this
  * one instead, so no unwind is in progress when the process forks.
+ *
+ * Only they wait on it. libunwind asks for the dynamic loader's list lock
+ * (dl_iterate_phdr()) while this one is held, and a sampled allocation may
+ * come from a thread that holds the loader's: a callback of
+ * dl_iterate_phdr() that allocates. If that thread waited here, each of the
+ * two would wait for the lock the other holds, for good.
  */
 static pthread_mutex_t unwind_lock = PTHREAD_MUTEX_INITIALIZER;
 static mallctl_fn mallctl_p;
@@ -62,7 +68,11 @@ static void libunwind_backtrace(void **vec, unsigned *len, unsigned max_len)
 		*len = 0;
 		return;
 	}
-	pthread_mutex_lock(&unwind_lock);
+	/* Nor does a thread that finds another one unwinding: see unwind_lock. */
+	if (pthread_mutex_trylock(&unwind_lock) != 0) {
+		*len = 0;
+		return;
+	}
 	int n = unw_backtrace_p(vec, (int)max_len);
 	pthread_mutex_unlock(&unwind_lock);
 	if (n <= 1) {

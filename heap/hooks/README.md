@@ -288,7 +288,7 @@ print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
 | A sampled allocation at 30 Python frames, on top of jemalloc's own 4 µs | 25 to 26 µs | 9 µs on 3.12, 20 µs on 3.13 |
 | The same, per GiB allocated | About 50 ms | 19 to 41 ms, plus the cost on every call |
 | System calls per sampled allocation | About 37 (`process_vm_readv`) | About 39 (libunwind checks each address) |
-| Threads sampled at the same moment | Walk side by side | One at a time: a lock is held for the whole unwind |
+| Threads sampled at the same moment | Walk side by side | One at a time: a lock is held for the whole unwind. A thread that finds it taken does not wait, and that one allocation is recorded with no stack. Python threads: none in 680,000 samples with up to 32 threads, since the GIL keeps them apart. Native threads that each allocate 70 MiB/s: 0.2% of samples with 8 threads, 0.5% with 32, 1.6% with 96. |
 | A mixed workload (tokenize, parse and compile 150 files) | No difference above noise | No difference above noise |
 | Memory | A 5 MiB table is mapped. Only the pages used are resident. | 64 KiB of generated code for 1,300 functions |
 | Files | About 1 KiB per function that was in a sampled stack | About 90 bytes per function that was ever called |
@@ -303,6 +303,7 @@ print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
 | A new Python version | Refused until its offsets are added. Stacks are native until then. | Nothing depends on the version |
 | A Python laid out differently | Refused by the check in `install()` | Nothing depends on the layout |
 | A bad pointer | Cannot fault | libunwind checks each address before reading it |
+| Locks taken inside `malloc` | None | The hooks' own, never waited for, and under it the dynamic loader's list lock, which libunwind takes to find the library an address is in |
 | Changes in the process | Nothing between samples | How every Python function is called, for the life of the process. It also maps executable memory at run time. |
 | Needs from the environment | `process_vm_readv` on itself, or `/proc/self/mem` | `libunwind.so.8`, and a writable `/tmp` |
 | Which process a map belongs to | The dump names its map by a token | By pid alone: a map left by an earlier process with the same pid is not told apart |
@@ -323,4 +324,5 @@ heap/hooks/
 - **The two parts do not call each other.** Each is built from its own folder and `common/`. The one thing that passes between them is the code map: the Python backtrace registers how to ask for it, through `common/`, and the responder hands over what it is given.
 - **`backtrace/py_offsets.h`** holds the CPython struct offsets, by version. It is rendered from systing's pystacks offsets. `cargo test -p systing-heap hook_offsets` fails when the two differ, and rewrites the header when run with `SYSTING_HEAP_UPDATE_OFFSETS=1`.
 - **A new Python minor version** needs its offsets added to systing's pystacks bindings (`scripts/generate_python_bindings.py`) and to `MINORS` in `heap/src/hook_offsets.rs`.
+- **The `libunwind` backtrace never waits for its lock.** libunwind takes the dynamic loader's list lock (`dl_iterate_phdr()`) while the hooks' lock is held. A thread that allocates in a `dl_iterate_phdr()` callback holds the loader's lock already, as a library that takes backtraces of its own may. If it waited for the hooks' lock, the two threads would wait for each other for good. In a Python process the blocked thread can hold the GIL, and then every Python thread stops with it. Up to 1.26.0 the hook did wait. `cargo test -p systing-heap --test two_locks` makes the two threads meet.
 - **The socket's protocol** is described at the top of `responder/responder.c`.
