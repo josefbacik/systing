@@ -19,6 +19,9 @@
  *   - Nothing of Python's is called but two getters that only read a
  *     thread-local, and the finalizing flag. The GIL is never taken, no
  *     reference count is touched, nothing is allocated.
+ *   - Reading a thread-local is not always only a read: where libpython is a
+ *     shared library it goes through the dynamic loader, which malloc's caller
+ *     can be. Where it is, the getters are not called (../common/common.h).
  *   - Every loop and length is bounded, and what is read is checked for what
  *     it should be (a code object's type, a str's, a bytes') before it is
  *     used, so mapped garbage gives a short or unnamed stack.
@@ -660,6 +663,8 @@ void systing_heap_hooks_python_backtrace(void **vec, unsigned *len,
 	 * written for the whole array (one ignores a smaller length, and a
 	 * debug build asserts it was given none), so nothing of ours is in
 	 * the array while one runs. */
+	/* malloc that succeeds is expected to leave errno alone. */
+	int saved_errno = errno;
 	*len = 0;
 	native_p(vec, len, max_len);
 	unsigned n = *len > max_len ? max_len : *len;
@@ -675,8 +680,14 @@ void systing_heap_hooks_python_backtrace(void **vec, unsigned *len,
 		}
 	}
 	*len = n;
-	if (max_len < 2 * MAX_SLOTS || !walk_begin())
+	/* The thread's state is a thread-local variable of the interpreter's,
+	 * and in a shared libpython the functions that return it read it
+	 * through the loader (common.h). */
+	if (max_len < 2 * MAX_SLOTS || shh_loader_called_malloc(vec, n) ||
+	    !walk_begin()) {
+		errno = saved_errno;
 		return;
+	}
 
 	/* The Python frames follow the native ones, which give up their
 	 * outermost frames where the two do not fit. */
@@ -698,6 +709,7 @@ void systing_heap_hooks_python_backtrace(void **vec, unsigned *len,
 		n = max_len - py.n;
 	memcpy(vec + n, py.slot, py.n * sizeof(py.slot[0]));
 	*len = n + py.n;
+	errno = saved_errno;
 }
 
 /* ---- starting, stopping, forking ---------------------------------------- */
