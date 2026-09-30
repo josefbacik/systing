@@ -18,10 +18,10 @@
  *
  * So a backtrace finds out whether the loader called malloc before it calls
  * anything that may read such a variable, and where the loader did, calls
- * nothing that does (backtrace.c, python.c). An unwinder cannot be what finds out. What does is a
- * look at the stack: malloc's return address is a little way above the
- * backtrace's frame, past jemalloc's own frames, and an address in the loader's
- * code is looked for among the words there.
+ * nothing that does (backtrace.c, python.c). An unwinder cannot be what finds
+ * out. What does is a look at the stack: malloc's return address is a little way
+ * above the backtrace's frame, past jemalloc's own frames, and an address in the
+ * loader's code is looked for among the words there.
  *
  * The look errs one way. Words that calls long returned have left behind are
  * taken for a caller too, and stay where they are for as long as nothing writes

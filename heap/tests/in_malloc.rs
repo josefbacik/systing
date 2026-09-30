@@ -225,7 +225,7 @@ def deep(n):
         return deep(n - 1)
     for i in range(int(sys.argv[3])):
         kept.append(ctypes.CDLL(f"{sys.argv[2]}/thread_local_{i}.so"))
-deep(30)
+deep(int(sys.argv[4]))
 try:
     os.unlink(f"/tmp/perf-{os.getpid()}.map")
 except OSError:
@@ -625,6 +625,9 @@ fn what_the_loader_allocates_has_a_stack() {
 /// slots under "python", neither of which is an address in a file.
 #[test]
 fn and_its_python_frames_too() {
+    // jemalloc keeps 128 frames of a stack. Under trampolines a Python call takes
+    // up to five of them (3.14), and the loader and ctypes some twenty.
+    const DEEP: usize = 12;
     let Some((python, _)) = common::python() else {
         common::skip("needs Python 3.12+");
         return;
@@ -640,6 +643,7 @@ fn and_its_python_frames_too() {
             .arg(backtrace)
             .arg(dir)
             .arg(LIBRARIES.to_string())
+            .arg(DEEP.to_string())
             .env(
                 "SYSTING_HEAP_HOOKS_LIB",
                 dir.join("libsysting_heap_hooks.so"),
@@ -665,7 +669,7 @@ fn and_its_python_frames_too() {
             of_the_loader += 1;
             let in_no_file = stack.iter().filter(|f| !f.contains('.')).count();
             assert!(
-                in_no_file >= 30,
+                in_no_file >= DEEP,
                 "{backtrace}: {in_no_file} Python frames: {stack:#?}"
             );
         }

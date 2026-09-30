@@ -335,7 +335,7 @@ print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
 
 ## A backtrace and the dynamic loader
 
-**The hooks of systing 1.26.0 and earlier can corrupt the heap of the service they are loaded in.** `backtrace="libunwind"` can on any Python, and `backtrace="python"` where libpython is a shared library built the usual way. A service with many threads that loads libraries late is close to certain to be hit. Both are fixed. This is what happened, for whoever changes a backtrace or meets the same thing elsewhere.
+**The hooks of systing 1.26.1 and earlier can corrupt the heap of the service they are loaded in.** `backtrace="libunwind"` can on any Python, and `backtrace="python"` where libpython is a shared library built the usual way. A service with many threads that loads libraries late is close to certain to be hit. Both are fixed. This is what happened, for whoever changes a backtrace or meets the same thing elsewhere.
 
 ### What was seen
 
@@ -480,7 +480,7 @@ A dump can show that a table's growth was sampled, which is what it takes. Look 
 | 32 threads that wait while half the libraries are loaded | Not caught, in any thread |
 | The same in a Python whose libpython asks the loader | Not caught. On the earlier `"python"` this is the one that fails. It needs such a libpython: Ubuntu's `libpython3.12t64`. |
 | Behind a chain of 20 wrappers, and in a program started as `ld.so program` | The loader is still seen |
-| What the loader allocated, 30 Python functions deep | All 30 are in its stack, under both backtraces, and nothing of the hooks' or libunwind's |
+| What the loader allocated, 12 Python functions deep | All 12 are in its stack, under both backtraces, and nothing of the hooks' or libunwind's |
 | A sandbox that refuses `process_vm_readv` | `"libunwind"` is not installed |
 | A JIT that hands libgcc 2,000 unwind tables | `"libunwind"` does not hang |
 | The two libraries | No thread-local variable, no `__tls_get_addr`, everything bound at load |
