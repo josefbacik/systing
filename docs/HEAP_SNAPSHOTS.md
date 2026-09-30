@@ -208,6 +208,8 @@ Two things differ from a native service:
 - **`PYTHONMALLOC=malloc`.** Python serves small objects from its own pools, which jemalloc never sees. For 400,000 small dicts on CPython 3.13, jemalloc's own count of allocated bytes grew by 3.4 MB without this setting and by 118.5 MB with it.
 - **Two calls at startup**, so the stacks show Python functions. Without them you get the interpreter's C functions (`_PyEval_EvalFrameDefault`) where your code ran.
 
+**Rebuild a library taken from systing 1.26.0 or earlier.** Its backtraces could, rarely, corrupt the service's heap: [what happened, and who is exposed](../heap/hooks/README.md#a-backtrace-and-the-dynamic-loader).
+
 ```yaml
 env:
   - name: LD_PRELOAD

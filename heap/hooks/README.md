@@ -226,6 +226,7 @@ flowchart LR
 | **Forked workers** | Nothing to do. Each child writes its own map, which starts with the parent's lines, so what the parent allocated before the fork is named too. The map is made when the worker's first allocation is sampled, or at the first request on its socket. A worker that writes a dump **file** before either has no map yet, and its Python frames read `unknown (python) [unknown]`. |
 | **At exit** | The helper turns the walk off as the interpreter exits. Allocations sampled after that have native stacks. |
 | **Threads Python never saw** | A native thread pool has no Python frames. Its stacks are native. |
+| **Allocations the dynamic loader makes** | Native stacks too: see [the dynamic loader](#a-backtrace-and-the-dynamic-loader) |
 | **Depth** | jemalloc 5.3 keeps 128 frames. Python frames get at most 64 of them, the innermost, and the native stack gets the rest: past 128 in all it loses its outermost frames. On such a truncated stack the Python frames may not pair up with the interpreter's native frames, and are then placed in front of them as one block. |
 | **Which frames** | The ones Python shows in a traceback |
 | **Cleanup** | Code maps are not deleted. Each process leaves one, created like the dumps: mode `0644` less the umask. Whoever can read the dumps can read the function names and source paths in it. |
@@ -237,6 +238,7 @@ It runs inside `malloc`, in the service's process, mostly on threads that do not
 
 | Rule | Why it matters |
 |---|---|
+| Where the dynamic loader called `malloc`, nothing of Python's is asked for | The thread's state is a thread-local variable of the interpreter's. Where libpython is a shared library, reading it goes through the loader, which is not made to be entered from its own `malloc`. See [the dynamic loader](#a-backtrace-and-the-dynamic-loader). |
 | A thread walks only its own frames | No other thread's state is touched |
 | No pointer from Python is dereferenced. Everything is read with `process_vm_readv` on the process itself, or `/proc/self/mem` where seccomp refuses that. | A bad address is an error, not a crash. If neither works, the backtrace is not installed. |
 | It calls only three Python functions: two that return the thread's state, one that says the interpreter is exiting | It never takes the GIL, touches a reference count or allocates |
@@ -245,6 +247,7 @@ It runs inside `malloc`, in the service's process, mostly on threads that do not
 | Where reads have to go through `/proc/self/mem`, that one descriptor stays open. A forked child closes its parent's and opens its own. | A child never reads its parent's memory |
 | The code map is opened without blocking, and written only if it is still the regular file that was made, unchanged since the last line | Someone else with write access to the folder cannot stall an allocation or redirect the write. A map that was touched by anything else stops growing. |
 | jemalloc's own backtrace is called exactly as jemalloc calls it | The native stack is what it would have been |
+| `errno` is left as it was | A `malloc` that succeeds is expected not to change it |
 
 ### Perf trampolines
 
@@ -267,6 +270,22 @@ print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
 | **Which maps are trusted** | A regular file of at most 256 MiB. In a world-writable folder, only one that you or root own, as `perf` requires. A refused candidate falls through to the next place. A map is consulted only for addresses in anonymous executable memory, so a stale one cannot name data. |
 | **Joining with captures** | Names match systing's pystacks apart from the line. Drop it to join: `regexp_replace(name, ':\d+\]$', ']')`. |
 
+### Safety rules of `backtrace="libunwind"`
+
+It runs inside `malloc` too, and most of what it does is libunwind's to decide. So:
+
+| Rule | Why it matters |
+|---|---|
+| jemalloc's own backtrace goes first. Where it shows that the dynamic loader called `malloc`, libunwind is not called, and that stack is the one recorded. | libunwind keeps a cache per thread in thread-local variables, and reads them through the loader at every call. See [the dynamic loader](#a-backtrace-and-the-dynamic-loader). |
+| One thread unwinds at a time, and a fork waits for it | libunwind's cache has a lock of its own and no fork handler: a fork in the middle of an unwind would leave it held in the child |
+| The thread that is forking records no stack | It may hold that lock already |
+| `errno` is left as it was | libunwind changes it: the first time it checks an address, `malloc` returned with `EAGAIN` in it |
+
+| It can still | When |
+|---|---|
+| Use two descriptors nobody gave it | Past a frame without unwind tables, which every trampoline is, libunwind 1.6 checks each address by writing a byte from it into a pipe of its own (`src/x86_64/Ginit.c`). It keeps the pipe's two descriptor numbers for the life of the process, and forked children inherit them. In a program that closes descriptors it did not open, the numbers can come to mean something else. Read in its source and seen in `/proc/PID/fd`. Not seen to go wrong. |
+| Wait on the loader's lock | It asks the loader which library an address is in (`dl_iterate_phdr`), the first time it meets the address |
+
 ### The two compared
 
 **What the stacks show**
@@ -285,15 +304,15 @@ print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
 | | `backtrace="python"` | Trampolines and `backtrace="libunwind"` |
 |---|---|---|
 | Python function calls, on a benchmark made only of calls | No change | 40% to 65% slower, about 16 ns a call. Far less for code that spends its time in C. |
-| A sampled allocation at 30 Python frames, on top of jemalloc's own 4 µs | 25 to 26 µs | 9 µs on 3.12, 20 µs on 3.13 |
-| The same, per GiB allocated | About 50 ms | 19 to 41 ms, plus the cost on every call |
+| A sampled allocation at 30 Python frames, on top of jemalloc's own 4 µs | 25 to 26 µs | 10 µs on 3.12, 23 µs on 3.13 |
+| The same, per GiB allocated | About 50 ms | 21 to 46 ms, plus the cost on every call |
 | System calls per sampled allocation | About 37 (`process_vm_readv`) | About 39 (libunwind checks each address) |
 | Threads sampled at the same moment | Walk side by side | One at a time: a lock is held for the whole unwind |
 | A mixed workload (tokenize, parse and compile 150 files) | No difference above noise | No difference above noise |
 | Memory | A 5 MiB table is mapped. Only the pages used are resident. | 64 KiB of generated code for 1,300 functions |
 | Files | About 1 KiB per function that was in a sampled stack | About 90 bytes per function that was ever called |
 
-`python` costs more per sample and nothing per call. It is the cheaper of the two once a program makes more than about 300 (3.13) to 1,000 (3.12) Python calls per sampled allocation, which at the default period is per 512 KiB allocated.
+`python` costs more per sample and nothing per call. It is the cheaper of the two once a program makes more than about 200 (3.13) to 1,000 (3.12) Python calls per sampled allocation, which at the default period is per 512 KiB allocated.
 
 **What can go wrong**
 
@@ -303,10 +322,142 @@ print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
 | A new Python version | Refused until its offsets are added. Stacks are native until then. | Nothing depends on the version |
 | A Python laid out differently | Refused by the check in `install()` | Nothing depends on the layout |
 | A bad pointer | Cannot fault | libunwind checks each address before reading it |
+| An allocation the dynamic loader makes | Native frames only | Native frames only, up to the first trampoline |
 | Changes in the process | Nothing between samples | How every Python function is called, for the life of the process. It also maps executable memory at run time. |
 | Needs from the environment | `process_vm_readv` on itself, or `/proc/self/mem` | `libunwind.so.8`, and a writable `/tmp` |
 | Which process a map belongs to | The dump names its map by a token | By pid alone: a map left by an earlier process with the same pid is not told apart |
 | Where the map is | Beside the dumps | In the container's `/tmp` |
+
+## A backtrace and the dynamic loader
+
+**The hooks of systing 1.26.0 and earlier can corrupt the heap of the service they are loaded in.** `backtrace="libunwind"` can on any Python, and `backtrace="python"` where libpython is a shared library built the usual way. Both are fixed. This is what happened, for whoever changes a backtrace or meets the same thing elsewhere.
+
+### What was seen
+
+- Worker processes of a Python service died of segmentation faults, minutes after they started.
+- The faults were in the garbage collector and the evaluation loop, on objects that had been fine. **No frame of the hooks, libunwind or jemalloc was in any of the fault stacks.**
+- Every one that died had been forked from the same parent, replacements included. Workers of other parents, with the same code and settings, ran on.
+
+What follows was found by reading the code and then made to happen on a test machine, with the same versions of Python, jemalloc, libunwind and glibc. It gave the same fault, down to the instruction, and the same pattern: of 24 parents, every worker of the 7 whose table had moved died, none of the 16 whose table had not, and one parent hung. **That it is what happened in that service was not confirmed there.**
+
+### What happens
+
+All of it on one thread:
+
+```mermaid
+sequenceDiagram
+    participant P as The program
+    participant L as The loader (ld.so)
+    participant J as jemalloc
+    participant H as The backtrace
+    P->>L: reads a thread-local variable
+    Note over L: A library was loaded since the thread last looked.<br/>Its table is out of date, and too small.
+    L->>J: realloc(table)
+    J->>H: this call is sampled
+    H->>L: reads a thread-local variable
+    Note over L: The first update is not finished,<br/>so the table still looks out of date.
+    L->>J: realloc(table): the same pointer
+    J-->>L: a new block. The old one is freed.
+    L-->>H: the variable
+    H-->>J: the stack
+    Note over J: The first realloc goes on: it copies out of<br/>the freed block, and frees it again.
+```
+
+| Step | Detail |
+|---|---|
+| **The table** | glibc keeps, for each thread, a table of the thread's blocks of thread-local variables: one entry for each library that has any (the *dtv*, `elf/dl-tls.c`). |
+| **It grows late** | Loading a library does not touch the tables. Each thread brings its own up to date at its next read of a thread-local variable that goes through `__tls_get_addr()`. The table has room for 14 more libraries than it needed last time, and past that: `_dl_update_slotinfo()` → `_dl_resize_dtv()` → `realloc()`. |
+| **Which reads go through `__tls_get_addr()`** | Those of a library that may have been loaded with `dlopen()`, so any shared library not built with `-ftls-model=initial-exec`. Whose variable it is makes no difference, nor which library makes the call. |
+| **The second update** | The generation number that says the table is up to date is written last. A read made from inside the `realloc()` sees the old one, so the loader starts over, with the same pointer. |
+| **The damage** | A block freed twice. From there jemalloc can give the same memory to two owners. In Python that is any object over 512 bytes and the items of any long list. Smaller objects are in Python's own arenas, unless `PYTHONMALLOC=malloc` puts them in jemalloc too. |
+| **When there is none** | If the second `realloc()` stays in the same size class, the block does not move, nothing is freed early, and nothing was seen to go wrong. |
+
+### Why it is hard to find
+
+| | |
+|---|---|
+| **It is rare** | The sample has to land on that one `realloc()`. The odds are the bytes the table grows by over the sampling period. A broad set of imports here loaded 48 libraries with thread-local variables, whose growths add up to about 2.5 KB on the main thread: about 1 process in 200 at `lg_prof_sample:19`. |
+| **It shows up far away** | The fault comes when one of the two owners reads what the other wrote: later, in code that has nothing to do with either. |
+| **It is inherited** | A process that forks after the damage hands it to every child. |
+| **Installing early makes it likelier** | Libraries are loaded while a program imports its modules. A backtrace installed before the imports, so as to miss nothing, is there for all of them. |
+
+### Who is exposed
+
+| Backtrace | What it reads through the loader | Exposed, before the fix |
+|---|---|---|
+| `"default"` | Nothing | No |
+| `"libunwind"` | libunwind's cache (`tls_cache`, `src/x86_64/Gtrace.c`), at every call. This library loads libunwind with `dlopen()`. | Always |
+| `"python"` | The interpreter's thread state (`PyThreadState_GetUnchecked()`), at every call | Where libpython is a shared library that asks the loader, as Ubuntu's `libpython3.12.so.1.0` does. Not where the interpreter is linked into `python3` itself, as in Ubuntu's `/usr/bin/python3.12`, or was built with `-ftls-model=initial-exec`. |
+
+```bash
+readelf --dyn-syms -W libpython3.13.so.1.0 | grep __tls_get_addr    # no output: not exposed
+```
+
+**Which glibc.** 2.39 and later, and any older one that was given the change below. Up to 2.38 a read brought the table up only to the generation of the library being read. libunwind and libpython are older than the library that was just loaded, so the second update found nothing to do. Since [`d2123d6`](https://github.com/bminor/glibc/commit/d2123d68275acc0f061e73d5f86ca504e0d5a344) ("Fix slow tls access after dlopen") every read brings it up to the newest. This was read in glibc's source. It was run on 2.39 only.
+
+**musl** is not expected to be exposed: it makes room in every thread's table when a library is loaded, not when a variable is read. Not tested.
+
+### The fix
+
+jemalloc keeps a backtrace from being entered twice. It cannot keep one from entering **its caller**, and a flag of the backtrace's own cannot either: nothing of ours runs twice here. What runs twice is the loader.
+
+But the caller is in the stack. So:
+
+1. `install()` finds where the loader's code is: the executable part of the library `__tls_get_addr` is in.
+2. Each backtrace first has jemalloc's own made, which asks the loader for no thread-local variable.
+3. If one of its 16 innermost frames is in the loader, that stack is recorded, and nothing else is done (`shh_loader_called_malloc()` in `common/`).
+
+Both libraries are also linked with `-z now`. A function bound at its first call is bound by the loader, from wherever that call is made.
+
+| It costs | |
+|---|---|
+| **Python frames on the loader's own allocations** | They have native stacks. So do those of a library's constructors, which the loader runs, where they are within 16 frames of it. |
+| **Time, with `"libunwind"`** | jemalloc's own backtrace is made before libunwind's. Under trampolines it ends at the first one: 1.2 to 3 µs more for a sampled allocation, which is 3 to 6 ms per GiB allocated at `lg_prof_sample:19`. In a native program it is the whole stack a second time. |
+
+| It does not cover | |
+|---|---|
+| **A loader that cannot be found** | Without a `__tls_get_addr` in the process, nothing is ever held back |
+| **A signal handler** | One that interrupts the loader and reads a thread-local variable does the same damage. That is the program's, and nothing here runs in one. |
+| **A jemalloc built with `--enable-prof-libunwind`** | Its own backtrace calls libunwind. There libunwind is loaded when the program starts, which is the case glibc 2.40 takes care of. Not tested. |
+
+### Whether a process was hit
+
+A dump can show that the table's growth was sampled, which is what it takes. Look for a live allocation of a few KB with this stack:
+
+```text
+… → __tls_get_addr → update_get_addr → _dl_update_slotinfo → _dl_resize_dtv → realloc
+```
+
+Found in a dump written under the earlier `"libunwind"`, it says the process had the second update. Not found, it says nothing: the table's next growth frees the block. The functions between `__tls_get_addr` and `realloc` are named only where the loader's debug symbols are at hand. Without them they are frames in `ld-linux`.
+
+### The tests
+
+`tests/in_malloc.rs` makes it happen: 64 libraries with a thread-local variable each, every allocation sampled, and in front of jemalloc a `realloc()` that ends the process when it is called for a block from inside its own call for that block.
+
+| Test | |
+|---|---|
+| A backtrace written to break the rule | It is caught. Where it is not, the C library has changed, and the tests say they cannot tell. |
+| Every backtrace, in a native program and in each Python found | Not caught |
+| The same in a Python whose libpython asks the loader | Not caught. On the earlier `"python"` this is the one that fails. |
+| What the loader allocated | Nothing of the hooks' or libunwind's is between the loader and jemalloc in its stack |
+| The two libraries | No thread-local variable, no `__tls_get_addr`, everything bound at load |
+| `errno` after the first `malloc` that is sampled | As it was, under every backtrace |
+
+### Others who met it
+
+No report was found of this exact case, a heap profiler's backtrace and a block freed twice. The mechanism is known:
+
+| Where | What it says |
+|---|---|
+| glibc [`018f0fc`](https://github.com/bminor/glibc/commit/018f0fc3b818d4d1460a4e2384c24802504b1d20), "Support recursive use of dynamic TLS in interposed malloc" (in 2.40) | *"It turns out that quite a few applications use bundled mallocs that have been built to use global-dynamic TLS."* `__tls_get_addr()` now knows *"a reentrant `__tls_get_addr` call"* and answers it from the table as it is. **Only for libraries loaded when the program starts**, whose entries cannot move. A library loaded with `dlopen()`, as libunwind is here, is not helped. *"All this will go away once the dynamic linker stops using malloc for TLS."* |
+| glibc [`afe42e9`](https://github.com/bminor/glibc/commit/afe42e935b3ee97bac9a7064157587777259c60e), "Avoid some free (NULL) calls in _dl_update_slotinfo" | The workaround before that one, for a test of lttng-tools and for tcmalloc 2.9.1 built without `-ftls-model=initial-exec` |
+| glibc [`d2123d6`](https://github.com/bminor/glibc/commit/d2123d68275acc0f061e73d5f86ca504e0d5a344), "Fix slow tls access after dlopen [BZ #19924]" | The change both say they fix |
+| [dotnet/runtime #121581](https://github.com/dotnet/runtime/issues/121581), fixed by [#122513](https://github.com/dotnet/runtime/pull/122513) | The closest. One thread's stack has `__tls_get_addr` → `_dl_update_slotinfo` → `_dl_resize_dtv` → `realloc` twice, one inside the other, and AddressSanitizer reports the table's block as freed. There a signal handler goes in, not a backtrace. The fix: the handler reads no thread-local variable. |
+| [libunwind-devel, 2018](https://libunwind-devel.nongnu.narkive.com/QG1K3Uke/tls-model-initial-exec-attribute-prevents-dynamic-loading-of-libunwind-via-dlopen) | On libunwind loaded with `dlopen()` by a heap profiler: *"access to them may result in malloc being called … That is highly problematic when you want to unwind from within malloc itself."* The answer given was that a recursion guard had been enough. The thread ends without a decision. |
+| [Ceph #13522](https://tracker.ceph.com/issues/13522) | A deadlock, not a double free: one thread in `dlopen()` waits for tcmalloc's lock, and the thread that holds it is taking a stack trace and waits for the loader's, in `tls_get_addr_tail()` |
+| [jemalloc #2472](https://github.com/jemalloc/jemalloc/issues/2472) | jemalloc's own variables are `initial-exec`, so it does not ask the loader for them. Built otherwise (`--disable-initial-exec-tls`) and run under `LD_AUDIT`: `malloc` → `__tls_get_addr` → `malloc`, without end. |
+| [gperftools: stacktrace capturing methods and their issues](https://github.com/gperftools/gperftools/wiki/gperftools%27-stacktrace-capturing-methods-and-their-issues) | What each way of unwinding from inside an allocator can and cannot be trusted with. Of libunwind: *"it has occasionally upset people with crashes and deadlocks."* |
+| [MaskRay, All about thread-local storage](https://maskray.me/blog/2021-02-14-all-about-thread-local-storage) | The background: the models, the table, and why *"general dynamic and local dynamic TLS models are not async-signal-safe in glibc"* |
 
 ## For maintainers
 
@@ -320,6 +471,7 @@ heap/hooks/
   responder/              responder.c
 ```
 
+- **A backtrace may not enter the dynamic loader where the loader called `malloc`.** No thread-local variable, its own or of a library it calls, no `dl*()` function, no function bound at its first call. What happens otherwise, and how it is held off, is under [the dynamic loader](#a-backtrace-and-the-dynamic-loader). A new backtrace goes into the lists in `tests/in_malloc.rs`.
 - **The two parts do not call each other.** Each is built from its own folder and `common/`. The one thing that passes between them is the code map: the Python backtrace registers how to ask for it, through `common/`, and the responder hands over what it is given.
 - **`backtrace/py_offsets.h`** holds the CPython struct offsets, by version. It is rendered from systing's pystacks offsets. `cargo test -p systing-heap hook_offsets` fails when the two differ, and rewrites the header when run with `SYSTING_HEAP_UPDATE_OFFSETS=1`.
 - **A new Python minor version** needs its offsets added to systing's pystacks bindings (`scripts/generate_python_bindings.py`) and to `MINORS` in `heap/src/hook_offsets.rs`.
