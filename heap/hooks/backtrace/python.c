@@ -19,6 +19,9 @@
  *   - Nothing of Python's is called but two getters that only read a
  *     thread-local, and the finalizing flag. The GIL is never taken, no
  *     reference count is touched, nothing is allocated.
+ *   - Reading a thread-local is not always only a read: where libpython is a
+ *     shared library it can go through the dynamic loader, which malloc's
+ *     caller can be. Where it is, that getter is not called (caller.c).
  *   - Every loop and length is bounded, and what is read is checked for what
  *     it should be (a code object's type, a str's, a bytes') before it is
  *     used, so mapped garbage gives a short or unnamed stack.
@@ -67,6 +70,7 @@
 
 #include "../common/common.h"
 #include "../systing_heap_hooks.h"
+#include "caller.h"
 #include "py_offsets.h"
 #include "python.h"
 
@@ -563,17 +567,22 @@ static inline int started(const unsigned char *frame, const unsigned char *code,
  * with the frame's code header (NULL for an entry frame) until it returns 0.
  * Returns how many were emitted.
  */
-static unsigned walk(unsigned max, pid_t pid,
+static unsigned walk(unsigned max, pid_t pid, int by_loader,
 		     int (*emit)(void *ctx, const struct seen *,
 				 const unsigned char *code),
 		     void *ctx)
 {
 	/* A thread Python has never seen has no state, and nothing of
-	 * Python's is touched for it. */
+	 * Python's is touched for it. This getter asks libc
+	 * (pthread_getspecific()), and never the loader. */
 	uintptr_t ts = (uintptr_t)gilstate_p();
 	if (!ts)
 		return 0;
-	uintptr_t attached = (uintptr_t)attached_p();
+	/* The state the thread runs with now, which is another one only in a
+	 * thread that has gone from one interpreter into another. It is a
+	 * thread-local variable, and a shared libpython may read it through
+	 * the loader: not where the loader called malloc. */
+	uintptr_t attached = by_loader ? 0 : (uintptr_t)attached_p();
 	if (attached)
 		ts = attached;
 
@@ -653,9 +662,20 @@ static int emit_slot(void *ctx, const struct seen *s, const unsigned char *code)
 	return out->n < MAX_SLOTS;
 }
 
+/* As much as there is of `len` bytes at `src`, for caller.c. Between
+ * walk_begin() and walk_end(), like every read. */
+static ssize_t read_some(void *dst, uintptr_t src, size_t len)
+{
+	if (read_mode == READ_MEM)
+		return pread(mem_fd, dst, len, (off_t)src);
+	return shh_read_self(dst, src, len);
+}
+
 void systing_heap_hooks_python_backtrace(void **vec, unsigned *len,
 					 unsigned max_len)
 {
+	/* A malloc that succeeds is expected to leave errno alone. */
+	int saved_errno = errno;
 	/* The native stack as jemalloc asks for it: its own backtraces are
 	 * written for the whole array (one ignores a smaller length, and a
 	 * debug build asserts it was given none), so nothing of ours is in
@@ -675,8 +695,10 @@ void systing_heap_hooks_python_backtrace(void **vec, unsigned *len,
 		}
 	}
 	*len = n;
-	if (max_len < 2 * MAX_SLOTS || !walk_begin())
+	if (max_len < 2 * MAX_SLOTS || !walk_begin()) {
+		errno = saved_errno;
 		return;
+	}
 
 	/* The Python frames follow the native ones, which give up their
 	 * outermost frames where the two do not fit. */
@@ -692,12 +714,17 @@ void systing_heap_hooks_python_backtrace(void **vec, unsigned *len,
 			append_map(NULL, 0);
 		pthread_mutex_unlock(&py_lock);
 	}
-	walk(MAX_SLOTS, py.pid, emit_slot, &py);
+	/* No thread-local variable of Python's has been read yet. What has run,
+	 * jemalloc's own backtrace, has written below this function's frame and
+	 * not above. */
+	int by_loader = shh_loader_called_malloc(__builtin_frame_address(0), read_some);
+	walk(MAX_SLOTS, py.pid, by_loader, emit_slot, &py);
 	walk_end();
 	if (n > max_len - py.n)
 		n = max_len - py.n;
 	memcpy(vec + n, py.slot, py.n * sizeof(py.slot[0]));
 	*len = n + py.n;
+	errno = saved_errno;
 }
 
 /* ---- starting, stopping, forking ---------------------------------------- */
@@ -834,6 +861,10 @@ int shh_python_prepare(shh_mallctl_fn mallctl, shh_backtrace_fn native)
 	if (!version || !gilstate_p || !attached_p || !code_type || !str_type ||
 	    !bytes_type)
 		return SHH_ERR_NO_PYTHON;
+	/* What the getters call is bound now. In a libpython that binds a
+	 * function at its first call, that is the loader's work. */
+	(void)gilstate_p();
+	(void)attached_p();
 
 	const struct shh_py_offsets *found = NULL;
 	py_minor = (int)((*version >> 16) & 0xff);
@@ -1005,7 +1036,7 @@ int systing_heap_hooks_python_check(char *buf, size_t cap)
 		return -SHH_ERR_NO_PYTHON;
 	struct check out = {buf, cap, 0, getpid()};
 	pthread_mutex_lock(&py_lock);
-	unsigned n = walk(MAX_STEPS, out.pid, emit_check, &out);
+	unsigned n = walk(MAX_STEPS, out.pid, 0, emit_check, &out);
 	pthread_mutex_unlock(&py_lock);
 	walk_end();
 	if (out.len < cap)

@@ -28,6 +28,8 @@
 #define SHH_ERR_SOCKET_PATH 10
 #define SHH_ERR_SOCKET 11
 #define SHH_ERR_LISTEN_HOW 12
+#define SHH_ERR_NO_LOADER 13
+#define SHH_ERR_STACK_READ 14
 
 #include <stddef.h>
 

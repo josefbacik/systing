@@ -20,7 +20,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2 libunwind8
+          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2 libunwind8 libpython3.12t64
       # The heap tests that ask a Python through its interpreter need a 3.14,
       # and the test that an older one is refused needs the runner's own: the
       # 3.14 is installed beside it, as python3.14, and python3 stays what it
