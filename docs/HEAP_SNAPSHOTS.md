@@ -572,6 +572,8 @@ For example a Rust service using the `tikv-jemallocator` crate.
 systing_heap_hooks.install(backtrace="libunwind")
 ```
 
+`backtrace="frame-pointer"` walks through the trampolines without libunwind, at less than half the cost for a sampled allocation. It is for x86-64 and an interpreter built with frame pointers, as Ubuntu 24.04's is. `install()` tries the walk first: on an interpreter it does not get through, it is not installed, and the result says why. Where a library built without frame pointers calls back into Python, it often shows only the Python functions inside the callback.
+
 Python then writes `/tmp/perf-<pid>.map`. Keep it with the dumps. The full comparison is in [`heap/hooks/README.md`](../heap/hooks/README.md).
 
 ### Pausing sampling

@@ -405,6 +405,7 @@ Everything below ran on **x86-64 Linux with glibc**.
 | `--snoop` | `libjemalloc2` 5.3.0 (stripped), jemalloc 5.3.0 built from source, and the `dev` branch, with `prof_accum` and `prof_unbias` each on and off |
 | `--check` | Every command it prints is run through a shell, against a service that has everything and whose socket folder is named with a space, `;` and `$` |
 | `backtrace="python"` | CPython 3.12, 3.13 and 3.14 |
+| `backtrace="frame-pointer"` | CPython 3.12, 3.13 and 3.14 built with frame pointers; CPython 3.13.15 built without, which is refused (by hand); frame pointers that are not, on the first stack, a thread's, a fiber's and a forked child's; a stack unmapped inside a range that was remembered; 18 changes that each take out one of its checks, of which 16 fail a test and the other two are covered by another check (by hand) |
 | Every backtrace | A thread's table of thread-local variables made to grow inside a sampled `realloc()`, on glibc 2.39: in a native program, in Python, and in a Python whose libpython is a shared library that reads its thread state through the loader |
 
 **In CI:** the tests run on every pull request, on GitHub's Ubuntu runners, whose default for `kernel.yama.ptrace_scope` is 1. A missing dependency, Python 3.14 and `sudo` included, fails the run and is not skipped.

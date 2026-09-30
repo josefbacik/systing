@@ -22,11 +22,11 @@ make -C heap/hooks OUT=/dir     # somewhere else
 make -C heap/hooks responder    # only one: "responder" or "hooks"
 ```
 
-It needs a C compiler and `make`. No Python headers, no libunwind. Both libraries link only `libdl` and `libpthread`.
+It needs a C compiler and `make`. No Python headers, no libunwind. Both libraries link `libdl` and `libpthread`. The one with the backtraces also links `libgcc_s`, which the distro's jemalloc is linked with too.
 
 | File | Contains | Load it into |
 |---|---|---|
-| `libsysting_heap_responder.so` | The responder. Nothing about Python. About a twentieth of the other's size in memory (14 KB against 276 KB). | Native services |
+| `libsysting_heap_responder.so` | The responder. Nothing about Python. About a twentieth of the other's size in memory (16 KB against 283 KB). | Native services |
 | `libsysting_heap_hooks.so` | The responder and the backtraces | Python services |
 | `systing_heap_hooks.py` | The Python helper. Keep it next to `libsysting_heap_hooks.so`. | Python services |
 | `systing_heap_hooks.h` | The C API | C, C++ and Rust services that call the library |
@@ -40,6 +40,7 @@ It needs a C compiler and `make`. No Python headers, no libunwind. Both librarie
 | The socket, from C, C++ or Rust | `libsysting_heap_responder.so`, linked | `systing_heap_hooks_listen(NULL)` |
 | Python functions with file and line | `libsysting_heap_hooks.so` and the helper | `install(backtrace="python")` |
 | Python functions through perf trampolines | The same, and `libunwind.so.8` in the image | `install(backtrace="libunwind")` |
+| The same, without libunwind | The same, and an interpreter built with frame pointers, on x86-64 | `install(backtrace="frame-pointer")` |
 
 ## Reference
 
@@ -64,7 +65,8 @@ import systing_heap_hooks
 | Call | Does | Returns |
 |---|---|---|
 | `install(backtrace="python")` | Puts Python functions in the stacks | `{'backtrace': …, 'trampolines': …, 'reasons': […]}`: what is active now, and why anything was skipped |
-| `install(backtrace="libunwind")` | Turns on perf trampolines and walks through them | The same |
+| `install(backtrace="libunwind")` | Turns on perf trampolines and walks through them with libunwind | The same |
+| `install(backtrace="frame-pointer")` | Turns on perf trampolines and walks through them by frame pointers, if a trial shows that it gets through | The same |
 | `install(backtrace="default", trampolines=False)` | Puts jemalloc's own backtrace back | The same |
 | `listen(dir=None)` | Starts the socket, here and in every process forked from here | The socket's path, or `None` with a warning |
 | `keep_perf_map_across_fork()` | Trampolines only, Python 3.13+: each forked child adds the parent's perf map to its own | Whether it is on |
@@ -86,8 +88,9 @@ import systing_heap_hooks
 |---|---|
 | `int systing_heap_hooks_listen(const char *dir)` | Starts the socket. `NULL`: the variable, then `/tmp`. |
 | `const char *systing_heap_hooks_socket(void)` | The socket's path, or `""` |
-| `int systing_heap_hooks_install(const char *backtrace)` | `"python"`, `"libunwind"` or `"default"` |
+| `int systing_heap_hooks_install(const char *backtrace)` | `"python"`, `"libunwind"`, `"frame-pointer"` or `"default"` |
 | `int systing_heap_hooks_prepare(const char *backtrace)` | Gets ready without installing, so the walk can be checked first |
+| `int systing_heap_hooks_frame_pointer_check(void **vec, int max)` | The calling thread's stack as `"frame-pointer"` captures it |
 | `const char *systing_heap_hooks_active(void)` | The backtrace in use |
 | `const char *systing_heap_hooks_strerror(int code)` | What a return code means. `SHH_OK` is 0. |
 
@@ -96,6 +99,8 @@ The responder-only library has `listen`, `socket` and `strerror`.
 **Installing `"python"` from C skips a safety check.** The Python helper compares the library's walk with Python's own view of the stack before it installs, and only Python can supply that view.
 From C the library goes by the interpreter's version alone. On a Python of a listed version that is laid out differently, every object is still checked for its type and every read is still made by the kernel, so stacks come out short or unnamed. Nothing faults.
 A C caller that wants the check calls `prepare("python")`, compares `systing_heap_hooks_python_check()` with what it knows the stack to be, and then installs.
+
+**Installing `"frame-pointer"` from C skips a check too.** The helper tries the walk under three Python functions and installs it only if all three are in what it captures. Without the check, a program built without frame pointers gets stacks that end where jemalloc's own do, or a few frames further on. Nothing faults.
 
 ## The responder
 
@@ -188,12 +193,13 @@ The thread does not exist in a forked child, and the child closes its copy of th
 _start → … → outer (python) [app.py:12] → leak_in_python (python) [app.py:10] → PyByteArray… → malloc
 ```
 
-**Use `backtrace="python"`.** Use trampolines with `backtrace="libunwind"` only for a Python it refuses: newer than 3.14, free-threaded or otherwise built differently, or a process that may not read its own memory through the kernel.
+**Use `backtrace="python"`.** Use trampolines only for a Python it refuses: newer than 3.14, free-threaded or otherwise built differently, or a process that may not read its own memory through the kernel. Two backtraces walk through them, [`"libunwind"` and `"frame-pointer"`](#libunwind-or-frame-pointer).
 
 | Setup | Stacks show | Cost |
 |---|---|---|
 | `backtrace="python"` | Every Python function with file and line, among the native frames | Per sampled allocation only |
 | Trampolines and `backtrace="libunwind"` | Every Python function with its file, no line | Every Python call, and per sampled allocation |
+| Trampolines and `backtrace="frame-pointer"` | The same for most allocations: see [where a stack ends early](#where-a-stack-ends-early) | Every Python call, and less per sampled allocation |
 | Trampolines and a jemalloc built with `--enable-prof-libunwind`, no hook | The same, expected. Not tested. | The same |
 | Trampolines and jemalloc's default | Only the innermost Python function | Every Python call |
 | Neither | Native frames only: the interpreter's C functions | None |
@@ -254,7 +260,7 @@ It runs inside `malloc`, in the service's process, mostly on threads that do not
 For a Python that `backtrace="python"` refuses. Two things make it work:
 
 - **Perf trampolines** (Python 3.12+). Python gives each function a small piece of generated code, so a native stack shows one frame per Python function, and names that code in `/tmp/perf-<pid>.map`.
-- **A backtrace that walks through them.** The distro's jemalloc uses libgcc's unwinder, which stops at the first trampoline. libunwind walks through, and the hook makes jemalloc use it.
+- **A backtrace that walks through them.** The distro's jemalloc uses libgcc's unwinder, which goes by the unwind tables compiled code comes with. Generated code has none, so it stops at the first trampoline. libunwind walks through, and `backtrace="libunwind"` makes jemalloc use it. `backtrace="frame-pointer"` walks through without it.
 
 ```python
 print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
@@ -286,7 +292,96 @@ It runs inside `malloc` too, and most of what it does is libunwind's to decide. 
 | Use two descriptors nobody gave it | Past a frame without unwind tables, which every trampoline is, libunwind 1.6 checks each address by writing a byte from it into a pipe of its own (`src/x86_64/Ginit.c`). It keeps the pipe's two descriptor numbers for the life of the process, and forked children inherit them. In a program that closes descriptors it did not open, the numbers can come to mean something else. Read in its source and seen in `/proc/PID/fd`. Not seen to go wrong. |
 | Wait on the loader's lock | It asks the loader which library an address is in (`dl_iterate_phdr`), the first time it meets the address |
 
-### The two compared
+### How `backtrace="frame-pointer"` works
+
+x86-64 only.
+
+```python
+print(systing_heap_hooks.install(backtrace="frame-pointer", trampolines=True))
+# {'backtrace': 'frame-pointer', 'trampolines': True, 'reasons': []}
+```
+
+```mermaid
+flowchart LR
+    A["malloc, in numpy<br/>or any other library"] -- "1. unwind tables (libgcc),<br/>as jemalloc's own" --> B["The first<br/>trampoline"]
+    B -- "2. frame pointers" --> C["The interpreter and the<br/>other trampolines"]
+    C --> D["_start"]
+```
+
+The two walks are needed for different code:
+
+| Walk | Gets through | Stops at |
+|---|---|---|
+| **1. Unwind tables** | Compiled code, built with frame pointers or not. Binary Python packages mostly are not: about 1% of the functions in pyarrow's `libarrow` set one up and 6% in numpy's core, against 88% in a `libpython` built with them. | Code without tables: the first trampoline |
+| **2. Frame pointers** | Trampolines, and code built with `-fno-omit-frame-pointer` | Code built without |
+
+**The interpreter must be built with frame pointers** (`-fno-omit-frame-pointer`). Ubuntu 24.04's is. `install()` finds out: it tries the walk under three Python functions of its own, and if any of them is missing from what it captures, the backtrace is not installed and `reasons` says so.
+
+### Where a stack ends early
+
+Once the walk is on frame pointers it stays on them. Where a library built without them calls **back** into Python, one of two things happens:
+
+- **It left the register alone.** The walk goes on, and passes over that library's own frames.
+- **It used the register for something else.** The stack ends there: the inner Python functions are shown and the outer ones are not.
+
+Measured on 6,000 sampled allocations under 3 to 28 Python calls, on three threads, CPython 3.13.15, against a walk that uses unwind tables wherever there are any:
+
+| Allocations made under | Stacks with every Python function |
+|---|---|
+| Plain Python, `pickle`, pyarrow, torch, pydantic, orjson, msgpack, zlib, zstd | 99% to 100% |
+| pandas | 91% |
+| Python called back from C (`sorted(key=…)`, `np.vectorize`, `Series.apply`) | 83% |
+| numpy, whose Python functions are themselves called from its C code | 83% |
+| All | 92% |
+
+No stack had a frame that was not really in it. With frame pointers alone, and no first walk, 67% had every Python function, and under numpy or torch fewer than 1%.
+
+### Safety rules of `backtrace="frame-pointer"`
+
+It runs inside `malloc`, on whatever thread allocated, on top of whatever called `malloc`. The register it starts from holds whatever code built without frame pointers left in it. So:
+
+| Rule | Why it matters |
+|---|---|
+| **Nothing it calls enters the dynamic loader**: no thread-local variable, no `dl*()` function, no function bound at its first call. The exception is libgcc asking which library an address is in, as it does for jemalloc's own backtrace. | `malloc`'s caller can be the loader itself, in the middle of work it is not made to start again. See [the dynamic loader](#a-backtrace-and-the-dynamic-loader). |
+| Where the loader called `malloc`, the second walk is not made | Nothing more is done there than jemalloc's own backtrace does |
+| No frame pointer is dereferenced. The kernel makes every read (`process_vm_readv` on the process itself), 4 KiB of the stack at a time. | A bad address is an error, not a crash. If the call is refused, the backtrace is not installed. |
+| A frame's record is believed only between the last frame the first walk saw and the top of the thread's stack | This is what keeps false frames out |
+| The top is an address known to be above the stack in the same mapping: the thread's control block, or for the process's first stack the random bytes the kernel puts above it. Which mapping that is comes from `/proc/self/maps`, and is remembered under two `pthread` keys. | `/proc` is read at a thread's first sample, and again when the first stack has grown |
+| A stack with neither above it, such as a fiber's or a signal handler's own, is not walked by frame pointers, and nor is that thread from then on | It cannot be vouched for, and looking again at every switch is dear |
+| A record must be 16-byte aligned, whole inside the range, and further up the stack than the last | The walk ends. An aligned value that points into the stack is still believed: no stack in the measurement above had one. |
+| Where `/proc` cannot be read, the thread goes without | Its stacks end where jemalloc's own do |
+| It takes no lock of its own, keeps no descriptor and leaves `errno` as it was | Threads walk side by side, and there is nothing to put right after a fork |
+
+| It can still | When |
+|---|---|
+| Allocate | glibc allocates 512 bytes inside `pthread_setspecific` at a thread's first use of a key past the process's 32nd. jemalloc allows a backtrace to allocate. |
+| Wait on a lock | libgcc takes the loader's lock to look a library up on glibc older than 2.35, and its own where a JIT has registered unwind tables on GCC 12 and older. jemalloc's own backtrace does the same. |
+| Show a frame of a stack that has ended | A stack the program made for itself directly below a thread's, with no guard page between, is in the thread's mapping and so in its range |
+
+The second walk follows jemalloc's own, and the reading of `/proc` is its code: it had a frame-pointer unwinder from 2024 to 2026 (`--enable-prof-frameptr`). `backtrace/frame_pointer.c` says what was kept and what was changed.
+
+### `libunwind` or `frame-pointer`
+
+Both walk through trampolines, and what is said of trampolines above and below holds for both.
+
+| | `backtrace="libunwind"` | `backtrace="frame-pointer"` |
+|---|---|---|
+| Past the first trampoline | Unwind tables wherever there are any, frame pointers elsewhere | Frame pointers only |
+| Python called back from a library built without frame pointers | Every Python function | Often only those inside the callback: 92% of all stacks measured had every Python function |
+| The interpreter | Any | Built with frame pointers. `install()` tries, and refuses one that is not. |
+| Machines | Wherever there is a libunwind. Tested on x86-64. | x86-64 |
+| A sampled allocation at 30 Python frames, on top of jemalloc's own | 10 µs on 3.12, 23 µs on 3.13 | 4.5 µs on 3.12, 9 µs on 3.13 |
+| System calls per sampled allocation | About 39 | About 13 |
+| Threads sampled at the same moment | One at a time | Side by side |
+| Whose code runs inside `malloc` | libunwind's, and libgcc's | libgcc's, which jemalloc's own backtrace runs there anyway |
+| The dynamic loader | libunwind asks it for its thread-local variables at every call. It is not called where the loader called `malloc`. | Nothing in it asks the loader for one |
+| Descriptors | libunwind keeps a pipe open | None kept |
+| A fork | Waits for an unwind in progress | Nothing to wait for |
+| Needs from the environment | `libunwind.so.8` | `process_vm_readv` on itself, and `/proc/self/maps` |
+
+**Which one.** `"frame-pointer"` where `install()` accepts it: it costs less, and it brings nobody else's code into `malloc`. `"libunwind"` for an interpreter built without frame pointers, on another machine, or where the outer Python functions around a callback from numpy or pandas are what is looked for.
+
+### `python` and trampolines compared
 
 **What the stacks show**
 
@@ -387,6 +482,7 @@ sequenceDiagram
 |---|---|---|
 | `"default"` | Nothing | No |
 | `"libunwind"` | libunwind's cache (`tls_cache`, `src/x86_64/Gtrace.c`), at every call. This library loads libunwind with `dlopen()`. | Always |
+| `"frame-pointer"` | Nothing. It came after the fix, and was written not to. | No |
 | `"python"` | The interpreter's thread state (`PyThreadState_GetUnchecked()`), at every call | Where libpython is a shared library that asks the loader, as Ubuntu's `libpython3.12.so.1.0` does. Not where the interpreter is linked into `python3` itself, as in Ubuntu's `/usr/bin/python3.12`, or was built with `-ftls-model=initial-exec`. |
 
 ```bash
@@ -404,7 +500,7 @@ jemalloc keeps a backtrace from being entered twice. It cannot keep one from ent
 But the caller is in the stack. So:
 
 1. `install()` finds where the loader's code is: the executable part of the library `__tls_get_addr` is in.
-2. Each backtrace first has jemalloc's own made, which asks the loader for no thread-local variable.
+2. Each backtrace first has jemalloc's own made, which asks the loader for no thread-local variable. `"frame-pointer"` makes the same walk itself.
 3. If one of its 16 innermost frames is in the loader, that stack is recorded, and nothing else is done (`shh_loader_called_malloc()` in `common/`).
 
 Both libraries are also linked with `-z now`. A function bound at its first call is bound by the loader, from wherever that call is made.
@@ -467,11 +563,13 @@ heap/hooks/
   systing_heap_hooks.py   the Python helper
   Makefile
   common/                 shared: finding jemalloc, fork handling, error texts
-  backtrace/              backtrace.c, python.c, py_offsets.h
+  backtrace/              backtrace.c, python.c, py_offsets.h,
+                          frame_pointer.c, stack_range.c (jemalloc's)
   responder/              responder.c
 ```
 
 - **A backtrace may not enter the dynamic loader where the loader called `malloc`.** No thread-local variable, its own or of a library it calls, no `dl*()` function, no function bound at its first call. What happens otherwise, and how it is held off, is under [the dynamic loader](#a-backtrace-and-the-dynamic-loader). A new backtrace goes into the lists in `tests/in_malloc.rs`.
+- **`backtrace/stack_range.c` is jemalloc's**, under jemalloc's license, which is at the top of the file with what was changed.
 - **The two parts do not call each other.** Each is built from its own folder and `common/`. The one thing that passes between them is the code map: the Python backtrace registers how to ask for it, through `common/`, and the responder hands over what it is given.
 - **`backtrace/py_offsets.h`** holds the CPython struct offsets, by version. It is rendered from systing's pystacks offsets. `cargo test -p systing-heap hook_offsets` fails when the two differ, and rewrites the header when run with `SYSTING_HEAP_UPDATE_OFFSETS=1`.
 - **A new Python minor version** needs its offsets added to systing's pystacks bindings (`scripts/generate_python_bindings.py`) and to `MINORS` in `heap/src/hook_offsets.rs`.
