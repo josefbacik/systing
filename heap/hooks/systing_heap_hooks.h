@@ -3,7 +3,8 @@
  * either without the other:
  *
  *   the backtraces   replace how jemalloc captures a sampled allocation's
- *                    stack (backtrace/): install, prepare, active, python_*
+ *                    stack (backtrace/): install, prepare, active,
+ *                    frame_pointer_check, python_*
  *   the responder    answers requests for a heap dump (responder/):
  *                    listen, socket
  *
@@ -28,28 +29,41 @@
 #define SHH_ERR_SOCKET_PATH 10
 #define SHH_ERR_SOCKET 11
 #define SHH_ERR_LISTEN_HOW 12
+#define SHH_ERR_FP_MACHINE 13
+#define SHH_ERR_FP_KEYS 14
+#define SHH_ERR_FP_READ 15
 
 #include <stddef.h>
 
 /*
  * Make jemalloc capture stacks with `backtrace`: "default" (jemalloc's own),
- * "libunwind", or "python" (jemalloc's own, then the allocating thread's
- * Python frames). Returns SHH_OK, or an SHH_ERR_* code with jemalloc left as
- * it was.
+ * "libunwind", "frame-pointer" (unwind tables as far as they go, then frame
+ * pointers), or "python" (jemalloc's own, then the allocating thread's Python
+ * frames). Returns SHH_OK, or an SHH_ERR_* code with jemalloc left as it was.
  */
 int systing_heap_hooks_install(const char *backtrace);
 
 /*
  * Everything install() does for `backtrace` short of installing it, so
- * "python" can be checked (systing_heap_hooks_python_check) before jemalloc
- * uses it. install() itself checks the interpreter's version and no more:
- * the check against Python's own view of the stack is the caller's, as
- * systing_heap_hooks.py makes it.
+ * "python" and "frame-pointer" can be checked (systing_heap_hooks_python_check,
+ * systing_heap_hooks_frame_pointer_check) before jemalloc uses them. install()
+ * itself checks the interpreter's version and no more: the check against
+ * Python's own view of the stack is the caller's, as systing_heap_hooks.py
+ * makes it.
  */
 int systing_heap_hooks_prepare(const char *backtrace);
 
-/* The backtrace installed: "default", "libunwind" or "python". */
+/* The backtrace installed: "default", "libunwind", "frame-pointer" or "python". */
 const char *systing_heap_hooks_active(void);
+
+/*
+ * The calling thread's stack as the "frame-pointer" backtrace captures it: up
+ * to `max` return addresses in `vec`, innermost first, the first of them in
+ * this function. Returns how many, or a negated SHH_ERR_* code. Whether the
+ * walk gets through the program's code without unwind tables depends on how the
+ * program was built, and this is how a caller finds out.
+ */
+int systing_heap_hooks_frame_pointer_check(void **vec, int max);
 
 /*
  * The calling thread's Python frames as the "python" backtrace reads them,

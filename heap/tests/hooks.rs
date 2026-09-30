@@ -32,7 +32,7 @@ outer()
 const FORK_APP: &str = r#"
 import ctypes, os, sys
 import systing_heap_hooks
-r = systing_heap_hooks.install(backtrace="libunwind", strict=True)
+r = systing_heap_hooks.install(backtrace=sys.argv[2], strict=True)
 if sys.argv[1] == "keep":
     systing_heap_hooks.keep_perf_map_across_fork(strict=True)
 keep = []
@@ -78,6 +78,53 @@ fn setup() -> Option<Env> {
         lib,
         dir,
     })
+}
+
+#[cfg(target_arch = "x86_64")]
+const CAN_HAVE_IT_APP: &str = r#"
+import os
+import systing_heap_hooks
+print(systing_heap_hooks.install(backtrace="frame-pointer")["backtrace"])
+os.unlink(f"/tmp/perf-{os.getpid()}.map")
+"#;
+
+/// `setup()` with a Python the "frame-pointer" backtrace gets through: one
+/// built with frame pointers, which not every one is.
+#[cfg(target_arch = "x86_64")]
+fn setup_with_frame_pointers() -> Option<Env> {
+    let mut env = setup()?;
+    let app = env.dir.path().join("can_have_it_app.py");
+    std::fs::write(&app, CAN_HAVE_IT_APP).unwrap();
+    for (python, minor) in common::pythons() {
+        let out = Command::new(&python)
+            .args(["-W", "ignore"])
+            .arg(&app)
+            .env("LD_PRELOAD", &env.jemalloc)
+            .env(
+                "MALLOC_CONF",
+                format!("prof:true,prof_prefix:{}/jeprof", env.dir.path().display()),
+            )
+            .env("SYSTING_HEAP_HOOKS_LIB", &env.lib)
+            .env("PYTHONPATH", HOOKS)
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&out.stdout).trim() == "frame-pointer" {
+            env.python = python;
+            env.python_minor = minor;
+            return Some(env);
+        }
+    }
+    common::skip("needs a Python 3.12+ built with frame pointers");
+    None
+}
+
+/// `setup()` where there is a libunwind to load.
+fn setup_with_libunwind() -> Option<Env> {
+    if !common::have_libunwind() {
+        common::skip("needs libunwind.so.8");
+        return None;
+    }
+    setup()
 }
 
 /// Run the app with `backtrace`; return what install() reported and the
@@ -175,15 +222,9 @@ fn python_frames(frames: &[String]) -> Vec<&str> {
         .collect()
 }
 
-#[test]
-fn libunwind_hook_keeps_every_python_caller() {
-    let Some(env) = setup() else { return };
-    if !common::have_libunwind() {
-        common::skip("needs libunwind.so.8");
-        return;
-    }
-    let (reported, frames) = run(&env, "libunwind", None);
-    assert_eq!(reported, "libunwind");
+fn keeps_every_python_caller(env: &Env, backtrace: &str) {
+    let (reported, frames) = run(env, backtrace, None);
+    assert_eq!(reported, backtrace);
     assert_eq!(
         python_frames(&frames),
         vec![
@@ -199,6 +240,23 @@ fn libunwind_hook_keeps_every_python_caller() {
         frames.last().unwrap().contains("libjemalloc"),
         "{frames:#?}"
     );
+}
+
+#[test]
+fn libunwind_hook_keeps_every_python_caller() {
+    let Some(env) = setup_with_libunwind() else {
+        return;
+    };
+    keeps_every_python_caller(&env, "libunwind");
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn the_frame_pointer_backtrace_keeps_every_python_caller() {
+    let Some(env) = setup_with_frame_pointers() else {
+        return;
+    };
+    keeps_every_python_caller(&env, "frame-pointer");
 }
 
 #[test]
@@ -225,14 +283,85 @@ fn without_libunwind_install_falls_back_to_the_default() {
     );
 }
 
+#[test]
+fn a_backtrace_there_is_not_falls_back_to_the_default() {
+    let Some(env) = setup() else { return };
+    let (reported, frames) = run(&env, "no-such", None);
+    assert_eq!(
+        reported,
+        "default unknown backtrace (expected \"default\", \"libunwind\", \"frame-pointer\" or \"python\")"
+    );
+    assert_eq!(
+        python_frames(&frames),
+        vec!["leak_in_python (python) [app.py]"],
+        "{frames:#?}"
+    );
+}
+
+#[test]
+#[cfg(not(target_arch = "x86_64"))]
+fn the_frame_pointer_backtrace_says_which_machines_it_is_for() {
+    let Some(env) = setup() else { return };
+    let (reported, _) = run(&env, "frame-pointer", None);
+    assert_eq!(
+        reported,
+        "default the frame-pointer backtrace is for x86-64 only"
+    );
+}
+
+// Whether the walk gets through is told by Python's perf map. With the map
+// gone it cannot be told: the backtrace is not installed, and the result says
+// why.
+#[cfg(target_arch = "x86_64")]
+const UNTOLD_APP: &str = r#"
+import os, sys
+import systing_heap_hooks
+sys.activate_stack_trampoline("perf")
+os.unlink(f"/tmp/perf-{os.getpid()}.map")
+r = systing_heap_hooks.install(backtrace="frame-pointer")
+print(r["backtrace"], ";".join(r["reasons"]))
+"#;
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn a_walk_that_is_not_seen_to_get_through_is_not_installed() {
+    let Some(env) = setup() else { return };
+    std::fs::write(env.dir.path().join("untold_app.py"), UNTOLD_APP).unwrap();
+    let out = Command::new(&env.python)
+        .args(["-W", "ignore"])
+        .arg(env.dir.path().join("untold_app.py"))
+        .env("LD_PRELOAD", &env.jemalloc)
+        .env(
+            "MALLOC_CONF",
+            format!("prof:true,prof_prefix:{}/jeprof", env.dir.path().display()),
+        )
+        .env("SYSTING_HEAP_HOOKS_LIB", &env.lib)
+        .env("PYTHONPATH", HOOKS)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reported = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        reported.starts_with(
+            "default frame pointers: whether the walk gets through Python's trampolines cannot be told"
+        ),
+        "{reported}"
+    );
+}
+
 /// Run the pre-fork app; return the Python frames of the worker's largest
 /// stack.
-fn run_fork(env: &Env, mode: &str) -> Vec<String> {
+fn run_fork(env: &Env, mode: &str, backtrace: &str) -> Vec<String> {
     let dumps = env.dir.path().join(format!("fork-{mode}"));
     std::fs::create_dir(&dumps).unwrap();
     let out = Command::new(&env.python)
         .arg(env.dir.path().join("fork_app.py"))
         .arg(mode)
+        .arg(backtrace)
         .env("LD_PRELOAD", &env.jemalloc)
         .env(
             "MALLOC_CONF",
@@ -291,13 +420,7 @@ fn run_fork(env: &Env, mode: &str) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn a_forked_worker_names_the_frames_it_inherited() {
-    let Some(env) = setup() else { return };
-    if !common::have_libunwind() {
-        common::skip("needs libunwind.so.8");
-        return;
-    }
+fn names_the_frames_it_inherited(env: &Env, backtrace: &str) {
     // The CPython API it rests on is 3.13's; not a missing dependency.
     if env.python_minor < 13 {
         eprintln!("skipped: keep_perf_map_across_fork needs Python 3.13+");
@@ -306,11 +429,11 @@ fn a_forked_worker_names_the_frames_it_inherited() {
     // Without it, the worker's map starts empty: serve(), entered in the
     // parent, has no name there.
     assert_eq!(
-        run_fork(&env, "plain"),
+        run_fork(env, "plain", backtrace),
         vec!["leak_in_worker (python) [fork_app.py]"]
     );
     assert_eq!(
-        run_fork(&env, "keep"),
+        run_fork(env, "keep", backtrace),
         vec![
             "serve (python) [fork_app.py]",
             "leak_in_worker (python) [fork_app.py]"
@@ -318,8 +441,26 @@ fn a_forked_worker_names_the_frames_it_inherited() {
     );
 }
 
+#[test]
+fn a_forked_worker_names_the_frames_it_inherited() {
+    let Some(env) = setup_with_libunwind() else {
+        return;
+    };
+    names_the_frames_it_inherited(&env, "libunwind");
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn a_forked_worker_names_the_frames_it_inherited_by_frame_pointers() {
+    let Some(env) = setup_with_frame_pointers() else {
+        return;
+    };
+    names_the_frames_it_inherited(&env, "frame-pointer");
+}
+
 // A library whose fork handlers allocate, registered before install(): its
-// handlers run while the forking thread holds the hook's unwind lock.
+// handlers run inside fork(), where the library's own have run already, and with
+// "libunwind" while the forking thread holds the hook's unwind lock.
 const ALLOCATING_ATFORK_C: &str = r#"
 #include <pthread.h>
 #include <stdlib.h>
@@ -332,20 +473,15 @@ const ALLOCATING_ATFORK_APP: &str = r#"
 import ctypes, os, sys
 ctypes.CDLL(sys.argv[1])
 import systing_heap_hooks
-systing_heap_hooks.install(backtrace="libunwind", strict=True)
+systing_heap_hooks.install(backtrace=sys.argv[2], strict=True)
 pid = os.fork()
+os.unlink(f"/tmp/perf-{os.getpid()}.map")
 if pid == 0:
     os._exit(0)
 os.waitpid(pid, 0)
 "#;
 
-#[test]
-fn a_fork_with_allocating_fork_handlers_does_not_hang() {
-    let Some(env) = setup() else { return };
-    if !common::have_libunwind() {
-        common::skip("needs libunwind.so.8");
-        return;
-    }
+fn a_fork_does_not_hang(env: &Env, backtrace: &str) {
     let dir = env.dir.path();
     let lib = dir.join("liballocating_atfork.so");
     let src = dir.join("allocating_atfork.c");
@@ -365,6 +501,7 @@ fn a_fork_with_allocating_fork_handlers_does_not_hang() {
     let mut child = Command::new(&env.python)
         .arg(dir.join("atfork_app.py"))
         .arg(&lib)
+        .arg(backtrace)
         .env("LD_PRELOAD", &env.jemalloc)
         .env(
             "MALLOC_CONF",
@@ -386,8 +523,25 @@ fn a_fork_with_allocating_fork_handlers_does_not_hang() {
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("the fork hung: a fork handler's sampled allocation waited on the unwind lock");
+            panic!("the fork hung on a fork handler's sampled allocation");
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+#[test]
+fn a_fork_with_allocating_fork_handlers_does_not_hang() {
+    let Some(env) = setup_with_libunwind() else {
+        return;
+    };
+    a_fork_does_not_hang(&env, "libunwind");
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn a_fork_with_allocating_fork_handlers_does_not_hang_on_frame_pointers() {
+    let Some(env) = setup_with_frame_pointers() else {
+        return;
+    };
+    a_fork_does_not_hang(&env, "frame-pointer");
 }

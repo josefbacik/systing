@@ -208,6 +208,8 @@ Two things differ from a native service:
 - **`PYTHONMALLOC=malloc`.** Python serves small objects from its own pools, which jemalloc never sees. For 400,000 small dicts on CPython 3.13, jemalloc's own count of allocated bytes grew by 3.4 MB without this setting and by 118.5 MB with it.
 - **Two calls at startup**, so the stacks show Python functions. Without them you get the interpreter's C functions (`_PyEval_EvalFrameDefault`) where your code ran.
 
+**Rebuild a library taken from systing 1.26.0 or earlier.** Its backtraces could, rarely, corrupt the service's heap: [what happened, and who is exposed](../heap/hooks/README.md#a-backtrace-and-the-dynamic-loader).
+
 ```yaml
 env:
   - name: LD_PRELOAD
@@ -569,6 +571,8 @@ For example a Rust service using the `tikv-jemallocator` crate.
 ```python
 systing_heap_hooks.install(backtrace="libunwind")
 ```
+
+`backtrace="frame-pointer"` walks through the trampolines without libunwind, at less than half the cost for a sampled allocation. It is for x86-64 and an interpreter built with frame pointers, as Ubuntu 24.04's is. `install()` tries the walk first: on an interpreter it does not get through, it is not installed, and the result says why. Where a library built without frame pointers calls back into Python, it often shows only the Python functions inside the callback.
 
 Python then writes `/tmp/perf-<pid>.map`. Keep it with the dumps. The full comparison is in [`heap/hooks/README.md`](../heap/hooks/README.md).
 

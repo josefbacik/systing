@@ -7,12 +7,16 @@
  * the "experimental.hooks.prof_backtrace" mallctl. The distro jemalloc
  * captures stacks with libgcc's unwinder, which stops at code without unwind
  * tables, such as Python's perf trampolines (-X perf, PYTHONPERFSUPPORT=1).
- * libunwind falls back to frame pointers there and walks the whole stack.
+ * libunwind falls back to frame pointers there and walks the whole stack, and
+ * so does a walk of this library's own.
  *
  * Backtraces:
  *   "default"    jemalloc's own (restores it if another was installed)
  *   "libunwind"  unw_backtrace() from libunwind.so.8, loaded at runtime so
- *                this library loads on machines without it
+ *                this library loads on machines without it. jemalloc's own
+ *                where the dynamic loader called malloc
+ *   "frame-pointer"  libgcc's unwinder as far as it goes, then frame pointers
+ *                (frame_pointer.c)
  *   "python"     jemalloc's own, then the allocating thread's Python frames
  *                read from the interpreter (python.c)
  *
@@ -20,6 +24,7 @@
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -27,6 +32,7 @@
 
 #include "../common/common.h"
 #include "../systing_heap_hooks.h"
+#include "frame_pointer.h"
 #include "python.h"
 
 typedef shh_mallctl_fn mallctl_fn;
@@ -49,12 +55,6 @@ static const char *active = "default";
 
 static void libunwind_backtrace(void **vec, unsigned *len, unsigned max_len)
 {
-	/*
-	 * Unwind into jemalloc's own array (no buffer of ours on the stack
-	 * inside malloc), then drop this function's frame so jemalloc's stacks
-	 * start where its own backends' do. At full depth that costs the
-	 * outermost frame.
-	 */
 	/* jemalloc holds none of its locks here and never calls this
 	 * reentrantly; the one thread that may already hold unwind_lock is
 	 * the one forking, which records no stack instead. */
@@ -62,9 +62,43 @@ static void libunwind_backtrace(void **vec, unsigned *len, unsigned max_len)
 		*len = 0;
 		return;
 	}
+	/* malloc that succeeds is expected to leave errno alone, and libunwind
+	 * changes it where it checks an address before reading it. */
+	int saved_errno = errno;
+	/*
+	 * libunwind keeps a cache per thread in thread-local variables. It is
+	 * loaded with dlopen(), so it reads them through the dynamic loader,
+	 * which must not happen where the loader is what called malloc
+	 * (../common/common.h). Only a stack can tell, so jemalloc's own
+	 * backtrace goes first, and where the loader is in it, it is the stack
+	 * that is recorded: less this function's frame, which is the one below
+	 * the address this function returns to.
+	 */
+	*len = 0;
+	jemalloc_default(vec, len, max_len);
+	unsigned own = *len > max_len ? max_len : *len;
+	if (shh_loader_called_malloc(vec, own)) {
+		for (unsigned i = 1; i < own && i < 4; i++) {
+			if (vec[i] == __builtin_return_address(0)) {
+				memmove(vec + i - 1, vec + i, (own - i) * sizeof(*vec));
+				own--;
+				break;
+			}
+		}
+		*len = own;
+		errno = saved_errno;
+		return;
+	}
+	/*
+	 * Unwind into jemalloc's own array (no buffer of ours on the stack
+	 * inside malloc), then drop this function's frame so jemalloc's stacks
+	 * start where its own backends' do. At full depth that costs the
+	 * outermost frame.
+	 */
 	pthread_mutex_lock(&unwind_lock);
 	int n = unw_backtrace_p(vec, (int)max_len);
 	pthread_mutex_unlock(&unwind_lock);
+	errno = saved_errno;
 	if (n <= 1) {
 		*len = 0;
 		return;
@@ -175,8 +209,9 @@ static int install_locked(const char *backtrace, bool install)
 		return SHH_ERR_UNKNOWN_BACKTRACE;
 	bool want_default = strcmp(backtrace, "default") == 0;
 	bool want_libunwind = strcmp(backtrace, "libunwind") == 0;
+	bool want_frame_pointer = strcmp(backtrace, "frame-pointer") == 0;
 	bool want_python = strcmp(backtrace, "python") == 0;
-	if (!want_default && !want_libunwind && !want_python)
+	if (!want_default && !want_libunwind && !want_frame_pointer && !want_python)
 		return SHH_ERR_UNKNOWN_BACKTRACE;
 
 	if (!mallctl_p)
@@ -189,6 +224,7 @@ static int install_locked(const char *backtrace, bool install)
 	if (mallctl_p("opt.prof", &prof, &prof_len, NULL, 0) != 0 || !prof)
 		return SHH_ERR_PROF_OFF;
 
+	shh_find_loader();
 	if (want_python) {
 		int rc = find_default();
 		if (rc == SHH_OK)
@@ -197,6 +233,14 @@ static int install_locked(const char *backtrace, bool install)
 			rc = set_hook(systing_heap_hooks_python_backtrace);
 		if (rc == SHH_OK && install)
 			active = "python";
+		return rc;
+	}
+	if (want_frame_pointer) {
+		int rc = shh_frame_pointer_prepare();
+		if (rc == SHH_OK && install)
+			rc = set_hook(shh_frame_pointer_backtrace);
+		if (rc == SHH_OK && install)
+			active = "frame-pointer";
 		return rc;
 	}
 	if (!install)
@@ -212,7 +256,11 @@ static int install_locked(const char *backtrace, bool install)
 		return SHH_OK;
 	}
 
-	int rc = load_libunwind();
+	/* jemalloc's own is known before the hook that calls it can run. */
+	int rc = find_default();
+	if (rc != SHH_OK)
+		return rc;
+	rc = load_libunwind();
 	if (rc != SHH_OK)
 		return rc;
 	rc = set_hook(libunwind_backtrace);
@@ -220,6 +268,22 @@ static int install_locked(const char *backtrace, bool install)
 		return rc;
 	active = "libunwind";
 	return SHH_OK;
+}
+
+int systing_heap_hooks_frame_pointer_check(void **vec, int max)
+{
+	unsigned n = 0;
+	if (max <= 0)
+		return 0;
+	shh_at_fork(&fork_part);
+	pthread_mutex_lock(&install_lock);
+	shh_find_loader();
+	int rc = shh_frame_pointer_prepare();
+	pthread_mutex_unlock(&install_lock);
+	if (rc != SHH_OK)
+		return -rc;
+	shh_frame_pointer_backtrace(vec, &n, (unsigned)max);
+	return (int)n;
 }
 
 const char *systing_heap_hooks_active(void)

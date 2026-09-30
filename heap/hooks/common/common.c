@@ -7,8 +7,10 @@
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <link.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 
 #include "../systing_heap_hooks.h"
 #include "common.h"
@@ -48,6 +50,45 @@ shh_mallctl_fn shh_find_mallctl(void)
 			return (shh_mallctl_fn)p;
 	}
 	return NULL;
+}
+
+/* The loader's code: [loader_start, loader_end), or nothing. Written under the
+ * lock of whoever installs a backtrace, before the backtrace is installed. */
+static uintptr_t loader_start, loader_end;
+/* How far in the loader is looked for. jemalloc's own frames are 3 to 6. */
+#define INNERMOST 16
+
+static int code_around(struct dl_phdr_info *info, size_t size, void *arg)
+{
+	(void)size;
+	uintptr_t address = *(uintptr_t *)arg;
+	for (int i = 0; i < info->dlpi_phnum; i++) {
+		const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+		uintptr_t start = info->dlpi_addr + ph->p_vaddr;
+		if (ph->p_type == PT_LOAD && (ph->p_flags & PF_X) &&
+		    address >= start && address - start < ph->p_memsz) {
+			loader_start = start;
+			loader_end = start + ph->p_memsz;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+void shh_find_loader(void)
+{
+	/* By name, so that this library does not itself depend on it. */
+	uintptr_t in_the_loader = (uintptr_t)dlsym(RTLD_DEFAULT, "__tls_get_addr");
+	if (in_the_loader && !loader_end)
+		dl_iterate_phdr(code_around, &in_the_loader);
+}
+
+int shh_loader_called_malloc(void *const *vec, unsigned n)
+{
+	for (unsigned i = 0; i < n && i < INNERMOST; i++)
+		if ((uintptr_t)vec[i] >= loader_start && (uintptr_t)vec[i] < loader_end)
+			return 1;
+	return 0;
 }
 
 int shh_forking_here(void)
@@ -120,7 +161,7 @@ const char *systing_heap_hooks_strerror(int code)
 	case SHH_OK:
 		return "ok";
 	case SHH_ERR_UNKNOWN_BACKTRACE:
-		return "unknown backtrace (expected \"default\", \"libunwind\" or \"python\")";
+		return "unknown backtrace (expected \"default\", \"libunwind\", \"frame-pointer\" or \"python\")";
 	case SHH_ERR_NO_JEMALLOC:
 		return "jemalloc is not this process's allocator (no mallctl)";
 	case SHH_ERR_PROF_OFF:
@@ -129,6 +170,12 @@ const char *systing_heap_hooks_strerror(int code)
 		return "this jemalloc has no prof_backtrace hook (needs >= 5.3)";
 	case SHH_ERR_NO_LIBUNWIND:
 		return "libunwind.so.8 not found";
+	case SHH_ERR_FP_MACHINE:
+		return "the frame-pointer backtrace is for x86-64 only";
+	case SHH_ERR_FP_KEYS:
+		return "frame pointers: the process has no pthread key left";
+	case SHH_ERR_FP_READ:
+		return "frame pointers: no protected way to read memory (process_vm_readv on the process itself is refused)";
 	case SHH_ERR_NO_PYTHON:
 		return "no Python interpreter in this process (its symbols are not exported)";
 	case SHH_ERR_PY_VERSION:
