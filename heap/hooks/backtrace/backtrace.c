@@ -7,13 +7,16 @@
  * the "experimental.hooks.prof_backtrace" mallctl. The distro jemalloc
  * captures stacks with libgcc's unwinder, which stops at code without unwind
  * tables, such as Python's perf trampolines (-X perf, PYTHONPERFSUPPORT=1).
- * libunwind falls back to frame pointers there and walks the whole stack.
+ * libunwind falls back to frame pointers there and walks the whole stack, and
+ * so does a walk of this library's own.
  *
  * Backtraces:
  *   "default"    jemalloc's own (restores it if another was installed)
  *   "libunwind"  unw_backtrace() from libunwind.so.8, loaded at runtime so
  *                this library loads on machines without it. jemalloc's own
  *                where the dynamic loader called malloc
+ *   "frame-pointer"  libgcc's unwinder as far as it goes, then frame pointers
+ *                (frame_pointer.c)
  *   "python"     jemalloc's own, then the allocating thread's Python frames
  *                read from the interpreter (python.c)
  *
@@ -29,6 +32,7 @@
 
 #include "../common/common.h"
 #include "../systing_heap_hooks.h"
+#include "frame_pointer.h"
 #include "python.h"
 
 typedef shh_mallctl_fn mallctl_fn;
@@ -205,8 +209,9 @@ static int install_locked(const char *backtrace, bool install)
 		return SHH_ERR_UNKNOWN_BACKTRACE;
 	bool want_default = strcmp(backtrace, "default") == 0;
 	bool want_libunwind = strcmp(backtrace, "libunwind") == 0;
+	bool want_frame_pointer = strcmp(backtrace, "frame-pointer") == 0;
 	bool want_python = strcmp(backtrace, "python") == 0;
-	if (!want_default && !want_libunwind && !want_python)
+	if (!want_default && !want_libunwind && !want_frame_pointer && !want_python)
 		return SHH_ERR_UNKNOWN_BACKTRACE;
 
 	if (!mallctl_p)
@@ -228,6 +233,14 @@ static int install_locked(const char *backtrace, bool install)
 			rc = set_hook(systing_heap_hooks_python_backtrace);
 		if (rc == SHH_OK && install)
 			active = "python";
+		return rc;
+	}
+	if (want_frame_pointer) {
+		int rc = shh_frame_pointer_prepare();
+		if (rc == SHH_OK && install)
+			rc = set_hook(shh_frame_pointer_backtrace);
+		if (rc == SHH_OK && install)
+			active = "frame-pointer";
 		return rc;
 	}
 	if (!install)
@@ -255,6 +268,22 @@ static int install_locked(const char *backtrace, bool install)
 		return rc;
 	active = "libunwind";
 	return SHH_OK;
+}
+
+int systing_heap_hooks_frame_pointer_check(void **vec, int max)
+{
+	unsigned n = 0;
+	if (max <= 0)
+		return 0;
+	shh_at_fork(&fork_part);
+	pthread_mutex_lock(&install_lock);
+	shh_find_loader();
+	int rc = shh_frame_pointer_prepare();
+	pthread_mutex_unlock(&install_lock);
+	if (rc != SHH_OK)
+		return -rc;
+	shh_frame_pointer_backtrace(vec, &n, (unsigned)max);
+	return (int)n;
 }
 
 const char *systing_heap_hooks_active(void)

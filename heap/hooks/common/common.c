@@ -161,7 +161,7 @@ const char *systing_heap_hooks_strerror(int code)
 	case SHH_OK:
 		return "ok";
 	case SHH_ERR_UNKNOWN_BACKTRACE:
-		return "unknown backtrace (expected \"default\", \"libunwind\" or \"python\")";
+		return "unknown backtrace (expected \"default\", \"libunwind\", \"frame-pointer\" or \"python\")";
 	case SHH_ERR_NO_JEMALLOC:
 		return "jemalloc is not this process's allocator (no mallctl)";
 	case SHH_ERR_PROF_OFF:
@@ -170,6 +170,12 @@ const char *systing_heap_hooks_strerror(int code)
 		return "this jemalloc has no prof_backtrace hook (needs >= 5.3)";
 	case SHH_ERR_NO_LIBUNWIND:
 		return "libunwind.so.8 not found";
+	case SHH_ERR_FP_MACHINE:
+		return "the frame-pointer backtrace is for x86-64 only";
+	case SHH_ERR_FP_KEYS:
+		return "frame pointers: the process has no pthread key left";
+	case SHH_ERR_FP_READ:
+		return "frame pointers: no protected way to read memory (process_vm_readv on the process itself is refused)";
 	case SHH_ERR_NO_PYTHON:
 		return "no Python interpreter in this process (its symbols are not exported)";
 	case SHH_ERR_PY_VERSION:

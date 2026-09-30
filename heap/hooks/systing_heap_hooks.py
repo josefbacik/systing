@@ -1,11 +1,12 @@
 """Choose how jemalloc captures heap-snapshot stacks in this Python process.
 
 Nothing changes until install() is called. Then, for jemalloc's sampled
-allocations (MALLOC_CONF=prof:true,...), either of:
+allocations (MALLOC_CONF=prof:true,...), one of:
 
     import systing_heap_hooks
     systing_heap_hooks.install(backtrace="python")
     systing_heap_hooks.install(backtrace="libunwind", trampolines=True)
+    systing_heap_hooks.install(backtrace="frame-pointer", trampolines=True)
 
 backtrace="python" adds the allocating thread's Python frames to jemalloc's
 own native stack, read from the interpreter when an allocation is sampled
@@ -19,9 +20,12 @@ trampolines=True turns on Python's perf trampolines (3.12+), so each Python
 function gets its own native frame and systing-heap can name it from
 /tmp/perf-<pid>.map. backtrace="libunwind" makes jemalloc capture stacks
 with libunwind, which walks through those frames; jemalloc's default
-(libgcc) stops at the first one. backtrace="default" leaves or puts back
-jemalloc's own. Trampolines are on unless the backtrace is "python", which
-has no use for them.
+(libgcc) stops at the first one. backtrace="frame-pointer" walks through them
+by frame pointers, without libunwind. The interpreter has to be built with
+them: before it is installed it is tried on this thread's stack, and if it does
+not get through, it is not installed. backtrace="default" leaves or puts back
+jemalloc's own. Trampolines are on unless the backtrace is "python", which has
+no use for them.
 
 What cannot be done is skipped with a warning, and the result says what is
 active, so one call works on machines with and without libunwind8:
@@ -84,6 +88,7 @@ def _load(path):
             ("install", ctypes.c_int, [ctypes.c_char_p]),
             ("active", ctypes.c_char_p, []),
             ("prepare", ctypes.c_int, [ctypes.c_char_p]),
+            ("frame_pointer_check", ctypes.c_int, [ctypes.c_void_p, ctypes.c_int]),
             ("python_check", ctypes.c_int, [ctypes.c_char_p, ctypes.c_size_t]),
             ("python_map", ctypes.c_char_p, []),
             ("python_stop", None, []),
@@ -214,6 +219,96 @@ def _install_python(hooks):
     return None
 
 
+def _trampolines_active():
+    return getattr(sys, "is_stack_trampoline_active", lambda: False)()
+
+
+def _walk_stops(hooks):
+    """Try the "frame-pointer" backtrace under three Python functions, whose
+    trampolines must all be in what it captures, in their order. Return why it
+    cannot be relied on here, or None."""
+    vec = (ctypes.c_void_p * 256)()
+
+    def inner():
+        return hooks.systing_heap_hooks_frame_pointer_check(vec, len(vec))
+
+    def middle():
+        return inner()
+
+    def outer():
+        return middle()
+
+    n = outer()
+    if n < 0:
+        return hooks.systing_heap_hooks_strerror(-n).decode()
+    # Where Python put each one's trampoline is in the map it writes for perf,
+    # a line at the function's first call: "<start> <size> py::<name>:<file>".
+    # An earlier process of this pid may have left lines of its own: the last
+    # one for a name is this process's.
+    path = f"/tmp/perf-{os.getpid()}.map"
+    names = {f"py::{f.__code__.co_qualname}:": f.__name__ for f in (inner, middle, outer)}
+    where = {}
+    try:
+        with open(path, errors="replace") as perf_map:
+            for line in perf_map:
+                fields = line.split(" ", 2)
+                name = len(fields) == 3 and next(
+                    (names[n] for n in names if fields[2].startswith(n)), None
+                )
+                if name:
+                    try:
+                        start = int(fields[0], 16)
+                        where[name] = range(start, start + int(fields[1], 16))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    if len(where) < len(names):
+        return (
+            "frame pointers: whether the walk gets through Python's trampolines "
+            f"cannot be told, since {path} does not say where they are"
+        )
+    after = 0
+    for name in ("inner", "middle", "outer"):
+        at = next((i for i in range(after, n) if vec[i] in where[name]), None)
+        if at is None:
+            return (
+                "frame pointers: the walk does not get through Python's trampolines "
+                "(an interpreter built without -fno-omit-frame-pointer)"
+            )
+        after = at + 1
+    return None
+
+
+_walk_tried = False
+
+
+def _install_frame_pointer(hooks):
+    """Install the "frame-pointer" backtrace once it gets through this
+    interpreter's trampolines; return why not, or None."""
+    global _walk_tried
+    installed = hooks.systing_heap_hooks_active() == b"frame-pointer"
+    # Without trampolines there is nothing of Python's to get through.
+    to_try = _trampolines_active() and not _walk_tried
+    if not installed:
+        rc = hooks.systing_heap_hooks_prepare(b"frame-pointer")
+        if rc != 0:
+            return hooks.systing_heap_hooks_strerror(rc).decode()
+    if to_try:
+        why = _walk_stops(hooks)
+        if why is not None:
+            if installed:
+                # Installed before there were trampolines to try it on.
+                hooks.systing_heap_hooks_install(b"default")
+            return why
+        _walk_tried = True
+    if not installed:
+        rc = hooks.systing_heap_hooks_install(b"frame-pointer")
+        if rc != 0:
+            return hooks.systing_heap_hooks_strerror(rc).decode()
+    return None
+
+
 def _enable_trampolines():
     """Turn on perf trampolines; return why not, or None."""
     if sys.platform != "linux" or not hasattr(sys, "activate_stack_trampoline"):
@@ -227,19 +322,16 @@ def _enable_trampolines():
 
 
 def install(backtrace="libunwind", trampolines=None, strict=False, lib=None):
-    """Install `backtrace` ("python", "libunwind" or "default") and, with
-    `trampolines`, Python's perf trampolines (on by default unless the
-    backtrace is "python"). Returns what is active."""
+    """Install `backtrace` ("python", "libunwind", "frame-pointer" or
+    "default") and, with `trampolines`, Python's perf trampolines (on by default
+    unless the backtrace is "python"). Returns what is active."""
     reasons = []
-    active_trampolines = False
 
     if trampolines is None:
         trampolines = backtrace != "python"
     if trampolines:
         why = _enable_trampolines()
-        if why is None:
-            active_trampolines = True
-        else:
+        if why is not None:
             reasons.append(why)
 
     hooks = None
@@ -258,6 +350,10 @@ def install(backtrace="libunwind", trampolines=None, strict=False, lib=None):
             why = _install_python(hooks)
             if why is not None:
                 reasons.append(why)
+        elif backtrace == "frame-pointer":
+            why = _install_frame_pointer(hooks)
+            if why is not None:
+                reasons.append(why)
         else:
             rc = hooks.systing_heap_hooks_install(backtrace.encode())
             if rc != 0:
@@ -266,7 +362,8 @@ def install(backtrace="libunwind", trampolines=None, strict=False, lib=None):
 
     result = {
         "backtrace": active_backtrace,
-        "trampolines": active_trampolines,
+        # Whoever turned them on: PYTHONPERFSUPPORT=1 does too.
+        "trampolines": _trampolines_active(),
         "reasons": reasons,
     }
     if reasons:

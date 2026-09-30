@@ -287,7 +287,11 @@ fn no_backtrace_of_a_native_program_enters_the_loader() {
         return;
     }
     let hooks = env.dir.path().join("libsysting_heap_hooks.so");
-    for backtrace in ["default", "libunwind"] {
+    let mut backtraces = vec!["default", "libunwind"];
+    if cfg!(target_arch = "x86_64") {
+        backtraces.push("frame-pointer");
+    }
+    for backtrace in backtraces {
         let out = native(&env, &hooks, backtrace);
         assert!(
             out.status.success(),
@@ -363,11 +367,22 @@ fn what_the_loader_allocates_has_the_stack_jemalloc_gives_it() {
     assert!(of_the_loader > 0, "no allocation of the loader's is live");
 }
 
+/// Not every interpreter and machine can have "frame-pointer", which is
+/// hooks.rs's to look into.
+fn cannot_have_it(backtrace: &str, said: &str) -> bool {
+    let refused =
+        backtrace == "frame-pointer" && said.contains("RuntimeError: systing_heap_hooks: ");
+    if refused {
+        eprintln!("{}", said.lines().last().unwrap());
+    }
+    refused
+}
+
 /// Run the Python program with `python` under each backtrace it can have.
 fn python_program(env: &Env, python: &Path) {
     let app = env.dir.path().join("loads_libraries.py");
     std::fs::write(&app, LOADS_LIBRARIES_PY).unwrap();
-    for backtrace in ["default", "python", "libunwind"] {
+    for backtrace in ["default", "python", "libunwind", "frame-pointer"] {
         let mut child = Command::new(python);
         child
             .arg(&app)
@@ -380,12 +395,15 @@ fn python_program(env: &Env, python: &Path) {
             )
             .env("PYTHONPATH", HOOKS);
         let out = sampled(env, &mut child);
+        let said = String::from_utf8_lossy(&out.stderr);
+        if cannot_have_it(backtrace, &said) {
+            continue;
+        }
         assert!(
             out.status.success(),
-            "{} with {backtrace}: {}: {}",
+            "{} with {backtrace}: {}: {said}",
             python.display(),
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
+            out.status
         );
     }
 }
@@ -478,7 +496,7 @@ fn a_sampled_malloc_leaves_errno_as_it_was() {
     let lib = cc(env.dir.path(), "errno_after_malloc", ERRNO_C, true);
     let app = env.dir.path().join("errno.py");
     std::fs::write(&app, ERRNO_PY).unwrap();
-    for backtrace in ["default", "python", "libunwind"] {
+    for backtrace in ["default", "python", "libunwind", "frame-pointer"] {
         let mut child = Command::new(&python);
         child
             .arg(&app)
@@ -490,12 +508,11 @@ fn a_sampled_malloc_leaves_errno_as_it_was() {
             )
             .env("PYTHONPATH", HOOKS);
         let out = sampled_with(&env, &mut child, ",prof_active:false");
-        assert!(
-            out.status.success(),
-            "{backtrace}: {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let said = String::from_utf8_lossy(&out.stderr);
+        if cannot_have_it(backtrace, &said) {
+            continue;
+        }
+        assert!(out.status.success(), "{backtrace}: {}: {said}", out.status);
     }
 }
 
