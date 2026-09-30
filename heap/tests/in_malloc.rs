@@ -184,6 +184,10 @@ int main(int argc, char **argv)
     void *hooks = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!hooks || ((int (*)(const char *))dlsym(hooks, "systing_heap_hooks_install"))(argv[2]) != 0)
         return 2;
+    // The libunwind a test asked for is the one in use.
+    const char *libunwind = getenv("SYSTING_HEAP_HOOKS_LIBUNWIND");
+    if (libunwind && argv[2][0] && !dlopen(libunwind, RTLD_NOW | RTLD_NOLOAD))
+        return 3;
     int libraries = atoi(argv[4]);
     if (load(argv[3], 0, libraries / 2) != 0)
         return 2;
@@ -218,6 +222,40 @@ int unw_backtrace(void **vec, int max)
     cache = vec;
     vec[0] = vec[1] = (void *)unw_backtrace;
     return 2;
+}
+"#;
+
+// The look at the stack, given a stack made up for it. It follows an #include of
+// caller.c.
+const LOOKS_AT_C: &str = r#"
+#include <string.h>
+static uintptr_t stack[8];
+static ssize_t made_up(void *dst, uintptr_t src, size_t len)
+{
+    (void)src;
+    memset(dst, 0, len);
+    memcpy(dst, stack, sizeof stack);
+    return (ssize_t)len;
+}
+static int seen(uintptr_t word)
+{
+    stack[3] = word;
+    return shh_loader_called_malloc(stack, made_up);
+}
+int main(void)
+{
+    if (shh_find_loader() != SHH_OK)
+        return 2;
+    uintptr_t in_the_loader = loader_start + 16;
+    if (seen(0) || seen(loader_start - 8) || seen(loader_start + loader_size))
+        return 3;
+    if (!seen(in_the_loader))
+        return 4;
+    // Signed: any of the bits above those of an address.
+    for (int bit = 63; ((uintptr_t)1 << bit) > loader_start + loader_size; bit--)
+        if (!seen(in_the_loader | (uintptr_t)1 << bit))
+            return 5;
+    return seen(in_the_loader | ~loader_bits) ? 0 : 6;
 }
 "#;
 
@@ -957,6 +995,18 @@ fn libunwind_does_not_wait_for_libgcc() {
         Some(status) => assert!(status.success(), "{status}"),
         None => panic!("waits for a lock its own thread holds"),
     }
+}
+
+/// On arm64 a saved return address may be signed, in the bits above those of an
+/// address. It is the loader's all the same.
+#[test]
+fn the_loader_is_seen_in_a_signed_return_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = format!("#include \"{HOOKS}/backtrace/caller.c\"\n{LOOKS_AT_C}");
+    let out = Command::new(cc(dir.path(), "looks_at", &source, false))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", out.status);
 }
 
 /// A backtrace that could not tell whether the loader called malloc is not

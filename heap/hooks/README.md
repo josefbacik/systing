@@ -420,7 +420,7 @@ readelf -rW libpython3.13.so.1.0 | grep -E 'DTPMOD|TLSDESC'    # no output: not 
 
 **Which glibc.** 2.39 and later, and any older one that was given the change below. Up to 2.38 a read brought the table up only to the generation of the library being read. libunwind and libpython are older than the library that was just loaded, so the second update found nothing to do. Since [`d2123d6`](https://github.com/bminor/glibc/commit/d2123d68275acc0f061e73d5f86ca504e0d5a344) ("Fix slow tls access after dlopen") every read brings it up to the newest. This was read in glibc's source. The tests were run on 2.39, 2.40, 2.41, 2.42 and 2.43: on each, all but one or two fail without the fix and all pass with it.
 
-**Which machine.** x86-64, and by what follows arm64 too, where nothing here has been run. On arm64 every thread-local variable is reached by a *TLS descriptor*, as it is on x86-64 in a library built with `-mtls-dialect=gnu2`. There are two kinds:
+**Which machine.** x86-64, and by what follows arm64 too, where nothing here has been run. On arm64 a shared library's thread-local variables are reached by a *TLS descriptor*, unless it was built with `-ftls-model=initial-exec`, as they are on x86-64 in a library built with `-mtls-dialect=gnu2`. There are two kinds:
 
 | The library's descriptors | When | Exposed |
 |---|---|---|
@@ -488,7 +488,7 @@ A dump can show that a table's growth was sampled, which is what it takes. Look 
 | 32 threads that wait while half the libraries are loaded | Not caught, in any thread |
 | The same, with a libunwind that reads its variables by dynamic TLS descriptors, and sampling off until the tables are about to grow | Not caught. A backtrace written to break the rule that way is. |
 | The same in a Python whose libpython asks the loader | Not caught. On the earlier `"python"` this is the one that fails. It needs such a libpython: Ubuntu's `libpython3.12t64`. |
-| Behind a chain of 20 wrappers, and in a program started as `ld.so program` | The loader is still seen |
+| Behind a chain of 20 wrappers, in a program started as `ld.so program`, and in a return address that is signed, as on arm64 | The loader is still seen |
 | What the loader allocated, 12 Python functions deep | All 12 are in its stack, under both backtraces (`"libunwind"`: on x86-64), and nothing of the hooks' or libunwind's |
 | A sandbox that refuses `process_vm_readv` | `"libunwind"` is not installed |
 | A JIT that hands libgcc 2,000 unwind tables | `"libunwind"` does not hang |

@@ -14,8 +14,9 @@
  * the loader starts the same update again and reallocates the same table. If
  * that moves it, the outer realloc() then frees a block that has been freed.
  * libunwind keeps a cache in such variables, and a shared libpython can keep its
- * thread state in one. A variable reached by a TLS descriptor, as all are on
- * arm64, goes the same way the first time a thread reads it.
+ * thread state in one. A variable reached by a TLS descriptor, as those of a
+ * shared library are on arm64, goes the same way the first time a thread reads
+ * it.
  *
  * So a backtrace finds out whether the loader called malloc before it calls
  * anything that may read such a variable, and where the loader did, calls
@@ -46,9 +47,16 @@
  * function's own frame, which is gone again before an unwinder is called. */
 #define SEEN 512
 
-/* The loader's code: [start, start + size). Written under the lock of whoever
- * installs a backtrace, before the backtrace is installed. */
-static uintptr_t loader_start, loader_size;
+/*
+ * The loader's code: [start, start + size). Written under the lock of whoever
+ * installs a backtrace, before the backtrace is installed.
+ *
+ * `loader_bits` has the bits an address in it can have set. Only those of a word
+ * are compared: on arm64 a saved return address may be signed, in bits above
+ * those of an address, and how many an address has is up to the kernel. It has
+ * at least as many as the loader's.
+ */
+static uintptr_t loader_start, loader_size, loader_bits;
 
 /* The library to find: the one loaded at `base`, or else the one `inside` is
  * in. */
@@ -97,6 +105,8 @@ int shh_find_loader(void)
 		dl_iterate_phdr(look_at, &l);
 	loader_start = l.code_start;
 	loader_size = l.code_size;
+	for (loader_bits = 1; loader_bits < loader_start + loader_size;)
+		loader_bits = loader_bits << 1 | 1;
 	return loader_size ? SHH_OK : SHH_ERR_NO_LOADER;
 }
 
@@ -121,15 +131,8 @@ int shh_loader_called_malloc(const void *above, shh_read_fn read)
 	ssize_t got = read(word, (uintptr_t)above, sizeof(word));
 	if (got <= 0)
 		return 1;
-	for (size_t i = 0; i < (size_t)got / sizeof(word[0]); i++) {
-		uintptr_t pc = word[i];
-#ifdef __aarch64__
-		/* A saved return address may be signed, in the bits above those
-		 * of an address. */
-		pc &= ((uintptr_t)1 << 48) - 1;
-#endif
-		if (pc - loader_start < loader_size)
+	for (size_t i = 0; i < (size_t)got / sizeof(word[0]); i++)
+		if ((word[i] & loader_bits) - loader_start < loader_size)
 			return 1;
-	}
 	return 0;
 }
