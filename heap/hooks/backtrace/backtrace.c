@@ -56,8 +56,6 @@ static pthread_mutex_t unwind_lock = PTHREAD_MUTEX_INITIALIZER;
 static mallctl_fn mallctl_p;
 static prof_backtrace_hook_t jemalloc_default;
 static unw_backtrace_fn unw_backtrace_p;
-/* Whether libunwind reads its thread-local variables through the loader. */
-static bool asks_the_loader;
 static const char *active = "default";
 
 /*
@@ -67,7 +65,8 @@ static const char *active = "default";
  * thread-local variables. So it can be called where the loader called malloc.
  *
  * The names are those <libunwind.h> gives unw_getcontext() and the rest on
- * x86-64, where they are all functions. find_steps() says where there are none.
+ * x86-64, where they are all functions. Where there are none (find_steps()),
+ * what the loader may have allocated is recorded with no stack.
  */
 static struct {
 	int (*getcontext)(ucontext_t *);
@@ -91,8 +90,7 @@ static void libunwind_backtrace(void **vec, unsigned *len, unsigned max_len)
 	/* A malloc that succeeds is expected to leave errno alone, and libunwind
 	 * changes it where it checks an address before reading it. */
 	int saved_errno = errno;
-	bool by_loader = asks_the_loader &&
-			 shh_loader_called_malloc(__builtin_frame_address(0), shh_read_self);
+	bool by_loader = shh_loader_called_malloc(__builtin_frame_address(0), shh_read_self);
 	/* Nor does a thread that finds another one unwinding: see unwind_lock. */
 	if (pthread_mutex_trylock(&unwind_lock) != 0) {
 		errno = saved_errno;
@@ -165,11 +163,6 @@ static const struct shh_fork_part fork_part = {before_fork, after_fork_in_parent
 
 static void find_steps(void *libunwind)
 {
-	/* On arm64 a thread-local variable is reached by a TLS descriptor, which
-	 * finds nothing to do in a table that is being brought up to date. */
-#ifndef __aarch64__
-	asks_the_loader = true;
-#endif
 #ifdef __x86_64__
 	/* A libunwind built with --enable-per-thread-cache keeps more in
 	 * thread-local variables than the cache of unw_backtrace(), which is a

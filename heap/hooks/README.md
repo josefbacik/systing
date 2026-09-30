@@ -311,7 +311,7 @@ print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
 | A sampled allocation at 30 Python frames, on top of jemalloc's own 4 µs | 25 to 26 µs | 9 µs on 3.12, 20 µs on 3.13 |
 | The same, per GiB allocated | About 50 ms | 19 to 41 ms, plus the cost on every call |
 | System calls per sampled allocation | About 39 (`process_vm_readv`) | About 41 (libunwind checks each address) |
-| Threads sampled at the same moment | Walk side by side | One at a time: a lock is held for the whole unwind. A thread that finds it taken does not wait, and that one allocation is recorded with no stack. Python threads: none in 680,000 samples with up to 32 threads, since the GIL keeps them apart. Native threads that each allocate 70 MiB/s: 0.2% of samples with 8 threads, 0.5% with 32, 1.6% with 96. |
+| Threads sampled at the same moment | Walk side by side | One at a time: a lock is held for the whole unwind. A thread that finds it taken does not wait, and that one allocation is recorded with no stack. Python threads: none in 680,000 samples with up to 32 threads, since the GIL keeps them apart. Native threads that each allocate 70 MiB/s: 0.2% of samples with 8 threads, 0.5% with 32, 1.6% with 96. Those were measured with every unwind the fast one. One made a frame at a time holds the lock four times as long. |
 | A mixed workload (tokenize, parse and compile 150 files) | No difference above noise | No difference above noise |
 | Memory | A 5 MiB table is mapped. Only the pages used are resident. | 64 KiB of generated code for 1,300 functions |
 | Files | About 1 KiB per function that was in a sampled stack | About 90 bytes per function that was ever called |
@@ -415,12 +415,19 @@ Three things make it all or nothing:
 | `"python"` | The interpreter's thread state (`PyThreadState_GetUnchecked()`), at every call | Where libpython is a shared library that asks the loader, as Ubuntu's `libpython3.12.so.1.0` does. Not where the interpreter is linked into `python3` itself, as in Ubuntu's `/usr/bin/python3.12`, or was built with `-ftls-model=initial-exec`. |
 
 ```bash
-readelf --dyn-syms -W libpython3.13.so.1.0 | grep __tls_get_addr    # no output: not exposed
+readelf -rW libpython3.13.so.1.0 | grep -E 'DTPMOD|TLSDESC'    # no output: not exposed
 ```
 
-**Which glibc.** 2.39 and later, and any older one that was given the change below. Up to 2.38 a read brought the table up only to the generation of the library being read. libunwind and libpython are older than the library that was just loaded, so the second update found nothing to do. Since [`d2123d6`](https://github.com/bminor/glibc/commit/d2123d68275acc0f061e73d5f86ca504e0d5a344) ("Fix slow tls access after dlopen") every read brings it up to the newest. This was read in glibc's source. It was run on 2.39 only.
+**Which glibc.** 2.39 and later, and any older one that was given the change below. Up to 2.38 a read brought the table up only to the generation of the library being read. libunwind and libpython are older than the library that was just loaded, so the second update found nothing to do. Since [`d2123d6`](https://github.com/bminor/glibc/commit/d2123d68275acc0f061e73d5f86ca504e0d5a344) ("Fix slow tls access after dlopen") every read brings it up to the newest. This was read in glibc's source. The tests were run on 2.39, 2.40, 2.41, 2.42 and 2.43: on each, all but one or two fail without the fix and all pass with it.
 
-**Which machine.** x86-64. On arm64 a thread-local variable is reached by a TLS descriptor, which asks only whether the table knows the variable's own library, and finds nothing to do. Read in glibc's source, not run.
+**Which machine.** x86-64, and by what follows arm64 too, where nothing here has been run. On arm64 every thread-local variable is reached by a *TLS descriptor*, as it is on x86-64 in a library built with `-mtls-dialect=gnu2`. There are two kinds:
+
+| The library's descriptors | When | Exposed |
+|---|---|---|
+| **Static** | The library was given a place in every thread's static block. One loaded with `dlopen()` gets it out of a spare 512 bytes, for as long as those last (`glibc.rtld.optional_static_tls`). | No: the table is not looked at |
+| **Dynamic** | The 512 bytes had been used up by the libraries loaded before | At **a thread's first read**. The descriptor answers by itself only if the table knows the library *and* the thread has a block for it (`_dl_tlsdesc_dynamic`, `sysdeps/aarch64/dl-tlsdesc.S`). Otherwise it goes on to `__tls_get_addr()`. |
+
+A thread's first read of libunwind's variables is at its first sampled allocation. At `lg_prof_sample:19` a thread that has done little has had none, so the growth of its table can well be the first. Run on x86-64 with the process [above](#how-likely-it-is), 450 threads, a stand-in for libunwind built with descriptors, and the look at the stack taken out: 37 of 40 processes hit with dynamic descriptors, none with static ones. With the look: none. So hooks installed before a program's imports are likely to be safe on arm64 even without the fix, and hooks installed after them are not.
 
 **musl** is not expected to be exposed: it makes room in every thread's table when a library is loaded, not when a variable is read. Not tested.
 
@@ -448,11 +455,12 @@ So a backtrace finds out whether the loader called `malloc` **before it calls an
 
 | It does not cover | |
 |---|---|
-| **A stack it cannot read** | `"libunwind"` is not installed where `process_vm_readv` is refused. `"python"` has `/proc/self/mem` to fall back on. |
-| **A libunwind that is not as described** | One built with `--enable-per-thread-cache` reads thread-local variables at each step. It is told by their size, and on machines other than x86-64 the functions have other names. There the loader's allocations are recorded with no stack. |
+| **A stack it cannot read** | `"libunwind"` is not installed where `process_vm_readv` is refused. `"python"` has `/proc/self/mem` to fall back on. Refused only later, by a sandbox entered after `install()`, every allocation is taken for the loader's, which is safe. Nothing says so: `"libunwind"` goes a frame at a time for every sample, and `"python"` has no Python frames. |
+| **Stacks, where libunwind cannot be driven a frame at a time** | On arm64 and any other machine than x86-64, where the functions have other names, and under a libunwind built with `--enable-per-thread-cache`, which reads thread-local variables at each step and is told by their size. There **every allocation taken for the loader's is recorded with no stack**, those wrongly taken for it too: the shares under "Taken for the loader's" above, and all of what some places in a program allocate. `install()` does not say so. |
 | **A caller further up than 4 KiB** | A jemalloc or a chain of wrappers whose frames take more than that |
 | **A signal handler** | One that interrupts the loader and reads a thread-local variable does the same damage. That is the program's, and nothing here runs in one. |
-| **A jemalloc built with `--enable-prof-libunwind`** | Its own backtrace calls libunwind, with or without these hooks, and `"python"` calls its own backtrace. There libunwind is loaded when the program starts, which is the case glibc 2.40 takes care of. Not tested. |
+| **A jemalloc built with `--enable-prof-libunwind`** | Its own backtrace calls libunwind, with or without these hooks, and `"python"` calls its own backtrace before it looks at the stack. On glibc 2.39 such a jemalloc was caught by the tests' trap with no hooks at all. There libunwind is loaded when the program starts, which is the case glibc 2.40 takes care of: that was not run. |
+| **A backtrace the program had set itself** | "jemalloc's own" is the one that was set when the hooks were first installed. `"python"` calls it, whatever it does. |
 
 ### Whether a process was hit
 
@@ -478,9 +486,10 @@ A dump can show that a table's growth was sampled, which is what it takes. Look 
 | A backtrace written to break the rule | It is caught. Where it is not, the C library has changed, and the tests say they cannot tell. |
 | Every backtrace, in a native program and in each Python found | Not caught |
 | 32 threads that wait while half the libraries are loaded | Not caught, in any thread |
+| The same, with a libunwind that reads its variables by dynamic TLS descriptors, and sampling off until the tables are about to grow | Not caught. A backtrace written to break the rule that way is. |
 | The same in a Python whose libpython asks the loader | Not caught. On the earlier `"python"` this is the one that fails. It needs such a libpython: Ubuntu's `libpython3.12t64`. |
 | Behind a chain of 20 wrappers, and in a program started as `ld.so program` | The loader is still seen |
-| What the loader allocated, 12 Python functions deep | All 12 are in its stack, under both backtraces, and nothing of the hooks' or libunwind's |
+| What the loader allocated, 12 Python functions deep | All 12 are in its stack, under both backtraces (`"libunwind"`: on x86-64), and nothing of the hooks' or libunwind's |
 | A sandbox that refuses `process_vm_readv` | `"libunwind"` is not installed |
 | A JIT that hands libgcc 2,000 unwind tables | `"libunwind"` does not hang |
 | The two libraries | No thread-local variable, no `__tls_get_addr`, everything bound at load |
@@ -518,7 +527,7 @@ heap/hooks/
 
 - **The two parts do not call each other.** Each is built from its own folder and `common/`. The one thing that passes between them is the code map: the Python backtrace registers how to ask for it, through `common/`, and the responder hands over what it is given.
 - **`backtrace/py_offsets.h`** holds the CPython struct offsets, by version. It is rendered from systing's pystacks offsets. `cargo test -p systing-heap hook_offsets` fails when the two differ, and rewrites the header when run with `SYSTING_HEAP_UPDATE_OFFSETS=1`.
-- **A new Python minor version** needs its offsets added to systing's pystacks bindings (`scripts/generate_python_bindings.py`) and to `MINORS` in `heap/src/hook_offsets.rs`.
+- **A new Python minor version** needs its offsets added to systing's pystacks bindings (`scripts/generate_python_bindings.py`) and to `MINORS` in `heap/src/hook_offsets.rs`. See also that `PyGILState_GetThisThreadState()` still gets the state from `pthread_getspecific()`, as it does in 3.12 to 3.14: it is called where the loader called `malloc`.
 - **The `libunwind` backtrace never waits for its lock.** libunwind takes the dynamic loader's list lock (`dl_iterate_phdr()`) while the hooks' lock is held. A thread that allocates in a `dl_iterate_phdr()` callback holds the loader's lock already, as a library that takes backtraces of its own may. If it waited for the hooks' lock, the two threads would wait for each other for good. In a Python process the blocked thread can hold the GIL, and then every Python thread stops with it. Up to 1.26.0 the hook did wait. `cargo test -p systing-heap --test two_locks` makes the two threads meet.
-- **A backtrace may not enter the dynamic loader where the loader called `malloc`.** No thread-local variable that is reached through it, its own or of a library it calls, no `dl*()` function, no function bound at its first call. What happens otherwise, and how it is held off, is under [the dynamic loader](#a-backtrace-and-the-dynamic-loader). A new backtrace goes into the lists in `tests/in_malloc.rs`.
+- **A backtrace may not enter the dynamic loader where the loader called `malloc`.** No thread-local variable that is reached through it, its own or of a library it calls, no `dlopen()`, `dlsym()` or the like, no function bound at its first call. `dl_iterate_phdr()`, which libunwind calls, is all right: its lock can be taken again by the thread that holds it, and it neither updates a thread's table nor allocates. What happens otherwise, and how it is held off, is under [the dynamic loader](#a-backtrace-and-the-dynamic-loader). A new backtrace goes into the lists in `tests/in_malloc.rs`.
 - **The socket's protocol** is described at the top of `responder/responder.c`.

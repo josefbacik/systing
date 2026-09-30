@@ -142,10 +142,12 @@ int main(int argc, char **argv)
 // What a service with many threads does when it imports something late: some of
 // the libraries are loaded, threads are started and wait, the rest are loaded,
 // and every thread then reads a thread-local variable it has read before.
+// Sampling, if it was off, is on from just before they do.
 const LOADS_LIBRARIES_LATE_C: &str = r#"
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -193,10 +195,29 @@ int main(int argc, char **argv)
         usleep(1000);
     if (load(argv[3], libraries / 2, libraries) != 0)
         return 2;
+    bool on = true;
+    int (*mallctl)(const char *, void *, size_t *, void *, size_t) = dlsym(RTLD_DEFAULT, "mallctl");
+    if (mallctl("prof.active", NULL, NULL, &on, sizeof on) != 0)
+        return 2;
     go = 1;
     for (int i = 0; i < THREADS; i++)
         pthread_join(threads[i], NULL);
     return 0;
+}
+"#;
+
+// What libunwind is to the hooks, as far as thread-local variables go: two words
+// of them, read at every unw_backtrace().
+const READS_ITS_CACHE_C: &str = r#"
+static __thread void *volatile cache;
+static __thread volatile long destroyed;
+int unw_backtrace(void **vec, int max)
+{
+    if (destroyed || max < 2)
+        return 0;
+    cache = vec;
+    vec[0] = vec[1] = (void *)unw_backtrace;
+    return 2;
 }
 "#;
 
@@ -212,7 +233,7 @@ except OSError:
     pass
 "#;
 
-// Loads the libraries from 30 Python functions deep, and keeps them. Sampling is
+// Loads the libraries from some Python functions deep, and keeps them. Sampling is
 // off until the backtrace is installed, so that every stack is one it made.
 const LOADS_LIBRARIES_DEEP_PY: &str = r#"
 import ctypes, os, sys
@@ -359,6 +380,10 @@ int main(int argc, char **argv)
 "#;
 
 fn cc(dir: &Path, name: &str, source: &str, shared: bool) -> PathBuf {
+    cc_with(dir, name, source, shared, false)
+}
+
+fn cc_with(dir: &Path, name: &str, source: &str, shared: bool, descriptors: bool) -> PathBuf {
     let src = dir.join(format!("{name}.c"));
     std::fs::write(&src, source).unwrap();
     let out = dir.join(if shared {
@@ -368,13 +393,21 @@ fn cc(dir: &Path, name: &str, source: &str, shared: bool) -> PathBuf {
     });
     let mut cmd = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()));
     cmd.args(["-O2", "-o"]).arg(&out).arg(&src);
-    // The way to a thread-local variable that goes through `__tls_get_addr()`,
-    // which is what these tests are about, whatever the compiler's default is.
-    // By TLS descriptors, a read made from inside malloc finds nothing to do.
+    // The way to a thread-local variable is said, whatever the compiler's default
+    // is: always through `__tls_get_addr()`, or by a TLS descriptor, which goes
+    // there only where the thread has no block for the library yet.
     if cfg!(target_arch = "x86_64") {
-        cmd.arg("-mtls-dialect=gnu");
+        cmd.arg(if descriptors {
+            "-mtls-dialect=gnu2"
+        } else {
+            "-mtls-dialect=gnu"
+        });
     } else if cfg!(target_arch = "aarch64") {
-        cmd.arg("-mtls-dialect=trad");
+        cmd.arg(if descriptors {
+            "-mtls-dialect=desc"
+        } else {
+            "-mtls-dialect=trad"
+        });
     }
     if shared {
         cmd.args(["-fPIC", "-shared"]);
@@ -554,6 +587,49 @@ fn nor_in_any_thread_of_one_that_loads_libraries_late() {
     }
 }
 
+/// A libunwind built to reach its variables by TLS descriptors, as any is on
+/// arm64, asks the loader too: the first time a thread reads them, where they
+/// were given no place in the thread's static block. So it is a thread's first
+/// sample that counts, and sampling is off until the tables are about to grow.
+#[test]
+fn nor_by_a_tls_descriptor_at_a_threads_first_sample() {
+    let Some(env) = setup() else { return };
+    let dir = env.dir.path();
+    let program = cc(dir, "loads_libraries_late", LOADS_LIBRARIES_LATE_C, false);
+    let libunwind = cc_with(dir, "reads_its_cache", READS_ITS_CACHE_C, true, true);
+    let run = |hooks: &Path, backtrace: &str| {
+        sampled_with(
+            &env,
+            Command::new(&program)
+                .arg(hooks)
+                .arg(backtrace)
+                .arg(dir)
+                .arg(LIBRARIES.to_string())
+                .env("SYSTING_HEAP_HOOKS_LIBUNWIND", &libunwind)
+                // No place in the static block for a library loaded late, as
+                // when others have used up what there is.
+                .env("GLIBC_TUNABLES", "glibc.rtld.optional_static_tls=0"),
+            ",prof_active:false",
+        )
+    };
+    let bad = cc_with(dir, "breaks_the_rule", BREAKS_THE_RULE_C, true, true);
+    let out = run(&bad, "");
+    if out.status.code() != Some(CAUGHT) {
+        common::skip(&format!(
+            "a backtrace that reads a __thread variable by a descriptor is not caught here ({})",
+            out.status
+        ));
+        return;
+    }
+    let out = run(&dir.join("libsysting_heap_hooks.so"), "libunwind");
+    assert!(
+        out.status.success(),
+        "{}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The stacks of a dump, innermost frame first, each frame as the file it is in.
 fn stacks_by_file(dump: &Path) -> Vec<Vec<String>> {
     let text = std::fs::read_to_string(dump).unwrap();
@@ -633,6 +709,11 @@ fn and_its_python_frames_too() {
         return;
     };
     for backtrace in ["python", "libunwind"] {
+        // Elsewhere libunwind is not driven a frame at a time, and there is no
+        // stack.
+        if backtrace == "libunwind" && !cfg!(target_arch = "x86_64") {
+            continue;
+        }
         let Some(env) = setup() else { return };
         let dir = env.dir.path();
         let app = dir.join("loads_libraries_deep.py");

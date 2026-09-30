@@ -14,7 +14,8 @@
  * the loader starts the same update again and reallocates the same table. If
  * that moves it, the outer realloc() then frees a block that has been freed.
  * libunwind keeps a cache in such variables, and a shared libpython can keep its
- * thread state in one.
+ * thread state in one. A variable reached by a TLS descriptor, as all are on
+ * arm64, goes the same way the first time a thread reads it.
  *
  * So a backtrace finds out whether the loader called malloc before it calls
  * anything that may read such a variable, and where the loader did, calls
@@ -120,8 +121,15 @@ int shh_loader_called_malloc(const void *above, shh_read_fn read)
 	ssize_t got = read(word, (uintptr_t)above, sizeof(word));
 	if (got <= 0)
 		return 1;
-	for (size_t i = 0; i < (size_t)got / sizeof(word[0]); i++)
-		if (word[i] - loader_start < loader_size)
+	for (size_t i = 0; i < (size_t)got / sizeof(word[0]); i++) {
+		uintptr_t pc = word[i];
+#ifdef __aarch64__
+		/* A saved return address may be signed, in the bits above those
+		 * of an address. */
+		pc &= ((uintptr_t)1 << 48) - 1;
+#endif
+		if (pc - loader_start < loader_size)
 			return 1;
+	}
 	return 0;
 }
