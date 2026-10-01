@@ -46,7 +46,8 @@ static pthread_mutex_t install_lock = PTHREAD_MUTEX_INITIALIZER;
  * leave that lock held in the child; the fork handlers below wait on this
  * one instead, so no unwind is in progress when the process forks.
  *
- * Only they wait on it. libunwind asks for the dynamic loader's list lock
+ * Only they wait on it, and install(), for its walks through the libraries
+ * (caller.h). A backtrace does not. libunwind asks for the dynamic loader's list lock
  * (dl_iterate_phdr()) while this one is held, and a sampled allocation may
  * come from a thread that holds the loader's: a callback of
  * dl_iterate_phdr() that allocates. If that thread waited here, each of the
@@ -109,6 +110,7 @@ static void libunwind_backtrace(void **vec, unsigned *len, unsigned max_len)
 			memmove(vec, vec + 1, (size_t)(n - 1) * sizeof(void *));
 			*len = (unsigned)(n - 1);
 		}
+		shh_missed(vec, *len);
 	} else if (steps.step) {
 		unsigned n = 0;
 		uintptr_t ip;
@@ -168,7 +170,7 @@ static void find_steps(void *libunwind, void *unw_backtrace)
 	/* A libunwind built with --enable-per-thread-cache keeps more in
 	 * thread-local variables than the cache of unw_backtrace(), which is a
 	 * pointer and a flag, and reads it at each step. */
-	if (shh_thread_locals((uintptr_t)unw_backtrace) > 2 * sizeof(void *))
+	if (shh_thread_locals((uintptr_t)unw_backtrace, &unwind_lock) > 2 * sizeof(void *))
 		return;
 	*(void **)&steps.getcontext = dlsym(libunwind, "_Ux86_64_getcontext");
 	*(void **)&steps.init_local = dlsym(libunwind, "_ULx86_64_init_local");
@@ -263,7 +265,7 @@ static int install_locked(const char *backtrace, bool install)
 
 	/* jemalloc's own is as safe as it is without this library. */
 	if (!want_default) {
-		int rc = shh_find_loader();
+		int rc = shh_find_loader(&unwind_lock);
 		if (rc != SHH_OK)
 			return rc;
 	}

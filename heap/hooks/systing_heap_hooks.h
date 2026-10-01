@@ -52,6 +52,9 @@ int systing_heap_hooks_prepare(const char *backtrace);
 
 /* The backtrace installed: "default", "libunwind" or "python". */
 const char *systing_heap_hooks_active(void);
+/* How often the "libunwind" backtrace found afterwards that the dynamic loader
+ * had called malloc, and it had not seen so in time. 0 is what to expect. */
+unsigned long systing_heap_hooks_missed(void);
 
 /*
  * The calling thread's Python frames as the "python" backtrace reads them,

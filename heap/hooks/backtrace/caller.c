@@ -36,6 +36,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <link.h>
+#include <stdatomic.h>
 #include <sys/auxv.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -47,6 +48,14 @@
  * function's own frame, which is gone again before an unwinder is called. */
 #define SEEN 512
 
+/* How many of a stack's innermost frames the loader is near in: jemalloc's own
+ * three or four, and a few wrappers' around it. */
+#define NEAR 8
+/* And __tls_get_addr(), which has three of the loader's own below it. */
+#define NEAR_ENOUGH 16
+/* More than __tls_get_addr() takes, on the machines looked at. */
+#define TLS_GET_ADDR_SIZE 128
+
 /*
  * The loader's code: [start, start + size). Written under the lock of whoever
  * installs a backtrace, before the backtrace is installed.
@@ -57,6 +66,8 @@
  * at least as many as the loader's.
  */
 static uintptr_t loader_start, loader_size, loader_bits;
+/* Where __tls_get_addr() starts, or 0. Written with the three above. */
+static uintptr_t tls_get_addr;
 
 /* The library to find: the one loaded at `base`, or else the one `inside` is
  * in. */
@@ -90,21 +101,29 @@ static int look_at(struct dl_phdr_info *info, size_t size, void *arg)
 	return 1;
 }
 
-int shh_find_loader(void)
+static void find(struct library *l, pthread_mutex_t *a_fork_waits_for)
+{
+	pthread_mutex_lock(a_fork_waits_for);
+	dl_iterate_phdr(look_at, l);
+	pthread_mutex_unlock(a_fork_waits_for);
+}
+
+int shh_find_loader(pthread_mutex_t *a_fork_waits_for)
 {
 	/* The last of the three to be stored: a child that another thread forks
 	 * in the middle of this has all of it, or finds it again. */
 	if (__atomic_load_n(&loader_bits, __ATOMIC_ACQUIRE))
 		return SHH_OK;
+	/* Looked up by name, so that this library does not itself depend on it. */
+	uintptr_t asked = (uintptr_t)dlsym(RTLD_DEFAULT, "__tls_get_addr");
 	/* Where the kernel put the program's interpreter, which no library can
 	 * stand in front of. There is none where the loader was itself run as the
-	 * program: then the library __tls_get_addr is in, looked up by name so
-	 * that this library does not itself depend on it. */
+	 * program: then the library __tls_get_addr is in. */
 	struct library l = {.base = getauxval(AT_BASE)};
 	if (!l.base)
-		l.inside = (uintptr_t)dlsym(RTLD_DEFAULT, "__tls_get_addr");
+		l.inside = asked;
 	if (l.base || l.inside)
-		dl_iterate_phdr(look_at, &l);
+		find(&l, a_fork_waits_for);
 	if (!l.code_size)
 		return SHH_ERR_NO_LOADER;
 	uintptr_t bits = 1;
@@ -112,14 +131,16 @@ int shh_find_loader(void)
 		bits = bits << 1 | 1;
 	loader_start = l.code_start;
 	loader_size = l.code_size;
+	/* One that some library has put in front of the loader's says nothing. */
+	tls_get_addr = asked - l.code_start < l.code_size ? asked : 0;
 	__atomic_store_n(&loader_bits, bits, __ATOMIC_RELEASE);
 	return SHH_OK;
 }
 
-size_t shh_thread_locals(uintptr_t pc)
+size_t shh_thread_locals(uintptr_t pc, pthread_mutex_t *a_fork_waits_for)
 {
 	struct library l = {.inside = pc};
-	dl_iterate_phdr(look_at, &l);
+	find(&l, a_fork_waits_for);
 	return l.thread_locals;
 }
 
@@ -141,4 +162,36 @@ int shh_loader_called_malloc(const void *above, shh_read_fn read)
 		if ((word[i] & loader_bits) - loader_start < loader_size)
 			return 1;
 	return 0;
+}
+
+int shh_loader_is_near(void *const *vec, unsigned len)
+{
+	for (unsigned i = 0; i < len && i < NEAR; i++)
+		if (((uintptr_t)vec[i] & loader_bits) - loader_start < loader_size)
+			return 1;
+	return 0;
+}
+
+static _Atomic unsigned long missed;
+
+int shh_missed(void *const *vec, unsigned len)
+{
+	static const char said[] =
+		"systing-heap hooks: the dynamic loader called malloc, and the look at the stack "
+		"did not see it. The heap may be damaged from here on: see \"A backtrace and the "
+		"dynamic loader\" in heap/hooks/README.md\n";
+	unsigned i = 0;
+	while (i < len && i < NEAR_ENOUGH &&
+	       (!tls_get_addr || ((uintptr_t)vec[i] & loader_bits) - tls_get_addr >= TLS_GET_ADDR_SIZE))
+		i++;
+	if (i == len || i == NEAR_ENOUGH)
+		return 0;
+	if (atomic_fetch_add(&missed, 1) == 0 && write(2, said, sizeof(said) - 1) < 0) {
+	}
+	return 1;
+}
+
+unsigned long systing_heap_hooks_missed(void)
+{
+	return atomic_load(&missed);
 }

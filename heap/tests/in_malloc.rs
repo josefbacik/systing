@@ -40,7 +40,8 @@ long touch(void) { return ++v; }
 // Goes in front of jemalloc. What it keeps for each thread it reaches without
 // the loader, as a library a program starts with can. SHIM_FRAMES puts that many
 // more frames between malloc's caller and jemalloc, as a chain of wrappers around
-// the allocator would.
+// the allocator would. SHIM_FAR puts one there that is larger than what the look at
+// the stack covers.
 const SHIM_C: &str = r#"
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -49,7 +50,7 @@ const SHIM_C: &str = r#"
 #include <unistd.h>
 #define PER_THREAD static __thread __attribute__((tls_model("initial-exec")))
 static void *(*next)(void *, size_t);
-static int frames;
+static int frames, far;
 PER_THREAD int depth;
 PER_THREAD void *outer;
 __attribute__((noinline)) static void *through(int more, void *p, size_t n)
@@ -58,10 +59,20 @@ __attribute__((noinline)) static void *through(int more, void *p, size_t n)
     __asm__ volatile("" ::: "memory"); /* so that the call is not the last thing done */
     return r;
 }
+__attribute__((noinline)) static void *from_afar(void *p, size_t n)
+{
+    volatile char frame[8192];
+    for (size_t i = 0; i < sizeof frame; i++)
+        frame[i] = 0;
+    void *r = next(p, n);
+    __asm__ volatile("" ::: "memory");
+    return r;
+}
 __attribute__((constructor)) static void start(void)
 {
     const char *more = getenv("SHIM_FRAMES");
     frames = more ? atoi(more) : 0;
+    far = getenv("SHIM_FAR") != NULL;
     next = (void *(*)(void *, size_t))dlsym(RTLD_NEXT, "realloc");
 }
 void *realloc(void *p, size_t n)
@@ -76,7 +87,7 @@ void *realloc(void *p, size_t n)
     if (depth == 0)
         outer = p;
     depth++;
-    void *r = through(frames, p, n);
+    void *r = far ? from_afar(p, n) : through(frames, p, n);
     depth--;
     return r;
 }
@@ -232,6 +243,165 @@ int unw_backtrace(void **vec, int max)
 }
 "#;
 
+// Goes in front of libc: the walk through the libraries that was asked for stays
+// where it is, with the loader's lock held, until another thread has forked or
+// has had 300 ms to.
+const HOLDS_THE_WALK_C: &str = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <link.h>
+#include <stdatomic.h>
+#include <unistd.h>
+typedef int (*callback)(struct dl_phdr_info *, size_t, void *);
+static atomic_int walks_to_go, held, forked;
+struct inner {
+    callback call;
+    void *data;
+    int hold;
+};
+static int slowly(struct dl_phdr_info *info, size_t size, void *data)
+{
+    struct inner *inner = data;
+    if (inner->hold) {
+        inner->hold = 0;
+        held = 1;
+        for (int ms = 0; ms < 300 && !forked; ms++)
+            usleep(1000);
+    }
+    return inner->call(info, size, inner->data);
+}
+int dl_iterate_phdr(callback call, void *data)
+{
+    int (*next)(callback, void *) = dlsym(RTLD_NEXT, "dl_iterate_phdr");
+    struct inner inner = {call, data, walks_to_go > 0 && --walks_to_go == 0};
+    return next(slowly, &inner);
+}
+void hold_walk(int which) { walks_to_go = which; }
+int walk_is_held(void) { return held; }
+void has_forked(void) { forked = 1; }
+"#;
+
+// Installs "libunwind" while another thread forks in the middle of the walk
+// through the libraries that argv[2] numbers. The child then does what any
+// program does sooner or later.
+const FORKS_DURING_INSTALL_C: &str = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <link.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+void hold_walk(int);
+int walk_is_held(void);
+void has_forked(void);
+static int nothing(struct dl_phdr_info *info, size_t size, void *data)
+{
+    (void)info, (void)size, (void)data;
+    return 1;
+}
+static void *forks(void *arg)
+{
+    (void)arg;
+    for (int ms = 0; !walk_is_held(); ms++) {
+        if (ms > 5000)
+            return (void *)6;
+        usleep(1000);
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        alarm(3);
+        dl_iterate_phdr(nothing, NULL);
+        _exit(0);
+    }
+    has_forked();
+    int status;
+    if (child < 0 || waitpid(child, &status, 0) != child)
+        return (void *)7;
+    return (void *)(long)(WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 5);
+}
+int main(int argc, char **argv)
+{
+    if (argc != 3)
+        return 2;
+    void *hooks = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    pthread_t thread;
+    if (!hooks || pthread_create(&thread, NULL, forks, NULL) != 0)
+        return 2;
+    hold_walk(atoi(argv[2]));
+    if (((int (*)(const char *))dlsym(hooks, "systing_heap_hooks_install"))("libunwind") != 0)
+        return 2;
+    void *said;
+    pthread_join(thread, &said);
+    return (int)(long)said;
+}
+"#;
+
+// A libunwind that does no harm, and whose every stack has the loader next to
+// jemalloc: __tls_get_addr(), or with ELSEWHERE some other part of it, as under a
+// library's constructor.
+const SHOWS_THE_LOADER_C: &str = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdlib.h>
+static char *in_the_loader;
+__attribute__((constructor)) static void start(void)
+{
+    in_the_loader = (char *)dlsym(RTLD_DEFAULT, "__tls_get_addr") + 16;
+    if (getenv("ELSEWHERE"))
+        in_the_loader -= 4096;
+}
+int unw_backtrace(void **vec, int max)
+{
+    if (max < 3)
+        return 0;
+    vec[0] = vec[1] = (void *)unw_backtrace;
+    vec[2] = in_the_loader;
+    return 3;
+}
+"#;
+
+// Allocates on a thread whose stack the loader has never run on, and says how
+// many misses were counted.
+const ALLOCATES_ON_A_NEW_THREAD_C: &str = r#"
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+static void *allocates(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 10; i++) {
+        void *volatile kept = malloc(100); /* or the compiler drops the pair */
+        free(kept);
+    }
+    return NULL;
+}
+int main(int argc, char **argv)
+{
+    if (argc != 2)
+        return 2;
+    void *hooks = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!hooks || ((int (*)(const char *))dlsym(hooks, "systing_heap_hooks_install"))("libunwind") != 0)
+        return 2;
+    unsigned long (*missed)(void) = (unsigned long (*)(void))dlsym(hooks, "systing_heap_hooks_missed");
+    if (missed() != 0)
+        return 3;
+    bool on = true;
+    int (*mallctl)(const char *, void *, size_t *, void *, size_t) = dlsym(RTLD_DEFAULT, "mallctl");
+    pthread_t thread;
+    if (mallctl("prof.active", NULL, NULL, &on, sizeof on) != 0 ||
+        pthread_create(&thread, NULL, allocates, NULL) != 0)
+        return 2;
+    pthread_join(thread, NULL);
+    on = false;
+    mallctl("prof.active", NULL, NULL, &on, sizeof on);
+    printf("%lu\n", missed());
+    return 0;
+}
+"#;
+
 // The look at the stack, given a stack made up for it. It follows an #include of
 // caller.c.
 const LOOKS_AT_C: &str = r#"
@@ -254,7 +424,8 @@ int main(void)
     // What a child has that another thread forked half way through
     // shh_find_loader(): it is found again.
     loader_start = loader_size = 1;
-    if (shh_find_loader() != SHH_OK)
+    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    if (shh_find_loader(&lock) != SHH_OK)
         return 2;
     uintptr_t in_the_loader = loader_start + 16;
     if (seen(0) || seen(loader_start - 8) || seen(loader_start + loader_size))
@@ -837,23 +1008,32 @@ fn and_its_python_frames_too() {
     }
 }
 
-/// Run the Python program with `python` under each backtrace it can have.
-fn python_program(env: &Env, python: &Path) {
+/// Run the Python program with `python` under `backtrace`, with malloc's caller
+/// further up the stack than is looked at if `far`.
+fn python_program_under(env: &Env, python: &Path, backtrace: &str, far: bool) -> Output {
     let app = env.dir.path().join("loads_libraries.py");
     std::fs::write(&app, LOADS_LIBRARIES_PY).unwrap();
+    let mut child = Command::new(python);
+    child
+        .arg(&app)
+        .arg(backtrace)
+        .arg(env.dir.path())
+        .arg(LIBRARIES.to_string())
+        .env(
+            "SYSTING_HEAP_HOOKS_LIB",
+            env.dir.path().join("libsysting_heap_hooks.so"),
+        )
+        .env("PYTHONPATH", HOOKS);
+    if far {
+        child.env("SHIM_FAR", "1");
+    }
+    sampled(env, &mut child)
+}
+
+/// Run the Python program with `python` under each backtrace it can have.
+fn python_program(env: &Env, python: &Path) {
     for backtrace in ["default", "python", "libunwind"] {
-        let mut child = Command::new(python);
-        child
-            .arg(&app)
-            .arg(backtrace)
-            .arg(env.dir.path())
-            .arg(LIBRARIES.to_string())
-            .env(
-                "SYSTING_HEAP_HOOKS_LIB",
-                env.dir.path().join("libsysting_heap_hooks.so"),
-            )
-            .env("PYTHONPATH", HOOKS);
-        let out = sampled(env, &mut child);
+        let out = python_program_under(env, python, backtrace, false);
         assert!(
             out.status.success(),
             "{} with {backtrace}: {}: {}",
@@ -908,6 +1088,84 @@ fn libpython_that_asks_the_loader(python: &str) -> Option<PathBuf> {
 #[test]
 fn nor_where_the_interpreters_own_variables_are_read_through_it() {
     let Some(env) = setup() else { return };
+    let Some(python) = python_that_asks_the_loader(&env) else {
+        return;
+    };
+    python_program(&env, &python);
+}
+
+/// The look covers 4 KiB. "python" has the native stack before it asks the
+/// interpreter for anything, and sees the loader there too.
+#[test]
+fn python_sees_the_loader_where_the_look_falls_short() {
+    let Some(env) = setup() else { return };
+    let Some(python) = python_that_asks_the_loader(&env) else {
+        return;
+    };
+    // It does fall short: "libunwind", which has nothing else to go by, is caught.
+    let out = python_program_under(&env, &python, "libunwind", true);
+    if out.status.code() != Some(CAUGHT) {
+        common::skip(&format!(
+            "the loader is seen from further off than expected ({})",
+            out.status
+        ));
+        return;
+    }
+    let out = python_program_under(&env, &python, "python", true);
+    assert!(
+        out.status.success(),
+        "{}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// What "libunwind" cannot see in time it sees afterwards, in the stack it made.
+/// That is counted, and said once.
+#[test]
+fn a_miss_is_counted_and_said_once() {
+    let Some(env) = setup() else { return };
+    let dir = env.dir.path();
+    let program = cc(
+        dir,
+        "allocates_on_a_new_thread",
+        ALLOCATES_ON_A_NEW_THREAD_C,
+        false,
+    );
+    let run = |libunwind: Option<&Path>, elsewhere: bool| {
+        let mut cmd = Command::new(&program);
+        cmd.arg(dir.join("libsysting_heap_hooks.so"));
+        if let Some(libunwind) = libunwind {
+            cmd.env("SYSTING_HEAP_HOOKS_LIBUNWIND", libunwind);
+        }
+        if elsewhere {
+            cmd.env("ELSEWHERE", "1");
+        }
+        let out = sampled_with(&env, &mut cmd, ",prof_active:false");
+        assert!(out.status.success(), "{}", out.status);
+        (
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            String::from_utf8_lossy(&out.stderr)
+                .matches("did not see it")
+                .count(),
+        )
+    };
+    assert_eq!(run(None, false), (0, 0));
+    let libunwind = cc(dir, "shows_the_loader", SHOWS_THE_LOADER_C, true);
+    let (missed, said) = run(Some(&libunwind), false);
+    assert!(missed >= 10, "{missed}");
+    assert_eq!(said, 1);
+    // The loader calls a library's constructors, and is in the middle of nothing
+    // when one of them allocates. Some have frames larger than is looked at.
+    assert_eq!(run(Some(&libunwind), true), (0, 0));
+}
+
+/// A program that runs the interpreter out of a shared libpython that asks the
+/// loader for its variables, where there is one and these tests can tell.
+fn python_that_asks_the_loader(env: &Env) -> Option<PathBuf> {
     let Some(lib) = common::pythons()
         .iter()
         .find_map(|(python, _)| libpython_that_asks_the_loader(python))
@@ -915,10 +1173,10 @@ fn nor_where_the_interpreters_own_variables_are_read_through_it() {
         common::skip(
             "needs a shared libpython that asks the loader for its variables (Ubuntu: libpython3.12t64)",
         );
-        return;
+        return None;
     };
-    if !the_trap_works(&env) {
-        return;
+    if !the_trap_works(env) {
+        return None;
     }
     let src = env.dir.path().join("python.c");
     std::fs::write(&src, PYTHON_C).unwrap();
@@ -936,7 +1194,7 @@ fn nor_where_the_interpreters_own_variables_are_read_through_it() {
         "{}",
         String::from_utf8_lossy(&built.stderr)
     );
-    python_program(&env, &python);
+    Some(python)
 }
 
 /// A miss costs the heap and a false alarm some of one sample's detail, so the
@@ -1032,6 +1290,47 @@ fn libunwind_does_not_wait_for_libgcc() {
     match ends(&env, &mut child) {
         Some(status) => assert!(status.success(), "{status}"),
         None => panic!("waits for a lock its own thread holds"),
+    }
+}
+
+/// install() walks through the libraries, with a lock of the loader's held that
+/// fork() does not make anew in the child. A child forked by another thread in the
+/// middle of that would wait for the lock for good, the next time it loaded a
+/// library. So a fork waits for the walk.
+#[test]
+fn a_fork_waits_for_installs_walks_through_the_libraries() {
+    let Some(env) = setup() else { return };
+    let dir = env.dir.path();
+    let holds = cc(dir, "holds_the_walk", HOLDS_THE_WALK_C, true);
+    let src = dir.join("forks_during_install.c");
+    std::fs::write(&src, FORKS_DURING_INSTALL_C).unwrap();
+    let program = dir.join("forks_during_install");
+    let built = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args(["-O2", "-o"])
+        .arg(&program)
+        .arg(&src)
+        .arg(&holds)
+        .args(["-ldl", "-lpthread"])
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    // Where the loader's code is, and how many thread-local variables libunwind
+    // has, which is asked where it can be driven a frame at a time.
+    let walks = if cfg!(target_arch = "x86_64") { 2 } else { 1 };
+    for walk in 1..=walks {
+        let status = ends(
+            &env,
+            Command::new(&program)
+                .arg(dir.join("libsysting_heap_hooks.so"))
+                .arg(walk.to_string())
+                .env("LD_LIBRARY_PATH", dir),
+        )
+        .expect("the program did not end");
+        assert!(status.success(), "walk {walk}: {status}");
     }
 }
 
