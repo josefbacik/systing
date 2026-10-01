@@ -92,7 +92,9 @@ static int look_at(struct dl_phdr_info *info, size_t size, void *arg)
 
 int shh_find_loader(void)
 {
-	if (loader_size)
+	/* The last of the three to be stored: a child that another thread forks
+	 * in the middle of this has all of it, or finds it again. */
+	if (__atomic_load_n(&loader_bits, __ATOMIC_ACQUIRE))
 		return SHH_OK;
 	/* Where the kernel put the program's interpreter, which no library can
 	 * stand in front of. There is none where the loader was itself run as the
@@ -103,11 +105,15 @@ int shh_find_loader(void)
 		l.inside = (uintptr_t)dlsym(RTLD_DEFAULT, "__tls_get_addr");
 	if (l.base || l.inside)
 		dl_iterate_phdr(look_at, &l);
+	if (!l.code_size)
+		return SHH_ERR_NO_LOADER;
+	uintptr_t bits = 1;
+	while (bits < l.code_start + l.code_size)
+		bits = bits << 1 | 1;
 	loader_start = l.code_start;
 	loader_size = l.code_size;
-	for (loader_bits = 1; loader_bits < loader_start + loader_size;)
-		loader_bits = loader_bits << 1 | 1;
-	return loader_size ? SHH_OK : SHH_ERR_NO_LOADER;
+	__atomic_store_n(&loader_bits, bits, __ATOMIC_RELEASE);
+	return SHH_OK;
 }
 
 size_t shh_thread_locals(uintptr_t pc)

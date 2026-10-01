@@ -97,9 +97,9 @@ static void libunwind_backtrace(void **vec, unsigned *len, unsigned max_len)
 		return;
 	}
 	/*
-	 * Unwind into jemalloc's own array (no buffer of ours on the stack
-	 * inside malloc), from this function's caller, so that jemalloc's stacks
-	 * start where its own backends' do.
+	 * Unwind into jemalloc's own array (no buffer of ours is on the stack
+	 * while an unwinder runs), from this function's caller, so that
+	 * jemalloc's stacks start where its own backends' do.
 	 */
 	if (!by_loader) {
 		/* This function's frame comes first. At full depth dropping it
@@ -114,7 +114,8 @@ static void libunwind_backtrace(void **vec, unsigned *len, unsigned max_len)
 		uintptr_t ip;
 		steps.getcontext(&steps_context);
 		if (steps.init_local(steps_cursor, &steps_context) >= 0)
-			while (n < max_len && steps.step(steps_cursor) > 0 &&
+			/* As many frames as the other way keeps. */
+			while (n + 1 < max_len && steps.step(steps_cursor) > 0 &&
 			       steps.get_reg(steps_cursor, UNW_REG_IP, &ip) >= 0)
 				vec[n++] = (void *)ip;
 		*len = n;
@@ -161,13 +162,13 @@ static void after_fork_in_child(void)
 static const struct shh_fork_part fork_part = {before_fork, after_fork_in_parent,
 					       after_fork_in_child};
 
-static void find_steps(void *libunwind)
+static void find_steps(void *libunwind, void *unw_backtrace)
 {
 #ifdef __x86_64__
 	/* A libunwind built with --enable-per-thread-cache keeps more in
 	 * thread-local variables than the cache of unw_backtrace(), which is a
 	 * pointer and a flag, and reads it at each step. */
-	if (shh_thread_locals((uintptr_t)unw_backtrace_p) > 2 * sizeof(void *))
+	if (shh_thread_locals((uintptr_t)unw_backtrace) > 2 * sizeof(void *))
 		return;
 	*(void **)&steps.getcontext = dlsym(libunwind, "_Ux86_64_getcontext");
 	*(void **)&steps.init_local = dlsym(libunwind, "_ULx86_64_init_local");
@@ -176,12 +177,14 @@ static void find_steps(void *libunwind)
 		*(void **)&steps.step = dlsym(libunwind, "_ULx86_64_step");
 #else
 	(void)libunwind;
+	(void)unw_backtrace;
 #endif
 }
 
 static int load_libunwind(void)
 {
-	if (unw_backtrace_p)
+	/* Stored last, as in shh_find_loader(). */
+	if (__atomic_load_n(&unw_backtrace_p, __ATOMIC_ACQUIRE))
 		return SHH_OK;
 	/* SYSTING_HEAP_HOOKS_LIBUNWIND names another library (or, in tests, a
 	 * missing one); ignored in a setuid or file-capability process. */
@@ -194,8 +197,8 @@ static int load_libunwind(void)
 			continue;
 		void *p = dlsym(h, "unw_backtrace");
 		if (p) {
-			unw_backtrace_p = (unw_backtrace_fn)p;
-			find_steps(h);
+			find_steps(h, p);
+			__atomic_store_n(&unw_backtrace_p, (unw_backtrace_fn)p, __ATOMIC_RELEASE);
 			return SHH_OK;
 		}
 		dlclose(h);
@@ -288,13 +291,16 @@ static int install_locked(const char *backtrace, bool install)
 		return SHH_OK;
 	}
 
-	/* "python" finds a read of its own. */
-	char from = 1, to = 0;
-	if (shh_read_self(&to, (uintptr_t)&from, 1) != 1 || to != from)
-		return SHH_ERR_STACK_READ;
 	int rc = load_libunwind();
 	if (rc != SHH_OK)
 		return rc;
+	/* Where the stack cannot be read, every allocation is taken for the
+	 * loader's. That costs time where libunwind can be driven a frame at a
+	 * time, and every stack where it cannot. "python" finds a read of its
+	 * own. */
+	char from = 1, to = 0;
+	if (!steps.step && (shh_read_self(&to, (uintptr_t)&from, 1) != 1 || to != from))
+		return SHH_ERR_STACK_READ;
 	rc = set_hook(libunwind_backtrace);
 	if (rc != SHH_OK)
 		return rc;

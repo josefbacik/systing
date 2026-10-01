@@ -188,7 +188,7 @@ The thread does not exist in a forked child, and the child closes its copy of th
 _start → … → outer (python) [app.py:12] → leak_in_python (python) [app.py:10] → PyByteArray… → malloc
 ```
 
-**Use `backtrace="python"`.** Use trampolines with `backtrace="libunwind"` only for a Python it refuses: newer than 3.14, free-threaded or otherwise built differently, or a process that may not read its own memory through the kernel.
+**Use `backtrace="python"`.** Use trampolines with `backtrace="libunwind"` only for a Python it refuses: newer than 3.14, free-threaded or otherwise built differently, or, on x86-64, a process that may not read its own memory through the kernel.
 
 | Setup | Stacks show | Cost |
 |---|---|---|
@@ -329,7 +329,7 @@ print(systing_heap_hooks.install(backtrace="libunwind", trampolines=True))
 | A JIT that hands libgcc its unwind tables | Can hang, as jemalloc's own backtrace can | Nothing of libgcc's is called |
 | Locks taken inside `malloc` | None | The hooks' own, never waited for, and under it the dynamic loader's list lock, which libunwind takes to find the library an address is in |
 | Changes in the process | Nothing between samples | How every Python function is called, for the life of the process. It also maps executable memory at run time. |
-| Needs from the environment | `process_vm_readv` on itself, or `/proc/self/mem` | `libunwind.so.8`, `process_vm_readv` on itself, and a writable `/tmp` |
+| Needs from the environment | `process_vm_readv` on itself, or `/proc/self/mem` | `libunwind.so.8` and a writable `/tmp`. `process_vm_readv` on itself: without it every unwind is the slow one on x86-64, and elsewhere the backtrace is not installed. |
 | Which process a map belongs to | The dump names its map by a token | By pid alone: a map left by an earlier process with the same pid is not told apart |
 | Where the map is | Beside the dumps | In the container's `/tmp` |
 
@@ -448,18 +448,19 @@ So a backtrace finds out whether the loader called `malloc` **before it calls an
 
 | Measured, with real libraries | |
 |---|---|
-| **How far up `malloc`'s caller is** | At most 1,152 bytes, through `realloc()` and one wrapper around jemalloc. 4 KiB is 3.6 times that. With 1 KiB looked at, the tests fail. |
+| **How far up `malloc`'s caller is** | At most 1,152 bytes, through `realloc()` and one wrapper around jemalloc: on x86-64, with Ubuntu's jemalloc 5.3.0 and the hooks built by gcc 13. 4 KiB is 3.6 times that. With 1 KiB looked at, the tests fail. On arm64 it was not measured, and the backtrace's own frame is part of what is looked at: 80 bytes of `"libunwind"`'s and 624 of `"python"`'s, in one build. |
 | **Missed** | None, in any run |
 | **Taken for the loader's** | Plain Python: 0.07% of samples or less. jax: 0.8%. pandas: 1.8%. A broad set of imports: 3.2%. torch: 18%. |
-| **The look itself** | 1.3 µs for a sampled allocation, and two system calls |
+| **The look itself** | 1.3 µs for a sampled allocation, and two system calls. It is made whatever the glibc and the libpython, those that were never exposed too: which they are cannot be told from a version. |
 
 | It does not cover | |
 |---|---|
-| **A stack it cannot read** | `"libunwind"` is not installed where `process_vm_readv` is refused. `"python"` has `/proc/self/mem` to fall back on. Refused only later, by a sandbox entered after `install()`, every allocation is taken for the loader's, which is safe. Nothing says so: `"libunwind"` goes a frame at a time for every sample, and `"python"` has no Python frames. |
+| **A miss** | It would do the damage, and nothing would say so. The answers are not counted, and a table's growth has the same stack in a dump whether the loader was seen or not. |
+| **A stack it cannot read** | Where `process_vm_readv` is refused, every allocation is taken for the loader's, which is safe. `"libunwind"` then goes a frame at a time for every sample. Where it cannot do that (the next row) it would have no stack at all: it is not installed, or, refused only after `install()`, records none. `"python"` has `/proc/self/mem` to fall back on at `install()`, and refused only later has no Python frames. Nothing says that any of this has happened. A sandbox that kills the process for the call, where others refuse it, kills it at `install()` or at the first sample. |
 | **Stacks, where libunwind cannot be driven a frame at a time** | On arm64 and any other machine than x86-64, where the functions have other names, and under a libunwind built with `--enable-per-thread-cache`, which reads thread-local variables at each step and is told by their size. There **every allocation taken for the loader's is recorded with no stack**, those wrongly taken for it too: the shares under "Taken for the loader's" above, and all of what some places in a program allocate. `install()` does not say so. |
 | **A caller further up than 4 KiB** | A jemalloc or a chain of wrappers whose frames take more than that |
 | **A signal handler** | One that interrupts the loader and reads a thread-local variable does the same damage. That is the program's, and nothing here runs in one. |
-| **A jemalloc built with `--enable-prof-libunwind`** | Its own backtrace calls libunwind, with or without these hooks, and `"python"` calls its own backtrace before it looks at the stack. On glibc 2.39 such a jemalloc was caught by the tests' trap with no hooks at all. There libunwind is loaded when the program starts, which is the case glibc 2.40 takes care of: that was not run. |
+| **A jemalloc built with `--enable-prof-libunwind`** | Its own backtrace calls libunwind, with or without these hooks, and `"python"` calls its own backtrace before it looks at the stack. `"libunwind"` is the one backtrace that is safe there. On glibc 2.39 such a jemalloc was caught by the tests' trap with no hooks at all. There libunwind is loaded when the program starts, which is the case glibc 2.40 takes care of: that was not run. |
 | **A backtrace the program had set itself** | "jemalloc's own" is the one that was set when the hooks were first installed. `"python"` calls it, whatever it does. |
 
 ### Whether a process was hit
@@ -490,7 +491,7 @@ A dump can show that a table's growth was sampled, which is what it takes. Look 
 | The same in a Python whose libpython asks the loader | Not caught. On the earlier `"python"` this is the one that fails. It needs such a libpython: Ubuntu's `libpython3.12t64`. |
 | Behind a chain of 20 wrappers, in a program started as `ld.so program`, and in a return address that is signed, as on arm64 | The loader is still seen |
 | What the loader allocated, 12 Python functions deep | All 12 are in its stack, under both backtraces (`"libunwind"`: on x86-64), and nothing of the hooks' or libunwind's |
-| A sandbox that refuses `process_vm_readv` | `"libunwind"` is not installed |
+| A sandbox that refuses `process_vm_readv` | `"libunwind"` is not caught, and its stacks are whole (x86-64). With a libunwind that cannot be driven a frame at a time it is not installed. |
 | A JIT that hands libgcc 2,000 unwind tables | `"libunwind"` does not hang |
 | The two libraries | No thread-local variable, no `__tls_get_addr`, everything bound at load |
 | `errno` after the first `malloc` that is sampled | As it was, under every backtrace |

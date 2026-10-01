@@ -109,6 +109,7 @@ int systing_heap_hooks_install(const char *backtrace)
 // program that imports extension modules does.
 const LOADS_LIBRARIES_C: &str = r#"
 #include <dlfcn.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 int main(int argc, char **argv)
@@ -125,6 +126,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "install: %d\n", rc);
         return 2;
     }
+    // Sampling, if it was off, is on from here.
+    bool on = true;
+    int (*mallctl)(const char *, void *, size_t *, void *, size_t) = dlsym(RTLD_DEFAULT, "mallctl");
+    if (mallctl("prof.active", NULL, NULL, &on, sizeof on) != 0)
+        return 2;
     for (int i = 0; i < atoi(argv[4]); i++) {
         char path[4096];
         snprintf(path, sizeof path, "%s/thread_local_%d.so", argv[3], i);
@@ -150,6 +156,7 @@ const LOADS_LIBRARIES_LATE_C: &str = r#"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #define THREADS 32
 static long (*touch)(void);
@@ -186,7 +193,7 @@ int main(int argc, char **argv)
         return 2;
     // The libunwind a test asked for is the one in use.
     const char *libunwind = getenv("SYSTING_HEAP_HOOKS_LIBUNWIND");
-    if (libunwind && argv[2][0] && !dlopen(libunwind, RTLD_NOW | RTLD_NOLOAD))
+    if (libunwind && !strcmp(argv[2], "libunwind") && !dlopen(libunwind, RTLD_NOW | RTLD_NOLOAD))
         return 3;
     int libraries = atoi(argv[4]);
     if (load(argv[3], 0, libraries / 2) != 0)
@@ -244,6 +251,9 @@ static int seen(uintptr_t word)
 }
 int main(void)
 {
+    // What a child has that another thread forked half way through
+    // shh_find_loader(): it is found again.
+    loader_start = loader_size = 1;
     if (shh_find_loader() != SHH_OK)
         return 2;
     uintptr_t in_the_loader = loader_start + 16;
@@ -340,12 +350,15 @@ const REFUSED_C: &str = r#"
 #include <errno.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 int main(int argc, char **argv)
 {
-    if (argc != 2)
+    if (argc != 4)
         return 100;
     void *hooks = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!hooks)
@@ -360,7 +373,22 @@ int main(int argc, char **argv)
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
         prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) != 0)
         return 101;
-    return ((int (*)(const char *))dlsym(hooks, "systing_heap_hooks_install"))("libunwind");
+    int rc = ((int (*)(const char *))dlsym(hooks, "systing_heap_hooks_install"))("libunwind");
+    if (rc != 0)
+        return rc;
+    bool on = true;
+    int (*mallctl)(const char *, void *, size_t *, void *, size_t) = dlsym(RTLD_DEFAULT, "mallctl");
+    if (mallctl("prof.active", NULL, NULL, &on, sizeof on) != 0)
+        return 100;
+    for (int i = 0; i < atoi(argv[3]); i++) {
+        char path[4096];
+        snprintf(path, sizeof path, "%s/thread_local_%d.so", argv[2], i);
+        void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!lib)
+            return 100;
+        ((long (*)(void))dlsym(lib, "touch"))();
+    }
+    return 0;
 }
 "#;
 
@@ -539,17 +567,22 @@ fn ends(env: &Env, cmd: &mut Command) -> Option<ExitStatus> {
 }
 
 fn native(env: &Env, hooks: &Path, backtrace: &str) -> Output {
+    native_with(env, hooks, backtrace, "")
+}
+
+fn native_with(env: &Env, hooks: &Path, backtrace: &str, conf: &str) -> Output {
     let program = env.dir.path().join("loads_libraries");
     if !program.exists() {
         cc(env.dir.path(), "loads_libraries", LOADS_LIBRARIES_C, false);
     }
-    sampled(
+    sampled_with(
         env,
         Command::new(program)
             .arg(hooks)
             .arg(backtrace)
             .arg(env.dir.path())
             .arg(LIBRARIES.to_string()),
+        conf,
     )
 }
 
@@ -625,8 +658,8 @@ fn nor_in_any_thread_of_one_that_loads_libraries_late() {
     }
 }
 
-/// A libunwind built to reach its variables by TLS descriptors, as any is on
-/// arm64, asks the loader too: the first time a thread reads them, where they
+/// A libunwind built to reach its variables by TLS descriptors, as one is on
+/// arm64 unless it was told otherwise, asks the loader too: the first time a thread reads them, where they
 /// were given no place in the thread's static block. So it is a thread's first
 /// sample that counts, and sampling is off until the tables are about to grow.
 #[test]
@@ -703,9 +736,14 @@ fn stacks_by_file(dump: &Path) -> Vec<Vec<String>> {
 /// a stack that starts where jemalloc's own does: nothing of the hook's is in it.
 #[test]
 fn what_the_loader_allocates_has_a_stack() {
+    // Elsewhere libunwind is not driven a frame at a time, and there is none.
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
     let Some(env) = setup() else { return };
     let hooks = env.dir.path().join("libsysting_heap_hooks.so");
-    let out = native(&env, &hooks, "libunwind");
+    // Every stack in the dump is one the backtrace made.
+    let out = native_with(&env, &hooks, "libunwind", ",prof_active:false");
     assert!(
         out.status.success(),
         "{}: {}",
@@ -1009,24 +1047,50 @@ fn the_loader_is_seen_in_a_signed_return_address() {
     assert!(out.status.success(), "{}", out.status);
 }
 
-/// A backtrace that could not tell whether the loader called malloc is not
-/// installed.
+/// Where the stack cannot be read, every allocation is taken for the loader's.
+/// "libunwind" goes on, a frame at a time, where it can. Where it cannot, it would
+/// have no stack at all, and is not installed.
 #[test]
-fn a_backtrace_that_cannot_read_the_stack_is_not_installed() {
+fn a_backtrace_that_cannot_read_the_stack_takes_the_loader_to_have_called() {
     let Some(env) = setup() else { return };
     let dir = env.dir.path();
     let program = cc(dir, "refused", REFUSED_C, false);
-    let status = ends(
-        &env,
-        Command::new(program).arg(dir.join("libsysting_heap_hooks.so")),
-    )
-    .expect("install() did not return");
+    let run = |libunwind: Option<&Path>| {
+        let mut cmd = Command::new(&program);
+        cmd.arg(dir.join("libsysting_heap_hooks.so"))
+            .arg(dir)
+            .arg(LIBRARIES.to_string());
+        if let Some(libunwind) = libunwind {
+            cmd.env("SYSTING_HEAP_HOOKS_LIBUNWIND", libunwind);
+        }
+        // Every stack in the dump is one the backtrace made.
+        sampled_with(&env, &mut cmd, ",prof_active:false").status
+    };
+    // SHH_ERR_STACK_READ
+    let refused = Some(14);
+    let status = run(None);
     if status.code() == Some(101) {
         common::skip("needs seccomp filters");
         return;
     }
-    // SHH_ERR_STACK_READ
-    assert_eq!(status.code(), Some(14), "{status}");
+    if cfg!(target_arch = "x86_64") {
+        assert!(status.success(), "{status}");
+        let dump = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "heap"))
+            .expect("jemalloc wrote no dump");
+        let whole = stacks_by_file(&dump)
+            .iter()
+            .filter(|stack| stack.iter().any(|f| f == "refused"))
+            .count();
+        assert!(whole > 0, "no stack reaches the program");
+    } else {
+        assert_eq!(status.code(), refused, "{status}");
+    }
+    // One with nothing to be driven a frame at a time by.
+    let libunwind = cc(dir, "reads_its_cache", READS_ITS_CACHE_C, true);
+    assert_eq!(run(Some(&libunwind)).code(), refused);
 }
 
 /// A malloc that succeeds is expected to leave errno alone.

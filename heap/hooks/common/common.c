@@ -146,7 +146,7 @@ const char *systing_heap_hooks_strerror(int code)
 	case SHH_ERR_NO_LOADER:
 		return "the dynamic loader's code was not found, so a backtrace could not tell when it is what called malloc";
 	case SHH_ERR_STACK_READ:
-		return "no protected way to read the stack (process_vm_readv refused), so a backtrace could not tell whether the dynamic loader called malloc";
+		return "no protected way to read the stack (process_vm_readv refused), so every allocation would be taken for the dynamic loader's, and this libunwind cannot be driven a frame at a time, so none would have a stack";
 	default:
 		return "unknown error";
 	}
