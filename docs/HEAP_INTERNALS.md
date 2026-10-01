@@ -405,6 +405,7 @@ Everything below ran on **x86-64 Linux with glibc**.
 | `--snoop` | `libjemalloc2` 5.3.0 (stripped), jemalloc 5.3.0 built from source, and the `dev` branch, with `prof_accum` and `prof_unbias` each on and off |
 | `--check` | Every command it prints is run through a shell, against a service that has everything and whose socket folder is named with a space, `;` and `$` |
 | `backtrace="python"` | CPython 3.12, 3.13 and 3.14 |
+| Every backtrace | A thread's table of thread-local variables made to grow inside a sampled `realloc()`, on glibc 2.39: in a native program, in each of 32 threads, in Python, and in a Python whose libpython is a shared library that reads its thread state through the loader |
 
 **In CI:** the tests run on every pull request, on GitHub's Ubuntu runners, whose default for `kernel.yama.ptrace_scope` is 1. A missing dependency, Python 3.14 and `sudo` included, fails the run and is not skipped.
 

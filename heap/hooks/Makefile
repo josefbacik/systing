@@ -16,11 +16,15 @@ HOOKS := $(OUT)/libsysting_heap_hooks.so
 RESPONDER := $(OUT)/libsysting_heap_responder.so
 
 COMMON_SRC := common/common.c
-BACKTRACE_SRC := backtrace/backtrace.c backtrace/python.c
+BACKTRACE_SRC := backtrace/backtrace.c backtrace/caller.c backtrace/python.c
 RESPONDER_SRC := responder/responder.c
-HDR := systing_heap_hooks.h common/common.h backtrace/python.h backtrace/py_offsets.h
+HDR := systing_heap_hooks.h common/common.h backtrace/caller.h backtrace/python.h \
+	backtrace/py_offsets.h
 
-BUILD = $(CC) $(CFLAGS) -Wall -Wextra -fPIC -shared -fno-omit-frame-pointer
+# -z now: every function is bound when the library is loaded. One bound at its
+# first call would be bound by the dynamic loader, from inside malloc.
+BUILD = $(CC) $(CFLAGS) -Wall -Wextra -fPIC -shared -fno-omit-frame-pointer \
+	-Wl,-z,now
 
 all: hooks responder
 
