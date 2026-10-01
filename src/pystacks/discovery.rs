@@ -304,16 +304,25 @@ fn try_python_module(
 
     pid_data.use_tls = pid_data.tls_key_addr > 0;
 
-    // Python 3.13+: GIL moved from _PyRuntimeState to PyInterpreterState
+    // Python 3.13+: GIL moved from _PyRuntimeState to PyInterpreterState. The
+    // interpreter to watch is the MAIN one: `_PyRuntime.interpreters.head` is
+    // the newest interpreter (the list is newest first), and from 3.12 a
+    // subinterpreter can own its own GIL, so a process with one alive would
+    // otherwise be gated on the wrong interpreter's GIL. `interpreters.main`
+    // is the field after `head`; the bindings say how far after.
     if major == 3
         && minor >= 13
         && pid_data.offsets.py_runtime_state_interpreters_head != BPF_LIB_DEFAULT_FIELD_OFFSET
         && pid_data.offsets.py_interpreter_state_gil_locked != BPF_LIB_DEFAULT_FIELD_OFFSET
     {
-        let interp_head_addr =
-            effective_runtime_addr + pid_data.offsets.py_runtime_state_interpreters_head;
+        let interp_main_addr = effective_runtime_addr
+            + main_interpreter_offset(
+                major,
+                minor,
+                pid_data.offsets.py_runtime_state_interpreters_head,
+            );
         let mut interp_addr_buf = [0u8; 8];
-        if process::read_process_memory(pid, interp_head_addr, &mut interp_addr_buf).is_ok() {
+        if process::read_process_memory(pid, interp_main_addr, &mut interp_addr_buf).is_ok() {
             let interp_addr = usize::from_ne_bytes(interp_addr_buf);
             if interp_addr != 0 {
                 pid_data.gil_locked_addr =
@@ -550,9 +559,39 @@ fn find_module_base_address(maps: &[MemoryMapping], module_path: &str) -> Option
     fallback
 }
 
+/// Where `_PyRuntime.interpreters.main` sits, given where `interpreters.head`
+/// sits for this process: the bindings for the version carry both, and the
+/// distance between them is the step, so the pair moves together wherever
+/// the head offset was taken from. A version with no object table (before
+/// 3.13) keeps `head`, the one interpreter it has.
+fn main_interpreter_offset(major: i32, minor: i32, head_offset: usize) -> usize {
+    match offsets::object_offsets_for_version(major, minor) {
+        Some(o) => head_offset + (o.runtime_interpreters_main - o.runtime_interpreters_head),
+        None => head_offset,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_main_interpreter_offset_is_the_field_after_head() {
+        use crate::pystacks::bindings::{v3_13_0, v3_14_0};
+        // The compiled layouts: `main` is the pointer after `head`.
+        assert_eq!(
+            main_interpreter_offset(3, 13, v3_13_0::PYRUNTIME_INTERPRETERS_HEAD_OFFSET),
+            v3_13_0::PYRUNTIME_INTERPRETERS_MAIN_OFFSET
+        );
+        assert_eq!(
+            main_interpreter_offset(3, 14, v3_14_0::PYRUNTIME_INTERPRETERS_HEAD_OFFSET),
+            v3_14_0::PYRUNTIME_INTERPRETERS_MAIN_OFFSET
+        );
+        // A head offset the process itself reported keeps the same step.
+        assert_eq!(main_interpreter_offset(3, 14, 1000), 1008);
+        // Before 3.13 there is no table, and one interpreter: head stands.
+        assert_eq!(main_interpreter_offset(3, 12, 632), 632);
+    }
 
     #[test]
     fn test_parse_cpython_version() {
