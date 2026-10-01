@@ -20,6 +20,13 @@
 //!    of them is believed: a record that claims another geometry, a region
 //!    larger than the ABI's, or an address other than its own is refused.
 //!
+//! A look can come while the loader is still mapping the library, which it does
+//! in steps: the whole of the file's extent first, as its first segment is
+//! mapped, then each other segment over that. In between, the first mapping
+//! becomes shorter, so the range the map gave a moment ago may name no entry of
+//! `map_files` any more, and other bytes of the file are where the record will
+//! be. Neither says anything about the process: it is looked at again.
+//!
 //! NOT looked for in this version: a library reached only through another
 //! library, through `LD_PRELOAD` or through `dlopen`, and a file whose
 //! section header table was removed. Such a process simply has no recipe.
@@ -194,8 +201,8 @@ pub(crate) enum Finding {
     Published(Recipe),
     /// Neither the executable nor a direct dependency carries the record.
     NotLinked,
-    /// The process links the library, and the library is not mapped yet or
-    /// has not published yet: look again.
+    /// The process links the library, and the library is not mapped yet, or
+    /// not all of it, or has not published yet: look again.
     NotYet,
     Refused(Refusal),
     /// The process is gone, or its files or memory cannot be read.
@@ -256,6 +263,8 @@ impl DiscoveryCounters {
 pub(crate) struct ElfFacts {
     /// Link-time address of a record whose constant fields check out.
     pub record_address: Option<u64>,
+    /// Where in the file that record is.
+    pub record_offset: u64,
     /// The file has the section, and what is in it is not a record.
     pub record_refused: bool,
     /// The file names the library among its direct dependencies.
@@ -453,6 +462,7 @@ pub(crate) fn elf_facts<'data, R: ReadRef<'data>>(data: R) -> Option<ElfFacts> {
     let sections = header.sections(endian, data).ok()?;
 
     let mut record_address = None;
+    let mut record_offset = 0;
     let mut record_refused = false;
     if let Some((_, section)) = sections.section_by_name(endian, INFO_SECTION.as_bytes()) {
         // The constant fields are in the file's data image, so a section
@@ -467,7 +477,8 @@ pub(crate) fn elf_facts<'data, R: ReadRef<'data>>(data: R) -> Option<ElfFacts> {
         };
         match bytes {
             Some(bytes) if constants_ok(bytes).is_ok() => {
-                record_address = Some(section.sh_addr(endian))
+                record_address = Some(section.sh_addr(endian));
+                record_offset = section.sh_offset(endian);
             }
             _ => record_refused = true,
         }
@@ -475,6 +486,7 @@ pub(crate) fn elf_facts<'data, R: ReadRef<'data>>(data: R) -> Option<ElfFacts> {
 
     Some(ElfFacts {
         record_address,
+        record_offset,
         record_refused,
         needs_library: needs_library(&sections, endian, data),
         first_load_address,
@@ -493,6 +505,16 @@ pub(crate) fn load_bias(facts: &ElfFacts, start: u64, map_offset: u64) -> Option
             .wrapping_sub(facts.first_load_address)
             .wrapping_add(into_file),
     )
+}
+
+/// Whether what is mapped at `address` is the file from `record_offset` on: the
+/// record's own bytes, and not those the loader's first mapping of the whole
+/// file leaves there until the record's segment is mapped over it.
+fn record_is_mapped(maps: &[MemoryMapping], address: u64, record_offset: u64) -> bool {
+    maps.iter().any(|mapping| {
+        (mapping.start as u64..mapping.end as u64).contains(&address)
+            && mapping.offset.checked_add(address - mapping.start as u64) == Some(record_offset)
+    })
 }
 
 /// The last component of a mapped file's name as `/proc/<pid>/maps` prints
@@ -556,8 +578,9 @@ fn exe_mapping<'a>(
 /// namespace, and whether or not the file still has a name. Never by the
 /// path the map prints: a path is the traced process's to choose, it means
 /// something else in another namespace, and an open acts (a device node, a
-/// FIFO) before anything can be checked. A process whose entry cannot be
-/// opened counts as gone, and its next exec is looked at again.
+/// FIFO) before anything can be checked. An entry is named by its mapping's
+/// exact range, so there is none for a range that has changed since the map was
+/// read.
 fn open_mapped_file(pid: u32, mapping: &MemoryMapping) -> Option<fs::File> {
     let by_range = format!(
         "/proc/{pid}/map_files/{:x}-{:x}",
@@ -651,20 +674,35 @@ impl Discovery {
         if maps.is_empty() {
             return Finding::Gone;
         }
+        self.look_in_map(pid, &exe, exe_facts, &maps)
+    }
+
+    /// The rest of a look at a process that links the library: `maps` is its
+    /// map as it was read a moment ago.
+    fn look_in_map(
+        &mut self,
+        pid: u32,
+        exe: &fs::File,
+        exe_facts: ElfFacts,
+        maps: &[MemoryMapping],
+    ) -> Finding {
         let (facts, start, map_offset) = if exe_facts.record_address.is_some() {
-            let Some(mapping) = exe_mapping(pid, &exe, &maps) else {
+            let Some(mapping) = exe_mapping(pid, exe, maps) else {
                 return Finding::Gone;
             };
             (exe_facts, mapping.start as u64, mapping.offset)
         } else {
-            let Some(mapping) = lowest_mapping(&maps, |mapping| {
+            let Some(mapping) = lowest_mapping(maps, |mapping| {
                 is_library_name(mapped_file_name(&mapping.name).as_bytes())
             }) else {
                 // The loader has not mapped it yet.
                 return Finding::NotYet;
             };
             let Some(library) = open_mapped_file(pid, mapping) else {
-                return Finding::Gone;
+                // The loader has gone on mapping it since the map was read. A
+                // process that is gone instead has no executable at its next
+                // look.
+                return Finding::NotYet;
             };
             let Some(library_facts) = self.facts_of(&library) else {
                 return Finding::Gone;
@@ -685,6 +723,9 @@ impl Discovery {
             return Finding::Gone;
         };
         let address = bias.wrapping_add(record_address);
+        if !record_is_mapped(maps, address, facts.record_offset) {
+            return Finding::NotYet;
+        }
 
         let Ok(memory) = ProcessMemory::open(pid as i32) else {
             return Finding::Gone;
@@ -1055,6 +1096,7 @@ mod tests {
         // 0, offset 0, mapped at 0x7f12_3456_0000.
         let pie = ElfFacts {
             record_address: Some(0x4010),
+            record_offset: 0x3010,
             record_refused: false,
             needs_library: false,
             first_load_address: 0,
@@ -1290,6 +1332,7 @@ mod tests {
         let file = small_elf(Some(&record_in_file()), None);
         let facts = elf_facts(&file[..]).expect("an ELF file");
         assert_eq!(facts.record_address, Some(LOAD_ADDRESS + 64 + 56));
+        assert_eq!(facts.record_offset, 64 + 56);
         assert!(!facts.record_refused);
         assert!(!facts.needs_library);
         assert_eq!(
@@ -1414,6 +1457,106 @@ mod tests {
         // Its first segment is at or after the start of that mapping.
         let facts = elf_facts(&ReadCache::new(&exe)).expect("an ELF file");
         assert!(load_bias(&facts, mapping.start as u64, mapping.offset).is_some());
+    }
+
+    /// Mappings of the library's file, each (start, end, offset in the file).
+    fn library_maps(ranges: &[(usize, usize, u64)]) -> Vec<MemoryMapping> {
+        ranges
+            .iter()
+            .map(|&(start, end, offset)| MemoryMapping {
+                start,
+                end,
+                perms: "r--p".to_string(),
+                offset,
+                dev_major: 0x103,
+                dev_minor: 5,
+                inode: 106,
+                name: "/tmp/x/libtask_context.so".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_record_is_not_read_before_the_loader_has_mapped_its_segment() {
+        // The library's map after each mmap() the loader made of it, as a build
+        // of the library was seen to be loaded: four segments, the record at
+        // address 0x5080 and at 0x4080 in the file.
+        const BASE: usize = 0x7fff_f7fb_7000;
+        let address = BASE as u64 + 0x5080;
+        let whole = library_maps(&[(BASE, BASE + 0x6000, 0)]);
+        let code = library_maps(&[
+            (BASE, BASE + 0x1000, 0),
+            (BASE + 0x1000, BASE + 0x3000, 0x1000),
+            (BASE + 0x3000, BASE + 0x6000, 0x3000),
+        ]);
+        let data = library_maps(&[
+            (BASE, BASE + 0x1000, 0),
+            (BASE + 0x1000, BASE + 0x3000, 0x1000),
+            (BASE + 0x3000, BASE + 0x4000, 0x3000),
+            (BASE + 0x4000, BASE + 0x6000, 0x3000),
+        ]);
+        // And once the start of that segment has been made read-only.
+        let protected = library_maps(&[
+            (BASE, BASE + 0x1000, 0),
+            (BASE + 0x1000, BASE + 0x3000, 0x1000),
+            (BASE + 0x3000, BASE + 0x4000, 0x3000),
+            (BASE + 0x4000, BASE + 0x5000, 0x3000),
+            (BASE + 0x5000, BASE + 0x6000, 0x4000),
+        ]);
+        assert!(!record_is_mapped(&whole, address, 0x4080));
+        assert!(!record_is_mapped(&code, address, 0x4080));
+        assert!(record_is_mapped(&data, address, 0x4080));
+        assert!(record_is_mapped(&protected, address, 0x4080));
+        // Nothing is mapped there at all.
+        assert!(!record_is_mapped(&data, address + 0x1000, 0x5080));
+        assert!(!record_is_mapped(&[], address, 0x4080));
+    }
+
+    #[test]
+    fn a_process_whose_record_is_not_mapped_yet_is_looked_at_again_not_refused() {
+        // This process, as if its executable's first bytes were the record.
+        let me = std::process::id();
+        let exe = fs::File::open(format!("/proc/{me}/exe")).unwrap();
+        let maps = parse_proc_maps(me as i32);
+        let facts = elf_facts(&ReadCache::new(&exe)).expect("an ELF file");
+        let mapped = ElfFacts {
+            record_address: Some(facts.first_load_address),
+            record_offset: facts.first_load_offset,
+            ..facts
+        };
+        let mut discovery = Discovery::new();
+        // Those bytes are read, and are no record.
+        assert_eq!(
+            discovery.look_in_map(me, &exe, mapped, &maps),
+            Finding::Refused(Refusal::Magic)
+        );
+        // Other bytes of the file are at the address: nothing is made of them.
+        let elsewhere = ElfFacts {
+            record_offset: facts.first_load_offset + 0x1000,
+            ..mapped
+        };
+        assert_eq!(
+            discovery.look_in_map(me, &exe, elsewhere, &maps),
+            Finding::NotYet
+        );
+    }
+
+    #[test]
+    fn a_library_whose_mapping_has_changed_since_the_map_was_read_is_looked_at_again() {
+        let me = std::process::id();
+        let exe = fs::File::open(format!("/proc/{me}/exe")).unwrap();
+        let facts = elf_facts(&ReadCache::new(&exe)).expect("an ELF file");
+        let links = ElfFacts {
+            needs_library: true,
+            ..facts
+        };
+        // A range that is no mapping of this process, as the library's whole
+        // extent is none once the loader has mapped its second segment.
+        let stale = library_maps(&[(0x1000, 0x7000, 0)]);
+        assert_eq!(
+            Discovery::new().look_in_map(me, &exe, links, &stale),
+            Finding::NotYet
+        );
     }
 
     #[test]

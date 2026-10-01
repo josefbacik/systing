@@ -716,8 +716,10 @@ void systing_heap_hooks_python_backtrace(void **vec, unsigned *len,
 	}
 	/* No thread-local variable of Python's has been read yet. What has run,
 	 * jemalloc's own backtrace, has written below this function's frame and
-	 * not above. */
-	int by_loader = shh_loader_called_malloc(__builtin_frame_address(0), read_some);
+	 * not above. The stack it made is a second way to tell, where the look
+	 * falls short. */
+	int by_loader = shh_loader_called_malloc(__builtin_frame_address(0), read_some) ||
+			shh_loader_is_near(vec, n);
 	walk(MAX_SLOTS, py.pid, by_loader, emit_slot, &py);
 	walk_end();
 	if (n > max_len - py.n)
