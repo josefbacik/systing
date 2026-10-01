@@ -282,6 +282,17 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.pid = vec![std::process::id()];
         c.collect_pystacks = true;
     });
+    // The same handlers without the Python walker. It is not the row above
+    // with less in it: the verifier adds up the frames of every chain of
+    // calls, a walker it pruned still counts one rounding step a function,
+    // and the kprobe and uprobe handlers reach the path that emits a running
+    // stack through a frame of their own, so this is the longest chain a
+    // capture without the walker has (eight frames) and the first to pass
+    // the limit when a frame in it grows.
+    add("trace-event-no-pystacks", &|c| {
+        c.trace_event = vec!["tracepoint:sched:sched_process_exit".to_string()];
+        c.pid = vec![std::process::id()];
+    });
 
     // --include-task-context. On every other row the flag is off: none of
     // its three programs is selected, none of its maps is created, and the
@@ -289,11 +300,11 @@ pub fn shape_table() -> Vec<LoadShape> {
     // are also the proof that the feature costs a capture without the flag
     // nothing at load. With the flag: the helper live in the CPU sampler and
     // the three lifecycle programs, at the default capture; beside the Python
-    // walker (the emit path's two user-memory readers in one program, the
-    // widest stack frame that path can have); in the generic probe handlers,
-    // each of which emits a running stack through the same path; and with
-    // build-id frames, the emit path's other reservation size. Written for
-    // Linux 6.12 and newer: the kernels these rows load on.
+    // walker (the emit path's two user-memory readers in one program); in the
+    // generic probe handlers, each of which emits a running stack through the
+    // same path, with the walker and without it; and with build-id frames,
+    // the emit path's other reservation size. Written for Linux 6.12 and
+    // newer: the kernels these rows load on.
     add("task-context", &|c| c.include_task_context = true);
     add("task-context-pystacks", &|c| {
         c.include_task_context = true;
@@ -304,6 +315,11 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.trace_event = vec!["tracepoint:sched:sched_process_exit".to_string()];
         c.pid = vec![std::process::id()];
         c.collect_pystacks = true;
+    });
+    add("task-context-trace-event-no-pystacks", &|c| {
+        c.include_task_context = true;
+        c.trace_event = vec!["tracepoint:sched:sched_process_exit".to_string()];
+        c.pid = vec![std::process::id()];
     });
     add("task-context-build-id", &|c| {
         c.include_task_context = true;
@@ -914,6 +930,16 @@ R0 unbounded memory access\n\
         assert!(shapes.iter().any(|s| s.config.network
             && s.config.kernel_hooks == KernelHooks::Trampoline
             && s.legs == LegSelection::Host));
+        // The generic probe handlers with the Python walker and without it:
+        // to the verifier the two are different chains of frames.
+        for walker in [true, false] {
+            assert!(
+                shapes.iter().any(|s| !s.config.trace_event.is_empty()
+                    && s.config.collect_pystacks == walker
+                    && !s.config.include_task_context),
+                "no trace-event row with collect_pystacks={walker}"
+            );
+        }
         // --include-task-context: loaded alone, beside the Python walker and
         // in the generic probe handlers; and off on every row that is not its
         // own, so that the rest of the table loads the object a capture
