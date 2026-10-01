@@ -12,7 +12,7 @@
  *
  * WHO CAN CALL IT. Two callers, in two objects. Any handler that records
  * something about the CURRENT thread calls task_context_read_current(): one
- * inline function taking the task, and every recorder's handlers in
+ * function taking the task, and every recorder's handlers in
  * systing_system.bpf.c are one translation unit with it. The first caller is
  * the path that emits a running stack. The task-stacks recorder's object
  * (src/bpf/task_stacks.bpf.c, built with STROBELIGHT_SLEEPABLE_BPF) includes
@@ -708,8 +708,17 @@ task_context_look(struct task_struct *task,
  * into a counted miss).
  *
  * The steps are the ABI's reader rule, in its order and with its numbers.
+ *
+ * A function of its own, never inlined: the caller is the path that emits a
+ * running stack, and the frames from a handler through that path to the
+ * bottom of the Python walker are added up against the verifier's 512 bytes.
+ * Inlined, this function's locals are part of the emit path's frame, and the
+ * compiler lays that frame out as one: the slots of code that runs with the
+ * feature off moved below them, so a capture without the feature was charged
+ * for it. Called, it is a chain of its own, three or four frames deep, and
+ * the emit path's frame holds nothing of it.
  */
-static __always_inline u64 task_context_read_current(struct task_struct *task)
+static __noinline u64 task_context_read_current(struct task_struct *task)
 {
 	struct task_context_value_event *rec;
 	const struct task_context_recipe *recipe;

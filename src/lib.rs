@@ -33,6 +33,7 @@ pub mod mcp;
 
 // Core library modules
 pub mod bpf_load_shapes;
+pub mod bpf_stack_budget;
 pub mod build_id_store;
 pub mod cgroup;
 pub mod duckdb;
