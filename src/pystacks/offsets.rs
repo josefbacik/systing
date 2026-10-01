@@ -7,12 +7,33 @@ use super::bindings;
 use super::types::OffsetConfig;
 use super::types::BPF_LIB_DEFAULT_FIELD_OFFSET;
 
-/// Returns the OffsetConfig for a given Python (major, minor) version.
-/// Returns None if the version is not supported.
-/// Falls back to Python 3.14 for unknown versions >= 3.14.
+/// Where a `_Py_DebugOffsets` (3.13+) says what it is: its cookie, the version
+/// of its Python, and whether that is a free-threaded build. The table starts
+/// with these, the same way in every version and build that has one.
+pub const DEBUG_OFFSETS_COOKIE: usize = bindings::v3_14_7t::PY_DEBUG_OFFSETS_COOKIE;
+pub const DEBUG_OFFSETS_VERSION: usize = bindings::v3_14_7t::PY_DEBUG_OFFSETS_VERSION;
+pub const DEBUG_OFFSETS_FREE_THREADED: usize = bindings::v3_14_7t::PY_DEBUG_OFFSETS_FREE_THREADED;
+
+/// Returns the OffsetConfig for a given Python (major, minor) version of the
+/// default build. See `for_build`.
 pub fn for_version(major: i32, minor: i32) -> Option<OffsetConfig> {
+    for_build(major, minor, false)
+}
+
+/// Returns the OffsetConfig for a given Python (major, minor) version and build:
+/// free-threaded (`--disable-gil`) is a different ABI from the default one.
+/// Returns None if the version or the build is not supported.
+/// Falls back to Python 3.14 for unknown versions >= 3.14 of the default build.
+pub fn for_build(major: i32, minor: i32, free_threaded: bool) -> Option<OffsetConfig> {
     if major != 3 {
         return None;
+    }
+    if free_threaded {
+        // No fallback: a table for another layout reads the wrong words.
+        return match minor {
+            14 => Some(py314t()),
+            _ => None,
+        };
     }
     match minor {
         8 => Some(py38()),
@@ -363,6 +384,61 @@ pub fn py314() -> OffsetConfig {
     c
 }
 
+/// Free-threaded 3.14: the fields `py314` sets, from that build's bindings.
+#[allow(clippy::field_reassign_with_default)]
+pub fn py314t() -> OffsetConfig {
+    use bindings::v3_14_7t::*;
+    let mut c = OffsetConfig::default();
+
+    // Common offsets
+    c.py_object_type = PY_OBJECT_OB_TYPE;
+    c.py_type_object_name = PY_TYPE_OBJECT_TP_NAME;
+    c.py_var_object_size = PY_VAR_OBJECT_OB_SIZE;
+    c.py_tuple_object_item = PY_TUPLE_OBJECT_OB_ITEM;
+    c.py_bytes_object_data = PY_BYTES_OBJECT_OB_SVAL;
+    c.string_data = PY_ASCII_OBJECT_SIZE;
+
+    // Thread state (current_frame directly on _ts, no _PyCFrame)
+    c.py_thread_state_cframe = PY_THREAD_STATE_CURRENT_FRAME;
+    c.py_thread_state_thread = PY_THREAD_STATE_THREAD;
+    c.py_thread_state_interp = PY_THREAD_STATE_INTERP;
+
+    // No _PyCFrame indirection - sentinel means "no second dereference"
+    c.py_cframe_current_frame = BPF_LIB_DEFAULT_FIELD_OFFSET;
+
+    // Interpreter frame (as in the default build, but for owner)
+    c.py_interpreter_frame_code = PY_INTERP_FRAME_CODE;
+    c.py_interpreter_frame_previous = PY_INTERP_FRAME_PREVIOUS;
+    c.py_interpreter_frame_localsplus = PY_INTERP_FRAME_LOCALSPLUS;
+    c.py_interpreter_frame_prev_instr = PY_INTERP_FRAME_PREV_INSTR;
+
+    // Code object
+    c.py_code_object_co_flags = PY_CODE_OBJECT_CO_FLAGS;
+    c.py_code_object_filename = PY_CODE_OBJECT_CO_FILENAME;
+    c.py_code_object_name = PY_CODE_OBJECT_CO_NAME;
+    c.py_code_object_qualname = PY_CODE_OBJECT_CO_QUALNAME;
+    c.py_code_object_linetable = PY_CODE_OBJECT_CO_LINETABLE;
+    c.py_code_object_firstlineno = PY_CODE_OBJECT_CO_FIRSTLINENO;
+    c.py_code_object_code_adaptive = PY_CODE_OBJECT_CO_CODE_ADAPTIVE;
+
+    // 3.12+ generator/coroutine offsets
+    c.py_coro_object_cr_awaiter = PY_CORO_OBJECT_CR_ORIGIN_OR_FINALIZER;
+    c.py_gen_object_iframe = PY_GEN_OBJECT_GI_IFRAME;
+    c.py_frame_object_owner = PY_INTERP_FRAME_OWNER;
+
+    // Compound offsets (from C program)
+    c.tls_key_offset = PYRUNTIME_TLS_KEY_OFFSET;
+    c.py_runtime_state_interpreters_head = PYRUNTIME_INTERPRETERS_HEAD_OFFSET;
+    c.py_interpreter_state_modules = PYINTERP_MODULES_OFFSET;
+    c.py_interpreter_state_gil_locked = PYINTERP_GIL_LOCKED_OFFSET;
+    c.py_interpreter_state_gil_last_holder = PYINTERP_GIL_LAST_HOLDER_OFFSET;
+
+    c.py_version_major = 3;
+    c.py_version_minor = 14;
+    c.py_version_micro = 0;
+    c
+}
+
 /// Offsets for reading Python objects out of a process from user space: a
 /// dict, an instance's attributes, a module, an int, a string (see
 /// `pyobject.rs`). BPF does none of this, so these are not part of the
@@ -478,7 +554,19 @@ macro_rules! object_offsets {
 /// `dk_size` and there are no unicode-only entries, and 3.11 and 3.12 keep an
 /// instance's values behind a pointer ahead of the object, not inline.
 pub fn object_offsets_for_version(major: i32, minor: i32) -> Option<ObjectOffsets> {
-    if major != 3 {
+    object_offsets_for_build(major, minor, false)
+}
+
+/// The `ObjectOffsets` for a Python (major, minor) and build. `None` for a
+/// free-threaded build: `pyobject.rs` reads a str's state bits, which that
+/// build lays out differently, so offsets alone would not read its objects.
+/// Nothing asks for one yet: thread names are read as for the default build.
+pub fn object_offsets_for_build(
+    major: i32,
+    minor: i32,
+    free_threaded: bool,
+) -> Option<ObjectOffsets> {
+    if major != 3 || free_threaded {
         return None;
     }
     match minor {
@@ -597,5 +685,121 @@ mod tests {
         assert_eq!(c.py_runtime_state_interpreters_head, 632);
         assert_eq!(c.py_interpreter_state_gil_locked, 7768);
         assert_eq!(c.py_interpreter_state_gil_last_holder, 7760);
+    }
+
+    /// Each field of an OffsetConfig as (name, value), from its Debug form:
+    /// the struct has no PartialEq to compare two of them with.
+    fn fields(c: &OffsetConfig) -> Vec<(String, String)> {
+        let debug = format!("{c:?}");
+        let body = debug
+            .trim_start_matches("OffsetConfig { ")
+            .trim_end_matches(" }");
+        body.split(", ")
+            .map(|f| f.split_once(": ").unwrap())
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_for_build_default_build() {
+        let tables = [
+            (8, py38()),
+            (9, py39()),
+            (10, py310()),
+            (11, py311()),
+            (12, py312()),
+            (13, py313()),
+            (14, py314()),
+            (15, py314()), // falls back to 3.14
+        ];
+        for (minor, table) in &tables {
+            assert_eq!(fields(&for_build(3, *minor, false).unwrap()), fields(table));
+            assert_eq!(fields(&for_version(3, *minor).unwrap()), fields(table));
+        }
+        assert!(for_build(3, 7, false).is_none());
+        assert!(for_build(2, 7, false).is_none());
+    }
+
+    #[test]
+    fn test_py314t_offsets() {
+        let c = for_build(3, 14, true).unwrap();
+        assert_eq!((c.py_version_major, c.py_version_minor), (3, 14));
+        // A 32-byte object header: ob_type is its last word, and a field behind
+        // a header is 16 bytes further than in the default build (24 when it is
+        // also behind co_tlbc, which only this build's code object has).
+        assert_eq!(c.py_object_type, 24);
+        assert_eq!(c.py_var_object_size, 32);
+        assert_eq!(c.string_data, 56);
+        assert_eq!(c.py_type_object_name, 40);
+        assert_eq!(c.py_tuple_object_item, 48);
+        assert_eq!(c.py_bytes_object_data, 48);
+        assert_eq!(c.py_code_object_co_flags, 64);
+        assert_eq!(c.py_code_object_firstlineno, 84);
+        assert_eq!(c.py_code_object_filename, 128);
+        assert_eq!(c.py_code_object_name, 136);
+        assert_eq!(c.py_code_object_qualname, 144);
+        assert_eq!(c.py_code_object_linetable, 152);
+        assert_eq!(c.py_code_object_code_adaptive, 232);
+        // The frame has tlbc_index ahead of owner, and is otherwise the same.
+        assert_eq!(c.py_frame_object_owner, 78);
+        assert_eq!(c.py_interpreter_frame_code, 0);
+        assert_eq!(c.py_interpreter_frame_previous, 8);
+        assert_eq!(c.py_interpreter_frame_prev_instr, 56);
+        assert_eq!(c.py_interpreter_frame_localsplus, 80);
+        // Neither the thread state nor the runtime has an object header.
+        let d = py314();
+        assert_eq!(c.py_thread_state_cframe, d.py_thread_state_cframe);
+        assert_eq!(c.py_thread_state_thread, d.py_thread_state_thread);
+        assert_eq!(c.tls_key_offset, d.tls_key_offset);
+    }
+
+    #[test]
+    fn test_py314t_sets_the_fields_py314_sets() {
+        let unset = BPF_LIB_DEFAULT_FIELD_OFFSET.to_string();
+        let (default, free_threaded) = (fields(&py314()), fields(&py314t()));
+        for ((name, d), (_, t)) in default.iter().zip(&free_threaded) {
+            assert_eq!(*d == unset, *t == unset, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_for_build_free_threaded_without_a_table() {
+        assert!(for_build(3, 12, true).is_none());
+        assert!(for_build(3, 13, true).is_none());
+        assert!(for_build(3, 15, true).is_none()); // no fallback
+        assert!(for_build(2, 7, true).is_none());
+    }
+
+    #[test]
+    fn test_object_offsets_for_build() {
+        for minor in 12..=15 {
+            assert_eq!(
+                object_offsets_for_build(3, minor, false),
+                object_offsets_for_version(3, minor)
+            );
+            assert!(object_offsets_for_build(3, minor, true).is_none());
+        }
+    }
+
+    #[test]
+    fn test_debug_offsets_start() {
+        use bindings::{v3_13_0, v3_14_0, v3_14_7t};
+        assert_eq!(
+            (
+                DEBUG_OFFSETS_COOKIE,
+                DEBUG_OFFSETS_VERSION,
+                DEBUG_OFFSETS_FREE_THREADED
+            ),
+            (0, 8, 16)
+        );
+        // The table is where every version and build has it.
+        assert_eq!(v3_14_7t::PYRUNTIME_DEBUG_OFFSETS_OFFSET, 0);
+        assert_eq!(v3_14_0::PYRUNTIME_DEBUG_OFFSETS_OFFSET, 0);
+        assert_eq!(v3_13_0::PYRUNTIME_DEBUG_OFFSETS_OFFSET, 0);
+        // And starts with those three words in each: what follows them (size,
+        // finalizing, then interpreters_head) is at 24 + 16.
+        assert_eq!(v3_14_7t::PY_DEBUG_OFFSETS_RUNTIME_INTERPRETERS_HEAD, 40);
+        assert_eq!(v3_14_0::PY_DEBUG_OFFSETS_RUNTIME_INTERPRETERS_HEAD, 40);
+        assert_eq!(v3_13_0::PY_DEBUG_OFFSETS_RUNTIME_INTERPRETERS_HEAD, 40);
     }
 }
