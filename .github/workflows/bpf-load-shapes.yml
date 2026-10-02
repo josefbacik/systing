@@ -185,6 +185,14 @@ jobs:
           - id: cos-129-6.12.90
             url: https://storage.googleapis.com/cos-tools/19506.224.80/gke-amd64-gcp/vmlinux
             sha256: 0c39e1964e6dfe2871227d30c4141a01a05b1e7fd1e184e87608b461e64ef69e
+          # Container-Optimized OS, milestone 121 build 18867.199.56: kernel
+          # 6.6.97+ — the first 6.6 row of this matrix. On a 6.6 kernel the six
+          # TIME_WAIT programs are unselected by the gate's own symbol check
+          # (`inet_twsk_hashdance_schedule` exists from 6.11), so this row also
+          # exercises that allowance's negative branch.
+          - id: cos-121-6.6.97
+            url: https://storage.googleapis.com/cos-tools/18867.199.56/gke-amd64-gcp/vmlinux
+            sha256: 3e5f74c3d3ed04576f71b219353ae86c60429cede2b4156c15681c8b44cafd5b
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/download-artifact@v4
