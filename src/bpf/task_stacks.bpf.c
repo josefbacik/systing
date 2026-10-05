@@ -383,6 +383,38 @@ __noinline u64 task_stacks_read_context(pid_t tid)
 	return id;
 }
 
+/*
+ * task_in_target_set() for the task the iterator hands the program.
+ *
+ * The kernel's --cgroup test, bpf_task_under_cgroup(), takes a task the
+ * verifier holds to be trusted. A task iterator's task is that from Linux 6.7
+ * on; a 6.5 or 6.6 verifier refuses the call on it ("R1 must be a rcu
+ * pointer"), and with it the whole program. So for that test the thread is
+ * acquired by its tid, as the legs above acquire it: what bpf_task_from_pid()
+ * returns is trusted on every kernel that has the test. One lookup more per
+ * thread such a capture's walk visits, on every kernel, so that one program
+ * loads on all of them. By number, as above; and a thread that has been
+ * reaped since the iterator took it has no tid to be found by: it is in no
+ * target set, and the legs above would have found nothing of it either.
+ */
+static __always_inline bool iter_task_in_target_set(struct task_struct *task)
+{
+	struct task_struct *held;
+	bool hit;
+
+	if (!task_in_target_pids(task))
+		return false;
+	if (!target_filter.filter_cgroup)
+		return true;
+	if (!target_filter.cgroup_match_kernel)
+		return task_in_legacy_cgroup_set(task);
+	if (get_task(task->pid, &held))
+		return false;
+	hit = task_in_cgroup_filter(held);
+	put_task(held);
+	return hit;
+}
+
 SEC("iter.s/task")
 int systing_task_stacks(struct bpf_iter__task *ctx)
 {
@@ -417,7 +449,7 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 		return 0;
 	/* Whatever the link covers: a walk scoped to the targets narrows what
 	 * is visited, never what is recorded. */
-	if (!task_in_target_set(task))
+	if (!iter_task_in_target_set(task))
 		return 0;
 	if (stats)
 		__sync_fetch_and_add(&stats->targeted, 1);
@@ -482,8 +514,16 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	err = bpf_seq_write(seq, e, sizeof(*e));
 	err |= bpf_seq_write(seq, s->kernel_stack, klen * sizeof(u64));
 	err |= bpf_seq_write(seq, s->user_stack, ulen * sizeof(u64));
+	/*
+	 * Bounded once more, at the call. py_len has to outlive the calls above,
+	 * and the compiler may keep it in a 4-byte stack slot it filled before
+	 * the bound was tested. An older verifier (6.6.97's; not 6.6.157's, nor
+	 * 6.12's) carries a tested bound to the registers that hold the value
+	 * and not to a stack slot narrower than a register, so what is read back
+	 * from the slot is any u32 to it ("R3 unbounded memory access").
+	 */
 	if (py)
-		err |= bpf_seq_write(seq, py, py_len);
+		err |= bpf_seq_write(seq, py, bounded(py_len, sizeof(*py)));
 	/*
 	 * The status becomes the thread's baseline only once its record is out.
 	 * When the seq buffer fills, the kernel drops what this call wrote and

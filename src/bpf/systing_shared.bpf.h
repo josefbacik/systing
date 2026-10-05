@@ -178,6 +178,11 @@ static __systing_maybe_unused bool current_in_cgroup_filter(void)
  * this KF_RCU kfunc). The rcu section holds no lock and takes no reference:
  * one map lookup and one ancestors[] compare per target.
  *
+ * The task has to be one the verifier trusts as well. A tp_btf program's
+ * arguments are; the task a task iterator hands over is from 6.7 only, so the
+ * iterator passes one it acquired itself (iter_task_in_target_set() in
+ * task_stacks.bpf.c).
+ *
  * Kernels without the kfunc (< 6.5) never get here - userspace selects the
  * legacy snapshot matching on them (target_filter.cgroup_match_kernel == 0,
  * see task_in_legacy_cgroup_set) - and bpf_ksym_exists() keeps every program
