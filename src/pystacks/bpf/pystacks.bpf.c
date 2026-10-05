@@ -661,6 +661,12 @@ static __always_inline void* get_code_ptr(
           sizeof(void*),
           (char*)frame_ptr + offsets->PyInterpreterFrame_code,
           task);
+      // From 3.14 on f_executable is a _PyStackRef: a pointer with a tag in its
+      // low bits (the mask Py_TAG_BITS: 3 in the default build, 1 in the
+      // free-threaded one). An object pointer's low two bits are always zero.
+      if (offsets->PyVersion_minor >= 14) {
+        code_ptr = (void*)((uintptr_t)code_ptr & ~(uintptr_t)3);
+      }
     } else {
       result = bpf_probe_read_user_task(
           &code_ptr,
