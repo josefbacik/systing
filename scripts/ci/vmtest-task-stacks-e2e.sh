@@ -14,6 +14,18 @@
 # were scoped. A line only a run of each case prints is required of every case: that
 # is what shows all four ran.
 #
+# One early return is the kernel's and not the guest's: the walk scoped to `--cgroup`
+# targets lists their processes with the css_task iterator, which a kernel before 6.7
+# does not have. There a `--cgroup` capture walks every thread on the host, by the
+# recorder's own decision before it loads anything, and the two cases with such a
+# capture say so in fixed words that name that reason. On a kernel without
+# `bpf_iter_css_task_new` (read here from kallsyms; the recorder reads the kernel's
+# BTF, so a kernel on which the two disagree fails the step) exactly those two lines
+# are required, and they are the only ones of the three wordings let through: the
+# `--pid` walks have to be scoped there as everywhere, and the first of the two lines
+# is printed only once the `--cgroup` capture has recorded what the forced full walk
+# did, which on such a kernel is the test of the program's own `--cgroup` match.
+#
 # The verdict travels in the FILE, as in vmtest-load-shapes.sh: a guest kernel
 # without a virtio console makes the VM tool return 255 whatever the test did. The
 # host side reads the `VNG-TEST-EXIT:<rc>` line.
@@ -68,6 +80,24 @@ forbid() {
         echo "E2E-CHECK ok: absent: $1"
     fi
 }
+# As forbid, on a kernel where one line with the words is the right one: $3 that line.
+# Any other line with the words fails.
+forbid_but() {
+    local others
+    others="$(grep -F -- "$1" "$RAW" | grep -v -F -- "$3")"
+    if [ -n "$others" ]; then
+        fail "$2: $(echo "$others" | head -n 1)"
+    else
+        echo "E2E-CHECK ok: absent but for the line this kernel is held to: $1"
+    fi
+}
+# The kfunc the walk scoped to --cgroup targets needs (the css_task iterator, Linux 6.7).
+CSS_TASK_KFUNC=bpf_iter_css_task_new
+if grep -q -E " [Tt] ${CSS_TASK_KFUNC}\$" /proc/kallsyms; then
+    cgroup_walk=scoped
+else
+    cgroup_walk=full
+fi
 {
     cat "$RAW"
     echo "=== checks"
@@ -77,17 +107,31 @@ forbid() {
     else
         fail "no summary line reading ok with one case or more passed, 0 failed, 0 ignored"
     fi
-    # The three wordings of an early return. The first is the bare word: the cases
-    # write both `skipping: ...` and `skipping the --cgroup half: ...`.
-    forbid 'skipping' 'a case skipped its work'
-    forbid 'took the full walk' 'a scoped walk fell back to every thread on the host'
-    forbid 'took the walk over every thread' 'a capture walked every thread on the host'
-    # One line or more of each case, so that all four ran. No line anchors: with one
-    # test thread the test runner prints `test <name> ... ` without a newline before a
+    # The three wordings of an early return (the first is the bare word: the cases
+    # write both `skipping: ...` and `skipping the --cgroup half: ...`), and one line
+    # or more of each case, so that all four ran. No line anchors: with one test
+    # thread the test runner prints `test <name> ... ` without a newline before a
     # case runs, so a case's first line follows it.
+    if [ "$cgroup_walk" = scoped ]; then
+        echo "E2E-CHECK ok: CGROUP-WALK-CONTRACT scoped: this kernel has $CSS_TASK_KFUNC"
+        forbid 'skipping' 'a case skipped its work'
+        forbid 'took the full walk' 'a scoped walk fell back to every thread on the host'
+        forbid 'took the walk over every thread' 'a capture walked every thread on the host'
+        need '[--cgroup] scoped: '
+        need 'the listing came back whole: 10 processes in two cgroups below the target, all recorded'
+    else
+        # What the recorder prints for this reason, and what the two cases print of it.
+        why="this kernel's BTF does not export $CSS_TASK_KFUNC"
+        fell_back="[--cgroup] this host took the full walk ($why); recorded the same"
+        not_listed="skipping: this host took the walk over every thread ($why)"
+        echo "E2E-CHECK ok: CGROUP-WALK-CONTRACT full: this kernel has no $CSS_TASK_KFUNC, so a --cgroup capture walks every thread and the two cases with one have to say so, for that reason"
+        forbid_but 'skipping' 'a case skipped its work' "$not_listed"
+        forbid_but 'took the full walk' 'a scoped walk fell back to every thread on the host' "$fell_back"
+        forbid_but 'took the walk over every thread' 'a capture walked every thread on the host' "$not_listed"
+        need "$fell_back"
+        need "$not_listed"
+    fi
     need '[--pid] scoped: '
-    need '[--cgroup] scoped: '
-    need 'the listing came back whole: 10 processes in two cgroups below the target, all recorded'
     need 'most walks cut, as it comes] visited '
     need 'most walks whole, as it comes] visited '
     need '[--pid, forks past the cap] scoped: '
