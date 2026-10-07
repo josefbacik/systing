@@ -316,6 +316,53 @@ fn build_task_stacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &
     println!("cargo:rerun-if-changed=crates/task-context/include/task_context.h");
 }
 
+/// Build the Python function trace's BPF object and its skeleton: an
+/// object of its own, loaded only by `systing-python-function-trace`. Like the
+/// task-stacks object it compiles `pystacks.bpf.c` into itself (here in its
+/// plain, non-sleepable form) for the symbol records and the thread-state
+/// lookup.
+fn build_python_function_trace_bpf(
+    out_dir: &Path,
+    arch_define: &str,
+    multiarch_include: &Option<String>,
+) {
+    let src = "src/bpf/python_function_trace.bpf.c";
+    let include = |dir: &str| {
+        format!(
+            "-I{}",
+            Path::new(dir)
+                .canonicalize()
+                .unwrap_or_else(|_| panic!("{dir} directory exists"))
+                .display()
+        )
+    };
+    let out_dir_include_arg = format!("-I{}", out_dir.display());
+    let pystacks_include_arg = include("src/pystacks/bpf/include");
+    // For `#include "pystacks.bpf.c"`.
+    let pystacks_src_arg = include("src/pystacks/bpf");
+
+    let obj_path = out_dir.join("python_function_trace.bpf.o");
+    let mut object_args = vec![
+        OsStr::new(&out_dir_include_arg),
+        OsStr::new(&pystacks_include_arg),
+        OsStr::new(&pystacks_src_arg),
+        OsStr::new(arch_define),
+    ];
+    if let Some(ref include_path) = multiarch_include {
+        object_args.push(OsStr::new(include_path));
+    }
+
+    compile_bpf_object(src, &obj_path, &object_args);
+
+    SkeletonBuilder::new()
+        .obj(&obj_path)
+        .generate(out_dir.join("python_function_trace.skel.rs"))
+        .expect("Failed to generate python_function_trace skeleton");
+
+    // The pystacks sources it includes are watched by build_pystacks_bpf.
+    println!("cargo:rerun-if-changed={src}");
+}
+
 /// Detect the target architecture and return the corresponding clang define
 /// and vmlinux header filename.
 ///
@@ -374,6 +421,8 @@ fn main() {
 
     // Build the task-stacks recorder's (sleepable) BPF object
     build_task_stacks_bpf(&out_dir, arch_define, &multiarch_include);
+
+    build_python_function_trace_bpf(&out_dir, arch_define, &multiarch_include);
 
     let include_arg = format!("-I{}", out_dir.display());
     let bpf_include_arg = format!(

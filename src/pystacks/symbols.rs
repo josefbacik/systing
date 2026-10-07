@@ -239,7 +239,7 @@ fn shape_recovered_filename(window: &[u8]) -> [u8; BPF_LIB_PYSTACKS_FILE_NAME_LE
 ///
 /// If the first partition contains the full qualname (including any dots),
 /// the second partition is empty and we use the first as-is.
-fn get_symbol_name(sym: &PystacksSymbol) -> String {
+pub(crate) fn get_symbol_name(sym: &PystacksSymbol) -> String {
     // Read qualname from first partition
     let qualname_full = cstring_from_bytes(&sym.qualname.value);
 
