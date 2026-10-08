@@ -54,6 +54,7 @@ pub mod perf_recorder;
 pub mod perfetto;
 pub mod profile_export;
 pub mod pystacks;
+pub mod python_function_trace;
 pub mod record;
 pub mod ringbuf;
 pub mod sandbox_maps;

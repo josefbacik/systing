@@ -518,6 +518,10 @@ mod tests {
             "task_stacks.bpf.o",
             include_bytes!(concat!(env!("OUT_DIR"), "/task_stacks.bpf.o")),
         ),
+        (
+            "python_function_trace.bpf.o",
+            include_bytes!(concat!(env!("OUT_DIR"), "/python_function_trace.bpf.o")),
+        ),
     ];
 
     fn chains_of(object: &str) -> (BTreeMap<String, Function>, Vec<Chain>) {

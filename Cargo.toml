@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/gopclntab", "crates/task-context", "heap"]
+members = [".", "crates/gopclntab", "crates/task-context", "heap", "python-function-trace"]
 
 [package]
 name = "systing"

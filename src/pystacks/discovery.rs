@@ -113,9 +113,15 @@ fn parse_elf_py_info(file_path: &str, file: &fs::File) -> Option<Arc<ElfPyInfo>>
     });
     let elapsed = start.elapsed().as_secs_f64();
     if result.is_some() {
-        eprintln!("[pystacks] Parsed Python runtime ELF {file_path} in {elapsed:.2}s");
+        eprintln!(
+            "[pystacks] Parsed Python runtime ELF {} in {elapsed:.2}s",
+            file_path.escape_debug()
+        );
     } else if elapsed >= SLOW_REJECT_SECS {
-        eprintln!("[pystacks] Rejected non-Python ELF {file_path} in {elapsed:.2}s");
+        eprintln!(
+            "[pystacks] Rejected non-Python ELF {} in {elapsed:.2}s",
+            file_path.escape_debug()
+        );
     }
     result
 }
@@ -544,7 +550,7 @@ fn find_module_base_address(maps: &[MemoryMapping], module_path: &str) -> Option
     if fallback.is_some() {
         eprintln!(
             "[pystacks] Warning: no executable mapping for {}, using fallback base address",
-            module_path
+            module_path.escape_debug()
         );
     }
     fallback

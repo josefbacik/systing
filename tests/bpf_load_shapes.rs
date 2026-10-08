@@ -210,8 +210,9 @@ fn selection_findings(reports: &[(String, LoadReport)]) -> Vec<String> {
 }
 
 /// The gate: every shape in both tables — the main object's and the
-/// task-stacks object's — loads on this kernel, and every program in each
-/// object is selected by some shape of its table (or documented).
+/// task-stacks object's — loads on this kernel, and so does the Python
+/// function trace's object; and every program in each object is selected by
+/// some shape of its table (or documented).
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn every_shape_loads() {
@@ -301,9 +302,24 @@ fn every_shape_loads() {
         task_stacks_reports.push((shape.name.to_string(), report));
     }
 
+    // The Python function trace's object, loaded by its own tool: one row,
+    // every program.
+    let started = std::time::Instant::now();
+    let report = systing::python_function_trace::load_probe(&|_| 0)
+        .unwrap_or_else(|e| panic!("[python-function-trace] probe failed before load: {e:#}"));
+    eprintln!(
+        "[python-function-trace] loaded={} programs selected={} in {:.1?}",
+        report.loaded,
+        report.programs.iter().filter(|p| p.autoload).count(),
+        started.elapsed()
+    );
+    record_rejections("python-function-trace", &report, &mut rejected);
+    let python_function_trace_reports = vec![("python-function-trace".to_string(), report)];
+
     let mut failures = rejection_findings(&rejected);
     failures.extend(selection_findings(&reports));
     failures.extend(selection_findings(&task_stacks_reports));
+    failures.extend(selection_findings(&python_function_trace_reports));
     assert!(
         failures.is_empty(),
         "{} finding(s):\n  {}",
