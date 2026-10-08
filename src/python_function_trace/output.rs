@@ -134,9 +134,85 @@ pub fn summary(trace: &Trace, top: usize) -> String {
     out
 }
 
+/// Creates or overwrites an output file in a way a third party cannot steer:
+/// the tool runs as root, and the name is often in a directory others can
+/// write to.
+///
+/// - The directory is opened first. It must belong to root, this user or the
+///   user who ran sudo (`SUDO_UID`), and be writable by its group and others
+///   only with the sticky bit (as `/tmp` is), so no one else can rename its
+///   entries. (The path itself is the operator's choice.)
+/// - The file is opened relative to that directory, without following a
+///   symlink and without truncating, and must then be a regular file of this
+///   user with one link (so not a FIFO, a device, or a hard link to a file
+///   elsewhere). Only then is it truncated.
+pub fn create_output(path: &Path) -> Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let refuse = |why: &str| anyhow::anyhow!("refusing to write {}: {why}", path.display());
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let leaf = path.file_name().ok_or_else(|| refuse("no file name"))?;
+    let euid = unsafe { libc::geteuid() };
+
+    let dir_file = std::fs::File::open(dir)
+        .with_context(|| format!("open the directory of {}", path.display()))?;
+    let d = dir_file.metadata()?;
+    if !d.is_dir() {
+        return Err(refuse("its directory is not a directory"));
+    }
+    // Its owner can rename its entries, so it must be someone this run
+    // already trusts: root, this user, or the user who ran sudo.
+    let sudo_uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    if d.uid() != 0 && d.uid() != euid && Some(d.uid()) != sudo_uid {
+        return Err(refuse("its directory belongs to another user"));
+    }
+    if d.mode() & 0o022 != 0 && d.mode() & 0o1000 == 0 {
+        return Err(refuse("others can rename files in its directory"));
+    }
+
+    let leaf = CString::new(leaf.as_bytes()).map_err(|_| refuse("a NUL in the name"))?;
+    // SAFETY: a plain openat on a descriptor and a C string we own.
+    let fd = unsafe {
+        libc::openat(
+            dir_file.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o644 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("create {} (a symlink is not followed)", path.display()));
+    }
+    // SAFETY: fd was just opened and is owned by nothing else.
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let m = file.metadata()?;
+    if !m.is_file() {
+        return Err(refuse("it is not a regular file"));
+    }
+    if m.uid() != euid || m.nlink() != 1 {
+        return Err(refuse("it belongs to another user or has another link"));
+    }
+    // SAFETY: fcntl on our own descriptor.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+    }
+    file.set_len(0)?;
+    Ok(file)
+}
+
 /// One line per kept slice, tab-separated, in order of start within a thread.
 pub fn write_tsv(trace: &Trace, path: &Path) -> Result<()> {
-    let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let file = create_output(path)?;
     let mut w = BufWriter::new(file);
     writeln!(
         w,
@@ -275,7 +351,7 @@ fn sorted(slices: &[Slice]) -> Vec<&Slice> {
 /// A Perfetto trace: a track per process and thread, and each slice as a
 /// begin/end pair on its thread's track. Open it at ui.perfetto.dev.
 pub fn write_perfetto(trace: &Trace, path: &Path) -> Result<()> {
-    let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let file = create_output(path)?;
     let mut buffered = BufWriter::new(file);
     {
         let mut writer = StreamingTraceWriter::new(&mut buffered);
@@ -419,6 +495,41 @@ mod tests {
     use super::super::{KernelCounters, Symbol};
     use super::*;
     use crate::perfetto::VecTraceWriter;
+
+    #[test]
+    fn an_output_name_is_not_steered_elsewhere() {
+        let dir = std::env::temp_dir().join(format!("pyft-out-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A new file, and the same file again, truncated.
+        let path = dir.join("trace.pb");
+        std::io::Write::write_all(&mut create_output(&path).unwrap(), b"first").unwrap();
+        create_output(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        // A symlink, a hard link and a FIFO at the name are refused.
+        let target = dir.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.join("link.pb");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(create_output(&link).is_err());
+        let hard = dir.join("hard.pb");
+        std::fs::hard_link(&target, &hard).unwrap();
+        assert!(create_output(&hard).is_err());
+        let fifo = dir.join("fifo.pb");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(create_output(&fifo).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        // A directory others can rename in, without the sticky bit.
+        let open_dir = dir.join("open");
+        std::fs::create_dir(&open_dir).unwrap();
+        std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(create_output(&open_dir.join("x.pb")).is_err());
+        std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(create_output(&open_dir.join("x.pb")).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn slice(symbol_id: u64, start: u64, end: u64, depth: u32) -> Slice {
         Slice {
