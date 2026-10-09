@@ -39,6 +39,37 @@ that is not waiting.
 Reading memory needs the program's own user or `CAP_SYS_PTRACE`, as for
 `--snoop` of jemalloc.
 
+## Goroutines and labels on CPU samples
+
+`systing --include-go-context` reads, for every CPU sample of a Go program,
+the goroutine that was running and its profiler labels (`pprof.Do`,
+`SetGoroutineLabels`), from inside the sampler:
+
+- `stack_sample.go_goid`: the goroutine, Go's own id for it;
+- `stack_sample.go_labels_id`: the id of its label set, and the set itself,
+  once per process, in the `go_labels` table (`SCHEMA_CHANGES.md`, schema 30).
+
+```sql
+SELECT l.name AS key, l.value_str AS value, count(*) AS samples
+FROM stack_sample s
+JOIN thread t ON t.trace_id = s.trace_id AND t.utid = s.utid
+JOIN go_labels l ON l.trace_id = s.trace_id AND l.upid = t.upid AND l.id = s.go_labels_id
+GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+It is built as `--include-task-context` is (`src/golang/context/`,
+`src/golang/bpf/go_context.bpf.h`). User space reads each Go program's
+executable once for where the runtime keeps the running goroutine (`g`, at a
+fixed distance from the thread pointer that the program's own code loads it
+from) and writes that, with the layout of its Go version, into a map the
+sampler looks up. A sample then costs three reads of the program's memory: `g`,
+its id, its labels' address. A thread's label set is copied only when its
+goroutine or set changes; a copy is named by a hash of what it holds (Go reuses
+a freed set's memory for the next request's), and goes to user space only if
+the process has not sent that set before. At most eight labels a set, keys cut
+at 64 bytes and values at 128. Every miss is counted, and printed at the end of
+the capture (`go_context samples:`).
+
 ## What it matches
 
 On a test program (Go 1.26.7, 10,000 idle goroutines, a garbage collection
@@ -103,7 +134,8 @@ no bindings is refused when the program is opened, never read with another's.
   bindings are for linux/amd64.
 - Function names only: no line numbers, and inlined calls are not expanded
   (the function table has both; they are not decoded yet).
-- No pprof labels, and no stack for a goroutine that is running.
+- `systing-go-profile` reads no pprof labels (`--include-go-context` does,
+  on CPU samples), and has no stack for a goroutine that is running.
 - Block and mutex profiles are empty until the program sets their rates, and
   the heap profile is empty in a program that never links Go's profile code
   (`GODEBUG=memprofilerate` turns it on), whichever way they are read.

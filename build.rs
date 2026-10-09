@@ -465,6 +465,15 @@ fn main() {
     );
     println!("cargo:rerun-if-changed=src/task_context/bpf/task_context_reader.bpf.h");
     println!("cargo:rerun-if-changed=crates/task-context/include/task_context.h");
+    // --include-go-context: the goroutine reader, one header of its own.
+    let golang_bpf_arg = format!(
+        "-I{}",
+        Path::new("src/golang/bpf")
+            .canonicalize()
+            .expect("src/golang/bpf directory exists")
+            .display()
+    );
+    println!("cargo:rerun-if-changed=src/golang/bpf/go_context.bpf.h");
     for src in SRC {
         let srcpath = Path::new(src);
         let fname = srcpath.file_name().unwrap().to_str().unwrap();
@@ -483,6 +492,7 @@ fn main() {
             OsStr::new(&pystacks_bpf_arg),
             OsStr::new(&task_context_bpf_arg),
             OsStr::new(&task_context_abi_arg),
+            OsStr::new(&golang_bpf_arg),
         ];
 
         if let Some(ref include_path) = multiarch_include {

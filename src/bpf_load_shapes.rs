@@ -334,6 +334,28 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.task_context_force_restricted = true;
     });
 
+    // --include-go-context, as task-context's rows above: off on every other
+    // row (none of its programs or maps, its call site rodata-dead); on, at
+    // the default capture, beside the Python walker (the sampler then
+    // verifies in about 492K of the 1M instructions, 9K of them the Go
+    // reader's), in the generic probe handlers without the walker (the
+    // longest chain of frames, see trace-event-no-pystacks), and beside
+    // --include-task-context, whose reader shares the emit path with it.
+    add("go-context", &|c| c.include_go_context = true);
+    add("go-context-pystacks", &|c| {
+        c.include_go_context = true;
+        c.collect_pystacks = true;
+    });
+    add("go-context-trace-event", &|c| {
+        c.include_go_context = true;
+        c.trace_event = vec!["tracepoint:sched:sched_process_exit".to_string()];
+        c.pid = vec![std::process::id()];
+    });
+    add("go-context-task-context", &|c| {
+        c.include_go_context = true;
+        c.include_task_context = true;
+    });
+
     // Memory lane: the continuous launcher's shape (default rss threshold,
     // fault/map sample rates 0 = every event), then each knob the launcher
     // or the on-demand lane can set.
@@ -953,9 +975,15 @@ R0 unbounded memory access\n\
         assert!(shapes
             .iter()
             .any(|s| s.config.include_task_context && !s.config.trace_event.is_empty()));
+        assert!(shapes.iter().all(|s| s.config.include_task_context
+            == (s.name.starts_with("task-context") || s.name == "go-context-task-context")));
+        // --include-go-context: the same.
         assert!(shapes
             .iter()
-            .all(|s| s.config.include_task_context == s.name.starts_with("task-context")));
+            .any(|s| s.config.include_go_context && !s.config.trace_event.is_empty()));
+        assert!(shapes
+            .iter()
+            .all(|s| s.config.include_go_context == s.name.starts_with("go-context")));
     }
 
     #[test]

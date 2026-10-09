@@ -860,6 +860,10 @@ pub fn get_required_bpf_programs(
     if opts.include_task_context {
         required.extend(crate::task_context::BPF_PROGRAMS);
     }
+    // --include-go-context: the same, for a Go program's recipe.
+    if opts.include_go_context {
+        required.extend(crate::golang::context::BPF_PROGRAMS);
+    }
 
     // Add programs from each enabled recorder
     for recorder in get_available_recorders() {
@@ -1698,6 +1702,12 @@ pub struct Config {
     /// complement, the region's base, the region's size). Testing-only; no
     /// CLI flag.
     pub task_context_planted_recipes: Vec<(u32, [u64; 3])>,
+    /// Read the goroutine and profiler labels of each running-stack sample of
+    /// a Go program (`--include-go-context`): `stack_sample.go_goid` and
+    /// `go_labels_id`, and the label sets in the `go_labels` table. Off, none
+    /// of the feature's programs or maps is loaded. See
+    /// [`crate::golang::context`].
+    pub include_go_context: bool,
     /// Output directory for parquet files
     pub output_dir: PathBuf,
     /// Output path (format auto-detected from extension: .pb = Perfetto, .duckdb = DuckDB)
@@ -1779,6 +1789,7 @@ impl Default for Config {
             include_task_context: false,
             task_context_force_restricted: false,
             task_context_planted_recipes: Vec::new(),
+            include_go_context: false,
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
             parquet_only: false,
@@ -3658,6 +3669,17 @@ fn configure_bpf_skeleton(
             rodata.task_context_config.execs_per_cpu_per_sec =
                 crate::task_context::DEFAULT_EXECS_PER_CPU_PER_SEC;
         }
+        if opts.include_go_context {
+            // As task_context_config: frozen, so with the flag off the call
+            // site is dead code, and in the confidentiality mode the feature
+            // is loaded and reads nothing.
+            rodata.go_context_config.enabled = 1;
+            rodata.go_context_config.restricted = confidentiality_mode;
+            rodata.go_context_config.labels_per_cpu_per_sec =
+                crate::golang::context::DEFAULT_LABELS_PER_CPU_PER_SEC;
+            rodata.go_context_config.execs_per_cpu_per_sec =
+                crate::golang::context::DEFAULT_EXECS_PER_CPU_PER_SEC;
+        }
         set_target_filter!(rodata, target_filter);
         if opts.no_stack_traces {
             rodata.tool_config.no_stack_traces = 1;
@@ -3763,6 +3785,12 @@ fn configure_bpf_skeleton(
         // reference: the shape memory_ringbufs already has under
         // systing_perf_event_clock when the memory recorder is off.
         if name.starts_with(crate::task_context::MAP_PREFIX) && !opts.include_task_context {
+            map.set_autocreate(false)
+                .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
+            continue;
+        }
+        // The same for --include-go-context.
+        if name.starts_with(crate::golang::context::MAP_PREFIX) && !opts.include_go_context {
             map.set_autocreate(false)
                 .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
             continue;
@@ -5454,6 +5482,8 @@ struct ThreadHandles {
     /// `--include-task-context`: finished once the ring pollers are joined
     /// (two of `ringbuf_threads` poll its rings).
     task_context: Option<crate::task_context::Running>,
+    /// `--include-go-context`: the same, for its two rings.
+    go_context: Option<crate::golang::context::Running>,
     task_info_tx: Sender<task_info>,
 }
 
@@ -5621,6 +5651,12 @@ fn run_tracing_loop(
         let _p = stop_phase("finish task_context");
         if let Err(e) = task_context.finish() {
             eprintln!("Warning: task_context: {e:#}");
+        }
+    }
+    if let Some(go_context) = handles.go_context {
+        let _p = stop_phase("finish go_context");
+        if let Err(e) = go_context.finish() {
+            eprintln!("Warning: go_context: {e:#}");
         }
     }
     shutdown_signal.store(true, Ordering::Relaxed);
@@ -6174,6 +6210,39 @@ pub fn systing(
             None
         };
 
+        // --include-go-context: the same, for the goroutine reader.
+        let go_context = if opts.include_go_context {
+            let restricted = skel
+                .maps
+                .rodata_data
+                .is_some_and(|rodata| rodata.go_context_config.restricted != 0);
+            let utids = recorder
+                .stack_recorder
+                .lock()
+                .unwrap()
+                .shared_utid_generator();
+            let started = crate::golang::context::start(
+                crate::golang::context::Maps {
+                    labels_ring: &skel.maps.go_context_labels,
+                    execs_ring: &skel.maps.go_context_execs,
+                    recipes: libbpf_rs::MapHandle::try_from(&skel.maps.go_context_recipes)
+                        .context("Failed to get handle to the go_context_recipes map")?,
+                    stats: libbpf_rs::MapHandle::try_from(&skel.maps.go_context_stats)
+                        .context("Failed to get handle to the go_context_stats map")?,
+                },
+                &sink,
+                utids,
+                crate::golang::context::Options {
+                    restricted,
+                    pids: opts.pid.clone(),
+                },
+            )?;
+            rings.extend(started.rings);
+            Some(started.running)
+        } else {
+            None
+        };
+
         // Create shutdown signal for receiver threads
         let shutdown_signal = Arc::new(AtomicBool::new(false));
 
@@ -6214,6 +6283,9 @@ pub fn systing(
         // --include-task-context starts looking at processes.
         if let Some(task_context) = &task_context {
             task_context.attached();
+        }
+        if let Some(go_context) = &go_context {
+            go_context.attached();
         }
 
         // Check for any probes that failed to attach and warn about them
@@ -6723,6 +6795,7 @@ pub fn systing(
             tpu_metrics_thread,
             task_stacks_thread,
             task_context,
+            go_context,
         };
 
         capture_end_ts = run_tracing_loop(

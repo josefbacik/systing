@@ -14,17 +14,22 @@
 //! - [`profiles`], [`goroutines`] and [`flight`] read what their names say;
 //! - [`symbols`] names a program counter by the program's own function table;
 //! - [`pprof`] reads Go's profile files, the form the program itself writes,
-//!   and writes them.
+//!   and writes them;
+//! - [`context`] is `systing --include-go-context`: the goroutine and the
+//!   profiler labels of every CPU sample of a Go program, read by the sampler
+//!   (`bpf/go_context.bpf.h`) with a recipe this module finds.
 //!
-//! Every read goes through `/proc/<pid>/mem`, with the reader the Python
-//! walker uses ([`crate::pystacks::process`]). The program runs on while it is
-//! read, so a record can change under the read: records that cannot be right
-//! are skipped and counted, never trusted.
+//! Every read from user space goes through `/proc/<pid>/mem`, with the reader
+//! the Python walker uses ([`crate::pystacks::process`]); the sampler's are
+//! `bpf_probe_read_user()`. The program runs on while it is read, so a record
+//! can change under the read: records that cannot be right are skipped and
+//! counted, never trusted.
 //!
 //! x86-64 only: the stripped-binary rules find globals by instruction
 //! encoding, and the bindings are generated for linux/amd64.
 
 pub mod bindings;
+pub mod context;
 pub mod discovery;
 pub mod flight;
 pub mod goroutines;

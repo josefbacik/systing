@@ -505,6 +505,7 @@ systing-heap -o heap.duckdb /heap-dumps/jeprof    # snapshot files: newest per p
 
 `systing-go-profile` reads a Go program's own heap, goroutine, block and mutex profiles, and its flight recorder, out of its memory: no pprof port and nothing added to the program.
 `systing-heap --pid PID --snoop` does the same for the heap profile, into the heap tables.
+`systing --include-go-context` adds the running goroutine and its pprof labels to every CPU sample of a Go program (`stack_sample.go_goid`, `go_labels`).
 It is experimental, Go 1.26 on x86-64 only; see [`docs/GO_PROFILES.md`](docs/GO_PROFILES.md).
 
 ```bash

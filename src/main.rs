@@ -217,6 +217,9 @@ struct Command {
     /// Read each sampled thread's task_context: the named values a program sets on its threads with the task-context library (`crates/task-context`). Every running-stack sample then carries the id of the thread's current context (`stack_sample.task_context_id`, and every event of the task-stacks recorder `task_stack_event.task_context_id`) and the values of each id are stored once, in the `task_context` table. A process is found when its executable carries the library or names it as a direct dependency; one that loads it later (`dlopen`, a preloaded or indirect dependency) is not. Without this flag none of the feature's BPF programs or maps is loaded. Written for Linux 6.12 and newer
     #[arg(long)]
     include_task_context: bool,
+    /// Read the goroutine of each running-stack sample of a Go program, and its profiler labels (`runtime/pprof.Do`, `SetGoroutineLabels`): every such sample then carries the goroutine's id (`stack_sample.go_goid`) and the id of its label set (`stack_sample.go_labels_id`), and each label set is stored once per process, in the `go_labels` table. Go 1.26 programs on x86-64; others are left out and counted. Without this flag none of the feature's BPF programs or maps is loaded
+    #[arg(long)]
+    include_go_context: bool,
     /// List all available recorders and their default states
     #[arg(long)]
     list_recorders: bool,
@@ -335,6 +338,7 @@ impl From<Command> for Config {
             task_stacks: cmd.task_stacks,
             task_stacks_interval_ms: cmd.task_stacks_interval_ms,
             include_task_context: cmd.include_task_context,
+            include_go_context: cmd.include_go_context,
             task_context_force_restricted: false,
             task_context_planted_recipes: Vec::new(),
             output_dir: cmd.output_dir,
@@ -721,6 +725,14 @@ mod tests {
         assert!(!opts.include_task_context);
         let opts = opts_from(&["--only-recorder", "cpu-stacks", "--include-task-context"]);
         assert!(opts.include_task_context);
+    }
+
+    #[test]
+    fn go_context_is_off_by_default_and_on_with_its_flag_alone() {
+        assert!(!opts_from(&[]).include_go_context);
+        let opts = opts_from(&["--include-go-context"]);
+        assert!(opts.include_go_context && !opts.include_task_context);
+        assert!(!opts.no_sched && !opts.no_cpu_stack_traces);
     }
 
     #[test]

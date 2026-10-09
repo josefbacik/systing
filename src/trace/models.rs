@@ -301,6 +301,12 @@ pub struct StackRecord {
 ///   (`--include-task-context`), `None` when the thread had none, the read
 ///   missed, or the capture ran without the flag. Its values are the
 ///   `task_context` rows with the same `utid` and `id`.
+/// - `go_goid`: the goroutine a Go program's thread was running at the sample
+///   (`--include-go-context`), `None` when the process is not a Go program
+///   with bindings, the thread was on a system stack, or the read missed.
+/// - `go_labels_id`: the id of that goroutine's profiler label set, `None`
+///   when it had no labels or they did not travel. Its labels are the
+///   `go_labels` rows of the thread's process (`thread.upid`) with that `id`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StackSampleRecord {
     pub ts: i64,
@@ -309,6 +315,8 @@ pub struct StackSampleRecord {
     pub stack_id: i64,
     pub stack_event_type: i8,
     pub task_context_id: Option<u64>,
+    pub go_goid: Option<u64>,
+    pub go_labels_id: Option<u64>,
 }
 
 // Network metadata records
@@ -912,6 +920,26 @@ pub struct TaskContextRecord {
     pub value_str: Option<String>,
 }
 
+/// One label of one Go label set (`--include-go-context`): a goroutine's
+/// profiler labels (`runtime/pprof.Do`, `SetGoroutineLabels`) as a sample of
+/// a process found them. A set's `id` is a hash of its contents, so the rows
+/// with one (`upid`, `id`) are the whole set, and a sample's labels are the
+/// rows of its thread's process whose `id` is the sample's `go_labels_id`.
+/// `ts` is the sample that first sent the set. Keys and values are whatever
+/// the traced program set: data, never identity. At most eight labels of a
+/// set travel, a key cut at 64 bytes and a value at 128; invalid UTF-8 and
+/// control characters are replaced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GoLabelRecord {
+    pub upid: i64,
+    pub id: u64,
+    pub ts: i64,
+    /// The label's key.
+    pub name: String,
+    /// The label's value.
+    pub value_str: String,
+}
+
 /// A `/proc/vmstat` counter sampled at the start and the end of the capture
 /// (the THP, compaction and direct-reclaim families), so `value_end -
 /// value_start` is the host-wide count over the capture: the fleet-general
@@ -963,6 +991,7 @@ pub struct ExtractedData {
     pub memory_vmstat: Vec<MemoryVmstatRecord>,
     pub task_stack_events: Vec<TaskStackEventRecord>,
     pub task_contexts: Vec<TaskContextRecord>,
+    pub go_labels: Vec<GoLabelRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
     pub cpu_infos: Vec<CpuInfoRecord>,

@@ -48,7 +48,7 @@ All `ts` columns are **nanoseconds** from an arbitrary epoch. Convert durations:
 Two representations exist:
 
 **Interned (the normal one)** — `stack_sample` → `stack` → `frame`:
-- `stack_sample(ts, utid, cpu, stack_id, stack_event_type, task_context_id)`. `stack_event_type`: `0` = uninterruptible sleep, `1` = CPU, `2` = interruptible sleep. `task_context_id` (from schema 25) is the id of what the sampled thread's program said it was working on, see below; NULL for none, and in every row of a trace recorded without `--include-task-context`.
+- `stack_sample(ts, utid, cpu, stack_id, stack_event_type, task_context_id, go_goid, go_labels_id)`. `stack_event_type`: `0` = uninterruptible sleep, `1` = CPU, `2` = interruptible sleep. `task_context_id` (from schema 25) is the id of what the sampled thread's program said it was working on, see below; NULL for none, and in every row of a trace recorded without `--include-task-context`. `go_goid` and `go_labels_id` (from schema 30) are a Go program's goroutine and the id of its profiler label set, see below; NULL in every row of a trace recorded without `--include-go-context`.
 - `stack(id, frame_ids BIGINT[], depth, leaf_name)`. **`frame_ids` is root-to-leaf** (outermost caller first, innermost executing frame last); `leaf_name` is the last frame's name.
 - `frame(id, name)` — interned strings, dense per-trace ids.
 - `frame_file(frame_id, file)` — the full source path of the frames that have one (from schema 23: Python frames, and the native and kernel frames of `task-stacks` stacks where debug info has the directory, which is the build machine's path): `frame.name` has only the file's name. `LEFT JOIN frame_file ff ON ff.trace_id = f.trace_id AND ff.frame_id = f.id`.
@@ -112,6 +112,27 @@ JOIN task_context c ON c.trace_id = s.trace_id AND c.utid = s.utid AND c.id = s.
 JOIN stack st ON st.trace_id = s.trace_id AND st.id = s.stack_id
 WHERE c.name = 'iteration_id' AND c.value_u64 = 42
 GROUP BY 1 ORDER BY 2 DESC LIMIT 10;
+```
+
+**Go goroutines and their labels** — `stack_sample.go_goid`, `stack_sample.go_labels_id` → `go_labels` (`--include-go-context`, from schema 30):
+- `go_goid` is the goroutine a Go program's thread was running at a CPU sample (Go 1.26 on x86-64); NULL on a system stack (scheduler, GC workers between goroutines), for other programs, and without the flag. Goroutine ids are unique within a process: group by the process (`thread.upid`) too.
+- `go_labels(upid, id, ts, name, value_str)`: one row per label (its key as `name`) of one label set (`runtime/pprof.Do`, `SetGoroutineLabels`) of one process. **Join through the sample's thread**: `thread.upid = go_labels.upid AND go_labels.id = stack_sample.go_labels_id`. The id is a hash of the set's contents, so the rows of one (`upid`, `id`) are the whole set. At most 8 labels a set, keys cut at 64 bytes, values at 128.
+- A `go_labels_id` with no rows is a set that was dropped on the way (budget, full ring). Keys and values are what the program set: data, not identity.
+
+```sql
+-- CPU samples of a Go service by label
+SELECT l.name, l.value_str, count(*) AS samples
+FROM stack_sample s
+JOIN thread t ON t.trace_id = s.trace_id AND t.utid = s.utid
+JOIN go_labels l ON l.trace_id = s.trace_id AND l.upid = t.upid AND l.id = s.go_labels_id
+GROUP BY 1, 2 ORDER BY 3 DESC;
+
+-- The busiest goroutines of each process
+SELECT t.upid, s.go_goid, count(*) AS samples
+FROM stack_sample s
+JOIN thread t ON t.trace_id = s.trace_id AND t.utid = s.utid
+WHERE s.go_goid IS NOT NULL
+GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20;
 ```
 
 **Normalized (Perfetto-style)** — `perf_sample` → `stack_profile_callsite` (parent-child tree) → `stack_profile_frame` → `stack_profile_symbol` / `stack_profile_mapping`. Use when you need mapping/build-id info. Walk the `parent_id` chain to reconstruct stacks.
