@@ -445,6 +445,59 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 30 (systing 1.27.0) — 2026-10-09
+
+`--include-go-context`: for a running-stack sample of a Go program, the
+goroutine that was running and its profiler labels (`runtime/pprof.Do`,
+`SetGoroutineLabels`), read by the sampler from the program's memory. A sample
+carries the goroutine's id and the id of its label set; each set is stored
+once per process, not once per sample.
+
+### Added columns
+- `stack_sample.go_goid` (UBIGINT): the goroutine the sampled thread was
+  running (Go's own goroutine id, as `runtime.Stack` prints it). Filled for
+  running-stack samples (`stack_event_type = 1`) of a Go 1.26 x86-64 program,
+  in a capture recorded with `--include-go-context`. NULL for every other
+  row: sleep stacks, a thread on a system stack (the scheduler, the garbage
+  collector's workers between goroutines), a program of another Go version or
+  architecture, a counted miss, a capture without the flag. Goroutine ids are
+  unique within a process, so join on the process (`thread.upid`) as well.
+- `stack_sample.go_labels_id` (UBIGINT): the id of the goroutine's label set,
+  NULL when it had no labels (or they did not travel; see below). The id is a
+  hash of the set's contents, so one id is one set within a process.
+
+### New tables
+- `go_labels` (upid BIGINT, id UBIGINT, ts BIGINT, name VARCHAR, value_str
+  VARCHAR): one row per label of one label set of one process, its key as
+  `name` and its value as `value_str` (the names `task_context` has). The rows with
+  one (`upid`, `id`) are the whole set. `ts` is the sample that first sent the
+  set. At most eight labels of a set travel, a key cut at 64 bytes and a
+  value at 128; invalid UTF-8 and control characters are replaced (U+FFFD).
+  Keys and values are whatever the traced program set: data about it, never
+  an identity to trust. Written only by a capture with the flag that read at
+  least one set: `go_labels.parquet` does not exist otherwise.
+
+  ```sql
+  SELECT s.ts, s.go_goid, l.name, l.value_str
+  FROM stack_sample s
+  JOIN thread t ON t.trace_id = s.trace_id AND t.utid = s.utid
+  LEFT JOIN go_labels l
+    ON l.trace_id = s.trace_id AND l.upid = t.upid AND l.id = s.go_labels_id
+  WHERE s.go_goid IS NOT NULL;
+  ```
+
+  A `go_labels_id` with no rows is a set that did not travel: a set is sent
+  when a thread's goroutine or label set changes to one its process has not
+  sent, inside a per-CPU budget, and a full ring or a spent budget leaves the
+  sample without an id (the capture's `go_context samples:` line counts both).
+
+### Compatibility
+- A reader at this version imports an older `stack_sample.parquet` with the
+  two new columns NULL.
+- A reader older than this version that has the import guard (1.18.2 and
+  newer) imports a newer `stack_sample.parquet` without the columns and warns
+  once, and never opens `go_labels.parquet`, a table it does not know.
+
 ## Schema Version 29 (systing 1.26.0) — 2026-09-25
 
 A capture says whether its task-stacks recorder read other tasks' user memory.

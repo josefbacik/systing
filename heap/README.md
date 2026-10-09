@@ -44,7 +44,7 @@ It opens in `systing-analyze` and merges with other traces like any capture.
 | Extension | Format | Status |
 |---|---|---|
 | `.heap` | jemalloc `prof.dump` (`heap_v2`) | Supported |
-| `.pb.gz`, `.pprof`, `.pb` | pprof | Not yet |
+| `.pb.gz`, `.pprof`, `.pb` | Go's pprof heap profile (`/debug/pprof/heap`) | Supported; frames keep the names and lines the file has |
 
 gperftools (tcmalloc) also writes `.heap` files. The parser checks the first line and refuses those with a clear error.
 
@@ -64,7 +64,7 @@ cargo build --release -p systing-heap
 | Named files or a folder. Never deletes. | `systing-heap -o heap.duckdb a.heap b.heap ./snapshots/` |
 | A container's files, read from the host | `systing-heap -o heap.duckdb --pid PID --latest-only PREFIX` |
 | A dump now from CPython 3.14, nothing added to it | `systing-heap -o heap.duckdb --pid PID --ask python` |
-| The profile read from memory | `systing-heap -o heap.duckdb --pid PID --snoop` |
+| The profile read from memory (jemalloc, or a Go program's own heap profile) | `systing-heap -o heap.duckdb --pid PID --snoop` |
 | Which of these will work on a process | `systing-heap --pid PID --check` |
 
 `PREFIX` is the `prof_prefix` given to jemalloc, such as `/heap-dumps/jeprof`.
@@ -260,7 +260,7 @@ One sampled 256-byte object at a 16 KiB period reads as 16,512 bytes, give or ta
 | Column | Meaning |
 |---|---|
 | `id` | Snapshot id, dense within the trace |
-| `format` | `jemalloc` |
+| `format` | `jemalloc`, or `pprof` for a Go heap profile (a file, or read from memory) |
 | `source_path` | See the table below |
 | `upid` | `process.upid` of the pid the process knows itself by, in its own pid namespace. NULL if a file name has none. |
 | `seq` | jemalloc's dump sequence number |
@@ -276,6 +276,8 @@ One sampled 256-byte object at a 16 KiB period reads as 16,512 bytes, give or ta
 | `final` | A file, at exit | The file | The same |
 | `asked` | `--ask` | The socket, or the dump's file as the process saw it | When the answer was read |
 | `snoop` | `--snoop` | `/proc/PID/mem` | When the memory was read |
+| `go-snoop` | `--snoop` of a Go program | `/proc/PID/mem` | When the memory was read |
+| `pprof` | A Go pprof heap profile file | The file | The profile's own time |
 
 ### `heap_sample`: one row per call stack in a snapshot
 

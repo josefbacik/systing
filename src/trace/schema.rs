@@ -334,6 +334,11 @@ pub fn stack_schema() -> Arc<Schema> {
 /// `task_context_id` is the sampled thread's task_context id
 /// (`--include-task-context`), NULL when there was none; its values are the
 /// `task_context` rows with the same `utid` and `id`.
+///
+/// `go_goid` is the goroutine a Go program's thread was running and
+/// `go_labels_id` the id of its label set (`--include-go-context`), NULL when
+/// there was none; the labels are the `go_labels` rows of the thread's
+/// process with that `id`.
 pub fn stack_sample_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),
@@ -342,6 +347,8 @@ pub fn stack_sample_schema() -> Arc<Schema> {
         Field::new("stack_id", DataType::Int64, false),
         Field::new("stack_event_type", DataType::Int8, false),
         Field::new("task_context_id", DataType::UInt64, true),
+        Field::new("go_goid", DataType::UInt64, true),
+        Field::new("go_labels_id", DataType::UInt64, true),
     ]))
 }
 
@@ -596,6 +603,19 @@ pub fn task_context_schema() -> Arc<Schema> {
         Field::new("name", DataType::Utf8, false),
         Field::new("value_u64", DataType::UInt64, true),
         Field::new("value_str", DataType::Utf8, true),
+    ]))
+}
+
+/// Schema for go_labels.parquet: one label of one Go label set of one
+/// process, its key as `name` and its value as `value_str` (as
+/// `task_context`'s; a bare `value` is the f64 column's name in every table).
+pub fn go_labels_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("upid", DataType::Int64, false),
+        Field::new("id", DataType::UInt64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("value_str", DataType::Utf8, false),
     ]))
 }
 

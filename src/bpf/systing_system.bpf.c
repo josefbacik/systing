@@ -12,6 +12,9 @@
 /* --include-task-context: the whole BPF side of the feature is this header
  * (src/task_context/bpf); this file only calls task_context_read_current(). */
 #include "task_context_reader.bpf.h"
+/* --include-go-context: the goroutine and label set of a Go program's sample
+ * (src/golang/bpf); this file only calls go_context_read_current(). */
+#include "go_context.bpf.h"
 
 /* Task state definitions (from task_struct->__state) */
 #define TASK_RUNNING		0x00000000
@@ -283,6 +286,11 @@ struct stack_event {
 	u32 kernel_stack_length;
 	u32 user_stack_length;
 	u64 task_context_id;
+	/* The goroutine a Go program's thread was running, and the id of its
+	 * label set (see go_context.bpf.h; 0 = none, and always 0 without
+	 * --include-go-context). */
+	u64 go_goid;
+	u64 go_labels_id;
 	u64 kernel_stack[MAX_STACK_DEPTH];
 #ifdef SYSTING_PYSTACKS
 	struct pystacks_message py_msg_buffer;
@@ -1959,6 +1967,10 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 	 */
 	if (task_context_config.enabled && type == STACK_RUNNING)
 		event->task_context_id = task_context_read_current(task);
+	/* The same for a Go program's goroutine, the same events, the same
+	 * reasons; pruned at load time without the flag. */
+	if (go_context_config.enabled && type == STACK_RUNNING)
+		event->go_goid = go_context_read_current(task, &event->go_labels_id);
 
 #ifdef SYSTING_PYSTACKS
 	event->py_msg_buffer.stack_len = 0;

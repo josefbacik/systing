@@ -1,0 +1,26 @@
+[package]
+name = "systing-go-profile"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+description = "Reads a Go program's own profiles and flight recorder out of its memory (experimental)"
+publish = false
+
+# A package of its own, as systing-heap is, so that installing systing does
+# not install it: a build of the root package leaves it out.
+[features]
+# Build DuckDB from source, as systing's own default does; CI's
+# --no-default-features rows link a prebuilt libduckdb (see heap/Cargo.toml).
+default = ["duckdb-bundled"]
+duckdb-bundled = ["systing/duckdb-bundled"]
+
+[[bin]]
+name = "systing-go-profile"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5.20", features = ["derive"] }
+serde_json = "1.0.140"
+systing = { path = "..", default-features = false }

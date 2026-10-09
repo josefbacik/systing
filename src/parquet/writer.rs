@@ -29,14 +29,14 @@ use crate::parquet::ParquetSink;
 use crate::record::RecordCollector;
 use crate::trace::{
     self, ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, CpuInfoRecord,
-    InstantArgRecord, InstantRecord, IrqSliceRecord, ManifestRecord, MemoryAllocRecord,
-    MemoryFaultRecord, MemoryIommuRecord, MemoryMapRecord, MemoryRssRecord, MemoryThpRecord,
-    MemoryVfioRecord, MemoryVmstatRecord, NetworkDnsRecord, NetworkInterfaceRecord,
-    NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
-    ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord, SliceRecord,
-    SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord,
-    TaskContextRecord, TaskStackEventRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord,
-    TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    GoLabelRecord, InstantArgRecord, InstantRecord, IrqSliceRecord, ManifestRecord,
+    MemoryAllocRecord, MemoryFaultRecord, MemoryIommuRecord, MemoryMapRecord, MemoryRssRecord,
+    MemoryThpRecord, MemoryVfioRecord, MemoryVmstatRecord, NetworkDnsRecord,
+    NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord,
+    NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord,
+    SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
+    SysInfoRecord, TaskContextRecord, TaskStackEventRecord, ThreadRecord, ThreadStateRecord,
+    TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -150,6 +150,7 @@ pub struct StreamingParquetWriter {
     memory_vmstat: Vec<MemoryVmstatRecord>,
     task_stack_events: Vec<TaskStackEventRecord>,
     task_contexts: Vec<TaskContextRecord>,
+    go_labels: Vec<GoLabelRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
     cpu_infos: Vec<CpuInfoRecord>,
@@ -204,6 +205,7 @@ pub struct StreamingParquetWriter {
     memory_vmstat_writer: Option<TableWriter>,
     task_stack_event_writer: Option<TableWriter>,
     task_context_writer: Option<TableWriter>,
+    go_labels_writer: Option<TableWriter>,
     clock_snapshot_writer: Option<TableWriter>,
     sysinfo_writer: Option<TableWriter>,
     cpu_info_writer: Option<TableWriter>,
@@ -291,6 +293,7 @@ impl StreamingParquetWriter {
             memory_vmstat: Vec::new(),
             task_stack_events: Vec::new(),
             task_contexts: Vec::new(),
+            go_labels: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
             cpu_infos: Vec::new(),
@@ -333,6 +336,7 @@ impl StreamingParquetWriter {
             memory_vmstat_writer: None,
             task_stack_event_writer: None,
             task_context_writer: None,
+            go_labels_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
             cpu_info_writer: None,
@@ -1222,6 +1226,24 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    fn flush_go_labels(&mut self) -> Result<()> {
+        if self.go_labels.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::go_labels_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.go_labels_writer,
+            &self.sink,
+            "go_labels",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_go_labels_batch(&self.go_labels, &schema)?;
+        writer.write(&batch)?;
+        self.go_labels.clear();
+        Ok(())
+    }
+
     fn flush_memory_vmstat(&mut self) -> Result<()> {
         if self.memory_vmstat.is_empty() {
             return Ok(());
@@ -1368,6 +1390,7 @@ impl StreamingParquetWriter {
         close_writer!(self.memory_vmstat_writer);
         close_writer!(self.task_stack_event_writer);
         close_writer!(self.task_context_writer);
+        close_writer!(self.go_labels_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
         close_writer!(self.cpu_info_writer);
@@ -1886,6 +1909,17 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_go_label(&mut self, record: GoLabelRecord) -> Result<()> {
+        // A low-volume table (one row per label per new label set, rate
+        // limited at the source): no batch-sized reservation up front.
+        self.go_labels.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.go_labels, self.batch_size) {
+            self.flush_go_labels()?;
+        }
+        Ok(())
+    }
+
     fn add_memory_vmstat(&mut self, record: MemoryVmstatRecord) -> Result<()> {
         Self::reserve_if_empty(&mut self.memory_vmstat, self.batch_size);
         self.memory_vmstat.push(record);
@@ -1983,6 +2017,7 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_memory_vmstat()?;
         self.flush_task_stack_events()?;
         self.flush_task_contexts()?;
+        self.flush_go_labels()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
         self.flush_cpu_infos()?;
@@ -2533,6 +2568,8 @@ fn build_stack_sample_batch(
     let mut stack_id_builder = Int64Builder::with_capacity(records.len());
     let mut stack_event_type_builder = Int8Builder::with_capacity(records.len());
     let mut task_context_id_builder = UInt64Builder::with_capacity(records.len());
+    let mut go_goid_builder = UInt64Builder::with_capacity(records.len());
+    let mut go_labels_id_builder = UInt64Builder::with_capacity(records.len());
 
     for record in records {
         ts_builder.append_value(record.ts);
@@ -2541,6 +2578,8 @@ fn build_stack_sample_batch(
         stack_id_builder.append_value(record.stack_id);
         stack_event_type_builder.append_value(record.stack_event_type);
         task_context_id_builder.append_option(record.task_context_id);
+        go_goid_builder.append_option(record.go_goid);
+        go_labels_id_builder.append_option(record.go_labels_id);
     }
 
     Ok(RecordBatch::try_new(
@@ -2552,6 +2591,8 @@ fn build_stack_sample_batch(
             Arc::new(stack_id_builder.finish()),
             Arc::new(stack_event_type_builder.finish()),
             Arc::new(task_context_id_builder.finish()),
+            Arc::new(go_goid_builder.finish()),
+            Arc::new(go_labels_id_builder.finish()),
         ],
     )?)
 }
@@ -3326,6 +3367,32 @@ fn build_task_context_batch(
             Arc::new(ts.finish()),
             Arc::new(name.finish()),
             Arc::new(value_u64.finish()),
+            Arc::new(value_str.finish()),
+        ],
+    )?)
+}
+
+fn build_go_labels_batch(records: &[GoLabelRecord], schema: &Arc<Schema>) -> Result<RecordBatch> {
+    let n = records.len();
+    let mut upid = Int64Builder::with_capacity(n);
+    let mut id = UInt64Builder::with_capacity(n);
+    let mut ts = Int64Builder::with_capacity(n);
+    let mut name = StringBuilder::with_capacity(n, n * 16);
+    let mut value_str = StringBuilder::with_capacity(n, n * 32);
+    for r in records {
+        upid.append_value(r.upid);
+        id.append_value(r.id);
+        ts.append_value(r.ts);
+        name.append_value(&r.name);
+        value_str.append_value(&r.value_str);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(upid.finish()),
+            Arc::new(id.finish()),
+            Arc::new(ts.finish()),
+            Arc::new(name.finish()),
             Arc::new(value_str.finish()),
         ],
     )?)
