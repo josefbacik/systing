@@ -501,6 +501,17 @@ systing-heap -o heap.duckdb /heap-dumps/jeprof    # snapshot files: newest per p
 | [`heap/hooks/README.md`](heap/hooks/README.md) | The library a service loads |
 | [`docs/HEAP_INTERNALS.md`](docs/HEAP_INTERNALS.md) | How each way works inside, and its safety rules |
 
+### Go Profiles
+
+`systing-go-profile` reads a Go program's own heap, goroutine, block and mutex profiles, and its flight recorder, out of its memory: no pprof port and nothing added to the program.
+`systing-heap --pid PID --snoop` does the same for the heap profile, into the heap tables.
+It is experimental, Go 1.26 on x86-64 only; see [`docs/GO_PROFILES.md`](docs/GO_PROFILES.md).
+
+```bash
+cargo build --release -p systing-go-profile
+systing-go-profile snoop --pid PID --profile goroutine
+```
+
 ### Debugging and Verbosity
 
 Use multiple `-v` flags to control verbosity levels:

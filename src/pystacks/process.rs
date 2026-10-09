@@ -1,7 +1,7 @@
 /// Process memory reading via /proc/pid/mem and /proc/pid/maps parsing.
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A memory mapping entry from /proc/pid/maps.
 #[derive(Debug, Clone)]
@@ -19,18 +19,15 @@ pub struct MemoryMapping {
 /// Parse /proc/pid/maps to get memory mappings.
 pub fn parse_proc_maps(pid: i32) -> Vec<MemoryMapping> {
     let path = format!("/proc/{pid}/maps");
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut mappings = Vec::new();
-    for line in content.lines() {
-        if let Some(mapping) = parse_maps_line(line) {
-            mappings.push(mapping);
-        }
+    match fs::read_to_string(&path) {
+        Ok(content) => parse_maps(&content),
+        Err(_) => Vec::new(),
     }
-    mappings
+}
+
+/// Parse the text of a maps file.
+pub fn parse_maps(content: &str) -> Vec<MemoryMapping> {
+    content.lines().filter_map(parse_maps_line).collect()
 }
 
 fn parse_maps_line(line: &str) -> Option<MemoryMapping> {
@@ -84,8 +81,14 @@ pub struct ProcessMemory {
 
 impl ProcessMemory {
     pub fn open(pid: i32) -> std::io::Result<Self> {
+        Self::open_path(Path::new(&format!("/proc/{pid}/mem")))
+    }
+
+    /// A `mem` file by its path: through a handle on the process's /proc
+    /// directory, the process it names cannot be another one by the same pid.
+    pub fn open_path(path: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            file: fs::File::open(format!("/proc/{pid}/mem"))?,
+            file: fs::File::open(path)?,
         })
     }
 }
