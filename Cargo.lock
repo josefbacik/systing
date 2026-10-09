@@ -3492,6 +3492,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "systing-go-profile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde_json",
+ "systing",
+]
+
+[[package]]
 name = "systing-heap"
 version = "0.1.0"
 dependencies = [

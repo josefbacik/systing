@@ -42,6 +42,7 @@ pub mod validation;
 
 // Tracing modules (previously in binary only)
 pub mod events;
+pub mod golang;
 pub mod gopclntab_resolver;
 pub mod gvisor_guest;
 pub mod marker_recorder;

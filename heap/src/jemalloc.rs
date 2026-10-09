@@ -192,6 +192,7 @@ pub fn parse(text: &str) -> Result<Snapshot> {
         perf_map: None,
         py_code: None,
         live_read: None,
+        named_frames: None,
     })
 }
 

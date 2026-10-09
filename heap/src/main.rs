@@ -11,7 +11,7 @@ use systing_heap::perfmap::{self, PerfMap};
 use systing_heap::pycode::{self, CodeMap};
 use systing_heap::root::Root;
 use systing_heap::{
-    ask, check, db, jemalloc, perfetto, retention, snoop, symbolize, Format, Snapshot,
+    ask, check, db, golang, jemalloc, perfetto, retention, snoop, symbolize, Format, Snapshot,
 };
 
 /// Turn heap dumps into a systing DuckDB database or a Perfetto trace.
@@ -221,6 +221,15 @@ fn main() -> Result<()> {
         }
         let (snapshot, report) = asked?;
         eprintln!("{}", report.summary(pid));
+        snapshots.push(snapshot);
+    } else if let Some(process) = pinned.as_ref().filter(|p| golang::is_go(p)) {
+        let pid = process.pid();
+        eprintln!(
+            "warning: --snoop reads the Go runtime's private data structures out of process \
+             {pid}'s memory, and refuses a Go version it has no layout for"
+        );
+        let (snapshot, summary) = golang::read(process)?;
+        eprintln!("{summary}");
         snapshots.push(snapshot);
     } else if let Some(process) = pinned.as_ref() {
         let pid = process.pid();
@@ -519,6 +528,7 @@ fn wal_path(db: &Path) -> PathBuf {
 fn read(path: &Path, format: Format) -> Result<Snapshot> {
     match format {
         Format::Jemalloc => jemalloc::read(path),
+        Format::Pprof => systing_heap::pprof::read(path),
     }
 }
 
