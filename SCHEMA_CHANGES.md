@@ -445,6 +445,85 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 30 (systing 1.27.0) — 2026-10-09
+
+`--include-go-context`: for a running-stack sample of a Go program, the
+goroutine that was running and its profiler labels (`runtime/pprof.Do`,
+`SetGoroutineLabels`), read by the sampler from the program's memory. A sample
+carries the goroutine's id and the id of its label set; each set is stored
+once per process, not once per sample.
+
+### Added columns
+- `stack_sample.go_goid` (UBIGINT): the goroutine the sampled thread was
+  running (Go's own goroutine id, as `runtime.Stack` prints it). Filled for
+  running-stack samples (`stack_event_type = 1`) of a Go 1.26 or 1.27 x86-64
+  program linked at fixed addresses (a position-independent one is refused),
+  in a capture recorded with `--include-go-context`. A thread on its system
+  stack (a cgo call, the garbage collector's work on a goroutine's behalf)
+  counts for the goroutine it is running for (its `m.curg`), as in Go's own
+  profiles. NULL for every other row: sleep stacks, a thread with no
+  goroutine (the scheduler alone; a thread that C code made, outside a call
+  into Go), a program of another Go version or
+  architecture, a counted miss, a capture without the flag. Goroutine ids are
+  unique within a process, so join on the process (`thread.upid`) as well.
+- `stack_sample.go_labels_id` (UBIGINT): the id of the goroutine's label set,
+  NULL when it had none (a set with no labels in it is none). The id is a hash
+  of the set's contents as the sample read them, so one id is one set within
+  a process. `1` means the goroutine had labels that this sample could not
+  read (a read failed, or both of the CPU's copy records were in use).
+- `sysinfo.go_context` (VARCHAR): how `--include-go-context` ran: `on`, or
+  `restricted` (the kernel's confidentiality mode: nothing was read). NULL
+  without the flag, so a NULL `go_goid` in such a trace says nothing about a
+  Go program.
+
+### New tables
+- `go_labels` (upid BIGINT, id UBIGINT, ts BIGINT, name VARCHAR, value_str
+  VARCHAR): one row per label of one label set of one process, its key as
+  `name` and its value as `value_str` (the names `task_context` has). The rows with
+  one (`upid`, `id`) are the whole set. `ts` is the sample that first sent the
+  set. At most eight labels of a set travel, a key cut at 64 bytes and a
+  value at 128; invalid UTF-8 and control characters are replaced (U+FFFD).
+  Keys and values are whatever the traced program set: data about it, never
+  an identity to trust. Written only by a capture with the flag that read at
+  least one set: `go_labels.parquet` does not exist otherwise.
+
+  ```sql
+  SELECT s.ts, s.go_goid, l.name, l.value_str
+  FROM stack_sample s
+  JOIN thread t ON t.trace_id = s.trace_id AND t.utid = s.utid
+  LEFT JOIN go_labels l
+    ON l.trace_id = s.trace_id AND l.upid = t.upid AND l.id = s.go_labels_id
+  WHERE s.go_goid IS NOT NULL;
+  ```
+
+  So every sample says which set it had, and a set's rows may be missing: a
+  set is sent when a sample finds one its process has not sent, inside a
+  per-CPU budget, and a sample over the budget keeps the set's id while the
+  set waits for a later sample to send it. A `go_labels_id` other than `1`
+  with no rows is a set that never travelled (the capture's `go_context
+  samples:` line counts `rate_limited` and `ring_full`). The share of
+  labelled samples that they hold:
+
+  ```sql
+  SELECT count(*) FILTER (WHERE l.id IS NULL AND s.go_labels_id > 1) * 1.0
+         / nullif(count(*) FILTER (WHERE s.go_labels_id > 1), 0)
+         AS samples_whose_set_has_no_rows
+  FROM stack_sample s
+  JOIN thread t ON t.trace_id = s.trace_id AND t.utid = s.utid
+  LEFT JOIN (SELECT DISTINCT trace_id, upid, id FROM go_labels) l
+    ON l.trace_id = s.trace_id AND l.upid = t.upid AND l.id = s.go_labels_id;
+  ```
+
+### Compatibility
+- A reader at this version imports an older `stack_sample.parquet` with the
+  two new columns NULL.
+- A reader older than this version that has the import guard (1.18.2 and
+  newer) imports a newer `stack_sample.parquet` without the columns and warns
+  once, and never opens `go_labels.parquet`, a table it does not know.
+- `sysinfo.parquet` has its new column in every trace, with or without the
+  flag. A reader with the import guard imports it without the column and warns
+  once; a reader older than 1.18.2 fails the import of it whole.
+
 ## Schema Version 29 (systing 1.26.0) — 2026-09-25
 
 A capture says whether its task-stacks recorder read other tasks' user memory.

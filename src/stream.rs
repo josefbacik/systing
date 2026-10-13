@@ -72,6 +72,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "memory_vmstat",
     "task_stack_event",
     "task_context",
+    "go_labels",
     "clock_snapshot",
     "sysinfo",
     "cpu_info",

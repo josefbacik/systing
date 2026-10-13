@@ -321,6 +321,11 @@ pub struct TraceSystemInfo {
     /// from before schema 29, where it means unknown and never "on".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_stacks_remote_reads: Option<String>,
+    /// How `--include-go-context` ran (from schema 30): "on", or
+    /// "restricted" (the kernel's confidentiality mode: nothing was read);
+    /// `None` without the flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub go_context: Option<String>,
 }
 
 /// Trace metadata.
@@ -975,7 +980,7 @@ impl AnalyzeDb {
             }
         };
         let sql = format!(
-            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
             col("trace_id"),
             col("release"),
             col("machine"),
@@ -998,6 +1003,7 @@ impl AnalyzeDb {
             col("network_tw_leg"),
             col("network_packet_sample_rate"),
             col("task_stacks_remote_reads"),
+            col("go_context"),
         );
 
         let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -1027,6 +1033,7 @@ impl AnalyzeDb {
                 network_tw_leg: row.get(19)?,
                 network_packet_sample_rate: row.get(20)?,
                 task_stacks_remote_reads: row.get(21)?,
+                go_context: row.get(22)?,
             })
         }) else {
             return Vec::new();
@@ -1486,11 +1493,11 @@ mod tests {
                  memory_alloc_sample_rate, memory_vfio_leg, memory_thp_leg, \
                  memory_thp_sample_rate, memory_iommu_overflow, \
                  memory_anon_huge_walk, memory_syscall_leg, network_tw_leg, \
-                 network_packet_sample_rate, task_stacks_remote_reads) \
+                 network_packet_sample_rate, task_stacks_remote_reads, go_context) \
                  VALUES ('t1', 'Linux', '6.12.0', '#1 SMP', 'x86_64', \
                  NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge', 'cpu-clock', 1000000, \
                  'tracepoint', 97, 1, NULL, 'on', NULL, NULL, 0, NULL, 'fentry', \
-                 'kprobe:nobtf', 8, 'off:kernel-release')",
+                 'kprobe:nobtf', 8, 'off:kernel-release', 'on')",
             )
             .unwrap();
         }
@@ -1535,6 +1542,7 @@ mod tests {
             sys.task_stacks_remote_reads.as_deref(),
             Some("off:kernel-release")
         );
+        assert_eq!(sys.go_context.as_deref(), Some("on"));
     }
 
     #[test]
@@ -1566,6 +1574,7 @@ mod tests {
                  ALTER TABLE sysinfo DROP COLUMN network_tw_leg; \
                  ALTER TABLE sysinfo DROP COLUMN network_packet_sample_rate; \
                  ALTER TABLE sysinfo DROP COLUMN task_stacks_remote_reads; \
+                 ALTER TABLE sysinfo DROP COLUMN go_context; \
                  INSERT INTO sysinfo (trace_id, sysname, release, version, machine) \
                  VALUES ('t1', 'Linux', '5.10.0', '#1 SMP', 'aarch64')",
             )
@@ -1599,6 +1608,7 @@ mod tests {
             sys.task_stacks_remote_reads, None,
             "a database from before the column reads unknown, never \"on\""
         );
+        assert_eq!(sys.go_context, None);
     }
 
     #[test]

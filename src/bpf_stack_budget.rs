@@ -614,4 +614,21 @@ mod tests {
             "nothing calls the reader"
         );
     }
+
+    /// The same for the reader of a Go program's goroutine.
+    #[test]
+    fn the_go_context_reader_is_in_no_frame_but_its_own() {
+        let (functions, _) = chains_of("systing_system.bpf.o");
+        let reader = functions.get("go_context_read_current").expect(
+            "go_context_read_current is not a function of the object: it was inlined into \
+             its caller, whose frame now holds its locals",
+        );
+        assert!(!reader.entry);
+        assert!(
+            functions
+                .values()
+                .any(|f| f.callees.iter().any(|c| c == "go_context_read_current")),
+            "nothing calls the reader"
+        );
+    }
 }

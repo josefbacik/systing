@@ -8,8 +8,9 @@ through `runtime/pprof`, which needs code in the program and usually a
 from outside: no port, no signal, no code of ours in the program, and the
 program is not stopped.
 
-**Status:** experimental. Go 1.26 on x86-64 only; other versions are refused
-until they have bindings (below). The reading is `systing::golang`
+**Status:** experimental. x86-64 only. The profile readers read Go 1.26, and
+the goroutine reader of `--include-go-context` Go 1.26 and 1.27; other
+versions are refused until they have bindings (below). The reading is `systing::golang`
 (`src/golang/`); two commands use it:
 
 - `systing-heap --pid PID --snoop` on a Go program: its heap profile, into the
@@ -38,6 +39,58 @@ and any other pprof tool read. A goroutine profile written so also has a
 that is not waiting.
 Reading memory needs the program's own user or `CAP_SYS_PTRACE`, as for
 `--snoop` of jemalloc.
+
+## Goroutines and labels on CPU samples
+
+`systing --include-go-context` reads, for every CPU sample of a Go program,
+the goroutine that was running and its profiler labels (`pprof.Do`,
+`SetGoroutineLabels`), from inside the sampler:
+
+- `stack_sample.go_goid`: the goroutine, Go's own id for it;
+- `stack_sample.go_labels_id`: the id of its label set, and the set itself,
+  once per process, in the `go_labels` table (`SCHEMA_CHANGES.md`, schema 30).
+
+```sql
+SELECT l.name AS key, l.value_str AS value, count(*) AS samples
+FROM stack_sample s
+JOIN thread t ON t.trace_id = s.trace_id AND t.utid = s.utid
+JOIN go_labels l ON l.trace_id = s.trace_id AND l.upid = t.upid AND l.id = s.go_labels_id
+GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+It is built as `--include-task-context` is (`src/golang/context/`,
+`src/golang/bpf/go_context.bpf.h`). User space reads each Go program's
+executable once, in bounded reads, for where the runtime keeps the running
+goroutine (`g`, at a fixed distance from the thread pointer that the
+program's own code loads it from), and writes that, with the layout of its Go
+version, into a map the sampler looks up. It does so only for a process whose
+executable is mapped in its own memory: a process forked from a Go program
+that never execs keeps the program's `exe` link, but not its memory (gVisor's
+systrap stubs hold their sandboxed guest's). A position-independent program
+is refused: it does not load `g` from a fixed offset.
+
+A sample then reads `g`, its m (`g.m`) and the m's current goroutine
+(`m.curg`): a thread on its system stack (a cgo call, the garbage collector's
+work) counts for the goroutine it runs for, as in Go's own profiles, and
+otherwise `g` must be `m.curg` itself, so words that only look like a `g` are
+not believed. A goroutine's label set is copied at every sample of it into one
+of the CPU's two copy records and named by a hash of what it holds: never by
+its address, which Go reuses for the next request's set once a set is freed.
+The copy goes to user space only when the process has not sent that set
+before, inside a per-CPU budget that bounds what is sent, not what is read;
+over the budget the sample still carries the set's id. At most eight labels a
+set, keys cut at 64 bytes and values at 128. A sample whose set could not be
+read carries the id `1`, and a set with no labels is no labels. Every miss is
+counted, and printed at the end of the capture (`go_context samples:`), and
+`sysinfo.go_context` says how the flag ran.
+
+On a labelled workload (three goroutines under labels, one without) the CPU
+sampler's mean run time, by the kernel's BPF statistics, went from 534 to 596
+ns without the flag to 972 to 1,016 ns with it. That is a mean over all of the
+sampler's runs, those that found no Go program included, on a machine with
+few CPUs sampling. So on that machine the sampler's run on a labelled sample
+takes at least 1 microsecond, of which the flag adds at least the difference,
+0.4 to 0.5: floors, not measures.
 
 ## What it matches
 
@@ -116,9 +169,12 @@ version's numbers, and so are release candidates and experiment builds
   and `timeout`.
 - x86-64 only: stripped binaries are read by instruction encoding, and the
   bindings are for linux/amd64.
+- `--include-go-context` gives no goroutine for a position-independent Go
+  program (`-buildmode=pie`, the default of some distributions).
 - Function names only: no line numbers, and inlined calls are not expanded
   (the function table has both; they are not decoded yet).
-- No pprof labels, and no stack for a goroutine that is running.
+- `systing-go-profile` reads no pprof labels (`--include-go-context` does,
+  on CPU samples), and has no stack for a goroutine that is running.
 - A flight recorder's window above 1 GiB, or of more than 2^20 batches, is
   refused. The limit is this reader's own: Go sets none.
 - Block and mutex profiles are empty until the program sets their rates,

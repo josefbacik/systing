@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 29;
+pub const SCHEMA_VERSION: u32 = 30;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -185,6 +185,7 @@ pub const DATA_TABLES: &[&str] = &[
     "memory_vmstat",
     "task_stack_event",
     "task_context",
+    "go_labels",
     "heap_snapshot",
     "heap_sample",
     "heap_live_read",
@@ -248,6 +249,7 @@ pub const PARQUET_TABLES: &[(&str, ParquetFileOf)] = &[
     ("memory_vmstat", |p| &p.memory_vmstat),
     ("task_stack_event", |p| &p.task_stack_event),
     ("task_context", |p| &p.task_context),
+    ("go_labels", |p| &p.go_labels),
     ("clock_snapshot", |p| &p.clock_snapshot),
     ("sysinfo", |p| &p.sysinfo),
     ("cpu_info", |p| &p.cpu_info),
@@ -520,7 +522,13 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- The sampled thread's task_context id (--include-task-context),
             -- NULL when none: its values are the task_context rows with the
             -- same utid and id.
-            task_context_id UBIGINT
+            task_context_id UBIGINT,
+            -- The goroutine a Go program's thread was running, and the id of
+            -- its label set (--include-go-context), NULL when none (1:
+            -- labels that could not be read): the labels are the go_labels
+            -- rows of the thread's process with that id.
+            go_goid UBIGINT,
+            go_labels_id UBIGINT
         );
 
         -- Network interface metadata
@@ -778,6 +786,19 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             value_str VARCHAR
         );
 
+        -- --include-go-context: one label of one Go label set of one
+        -- process. A sample's labels are the rows of its thread's process
+        -- (thread.upid) whose id is its go_labels_id; an id is a hash of the
+        -- set's contents, so its rows are the whole set.
+        CREATE TABLE IF NOT EXISTS go_labels (
+            trace_id VARCHAR,
+            upid BIGINT,
+            id UBIGINT,
+            ts BIGINT,
+            name VARCHAR, -- the label's key
+            value_str VARCHAR -- the label's value
+        );
+
         -- Heap snapshots read by systing-heap: an allocator's own dump of the
         -- memory a process had live when it wrote the file (jemalloc
         -- prof.dump, later pprof and tcmalloc), not a stream of malloc calls
@@ -952,7 +973,11 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- this column is the only marker. NULL when the task-stacks
             -- recorder was not asked for, and in traces from before schema 29,
             -- where it means unknown and never 'on'.
-            task_stacks_remote_reads VARCHAR
+            task_stacks_remote_reads VARCHAR,
+            -- How --include-go-context ran: 'on', or 'restricted' (the
+            -- kernel's confidentiality mode: nothing was read). NULL without
+            -- the flag, and in traces from before schema 30.
+            go_context VARCHAR
         );
 
         -- Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on
@@ -1354,6 +1379,7 @@ pub fn import_order_by(table_name: &str) -> Option<&'static str> {
         "sched_slice" => Some("cpu, ts"),
         "thread_state" => Some("utid, ts"),
         "stack_sample" | "task_stack_event" | "task_context" => Some("utid, ts"),
+        "go_labels" => Some("upid, id"),
         "softirq_slice" | "irq_slice" => Some("cpu, ts"),
         "counter" => Some("track_id, ts"),
         _ => None,

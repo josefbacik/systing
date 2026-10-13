@@ -543,7 +543,7 @@ fn lowest_mapping(
 /// among the first file mappings) is the path the map prints compared with
 /// the path the `exe` link prints; whatever is found is checked by content
 /// afterwards, like everything else here.
-fn exe_mapping<'a>(
+pub(crate) fn exe_mapping<'a>(
     pid: u32,
     exe: &fs::File,
     maps: &'a [MemoryMapping],
@@ -570,7 +570,16 @@ fn exe_mapping<'a>(
     }
     let exe_path = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     let exe_path = exe_path.to_string_lossy();
-    lowest_mapping(maps, |mapping| mapping.name == exe_path)
+    // A printed path is not the file: another file can print the same one (a
+    // name that ends in " (deleted)", a mount over the name, another mount
+    // namespace), and the link read here may already be the next program's.
+    // The line's inode number must be the handle's too. On a kernel before
+    // 6.8 a map line of a file that overlayfs copied up may print another
+    // inode than the handle's, so where the handles above cannot be followed
+    // (without the privilege to) such an executable is not found.
+    lowest_mapping(maps, |mapping| {
+        mapping.name == exe_path && mapping.inode == exe_meta.ino()
+    })
 }
 
 /// Open the file behind a mapping through the process's own map: the entry
@@ -1457,6 +1466,28 @@ mod tests {
         // Its first segment is at or after the start of that mapping.
         let facts = elf_facts(&ReadCache::new(&exe)).expect("an ELF file");
         assert!(load_bias(&facts, mapping.start as u64, mapping.offset).is_some());
+    }
+
+    #[test]
+    fn a_mapping_that_only_prints_the_executables_path_is_not_it() {
+        let me = std::process::id();
+        let exe = fs::File::open(format!("/proc/{me}/exe")).unwrap();
+        let path = fs::read_link(format!("/proc/{me}/exe")).unwrap();
+        // A range no process has (below the lowest address that can be
+        // mapped), so the handles find nothing and the path is compared.
+        let line = |inode: u64| MemoryMapping {
+            start: 0x1000,
+            end: 0x2000,
+            perms: "r-xp".to_string(),
+            offset: 0,
+            dev_major: 0,
+            dev_minor: 0,
+            inode,
+            name: path.to_string_lossy().into_owned(),
+        };
+        let inode = exe.metadata().unwrap().ino();
+        assert!(exe_mapping(me, &exe, &[line(inode)]).is_some());
+        assert!(exe_mapping(me, &exe, &[line(inode + 1)]).is_none());
     }
 
     /// Mappings of the library's file, each (start, end, offset in the file).

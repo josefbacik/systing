@@ -291,6 +291,9 @@ pub struct SessionRecorder {
     /// (`sysinfo.task_stacks_remote_reads`), set once its iterator is loaded.
     /// Unset when the recorder is not enabled (the column is then NULL).
     pub task_stacks_remote_reads: OnceLock<bool>,
+    /// How `--include-go-context` ran (`sysinfo.go_context`): `on` or
+    /// `restricted`, set when it starts. Unset without the flag.
+    pub go_context: OnceLock<&'static str>,
 }
 
 pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -1025,6 +1028,7 @@ impl SessionRecorder {
             memory_recorder_end: OnceLock::new(),
             network_recorder_config: OnceLock::new(),
             task_stacks_remote_reads: OnceLock::new(),
+            go_context: OnceLock::new(),
         }
     }
 
@@ -1715,6 +1719,7 @@ impl SessionRecorder {
                     .task_stacks_remote_reads
                     .get()
                     .map(|&remote| remote_reads_sysinfo_value(remote).to_string()),
+                go_context: self.go_context.get().map(|mode| mode.to_string()),
             })?;
         }
 
@@ -2227,6 +2232,7 @@ mod tests {
             memory_recorder_end: OnceLock::new(),
             network_recorder_config: OnceLock::new(),
             task_stacks_remote_reads: OnceLock::new(),
+            go_context: OnceLock::new(),
         }
     }
 

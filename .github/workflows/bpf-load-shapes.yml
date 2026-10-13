@@ -57,6 +57,15 @@ name: bpf-load-shapes
 # requires the two cases with a `--cgroup` capture to say exactly that, and for that
 # reason; the first of them says it once that capture has recorded what a forced full
 # walk did, so a green row there means the program's own `--cgroup` match ran.
+#
+# Each guest job also boots its kernel once more and runs the go_context end-to-end
+# cases (tests/go_context_record.rs) as root, once with each Go that systing has
+# bindings for (1.26 and 1.27), both installed on the runner, whose filesystem the
+# guest sees: small Go programs, built in the guest, are traced with
+# --include-go-context - as built, stripped, spinning in a cgo call, driving an
+# iter.Pull iterator, in a thread that C made, and under an empty label set - and the
+# trace must carry their goroutines and label sets, or none where Go's own profiler
+# gives none. scripts/ci/vmtest-go-context-e2e.sh fails the step on any early return.
 
 on:
   push:
@@ -135,6 +144,21 @@ jobs:
           pwd > gate/manifest-dir.txt
           cat gate/manifest-dir.txt
           ls -l gate
+      - name: Build the go_context_record test binary (its cases build Go programs and trace them in-process)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo test --test go_context_record --no-run --no-default-features --message-format=json > /tmp/build-go-context.json
+          BIN="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "go_context_record") | .executable' /tmp/build-go-context.json | tail -1)"
+          test -x "$BIN"
+          cp "$BIN" gate/go_context_record
+          strip --strip-debug gate/go_context_record
+          ls -l gate
       - name: Build the trace_validation test binary and the systing binary its end-to-end cases start
         env:
           SCCACHE_GHA_ENABLED: "true"
@@ -207,6 +231,19 @@ jobs:
         with:
           name: load-shape-gate
           path: gate
+      # The go_context cases build their programs in the guest, which sees this
+      # runner's filesystem: each Go systing has bindings for, the second one set
+      # up last, so that it is the one on PATH for anything else.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache: false
+      - run: echo "GO_1_27=$(command -v go)" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.7"
+          cache: false
+      - run: echo "GO_1_26=$(command -v go)" >> "$GITHUB_ENV"
       - name: Install qemu and virtme-ng
         run: |
           sudo apt-get update
@@ -316,6 +353,27 @@ jobs:
           cat "$OUT" || cat "$OUT.raw" || true
           echo "::endgroup::"
           grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      - name: Boot the kernel again and run the go_context end-to-end cases
+        run: |
+          chmod +x gate/go_context_record scripts/ci/vmtest-go-context-e2e.sh
+          "$GO_1_26" version
+          "$GO_1_27" version
+          mkdir -p guest-tmp
+          OUT="$GITHUB_WORKSPACE/go-context-e2e-${{ matrix.kernel.id }}.log"
+          KVM_FLAG=""
+          [ -w /dev/kvm ] || KVM_FLAG="--disable-kvm"
+          set +e
+          timeout 1800 vng --run "kernels/${{ matrix.kernel.id }}/kernel" $KVM_FLAG --force-9p --cpus 4 --memory 8G \
+            --rwdir "$GITHUB_WORKSPACE" --rwdir "/tmp=$GITHUB_WORKSPACE/guest-tmp" \
+            --append oops=panic --append virtme_root_user=1 --verbose \
+            -- bash "$GITHUB_WORKSPACE/scripts/ci/vmtest-go-context-e2e.sh" \
+                 "$GITHUB_WORKSPACE/gate/go_context_record" "$GITHUB_WORKSPACE/gate" "$OUT" "$GO_1_26" "$GO_1_27"
+          echo "vng exited $? (informational, as above: the guest-written file decides)"
+          set -e
+          echo "::group::guest output (${{ matrix.kernel.id }})"
+          cat "$OUT" || cat "$OUT.raw" || true
+          echo "::endgroup::"
+          grep -q '^VNG-TEST-EXIT:0$' "$OUT"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -331,6 +389,15 @@ jobs:
             task-context-e2e-${{ matrix.kernel.id }}.log
             task-context-e2e-${{ matrix.kernel.id }}.log.raw
             task-context-e2e-${{ matrix.kernel.id }}.log.counters
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-context-e2e-${{ matrix.kernel.id }}
+          path: |
+            go-context-e2e-${{ matrix.kernel.id }}.log
+            go-context-e2e-${{ matrix.kernel.id }}.log.*.raw
           if-no-files-found: ignore
           retention-days: 7
       - uses: actions/upload-artifact@v4

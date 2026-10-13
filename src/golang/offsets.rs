@@ -6,11 +6,12 @@
 //! structs change between minor releases (Go 1.27's heap record is half the
 //! size of 1.26's), and a wrong layout would read wrong numbers, not fail.
 //!
-//! Each reader has a table of its own in a version's bindings, [`Layout`]
-//! for the profile readers. A version's file has a table only when everything
+//! Each reader has a table of its own in a version's bindings: [`Layout`]
+//! for the profile readers, [`ContextLayout`] for the goroutine reader of
+//! `--include-go-context`. A version's file has a table only when everything
 //! it names is in that runtime, so one reader can support a version whose
-//! changes another's code does not follow yet. A new version is a new
-//! bindings file and a line in [`for_version`].
+//! changes the other's code does not follow yet. A new version is a new
+//! bindings file and a line in [`for_version`] or [`context_for_version`].
 
 use super::bindings;
 
@@ -178,6 +179,68 @@ pub fn go1_26() -> Layout {
     }
 }
 
+/// Where the goroutine reader (`--include-go-context`) finds the running
+/// goroutine and its labels, in one Go version.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextLayout {
+    /// `runtime.g.goid`, `runtime.g.labels` (a `*runtime/pprof.labelMap`,
+    /// nil without labels), `runtime.g.m`.
+    pub g_goid: usize,
+    pub g_labels: usize,
+    pub g_m: usize,
+    /// `runtime.m.curg`: the user goroutine of a thread on its system stack.
+    pub m_curg: usize,
+    /// `runtime.m.isExtraInC` (one byte): set on a thread that C made while
+    /// it is outside any call into Go. Go's profiler gives it no goroutine.
+    pub m_is_extra_in_c: usize,
+    /// Where a `labelMap`'s slice of labels is, and a label's size and
+    /// fields (two strings).
+    pub label_map_list: usize,
+    pub label_size: usize,
+    pub label_key: usize,
+    pub label_value: usize,
+}
+
+/// The goroutine reader's layout for Go `major.minor`, if its table is in
+/// that version's bindings.
+pub fn context_for_version(major: u32, minor: u32) -> Option<ContextLayout> {
+    match (major, minor) {
+        (1, 26) => Some(context_go1_26()),
+        (1, 27) => Some(context_go1_27()),
+        _ => None,
+    }
+}
+
+pub fn context_go1_26() -> ContextLayout {
+    use bindings::v1_26::context::*;
+    ContextLayout {
+        g_goid: G_GOID,
+        g_labels: G_LABELS,
+        g_m: G_M,
+        m_curg: M_CURG,
+        m_is_extra_in_c: M_IS_EXTRA_IN_C,
+        label_map_list: LABEL_MAP_LIST,
+        label_size: LABEL_SIZE,
+        label_key: LABEL_KEY,
+        label_value: LABEL_VALUE,
+    }
+}
+
+pub fn context_go1_27() -> ContextLayout {
+    use bindings::v1_27::context::*;
+    ContextLayout {
+        g_goid: G_GOID,
+        g_labels: G_LABELS,
+        g_m: G_M,
+        m_curg: M_CURG,
+        m_is_extra_in_c: M_IS_EXTRA_IN_C,
+        label_map_list: LABEL_MAP_LIST,
+        label_size: LABEL_SIZE,
+        label_key: LABEL_KEY,
+        label_value: LABEL_VALUE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +251,11 @@ mod tests {
         assert!(for_version(1, 25).is_none());
         assert!(for_version(1, 27).is_none());
         assert!(for_version(2, 26).is_none());
+        assert!(context_for_version(1, 26).is_some());
+        assert!(context_for_version(1, 25).is_none());
+        // Go 1.27's heap record changed: its labels table only.
+        assert!(context_for_version(1, 27).is_some());
+        assert!(for_version(1, 27).is_none());
     }
 
     #[test]

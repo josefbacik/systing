@@ -151,3 +151,24 @@ pub mod profiles {
         "cleanup wait",
     ];
 }
+
+/// The goroutine reader's table (context): the running goroutine of a
+/// thread, its id and its profiler labels.
+pub mod context {
+    // runtime.g
+    pub const G_GOID: usize = 152;
+    pub const G_LABELS: usize = 352;
+    pub const G_M: usize = 48;
+
+    // runtime.m
+    pub const M_CURG: usize = 184;
+    pub const M_IS_EXTRA_IN_C: usize = 282;
+
+    // runtime/pprof.labelMap
+    pub const LABEL_MAP_LIST: usize = 0;
+
+    // internal/runtime/pprof/label.Label
+    pub const LABEL_SIZE: usize = 32;
+    pub const LABEL_KEY: usize = 0;
+    pub const LABEL_VALUE: usize = 16;
+}

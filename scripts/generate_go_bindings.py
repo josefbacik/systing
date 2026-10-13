@@ -134,6 +134,22 @@ TABLES = [
             ("WAIT_REASONS", "runtime.waitReasonStrings"),
         ],
     },
+    {
+        "name": "context",
+        "about": "The goroutine reader's table (context): the running goroutine of a\n"
+        "/// thread, its id and its profiler labels.",
+        "offsets": [
+            ("G_GOID", "runtime.g", "goid"),
+            ("G_LABELS", "runtime.g", "labels"),
+            ("G_M", "runtime.g", "m"),
+            ("M_CURG", "runtime.m", "curg"),
+            ("M_IS_EXTRA_IN_C", "runtime.m", "isExtraInC"),
+            ("LABEL_MAP_LIST", "runtime/pprof.labelMap", "Set.List"),
+            ("LABEL_SIZE", "internal/runtime/pprof/label.Label", ""),
+            ("LABEL_KEY", "internal/runtime/pprof/label.Label", "Key"),
+            ("LABEL_VALUE", "internal/runtime/pprof/label.Label", "Value"),
+        ],
+    },
 ]
 
 # The reader. Prints `name value` lines; `name` is a request's key.
