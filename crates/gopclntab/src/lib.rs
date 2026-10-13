@@ -60,6 +60,10 @@ const GO120_MAGIC: u32 = 0xFFFF_FFF1;
 /// Header prefix: magic u32, two pad bytes, minLC u8, ptrsize u8.
 const HEADER_PREFIX_LEN: usize = 8;
 
+/// Most bytes taken as one function table. The largest known are a few dozen
+/// MiB.
+pub(crate) const MAX_TABLE: usize = 256 << 20;
+
 /// Whether `b` starts with a plausible pclntab header: a supported magic,
 /// the two mandatory zero pad bytes, an instruction-size quantum Go
 /// actually emits (1 on x86, 2 on arm, 4 on arm64/riscv), and a sane
@@ -96,10 +100,14 @@ pub struct GoPclntab {
     version: PclnVersion,
     ptrsize: usize,
     nfunctab: usize,
-    /// Virtual address of the start of text, the base for V118 entry
-    /// offsets. Callers should prefer the `.text` section address
-    /// (matching what the Go runtime relocates against); the pclntab
-    /// header value is the fallback. Unused for V116.
+    /// Virtual address of Go's own start of code — the runtime's
+    /// `moduledata.text`, the symbol `runtime.text` — the base for V118
+    /// entry offsets. It equals the `.text` section's address only when
+    /// Go's own linker linked the binary: under the system linker the
+    /// section opens with C start-up code and Go's code starts later.
+    /// [`ElfPclntab`] resolves it from the module data record; the pclntab
+    /// header value is the fallback for callers that pass none. Unused
+    /// for V116.
     text_start: u64,
     /// Offset of the function-name string table within `data`.
     funcnametab: usize,
@@ -152,10 +160,15 @@ impl GoPclntab {
     /// Parse a pclntab from its raw bytes (e.g. the contents of the
     /// `.gopclntab` ELF section).
     ///
-    /// `text_vaddr` is the virtual address of the binary's `.text` section
-    /// when known; Go's own tooling prefers it over the header's stored
-    /// value (which may be unrelocated in edge cases) and so does this
-    /// crate. [`ElfPclntab`] supplies it automatically.
+    /// `text_vaddr` is the virtual address of Go's own start of code — the
+    /// value of the runtime's `moduledata.text`, the `runtime.text`
+    /// symbol — when known. Go's own `debug/gosym.NewLineTable` says of
+    /// the same parameter that it "may differ from the start address of
+    /// the text segment if binary was built with cgo enabled": the
+    /// `.text` section's address is that value only for binaries linked
+    /// by Go's own linker. With `None` the header's stored value is used,
+    /// which reads zero in binaries built by go1.26.7.
+    /// [`ElfPclntab`] resolves the value from the module data record.
     pub fn parse(data: Vec<u8>, text_vaddr: Option<u64>) -> Result<Self, Error> {
         let h = Self::parse_header(&data, text_vaddr)?;
         Ok(Self {
@@ -270,23 +283,34 @@ impl GoPclntab {
     /// zero pad bytes, a plausible instruction quantum and pointer size)
     /// at 8-byte alignment, then validates each candidate on the borrowed
     /// slice: the header's offset words and the full functab extent must
-    /// all land inside the region, which rejects signature lookalikes.
+    /// all land inside the region, and within 256 MiB of the header, which
+    /// rejects signature lookalikes.
     /// Bytes are copied exactly once, for the adopted table — candidate
     /// validation allocates nothing, so a region tiled with fake
     /// signatures costs a constant-time rejection each, not a copy each.
     /// The first non-empty candidate that validates wins; `None` means
     /// the region holds no parseable table.
     pub fn scan(region: &[u8], text_vaddr: Option<u64>) -> Option<Self> {
+        Self::scan_at(region, text_vaddr).map(|(_, table)| table)
+    }
+
+    /// [`GoPclntab::scan`], also reporting the table's byte offset within
+    /// `region`: what a caller needs to turn the region's address into
+    /// the table's own.
+    pub(crate) fn scan_at(region: &[u8], text_vaddr: Option<u64>) -> Option<(usize, Self)> {
         let mut off = 0;
         while off + HEADER_PREFIX_LEN <= region.len() {
             if header_signature(&region[off..]) {
-                match Self::parse_header(&region[off..], text_vaddr) {
+                let candidate = &region[off..region.len().min(off.saturating_add(MAX_TABLE))];
+                match Self::parse_header(candidate, text_vaddr) {
                     // An empty table parses but resolves nothing; keep
                     // scanning rather than let it shadow a real one.
                     Ok(h) if h.nfunctab > 0 => {
                         // The borrowed validation just passed over these
                         // exact bytes, so this parse cannot fail.
-                        return Self::parse(region[off..].to_vec(), text_vaddr).ok();
+                        return Self::parse(candidate.to_vec(), text_vaddr)
+                            .ok()
+                            .map(|table| (off, table));
                     }
                     _ => {}
                 }
@@ -294,6 +318,27 @@ impl GoPclntab {
             off += 8;
         }
         None
+    }
+
+    /// The table's first entry offset and its end-of-text sentinel, both
+    /// relative to Go's own start of code: the two figures the runtime's
+    /// `minpc` and `maxpc` are that start plus. `None` for V116 tables,
+    /// whose entries are absolute addresses and need no base.
+    pub(crate) fn text_extent(&self) -> Option<(u64, u64)> {
+        match self.version {
+            PclnVersion::V118 => Some((self.entry_value(0)?, self.entry_value(self.nfunctab)?)),
+            PclnVersion::V116 => None,
+        }
+    }
+
+    /// Pointer size the table was linked for, in bytes (4 or 8).
+    pub(crate) fn ptrsize(&self) -> usize {
+        self.ptrsize
+    }
+
+    /// Re-base a V118 table's entry offsets onto `text_start`.
+    pub(crate) fn set_text_start(&mut self, text_start: u64) {
+        self.text_start = text_start;
     }
 
     /// The number of functions in the table.
