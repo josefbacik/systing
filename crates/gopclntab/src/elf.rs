@@ -14,13 +14,29 @@
 //! the table anonymously into `.data.rel.ro`, and the header is its only
 //! remaining identification. See [`GoPclntab::scan`].
 //!
+//! The base of the table's entry offsets — Go's own start of code, the
+//! runtime's `moduledata.text` — is resolved from the runtime's module
+//! data record and never taken from the `.text` section: the two
+//! addresses agree only under Go's own linker. Under the system linker
+//! (`-linkmode=external`, the same distro builds as above) `.text` opens
+//! with C start-up code, and a base taken from the section shifts every
+//! lookup onto a neighboring function's name. A table whose base cannot
+//! be validated makes the binary "not a candidate": a miss is better
+//! than a wrong name.
+//!
 //! Binaries that are not ELF, or in which no table can be located,
 //! report "not a candidate" (`Ok(None)`) rather than an error. Section
 //! metadata is validated against the input's actual size, so the only
 //! inputs rejected as malformed are ones whose headers are inconsistent
 //! with the bytes on disk — there is no size threshold a large-but-valid
 //! binary could trip over (the scan's own budget caps work done, not
-//! input size).
+//! input size), save five. The base step reads no relocation or data
+//! section larger than what is left of its 256 MiB budget, so a binary
+//! whose module data record can be reached only through a larger section
+//! is "not a candidate"; and so is an image with more than 4,096
+//! sections, a hundred times what a Go binary has, with more segments
+//! than the file header's own field can count, with more than 256 MiB of
+//! symbol tables, or with a function table of more than 256 MiB.
 //!
 //! Policy is deliberately left to the caller: this module reports whether
 //! a symbol table is present ([`ElfPclntab::has_symtab`]) but does not
@@ -30,6 +46,7 @@
 use std::fs::File;
 use std::path::Path;
 
+use object::read::elf::Rela as _;
 use object::read::ReadCache;
 use object::read::ReadRef;
 use object::Object;
@@ -37,6 +54,7 @@ use object::ObjectSection;
 
 use crate::Error;
 use crate::GoPclntab;
+use crate::MAX_TABLE;
 
 /// A `.gopclntab` extracted from an ELF binary, with the context a caller
 /// needs to decide how to use it.
@@ -73,6 +91,11 @@ impl ElfPclntab {
     }
 
     fn from_read_ref<'data, R: ReadRef<'data>>(source: R) -> Result<Option<Self>, Error> {
+        // Counts and sizes are the file's own claims: they are looked at
+        // first.
+        if !stated_sizes_are_plausible(source) {
+            return Ok(None);
+        }
         let Ok(elf) = object::File::parse(source) else {
             // Not an object file this build recognizes (only the ELF
             // format is compiled in): not a candidate.
@@ -88,8 +111,13 @@ impl ElfPclntab {
             let Some(section) = elf.section_by_name(name) else {
                 continue;
             };
-            let data = read_named_section(&section, input_len, name)?;
-            let table = GoPclntab::parse(data, text_vaddr)?;
+            let Some(data) = read_named_section(&section, input_len, name)? else {
+                return Ok(None);
+            };
+            let mut table = GoPclntab::parse(data, text_vaddr)?;
+            if !settle_text_start(&elf, &mut table, section.address(), input_len) {
+                return Ok(None);
+            }
             return Ok(Some(Self { table, has_symtab }));
         }
 
@@ -141,7 +169,11 @@ impl ElfPclntab {
                 continue;
             };
             budget = budget.saturating_sub(data.len() as u64);
-            if let Some(table) = GoPclntab::scan(&data, text_vaddr) {
+            if let Some((offset, mut table)) = GoPclntab::scan_at(&data, text_vaddr) {
+                let table_vaddr = section.address().saturating_add(offset as u64);
+                if !settle_text_start(&elf, &mut table, table_vaddr, input_len) {
+                    return Ok(None);
+                }
                 return Ok(Some(Self { table, has_symtab }));
             }
         }
@@ -149,15 +181,66 @@ impl ElfPclntab {
     }
 }
 
+/// Whether an image's header tables and symbol tables are of sizes a real
+/// binary has: at most [`MAX_SECTIONS`] section headers, no extended
+/// numbering of sections or segments, and at most [`MAX_SYMBOL_TABLES`] bytes
+/// of symbol tables in all. Judged from the file header and the section
+/// headers alone. What is no ELF file passes: the parse says so itself.
+fn stated_sizes_are_plausible<'data, R: ReadRef<'data>>(source: R) -> bool {
+    fn check<'data, Elf, R>(source: R) -> Option<bool>
+    where
+        Elf: object::read::elf::FileHeader<Endian = object::Endianness>,
+        R: ReadRef<'data>,
+    {
+        use object::read::elf::SectionHeader as _;
+        let header = Elf::parse(source).ok()?;
+        let endian = header.endian().ok()?;
+        if header.e_phnum(endian) == object::elf::PN_XNUM
+            || header.e_shstrndx(endian) == object::elf::SHN_XINDEX
+            || (header.e_shnum(endian) == 0 && header.e_shoff(endian).into() != 0)
+            || usize::from(header.e_shnum(endian)) > MAX_SECTIONS
+        {
+            return Some(false);
+        }
+        let tables = header
+            .section_headers(endian, source)
+            .ok()?
+            .iter()
+            .filter(|section| {
+                matches!(
+                    section.sh_type(endian),
+                    object::elf::SHT_SYMTAB
+                        | object::elf::SHT_DYNSYM
+                        | object::elf::SHT_SYMTAB_SHNDX
+                )
+            })
+            .fold(0u64, |sum, section| {
+                sum.saturating_add(section.sh_size(endian).into())
+            });
+        Some(tables <= MAX_SYMBOL_TABLES)
+    }
+    match object::FileKind::parse(source) {
+        Ok(object::FileKind::Elf32) => {
+            check::<object::elf::FileHeader32<object::Endianness>, R>(source)
+        }
+        Ok(object::FileKind::Elf64) => {
+            check::<object::elf::FileHeader64<object::Endianness>, R>(source)
+        }
+        _ => None,
+    }
+    .unwrap_or(true)
+}
+
 /// Read a named pclntab section's bytes, validating its metadata against
 /// the input's real length first: a section header claiming bytes past
 /// end-of-input is inconsistent with the file itself, which is the only
-/// "too large" this module rejects.
+/// "too large" this module rejects as malformed. A section of more than
+/// [`MAX_TABLE`] bytes is not read: `None`, not a candidate.
 fn read_named_section<'data>(
     section: &object::Section<'data, '_, impl ReadRef<'data>>,
     input_len: u64,
     name: &str,
-) -> Result<Vec<u8>, Error> {
+) -> Result<Option<Vec<u8>>, Error> {
     let range = section
         .compressed_file_range()
         .map_err(|_| Error::Malformed(format!("{name} has no file range")))?;
@@ -174,10 +257,356 @@ fn read_named_section<'data>(
             range.uncompressed_size, range.offset, input_len
         )));
     }
-    Ok(section
-        .uncompressed_data()
-        .map_err(|_| Error::Malformed(format!("short read of {name}")))?
-        .into_owned())
+    if range.uncompressed_size > MAX_TABLE as u64 {
+        return Ok(None);
+    }
+    Ok(Some(
+        section
+            .uncompressed_data()
+            .map_err(|_| Error::Malformed(format!("short read of {name}")))?
+            .into_owned(),
+    ))
+}
+
+/// Most sections an image may have to be looked at. A Go binary has a few
+/// dozen.
+const MAX_SECTIONS: usize = 4096;
+
+/// Most bytes of symbol tables, in all, an image may state to be looked at.
+const MAX_SYMBOL_TABLES: u64 = 256 << 20;
+
+/// Words of the module data record searched for the (`minpc`, `maxpc`,
+/// `text`) triple, counted from the record's first word. The triple stood
+/// at words 20 to 22 in the binaries this was developed against; the
+/// window is wider so that a field added ahead of it does not hide it.
+const MODULEDATA_WINDOW_WORDS: u64 = 64;
+
+/// Bound on the bytes of relocation and data sections read while looking
+/// for the module data record. It bounds the bytes read, not the passes
+/// made over them: those are one over the relocations to find the records
+/// and one more per record followed ([`MODULEDATA_MAX_CANDIDATES`]), and
+/// one over the data sections where no relocation names the table. It
+/// bounds input as well: a section larger than what is left of it
+/// is not read, so a record that can be reached only through such a
+/// section goes unvalidated and the binary is not a candidate. Section
+/// sizes come from the file, which is whatever the traced process mapped:
+/// each read is checked against the input's real length and against what
+/// is left of this budget first.
+const TEXT_START_BUDGET: u64 = 256 << 20;
+
+/// Most pointers to the table that are followed as module data records.
+/// A Go binary holds one. Each record followed costs one pass over the
+/// relocations and, for each of its words that no relocation names, a walk
+/// over the sections, so this cap bounds the work a file tiled with the
+/// table's address can cause together with [`TEXT_START_BUDGET`] and
+/// [`MAX_SECTIONS`], not alone.
+const MODULEDATA_MAX_CANDIDATES: usize = 16;
+
+/// Give `table` the base its entry offsets are relative to — Go's own
+/// start of code, the runtime's `moduledata.text` — or report `false`
+/// when none could be validated, in which case the binary is not a
+/// candidate.
+///
+/// The `.text` section's address is that base only when Go's own linker
+/// linked the binary. Under the system linker (`-linkmode=external`:
+/// distro PIE builds, any program with non-standard cgo) the section
+/// opens with C start-up code and Go's code starts later, so a base taken
+/// from the section shifts every lookup by the gap and yields
+/// real-looking names of the wrong functions. The runtime itself resolves
+/// against its module data record, whose first word points at this table
+/// and which holds `minpc`, `maxpc` and `text` side by side; that record
+/// needs no symbol to find. A triple is accepted only where `minpc - text`
+/// is the table's first entry offset and `maxpc - text` its end sentinel
+/// — the runtime's own invariant — and where the code it spans lies
+/// inside `.text` when that section exists. A miss is better than a wrong
+/// name, so nothing falls back to the section's address.
+fn settle_text_start<'data, R: ReadRef<'data>>(
+    elf: &object::File<'data, R>,
+    table: &mut GoPclntab,
+    table_vaddr: u64,
+    input_len: u64,
+) -> bool {
+    // V116 entries are absolute addresses: there is no base to settle.
+    let Some((first, end)) = table.text_extent() else {
+        return true;
+    };
+    match moduledata_text(elf, table_vaddr, table.ptrsize(), first, end, input_len) {
+        Some(text_start) => {
+            table.set_text_start(text_start);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Find the runtime's module data record by its pointer to the table at
+/// `table_vaddr` and return its validated `text` (see
+/// [`settle_text_start`] for the validation).
+fn moduledata_text<'data, R: ReadRef<'data>>(
+    elf: &object::File<'data, R>,
+    table_vaddr: u64,
+    ptrsize: usize,
+    first: u64,
+    end: u64,
+    input_len: u64,
+) -> Option<u64> {
+    // A table at address zero has no pointer to tell from empty words,
+    // and the table parser accepts little-endian tables alone.
+    if table_vaddr == 0 || !elf.is_little_endian() {
+        return None;
+    }
+    let mut image = ImageWords {
+        elf,
+        input_len,
+        budget: TEXT_START_BUDGET,
+        ptrsize,
+        loaded: Vec::new(),
+    };
+    let relas = image.relative_relas();
+    let text_section = elf
+        .section_by_name(".text")
+        .map(|text| (text.address(), text.size()));
+    image
+        .pointers_to(table_vaddr, &relas)
+        .into_iter()
+        .find_map(|record| {
+            let words = image.record_words(record, &relas);
+            validated_text(&words, first, end, text_section)
+        })
+}
+
+/// The `text` of the first (`minpc`, `maxpc`, `text`) triple of
+/// consecutive `words` that holds the runtime's invariant against the
+/// table's own extent and spans code inside `.text` where that section
+/// exists. Word 0 is the pointer to the table and is part of no triple.
+fn validated_text(
+    words: &[Option<u64>],
+    first: u64,
+    end: u64,
+    text_section: Option<(u64, u64)>,
+) -> Option<u64> {
+    words.windows(3).skip(1).find_map(|triple| {
+        let &[Some(minpc), Some(maxpc), Some(text)] = triple else {
+            return None;
+        };
+        // The runtime sets minpc = text + first and maxpc = text + end.
+        if text == 0 || minpc.wrapping_sub(text) != first || maxpc.wrapping_sub(text) != end {
+            return None;
+        }
+        let inside_text = text_section.is_none_or(|(address, size)| {
+            text >= address
+                && text
+                    .checked_add(end)
+                    .is_some_and(|stop| stop <= address.saturating_add(size))
+        });
+        inside_text.then_some(text)
+    })
+}
+
+/// The RELA-form relocations of a 64-bit image's `.rela.dyn`, read through
+/// `object`'s typed view; [`Relas::iter`] yields the relative ones. Empty
+/// for an image that has none this module reads.
+struct Relas<'data> {
+    entries: &'data [object::elf::Rela64<object::Endianness>],
+    endian: object::Endianness,
+    /// The architecture's `R_*_RELATIVE` type.
+    relative: u32,
+}
+
+impl Relas<'_> {
+    /// The (`r_offset`, `r_addend`) pair of each relative relocation. The
+    /// addend is a signed field that holds an address here.
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let (endian, relative) = (self.endian, self.relative);
+        self.entries
+            .iter()
+            .filter(move |entry| entry.r_type(endian, false) == relative)
+            .map(move |entry| (entry.r_offset(endian), entry.r_addend(endian) as u64))
+    }
+}
+
+/// Symbol-free reader of the pointer-sized words of an ELF image as the
+/// loader would leave them: enough to follow the runtime's module data
+/// record. Every section read is charged to one budget and checked
+/// against the input's real length first.
+struct ImageWords<'data, 'file, R: ReadRef<'data>> {
+    elf: &'file object::File<'data, R>,
+    input_len: u64,
+    budget: u64,
+    ptrsize: usize,
+    /// The sections read so far: each one's address and bytes.
+    loaded: Vec<(u64, &'data [u8])>,
+}
+
+impl<'data, 'file, R: ReadRef<'data>> ImageWords<'data, 'file, R> {
+    /// One little-endian pointer-sized word from the head of `bytes`.
+    fn decode(&self, bytes: &[u8]) -> Option<u64> {
+        match self.ptrsize {
+            8 => Some(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)),
+            4 => Some(u64::from(u32::from_le_bytes(
+                bytes.get(..4)?.try_into().ok()?,
+            ))),
+            _ => None,
+        }
+    }
+
+    /// Addresses of the words that point at `table_vaddr`, each a
+    /// candidate for the module data record's first word, at most
+    /// [`MODULEDATA_MAX_CANDIDATES`] of them. A position-independent file
+    /// with explicit addends (RELA) keeps the pointer's value in a
+    /// relative relocation. A fixed-address file, or one whose relative
+    /// relocations keep their addends in place (REL, RELR), holds it in a
+    /// writable data section, where the runtime's module data lives.
+    fn pointers_to(&mut self, table_vaddr: u64, relas: &Relas<'data>) -> Vec<u64> {
+        let mut records: Vec<u64> = relas
+            .iter()
+            .filter(|(_, addend)| *addend == table_vaddr)
+            .map(|(offset, _)| offset)
+            .take(MODULEDATA_MAX_CANDIDATES)
+            .collect();
+        if !records.is_empty() {
+            return records;
+        }
+        let width = self.ptrsize as u64;
+        let elf = self.elf;
+        for section in elf.sections() {
+            if section.kind() != object::SectionKind::Data {
+                continue;
+            }
+            let address = section.address();
+            let Some(bytes) = self.section_bytes(&section) else {
+                continue;
+            };
+            self.loaded.push((address, bytes));
+            let lead = ((width - address % width) % width) as usize;
+            let aligned = bytes.get(lead..).unwrap_or(&[]);
+            for (i, word) in aligned.chunks_exact(self.ptrsize).enumerate() {
+                if self.decode(word) == Some(table_vaddr) {
+                    records.push(address.saturating_add((lead + i * self.ptrsize) as u64));
+                    if records.len() == MODULEDATA_MAX_CANDIDATES {
+                        return records;
+                    }
+                }
+            }
+        }
+        records
+    }
+
+    /// The first [`MODULEDATA_WINDOW_WORDS`] words of the record at
+    /// `record` as the loader would leave them: a relocated word reads its
+    /// addend, any other the file's bytes. A word that cannot be read is
+    /// `None`.
+    fn record_words(&mut self, record: u64, relas: &Relas<'data>) -> Vec<Option<u64>> {
+        let width = self.ptrsize as u64;
+        // One pass over the relocations, into one slot per word: the file
+        // chooses how many entries there are and where they point, so
+        // nothing here may grow with them or be searched once per word.
+        let mut overlay = [None; MODULEDATA_WINDOW_WORDS as usize];
+        // The width is 4 or 8 (the table parser takes no other).
+        let shift = width.trailing_zeros();
+        for (offset, addend) in relas.iter() {
+            let Some(delta) = offset.checked_sub(record) else {
+                continue;
+            };
+            if delta >> shift < MODULEDATA_WINDOW_WORDS && delta & (width - 1) == 0 {
+                // The first entry for a word wins.
+                overlay[(delta >> shift) as usize].get_or_insert(addend);
+            }
+        }
+        (0..MODULEDATA_WINDOW_WORDS)
+            .map(|i| {
+                let vaddr = record.saturating_add(i * width);
+                let relocated = overlay[i as usize];
+                relocated.or_else(|| {
+                    let in_place = self.bytes_at(vaddr, width);
+                    in_place.and_then(|bytes| self.decode(bytes))
+                })
+            })
+            .collect()
+    }
+
+    /// A section's bytes, charged to the budget. `None` when the section
+    /// is compressed, claims bytes past end-of-input, exceeds what is
+    /// left of the budget or cannot be read.
+    fn section_bytes(&mut self, section: &object::Section<'data, 'file, R>) -> Option<&'data [u8]> {
+        let range = section.compressed_file_range().ok()?;
+        if range.format != object::CompressionFormat::None {
+            return None;
+        }
+        if range
+            .offset
+            .checked_add(range.uncompressed_size)
+            .is_none_or(|end| end > self.input_len)
+        {
+            return None;
+        }
+        if range.uncompressed_size > self.budget {
+            return None;
+        }
+        let bytes = section.data().ok()?;
+        self.budget -= range.uncompressed_size;
+        Some(bytes)
+    }
+
+    /// The bytes backing `[vaddr, vaddr + len)`, reading (once) the
+    /// initialized section that holds them.
+    fn bytes_at(&mut self, vaddr: u64, len: u64) -> Option<&'data [u8]> {
+        let stop = vaddr.checked_add(len)?;
+        let within = |address: u64, bytes: &'data [u8]| -> Option<&'data [u8]> {
+            let start = usize::try_from(vaddr.checked_sub(address)?).ok()?;
+            bytes.get(start..start.checked_add(usize::try_from(len).ok()?)?)
+        };
+        for &(address, bytes) in &self.loaded {
+            if vaddr >= address && stop <= address.saturating_add(bytes.len() as u64) {
+                return within(address, bytes);
+            }
+        }
+        let elf = self.elf;
+        for section in elf.sections() {
+            // Sections without file bytes hold no words, and a thread-local
+            // one shares its addresses with the section that follows it.
+            if matches!(
+                section.kind(),
+                object::SectionKind::UninitializedData | object::SectionKind::UninitializedTls
+            ) {
+                continue;
+            }
+            let address = section.address();
+            if address == 0 || vaddr < address || stop > address.saturating_add(section.size()) {
+                continue;
+            }
+            let bytes = self.section_bytes(&section)?;
+            self.loaded.push((address, bytes));
+            return within(address, bytes);
+        }
+        None
+    }
+
+    /// The image's RELA-form relocations, where this module knows the
+    /// architecture's relative type. A section that is no whole number of
+    /// aligned entries reads as empty. The entries are viewed through
+    /// `object`'s low-level `Rela64` rather than taken from
+    /// `Object::dynamic_relocations()`, which would read the relocation
+    /// sections with no bound of this module's.
+    fn relative_relas(&mut self) -> Relas<'data> {
+        let elf = self.elf;
+        let relative = match elf.architecture() {
+            object::Architecture::X86_64 => Some(object::elf::R_X86_64_RELATIVE),
+            object::Architecture::Aarch64 => Some(object::elf::R_AARCH64_RELATIVE),
+            _ => None,
+        };
+        let bytes = match (relative, elf.is_64(), elf.section_by_name(".rela.dyn")) {
+            (Some(_), true, Some(section)) => self.section_bytes(&section),
+            _ => None,
+        };
+        Relas {
+            entries: bytes
+                .and_then(|bytes| object::pod::slice_from_all_bytes(bytes).ok())
+                .unwrap_or(&[]),
+            endian: elf.endianness(),
+            relative: relative.unwrap_or(u32::MAX),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +750,193 @@ mod tests {
         ));
     }
 
+    /// The base under each linker. Under the system linker
+    /// (`-linkmode=external`) `.text` opens with C start-up code, so Go's
+    /// own start of code — the base of the table's entry offsets — lies
+    /// after the section's start; under Go's own the two agree. Names are
+    /// asserted at addresses read from the unstripped twin's symbol table,
+    /// the one check a wrong base cannot pass; the self-resolving sweep
+    /// above holds under any base. Four shapes: the system linker, where
+    /// the gap is, and Go's own, where a base that could not be settled
+    /// would turn a working binary into a miss; each at a fixed address
+    /// and position-independent, whose pointers live in relocations.
+    /// Skips (with a notice) when no `go` binary is on PATH or a shape
+    /// cannot be built (typically no C compiler).
+    #[test]
+    fn settles_the_text_base_under_both_linkers() {
+        use object::ObjectSymbol as _;
+
+        if Command::new("go").arg("version").output().is_err() {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("main.go");
+        std::fs::write(
+            &src,
+            b"package main\n\nfunc main() {\n\tprintln(helper())\n}\n\n//go:noinline\nfunc helper() int {\n\treturn 42\n}\n",
+        )
+        .unwrap();
+
+        // `false` when the shape cannot be built here: the test skips.
+        let build = |out: &Path, buildmode: &str, linkmode: &str, strip: bool| -> bool {
+            let strip = if strip { "-s -w " } else { "" };
+            let result = Command::new("go")
+                .arg("build")
+                .arg("-trimpath")
+                .arg(format!("-buildmode={buildmode}"))
+                .arg(format!("-ldflags={strip}-linkmode={linkmode}"))
+                .arg("-o")
+                .arg(out)
+                .arg(&src)
+                .env("GOCACHE", out.parent().unwrap().join("gocache"))
+                // External linking pulls in runtime/cgo.
+                .env(
+                    "CGO_ENABLED",
+                    if linkmode == "external" { "1" } else { "0" },
+                )
+                .output()
+                .unwrap();
+            if !result.status.success() {
+                eprintln!(
+                    "skipping: go build -buildmode={buildmode} -linkmode={linkmode} failed: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            result.status.success()
+        };
+
+        // Shapes whose stripped fixture kept a section of the table's own,
+        // so that the rename at the end of the loop ran for them.
+        let mut renamed_shapes = 0;
+        for (buildmode, linkmode) in [
+            ("exe", "external"),
+            ("pie", "external"),
+            ("exe", "internal"),
+            ("pie", "internal"),
+        ] {
+            let shape = format!("{buildmode}-{linkmode}");
+            let stripped = dir.path().join(format!("{shape}-stripped"));
+            let twin = dir.path().join(format!("{shape}-twin"));
+            if !build(&stripped, buildmode, linkmode, true)
+                || !build(&twin, buildmode, linkmode, false)
+            {
+                return;
+            }
+
+            let elf = ElfPclntab::from_path(&stripped)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{shape}: fixture is not a candidate"));
+            assert!(
+                !elf.has_symtab,
+                "{shape}: stripped fixture reports a symtab"
+            );
+            let tab = elf.table;
+
+            let twin_bytes = std::fs::read(&twin).unwrap();
+            let twin_elf = object::File::parse(&*twin_bytes).unwrap();
+            let symbol = |names: &[&str]| -> u64 {
+                twin_elf
+                    .symbols()
+                    .find(|symbol| symbol.name().is_ok_and(|name| names.contains(&name)))
+                    .unwrap_or_else(|| panic!("{shape}: twin has none of {names:?}"))
+                    .address()
+            };
+
+            // The base is Go's own start of code, whatever `.text` opens
+            // with.
+            let runtime_text = symbol(&["runtime.text"]);
+            assert_eq!(tab.text_start, runtime_text, "{shape}: wrong base");
+            let text_section = twin_elf.section_by_name(".text").unwrap().address();
+            eprintln!(
+                "{shape}: .text {text_section:#x}, runtime.text {runtime_text:#x}, gap {:#x}",
+                runtime_text - text_section
+            );
+
+            // Assembly functions carry an ABI suffix in the symbol table
+            // and none in the pclntab.
+            for (symbols, want) in [
+                (&["main.main"][..], "main.main"),
+                (&["main.helper"][..], "main.helper"),
+                (
+                    &["runtime.goexit.abi0", "runtime.goexit"][..],
+                    "runtime.goexit",
+                ),
+                (
+                    &["runtime.mstart.abi0", "runtime.mstart"][..],
+                    "runtime.mstart",
+                ),
+            ] {
+                let entry = symbol(symbols);
+                let func = tab
+                    .find_func(entry + 1)
+                    .unwrap_or_else(|| panic!("{shape}: {want} at {entry:#x} did not resolve"));
+                assert_eq!(func.name, want, "{shape}: address {entry:#x}");
+                assert_eq!(func.entry, entry, "{shape}: {want}");
+            }
+
+            // The scan road settles the same base: with the section
+            // renamed, only the header identifies the table. Go's own
+            // linker names the section after its segment in a
+            // position-independent build. Where the system linker folded
+            // the table into `.data.rel.ro` (see the module docs), no
+            // section is left to rename, and `from_path` above already
+            // went the scan road for this shape.
+            let bytes = std::fs::read(&stripped).unwrap();
+            let named = [
+                (".gopclntab", ".mystery00"),
+                (".data.rel.ro.gopclntab", ".data.rel.ro.mystery00"),
+            ]
+            .into_iter()
+            .find(|(from, _)| section_exists(&bytes, from));
+            let Some((from, to)) = named else {
+                eprintln!("{shape}: the table has no section of its own; the scan road ran above");
+                continue;
+            };
+            let renamed = rename_section(&bytes, from, to);
+            let scanned = ElfPclntab::from_bytes(&renamed)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{shape}: scan road lost the fixture"));
+            assert_eq!(scanned.table.text_start, runtime_text, "{shape}: scan road");
+            renamed_shapes += 1;
+        }
+        assert!(
+            renamed_shapes > 0,
+            "no shape kept a section of the table's own to rename"
+        );
+
+        // No validating record, no candidate: with every in-place pointer
+        // to the table zeroed in the fixed-address fixture, nothing names
+        // the module data record, and the section's address is not
+        // trusted in its place.
+        let bytes = std::fs::read(dir.path().join("exe-external-stripped")).unwrap();
+        // Stop ahead of the section header table: its own `sh_addr` for
+        // the table holds the same eight bytes and must stay as it is.
+        let (table_vaddr, e_shoff) = {
+            use object::read::elf::{ElfFile64, FileHeader as _};
+            let parsed: ElfFile64 = ElfFile64::parse(&*bytes).unwrap();
+            let table_vaddr = parsed.section_by_name(".gopclntab").unwrap().address();
+            let e_shoff = parsed.elf_header().e_shoff(parsed.endian());
+            (table_vaddr, e_shoff as usize)
+        };
+        let needle = table_vaddr.to_le_bytes();
+        let mut orphaned = bytes.clone();
+        let mut zeroed = 0;
+        let mut at = 0;
+        while at + 8 <= e_shoff.min(orphaned.len()) {
+            if orphaned[at..at + 8] == needle {
+                orphaned[at..at + 8].fill(0);
+                zeroed += 1;
+            }
+            at += 8;
+        }
+        assert!(zeroed > 0, "fixture holds no pointer to its own table");
+        assert!(
+            ElfPclntab::from_bytes(&orphaned).unwrap().is_none(),
+            "a table with no validating module data record was adopted"
+        );
+    }
+
     /// Whether the ELF has a section with this exact name.
     fn section_exists(elf: &[u8], name: &str) -> bool {
         use object::read::elf::ElfFile64;
@@ -404,10 +1020,11 @@ mod tests {
             }
         }
         eprintln!(
-            "resolved {named}/{} functions from {} (symtab: {})",
+            "resolved {named}/{} functions from {} (symtab: {}, text base {:#x})",
             tab.func_count(),
             Path::new(&path).display(),
             elf.has_symtab,
+            tab.text_start,
         );
         assert_eq!(named, tab.func_count());
     }

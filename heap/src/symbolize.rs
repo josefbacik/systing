@@ -107,7 +107,7 @@ pub fn symbolize_in(snapshots: &[Snapshot], root: Option<&Root>) -> Symbolized {
     // Every (file, offset) to look up, by file, so each file is opened once.
     let mut wanted: BTreeMap<&str, HashSet<u64>> = BTreeMap::new();
     let mut identities: HashMap<&str, ((u32, u32), u64)> = HashMap::new();
-    for s in snapshots {
+    for s in snapshots.iter().filter(|s| s.named_frames.is_none()) {
         for sample in &s.samples {
             for (addr, leaf) in native(sample) {
                 if let Target::File { path, lookup } = target(s, addr, leaf) {
@@ -182,6 +182,19 @@ pub fn symbolize_in(snapshots: &[Snapshot], root: Option<&Root>) -> Symbolized {
         }
         let fd = file.as_raw_fd();
         open_files.push(file);
+        // A stripped Go binary has no symbol table, but its .gopclntab
+        // names every function, as it does for the recorders.
+        if let Some(go) = systing::gopclntab_resolver::try_gopclntab_resolver(
+            Path::new(&format!("/proc/self/fd/{fd}")),
+            Path::new(path),
+        ) {
+            for off in &offsets {
+                let sym = go_sym(go.as_ref(), *off);
+                stats.resolved += usize::from(sym.is_some());
+                names.insert((path, *off), sym);
+            }
+            continue;
+        }
         let src = Source::Elf(elf_source(fd, root.is_some()));
         let Ok(results) = symbolizer.symbolize(&src, Input::FileOffset(&offsets)) else {
             continue;
@@ -209,6 +222,9 @@ pub fn symbolize_in(snapshots: &[Snapshot], root: Option<&Root>) -> Symbolized {
         .iter()
         .enumerate()
         .map(|(si, s)| {
+            if let Some(named) = &s.named_frames {
+                return named.clone();
+            }
             let mut unnamed = false;
             let stacks = s
                 .samples
@@ -269,6 +285,28 @@ pub fn symbolize_in(snapshots: &[Snapshot], root: Option<&Root>) -> Symbolized {
         files,
         stats,
     }
+}
+
+/// The function a stripped Go binary's pclntab gives for file offset `off`.
+fn go_sym(
+    go: &dyn blazesym::symbolize::Resolve,
+    off: u64,
+) -> Option<blazesym::symbolize::Sym<'static>> {
+    let vaddr = go.file_offset_to_virt_offset(off).ok()??;
+    let found = go
+        .find_sym(vaddr, &blazesym::symbolize::FindSymOpts::Basic)
+        .ok()?
+        .ok()?;
+    Some(blazesym::symbolize::Sym {
+        name: std::borrow::Cow::Owned(found.name.to_string()),
+        module: None,
+        addr: found.addr,
+        offset: usize::try_from(vaddr - found.addr).unwrap_or(0),
+        size: found.size,
+        code_info: None,
+        inlined: Box::new([]),
+        _non_exhaustive: (),
+    })
 }
 
 /// Where `addr` points in `s`'s maps. Every frame but the leaf holds a

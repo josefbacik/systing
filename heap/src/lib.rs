@@ -6,7 +6,8 @@
 //! malloc/free calls (that is systing's `memory-alloc` recorder); a snapshot
 //! is what the allocator itself sampled and aggregated.
 //!
-//! The pipeline is parse ([`jemalloc`]), symbolize ([`symbolize`], offline,
+//! The pipeline is parse ([`jemalloc`], or Go's own heap profile: a [`pprof`]
+//! file, or [`golang`] from memory), symbolize ([`symbolize`], offline,
 //! through the memory map each dump carries) and write ([`db`]), into the
 //! same `frame` / `stack` tables every systing recorder uses plus
 //! `heap_snapshot` / `heap_sample`.
@@ -15,12 +16,14 @@ pub mod ask;
 pub mod check;
 pub mod db;
 pub mod format;
+pub mod golang;
 #[cfg(test)]
 mod hook_offsets;
 pub mod jemalloc;
 pub mod maps;
 pub mod perfetto;
 pub mod perfmap;
+pub mod pprof;
 pub mod pycode;
 pub mod retention;
 pub mod root;
@@ -63,6 +66,10 @@ pub struct Snapshot {
     /// (`--snoop`); None for a dump, which the allocator wrote under its own
     /// locks.
     pub live_read: Option<LiveRead>,
+    /// Frame names for each sample, root (outermost) first, for a source
+    /// that names its own frames (a pprof file): used as they are, instead
+    /// of symbolizing `addrs`.
+    pub named_frames: Option<Vec<Vec<String>>>,
 }
 
 /// How reading a snapshot out of a running process's memory went

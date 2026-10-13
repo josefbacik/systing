@@ -8,6 +8,9 @@ use anyhow::{bail, Result};
 pub enum Format {
     /// jemalloc `prof.dump` output (`heap_v2`), e.g. `jeprof.1234.0.f.heap`.
     Jemalloc,
+    /// A Go pprof heap profile (`profile.proto`, gzipped or not), as
+    /// `/debug/pprof/heap` serves it.
+    Pprof,
 }
 
 impl Format {
@@ -15,6 +18,7 @@ impl Format {
     pub fn name(self) -> &'static str {
         match self {
             Format::Jemalloc => "jemalloc",
+            Format::Pprof => "pprof",
         }
     }
 
@@ -30,7 +34,7 @@ impl Format {
             return Ok(Format::Jemalloc);
         }
         if name.ends_with(".pb.gz") || name.ends_with(".pprof") || name.ends_with(".pb") {
-            bail!("{}: pprof snapshots are not supported yet", path.display());
+            return Ok(Format::Pprof);
         }
         bail!(
             "{}: unknown snapshot format (expected a .heap file); pass --format to name one",
@@ -50,9 +54,10 @@ mod tests {
     }
 
     #[test]
-    fn pprof_is_named_as_unsupported() {
-        let err = Format::from_path(Path::new("x.pb.gz")).unwrap_err();
-        assert!(err.to_string().contains("not supported yet"), "{err}");
+    fn pprof_extensions_are_pprof() {
+        for name in ["heap.pb.gz", "heap.pprof", "heap.pb"] {
+            assert_eq!(Format::from_path(Path::new(name)).unwrap(), Format::Pprof);
+        }
     }
 
     #[test]

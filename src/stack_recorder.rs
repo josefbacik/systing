@@ -2496,6 +2496,11 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                     stack_id,
                     stack_event_type: convert_stack_event_type(event.stack_event_type.0),
                     task_context_id: convert_task_context_id(event.task_context_id),
+                    // 0 is "none" for both: goroutine 0 is the scheduler's
+                    // g0, never one the reader reports, and a set's id is
+                    // never 0.
+                    go_goid: (event.go_goid != 0).then_some(event.go_goid),
+                    go_labels_id: (event.go_labels_id != 0).then_some(event.go_labels_id),
                 };
 
                 if let Err(e) = collector.add_stack_sample(sample) {

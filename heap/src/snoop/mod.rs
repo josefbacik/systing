@@ -294,6 +294,7 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
         perf_map: None,
         py_code: None,
         live_read: Some(report.live_read()),
+        named_frames: None,
     };
     Ok((snapshot, report))
 }

@@ -161,7 +161,7 @@ fn parse_name(slot: &[u8]) -> Option<String> {
 /// A string value as a trace may carry it: bytes that are not valid UTF-8,
 /// and the control ranges U+0000-U+001F and U+007F-U+009F, become U+FFFD.
 /// The second part of the result says whether anything was replaced.
-fn sanitize(bytes: &[u8]) -> (String, bool) {
+pub(crate) fn sanitize(bytes: &[u8]) -> (String, bool) {
     let lossy = String::from_utf8_lossy(bytes);
     let mut replaced = matches!(lossy, std::borrow::Cow::Owned(_));
     let mut kept = String::with_capacity(lossy.len());

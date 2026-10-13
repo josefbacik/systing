@@ -546,6 +546,7 @@ mod tests {
             add_memory_vmstat(crate::trace::MemoryVmstatRecord),
             add_task_stack_event(crate::trace::TaskStackEventRecord),
             add_task_context(crate::trace::TaskContextRecord),
+            add_go_label(crate::trace::GoLabelRecord),
             set_sysinfo(crate::trace::SysInfoRecord),
             add_cpu_info(crate::trace::CpuInfoRecord),
             add_tpu_device(crate::trace::TpuDeviceRecord),

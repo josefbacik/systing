@@ -25,6 +25,13 @@ jobs:
       # and the test that an older one is refused needs the runner's own: the
       # 3.14 is installed beside it, as python3.14, and python3 stays what it
       # was. Both are printed, so the log says what a green run ran.
+      # The Go version systing has bindings for: the gopclntab crate's test
+      # builds Go programs with both linkers, and the Go reader's end-to-end
+      # check below runs them. Without a Go, both would only say they skip.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.7"
+          cache: false
       - name: Install Python 3.14 beside the runner's Python
         run: |
           sudo add-apt-repository -y ppa:deadsnakes/ppa
@@ -61,6 +68,24 @@ jobs:
           # The heap tests that run Python under jemalloc fail rather than skip.
           SYSTING_HEAP_REQUIRE_TEST_DEPS: "1"
         run: cargo test --workspace --no-default-features
+      # systing-go-profile against the programs' own pprof port and flight
+      # recorder, on four builds of its workload (Go's linker and the system
+      # linker, each as built and stripped); any build it cannot make fails.
+      # The tool reads a workload's memory as the same user, which Yama's
+      # default scope allows only to an ancestor of the workload.
+      - name: Go reader end to end
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          go version
+          cargo build --release --no-default-features -p systing-go-profile
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          go-profile/e2e/run.sh
 
   fmt:
     name: Rustfmt
