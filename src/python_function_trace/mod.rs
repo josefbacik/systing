@@ -595,9 +595,7 @@ pub fn run_with(
     let threads: Rc<RefCell<HashMap<u32, String>>> = Rc::default();
 
     let mut raw_events = match &opts.events_path {
-        Some(path) => Some(std::io::BufWriter::new(
-            std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?,
-        )),
+        Some(path) => Some(std::io::BufWriter::new(output::create_output(path)?)),
         None => None,
     };
     let cutoff = Rc::new(std::cell::Cell::new(u64::MAX));

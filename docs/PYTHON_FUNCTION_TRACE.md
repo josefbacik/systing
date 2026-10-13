@@ -7,7 +7,10 @@ timeline. It works with or without perf trampolines and does not use ptrace.
 **Status:** experimental. It is a tool of its own, in a workspace package of
 its own (`python-function-trace/`), so installing systing does not install
 it. It is not yet a recorder of a systing capture, and it has run only on
-x86-64, Linux 6.12, with CPython 3.12, 3.13 and 3.14.
+x86-64, Linux 6.12, with CPython 3.12, 3.13 and 3.14. It is not for
+production hosts until it is a recorder: a run by hand stands outside the
+limits, audit and requester checks a capture service applies, and it slows
+the traced process while its probes are in.
 
 ## Why
 
@@ -64,6 +67,13 @@ SIGINT, SIGTERM and SIGHUP each end it with its files written (the files
 first, then the summary on stdout). The summary says which of these ended
 it. One process at a time (see
 [Limits](#limits)).
+
+Output files are written as root, so their names cannot be used to steer a
+write elsewhere: the directory must belong to root, the caller or the user
+who ran `sudo`, and not be open to renames by others (a sticky directory such
+as `/tmp` is fine), and an
+existing entry at the name must be the caller's own regular file with one
+link (no symlink, hard link, FIFO or device).
 
 | Output | What |
 | --- | --- |
