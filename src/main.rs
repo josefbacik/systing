@@ -84,6 +84,19 @@ struct Command {
     /// unbounded
     #[arg(long, default_value_t = systing::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_MS)]
     build_id_index_max_ms: u64,
+    /// The most the unique-stack store may hold, in MiB, summed over the
+    /// recorders that intern stacks (cpu and sleep stacks, memory, task
+    /// stacks). Each new (stack, process) pair is kept in an unlinked spill
+    /// file, one per recorder, in the output directory (with --stream: in a
+    /// private directory under the system's temporary directory) until the
+    /// trace ends, so a trace with no --duration grows those files for as
+    /// long as it runs. Once the budget is spent, or that directory's file
+    /// system runs low on free space, stacks not seen before are recorded as
+    /// a placeholder stack, "unknown ([stack-store-full])", one per recorder;
+    /// samples keep flowing and stacks seen earlier keep their frames. 0 =
+    /// unbounded, with no free-space check
+    #[arg(long, default_value_t = systing::stack_recorder::DEFAULT_STACK_SPILL_BUDGET_MIB)]
+    stack_spill_budget_mib: u64,
     /// Enable debug output for pystacks (Python stack tracing)
     #[arg(long)]
     pystacks_debug: bool,
@@ -292,6 +305,7 @@ impl From<Command> for Config {
             collect_build_id: cmd.collect_build_id,
             build_id_index_max_files: cmd.build_id_index_max_files,
             build_id_index_max_ms: cmd.build_id_index_max_ms,
+            stack_spill_budget_mib: cmd.stack_spill_budget_mib,
             pystacks_pids: Vec::new(), // CLI doesn't expose this yet, uses discovery
             pystacks_debug: cmd.pystacks_debug,
             enable_debuginfod: cmd.enable_debuginfod,

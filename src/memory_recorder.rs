@@ -237,6 +237,13 @@ impl MemoryRecorder {
         self.interner.set_spill_dir(dir);
     }
 
+    /// Draw this recorder's unique stacks on the trace's shared spill budget
+    /// (see [`crate::stack_recorder::SpillBudget`]). Must be called before
+    /// recording starts.
+    pub fn set_spill_budget(&mut self, budget: crate::stack_recorder::SpillBudget) {
+        self.interner.set_spill_budget(budget);
+    }
+
     /// Drain the stack interner for hand-off to `StackRecorder` so its stacks
     /// are symbolized in the shared `stack` table during finish.
     pub(crate) fn take_interner(&mut self) -> StackInterner {

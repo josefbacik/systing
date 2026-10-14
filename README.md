@@ -525,6 +525,40 @@ cargo build --release -p systing-go-profile
 systing-go-profile snoop --pid PID --profile goroutine
 ```
 
+### Long Traces and Disk Use
+
+Each stack is symbolized once, when the trace ends. Until then every new (stack, process) pair is kept in
+temporary files: one for the stack recorders (`cpu-stacks`, `sleep-stacks`, `interruptible-stacks`) and for
+custom track events with `"stack": true`, one for the memory recorders (`memory`, `memory-alloc`) and one for
+`task-stacks`. All three are made when the trace starts; one whose recorders are off stays empty. The files
+stand in the output directory or, with `--stream`, in a private `systing-spill-*` directory under the system's
+temporary directory (`$TMPDIR`, else `/tmp`). They have no name there, so a directory listing does not show
+them; `lsof +L1` does. A trace with `--duration` stops adding to them when the duration ends. A trace with no
+`--duration` keeps adding to them for as long as it runs, fastest on a host that starts many short-lived
+processes.
+
+`--stack-spill-budget-mib` sets how large that store may grow, in MiB, summed over all recorders (default
+1024). The store closes when that budget is spent. It also closes when the file system that holds the files has
+less than 64 MiB free, which each recorder reads once for every 256 stacks it adds, or when a write to a file
+fails. A file system that reports no size at all (ramfs, a tmpfs with no size limit) gets no free-space check.
+With 0 there is no budget and no free-space check: the store is unbounded, and after a failed write that file's
+stacks go on in memory, as before the flag existed. The budget counts the bytes of the kept stacks; the tracer's
+in-memory index of the stacks it has seen, a few tens of bytes a stack, is not counted and stops growing when
+the store closes. Once the store has closed, samples keep flowing and every stack seen earlier keeps its frames;
+a stack not seen before is recorded as a placeholder stack, `unknown ([stack-store-full])`, of which there is one
+for each of the three files. There is one exception: when a write to one of the files failed, the stacks which
+that file held at its last periodic flush (one for every 256 stacks) are lost with it, as they were before the
+budget existed; the newer ones are kept in memory. The same holds for the second copy described below. systing
+prints one warning on standard error when the store closes, and one note at the end of the trace that says how
+many stack lookups got a placeholder.
+
+The budget does not bound everything that a long trace writes. When the trace ends, the kept stacks of
+processes that are still alive are written a second time, into temporary files in the same directory, before
+they are symbolized. That copy has no budget and no free-space check, so while it lasts the store can take up
+to about twice its budget on disk. The trace's tables grow with the number of samples, and the end-of-trace
+symbolization takes as long as the kept stacks need. Stopping the trace and starting it again at intervals,
+each run with its own `--duration`, bounds all three.
+
 ### Debugging and Verbosity
 
 Use multiple `-v` flags to control verbosity levels:

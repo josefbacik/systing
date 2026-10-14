@@ -1829,7 +1829,11 @@ impl SessionRecorder {
         {
             let mut memory = self.memory_recorder.lock().unwrap();
             let memory_interner = memory.take_interner();
-            if memory_interner.total() > 0 {
+            // `has_output`, never `total() > 0`: an interner that met the
+            // closed stack store at its first pair has stored nothing and
+            // still owns the placeholder id that its samples carry, whose row
+            // only `StackRecorder::finish` writes.
+            if memory_interner.has_output() {
                 self.stack_recorder
                     .lock()
                     .unwrap()
@@ -1843,7 +1847,7 @@ impl SessionRecorder {
         // get their native frames' full source paths, which the others' do not.
         {
             let task_stacks_interner = self.task_stacks_recorder.lock().unwrap().take_interner();
-            if task_stacks_interner.total() > 0 {
+            if task_stacks_interner.has_output() {
                 let mut stack_recorder = self.stack_recorder.lock().unwrap();
                 stack_recorder.merge_external_interner(task_stacks_interner);
                 stack_recorder.keep_native_paths_from(

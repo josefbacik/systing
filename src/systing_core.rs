@@ -1570,6 +1570,11 @@ pub struct Config {
     /// With `collect_build_id`: the longest that walk may run, in
     /// milliseconds, checked between file reads; 0 = unbounded
     pub build_id_index_max_ms: u64,
+    /// The most the trace's unique-stack store may hold, in MiB, summed over
+    /// every recorder that interns stacks (`--stack-spill-budget-mib`); 0 =
+    /// unbounded. Once it is spent, stacks not seen before are recorded as
+    /// a placeholder stack, one per recorder (see `stack_recorder::SpillBudget`)
+    pub stack_spill_budget_mib: u64,
     /// Explicit PIDs for pystacks (bypasses auto-discovery)
     pub pystacks_pids: Vec<u32>,
     /// Enable debug output for pystacks
@@ -1746,6 +1751,7 @@ impl Default for Config {
             collect_build_id: false,
             build_id_index_max_files: crate::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_FILES,
             build_id_index_max_ms: crate::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_MS,
+            stack_spill_budget_mib: crate::stack_recorder::DEFAULT_STACK_SPILL_BUDGET_MIB,
             pystacks_pids: Vec::new(),
             pystacks_debug: false,
             enable_debuginfod: false,
@@ -2791,6 +2797,28 @@ fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
     if opts.continuous > 0 {
         let duration_nanos = Duration::from_secs(opts.continuous).as_nanos() as u64;
         set_ringbuf_duration(recorder, duration_nanos);
+    }
+    if opts.stack_spill_budget_mib > 0 {
+        // One budget for the whole trace: the three recorders that intern
+        // stacks each keep a spill file of their own, and share this count.
+        // Zero leaves them without one: the store is then unbounded, as it
+        // was before the budget existed.
+        let budget = crate::stack_recorder::SpillBudget::from_mib(opts.stack_spill_budget_mib);
+        recorder
+            .stack_recorder
+            .lock()
+            .unwrap()
+            .set_spill_budget(budget.clone());
+        recorder
+            .memory_recorder
+            .lock()
+            .unwrap()
+            .set_spill_budget(budget.clone());
+        recorder
+            .task_stacks_recorder
+            .lock()
+            .unwrap()
+            .set_spill_budget(budget);
     }
     if opts.collect_build_id {
         let mut stack_recorder = recorder.stack_recorder.lock().unwrap();

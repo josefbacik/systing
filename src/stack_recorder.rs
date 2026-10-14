@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -174,15 +175,167 @@ fn stack_dedup_hash(hashers: &(RandomState, RandomState), stack: &Stack, tgid: i
     ((h1.finish() as u128) << 64) | h2.finish() as u128
 }
 
+/// Rendered name of the one stack that samples point at once the unique-stack
+/// store has closed (see [`SpillBudget`]): the `symbol (module)` frame shape
+/// with the label in the module slot, like [`GUEST_FRAME_NAME`], so existing
+/// frame parsers classify it without changes.
+const STORE_FULL_FRAME_NAME: &str = "unknown ([stack-store-full])";
+
+/// Default size, in MiB, of the unique-stack store of one trace
+/// (`--stack-spill-budget-mib`).
+pub const DEFAULT_STACK_SPILL_BUDGET_MIB: u64 = 1024;
+
+/// The store also closes once the file system that holds the spill file has
+/// less than this much free: on a small disk that the traced workload shares,
+/// any fixed budget can still be too large.
+const SPILL_MIN_FREE_BYTES: u64 = 64 << 20;
+
+/// Byte budget shared by every stack interner (`StackInterner`) of one trace.
+///
+/// A trace without `--duration` runs until it is stopped, and every new
+/// (stack, tgid) pair adds a record to an unlinked spill file (or to memory,
+/// where there is no file) and an entry to the dedup map. Under process churn
+/// that growth has no bound of its own. The budget counts the serialized
+/// bytes of every record the interners take, in the file and in memory alike.
+/// Once it is spent, or a write to the spill file fails, or the spill
+/// directory runs low on free space, the budget closes for good: interners
+/// take no further pair and hand out one placeholder id instead (see
+/// `StackInterner::intern`), so the file, the in-memory fallback and the
+/// dedup map stop growing together. Samples keep flowing; only stacks first
+/// seen after the close lose their frames.
+///
+/// Clones share one set of counters. A cap of 0 never closes on size.
+#[derive(Clone)]
+pub struct SpillBudget {
+    inner: Arc<SpillBudgetInner>,
+}
+
+struct SpillBudgetInner {
+    cap_bytes: u64,
+    min_free_bytes: u64,
+    used_bytes: AtomicU64,
+    closed: AtomicBool,
+}
+
+impl SpillBudget {
+    /// A budget of `cap_mib` MiB (0 = no cap) with the default free-space
+    /// floor on the spill directory.
+    pub fn from_mib(cap_mib: u64) -> Self {
+        Self::new(cap_mib.saturating_mul(1 << 20), SPILL_MIN_FREE_BYTES)
+    }
+
+    fn new(cap_bytes: u64, min_free_bytes: u64) -> Self {
+        Self {
+            inner: Arc::new(SpillBudgetInner {
+                cap_bytes,
+                min_free_bytes,
+                used_bytes: AtomicU64::new(0),
+                closed: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Relaxed)
+    }
+
+    fn used_bytes(&self) -> u64 {
+        self.inner.used_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Take `len` bytes for one record. Returns false, closing the budget,
+    /// when they no longer fit; a closed budget takes nothing.
+    fn try_take(&self, len: u64) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        let before = self.inner.used_bytes.fetch_add(len, Ordering::Relaxed);
+        if self.inner.cap_bytes != 0 && before.saturating_add(len) > self.inner.cap_bytes {
+            self.inner.used_bytes.fetch_sub(len, Ordering::Relaxed);
+            self.close("its budget is spent");
+            return false;
+        }
+        true
+    }
+
+    /// Close the budget. The first close prints the one line that says so;
+    /// the count of what was left out follows at the end of the trace.
+    fn close(&self, why: &str) {
+        if !self.inner.closed.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "Warning: the unique-stack store closed at {} MiB ({why}); stacks first \
+                 seen from here on are recorded as {STORE_FULL_FRAME_NAME}",
+                self.used_bytes() >> 20
+            );
+        }
+    }
+
+    /// Close the budget when the file system holding `dir` is under the
+    /// free-space floor. One `statvfs` call; an error leaves the budget open.
+    fn check_free_space(&self, dir: &Path) {
+        if self.inner.min_free_bytes == 0 || self.is_closed() {
+            return;
+        }
+        if free_bytes(dir).is_some_and(|free| free < self.inner.min_free_bytes) {
+            self.close("its directory is low on free space");
+        }
+    }
+}
+
+/// Bytes that the file system holding `dir` reports as available to an
+/// unprivileged process (`f_bavail`), the conservative figure where the
+/// tracer runs as root. `None` where the call fails, and where the file system
+/// reports no size at all: ramfs and a tmpfs mounted with no size limit report
+/// zero blocks in total and zero available, which says "not known", not
+/// "full", so the free-space floor does not apply to them.
+fn free_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: an all-zero statvfs is a valid value of that plain C struct.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statvfs only writes the struct we hand it, and `path` is a valid
+    // NUL-terminated string for the duration of the call.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    if st.f_blocks == 0 {
+        return None;
+    }
+    // Both fields are already u64 on the 64-bit Linux targets systing builds
+    // for, so they are bound with an annotation rather than cast.
+    let blocks_available: u64 = st.f_bavail;
+    let fragment_size: u64 = st.f_frsize;
+    Some(blocks_available.saturating_mul(fragment_size))
+}
+
+/// Serialized size of one spill record (see [`StackSpill::push`] for the
+/// format): what the record costs against a [`SpillBudget`].
+fn spill_record_len(stack: &Stack) -> u64 {
+    let user: u64 = stack
+        .user_stack
+        .iter()
+        .map(|frame| match frame {
+            UserFrame::Ip(_) => 1 + 8,
+            UserFrame::BuildId { .. } => 1 + 20 + 8,
+            UserFrame::Guest => 1,
+        })
+        .sum();
+    18 + 8 * stack.kernel_stack.len() as u64 + user + 16 * stack.py_stack.len() as u64
+}
+
 /// Disk-backed store for unique stack contents. During recording each unique
 /// (stack, tgid) is appended once; at end of trace the records are streamed
 /// back for symbolization. This keeps per-unique-stack memory at ~16 bytes
 /// (the dedup hash) instead of the full address vectors, which on hosts with
 /// heavy short-lived-process churn (CI) otherwise grow to multiple GiB.
 ///
-/// The backing file is created unlinked (tempfile) in the trace output
-/// directory. If no directory was configured (unit tests) or a write fails,
-/// records are kept in memory instead.
+/// The backing file is created unlinked (tempfile) in the spill directory: the
+/// trace output directory, or the stream sink's private temporary directory
+/// with `--stream`. If no directory was configured (unit tests), records are
+/// kept in memory instead. A failed write moves what was buffered into memory;
+/// under a [`SpillBudget`] it also closes the store, and with no budget the
+/// records after it keep going to memory.
 struct StackSpill {
     writer: Option<BufWriter<File>>,
     /// In-memory fallback used when no spill dir is set or after an IO error.
@@ -198,6 +351,11 @@ struct StackSpill {
     pending: Vec<(Stack, i32, i64)>,
     /// Reusable serialization buffer.
     buf: Vec<u8>,
+    /// The trace-wide byte budget this store draws on; `None` (unit tests,
+    /// the end-of-trace re-spill buckets) means unbounded.
+    budget: Option<SpillBudget>,
+    /// Directory of the spill file, kept for the budget's free-space check.
+    dir: Option<PathBuf>,
 }
 
 /// Explicitly flush the spill BufWriter every this many records. Bounds both
@@ -214,12 +372,17 @@ impl StackSpill {
             flushed: 0,
             pending: Vec::new(),
             buf: Vec::new(),
+            budget: None,
+            dir: None,
         }
     }
 
     fn set_dir(&mut self, dir: &Path) {
         match tempfile::tempfile_in(dir) {
-            Ok(f) => self.writer = Some(BufWriter::new(f)),
+            Ok(f) => {
+                self.writer = Some(BufWriter::new(f));
+                self.dir = Some(dir.to_path_buf());
+            }
             Err(e) => {
                 eprintln!(
                     "Warning: failed to create stack spill file in {}: {e}; \
@@ -227,6 +390,38 @@ impl StackSpill {
                     dir.display()
                 );
             }
+        }
+    }
+
+    fn set_budget(&mut self, budget: SpillBudget) {
+        self.budget = Some(budget);
+    }
+
+    /// Whether the store may take `stack` as a new record: charges its
+    /// serialized size to the budget, and answers false once the budget has
+    /// closed. A store without a budget takes everything.
+    fn admit(&self, stack: &Stack) -> bool {
+        match &self.budget {
+            Some(budget) => budget.try_take(spill_record_len(stack)),
+            None => true,
+        }
+    }
+
+    /// A write to the spill file failed: from here on the records would pile
+    /// up in memory instead, so a budgeted store takes no further ones.
+    fn close_budget_on_io_error(&self) {
+        if let Some(budget) = &self.budget {
+            budget.close("a write to its file failed");
+        }
+    }
+
+    /// What an IO-error warning says of later stacks: without a budget the
+    /// store goes on in memory; with one it closes, and the budget's own line
+    /// says so.
+    fn further_stacks_note(&self) -> &'static str {
+        match self.budget {
+            Some(_) => "",
+            None => " (and all further ones)",
         }
     }
 
@@ -292,6 +487,9 @@ impl StackSpill {
             self.buf.extend_from_slice(&py.addr.inst_idx.to_le_bytes());
             self.buf.extend_from_slice(&py.addr.pad_.to_le_bytes());
         }
+        // The budget is charged by `spill_record_len` before the record is
+        // built, so the two must agree on the format.
+        debug_assert_eq!(self.buf.len() as u64, spill_record_len(&stack));
 
         let writer = self.writer.as_mut().expect("writer checked above");
         if let Err(e) = writer.write_all(&self.buf) {
@@ -299,14 +497,16 @@ impl StackSpill {
             // moves to the in-memory fallback; the reader only replays up to
             // `flushed`, so nothing is lost or duplicated.
             eprintln!(
-                "Warning: stack spill write failed ({e}); keeping {} affected stacks \
-                 (and all further ones) in memory",
-                self.pending.len() + 1
+                "Warning: stack spill write failed ({e}); keeping {} affected stacks\
+                 {} in memory",
+                self.pending.len() + 1,
+                self.further_stacks_note()
             );
             self.writer = None;
             self.written = self.flushed;
             self.fallback.append(&mut self.pending);
             self.fallback.push((stack, tgid, id));
+            self.close_budget_on_io_error();
             return;
         }
         self.written += 1;
@@ -317,16 +517,21 @@ impl StackSpill {
                 Ok(()) => {
                     self.flushed = self.written;
                     self.pending.clear();
+                    if let (Some(budget), Some(dir)) = (&self.budget, &self.dir) {
+                        budget.check_free_space(dir);
+                    }
                 }
                 Err(e) => {
                     eprintln!(
                         "Warning: stack spill flush failed ({e}); keeping {} affected \
-                         stacks (and all further ones) in memory",
-                        self.pending.len()
+                         stacks{} in memory",
+                        self.pending.len(),
+                        self.further_stacks_note()
                     );
                     self.writer = None;
                     self.written = self.flushed;
                     self.fallback.append(&mut self.pending);
+                    self.close_budget_on_io_error();
                 }
             }
         }
@@ -515,6 +720,13 @@ pub(crate) struct StackInterner {
     /// small-set insert per new stack. Read at symbolization time to order
     /// the build-id fill walk: the processes that were sampled go first.
     sampled_tgids: HashSet<i32>,
+    /// The id handed out for every new (stack, tgid) pair once the spill
+    /// budget has closed. Taken from this interner's own range at the first
+    /// such pair, so a trace that never meets the budget assigns exactly the
+    /// ids it always did.
+    overflow_id: Option<i64>,
+    /// How many lookups were answered with `overflow_id`.
+    overflow_lookups: u64,
 }
 
 impl StackInterner {
@@ -527,6 +739,8 @@ impl StackInterner {
             id_limit: None,
             id_limit_warned: false,
             sampled_tgids: HashSet::new(),
+            overflow_id: None,
+            overflow_lookups: 0,
         }
     }
 
@@ -541,18 +755,20 @@ impl StackInterner {
         self.spill.set_dir(dir);
     }
 
+    /// Draw this interner's records on `budget`, shared with the trace's other
+    /// interners. Must be called before recording starts; without it the
+    /// store is unbounded.
+    pub(crate) fn set_spill_budget(&mut self, budget: SpillBudget) {
+        self.spill.set_budget(budget);
+    }
+
     /// The tgids at least one unique stack was interned for.
     pub(crate) fn sampled_tgids(&self) -> &HashSet<i32> {
         &self.sampled_tgids
     }
 
-    /// Get or assign the stack id for this (stack, tgid) pair, persisting the
-    /// contents on first sight.
-    pub(crate) fn intern(&mut self, stack: Stack, tgid: i32) -> i64 {
-        let hash = stack_dedup_hash(&self.hashers, &stack, tgid);
-        if let Some(&id) = self.stack_ids.get(&hash) {
-            return id;
-        }
+    /// Assign the next id of this interner's range.
+    fn assign_id(&mut self) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
         if !self.id_limit_warned && self.id_limit.is_some_and(|limit| id >= limit) {
@@ -563,6 +779,32 @@ impl StackInterner {
                 self.id_limit.unwrap_or(0)
             );
         }
+        id
+    }
+
+    /// Get or assign the stack id for this (stack, tgid) pair, persisting the
+    /// contents on first sight.
+    ///
+    /// Once the spill budget has closed, a pair not seen before is neither
+    /// stored nor remembered: it gets the interner's one placeholder id, whose
+    /// stack `StackRecorder::finish` emits as [`STORE_FULL_FRAME_NAME`]. The
+    /// miss path is the only place the spill file, its in-memory fallback and
+    /// the dedup map grow, so this one test bounds all three.
+    pub(crate) fn intern(&mut self, stack: Stack, tgid: i32) -> i64 {
+        let hash = stack_dedup_hash(&self.hashers, &stack, tgid);
+        if let Some(&id) = self.stack_ids.get(&hash) {
+            return id;
+        }
+        if !self.spill.admit(&stack) {
+            self.overflow_lookups += 1;
+            if let Some(id) = self.overflow_id {
+                return id;
+            }
+            let id = self.assign_id();
+            self.overflow_id = Some(id);
+            return id;
+        }
+        let id = self.assign_id();
         self.stack_ids.insert(hash, id);
         self.sampled_tgids.insert(tgid);
         self.spill.push(stack, tgid, id);
@@ -572,6 +814,22 @@ impl StackInterner {
     /// Number of unique stacks interned.
     pub(crate) fn total(&self) -> u64 {
         self.spill.total()
+    }
+
+    /// Whether `StackRecorder::finish` has a row to write for this interner:
+    /// a stored stack, or the placeholder that answered its lookups once the
+    /// spill budget had closed. An interner that met the closed store at its
+    /// first pair has stored nothing and still owns a placeholder id that its
+    /// recorder's samples carry, so a caller that hands interners over for
+    /// `finish` asks this and never `total() > 0`.
+    pub(crate) fn has_output(&self) -> bool {
+        self.total() > 0 || self.overflow_id.is_some()
+    }
+
+    /// The placeholder id and how many lookups it answered, if the spill
+    /// budget closed while this interner was in use.
+    fn overflow(&self) -> Option<(i64, u64)> {
+        self.overflow_id.map(|id| (id, self.overflow_lookups))
     }
 }
 
@@ -1401,6 +1659,13 @@ impl StackRecorder {
         self.spill_dir = Some(dir.to_path_buf());
     }
 
+    /// Bound the unique-stack store: this recorder's interner draws on
+    /// `budget`, which the trace's other stack-interning recorders share (see
+    /// [`SpillBudget`]). Must be called before recording starts.
+    pub fn set_spill_budget(&mut self, budget: SpillBudget) {
+        self.interner.set_spill_budget(budget);
+    }
+
     /// Take ownership of another recorder's interner so its stacks are
     /// symbolized and emitted alongside profiler stacks in `finish()`.
     /// Interners use disjoint id ranges, so ids never collide; identical
@@ -1537,6 +1802,34 @@ impl StackRecorder {
             eprintln!(
                 "Note: dropped {} stack samples that carried no frames (kernel and user unwind both empty)",
                 self.dropped_frameless
+            );
+        }
+
+        // The unique-stack store closed during the trace (see `SpillBudget`):
+        // every interner that met the closed store answered its new pairs
+        // with one placeholder id. Emit that id's stack, one frame deep so
+        // the row is written and the samples behind it still join to a
+        // stack, and say once how many lookups it answered. This comes ahead
+        // of the empty-store return below: a budget can close before an
+        // interner has stored anything. The recorders that hand their
+        // interner over ask `StackInterner::has_output` for the same reason.
+        // The row names no source file, so its `frame_files` is empty, as
+        // `StackRecord` asks.
+        let mut store_full_lookups: u64 = 0;
+        for interner in &interners {
+            if let Some((stack_id, lookups)) = interner.overflow() {
+                store_full_lookups += lookups;
+                emit_stack_record(
+                    collector,
+                    stack_id,
+                    (vec![STORE_FULL_FRAME_NAME.to_string()], Vec::new()),
+                )?;
+            }
+        }
+        if store_full_lookups > 0 {
+            eprintln!(
+                "Note: {store_full_lookups} stack lookups found the unique-stack store closed \
+                 and were recorded as {STORE_FULL_FRAME_NAME}"
             );
         }
 
@@ -3362,6 +3655,286 @@ mod tests {
             assert_eq!(rid, *id);
         }
         assert!(read_spill_record(&mut reader).unwrap().is_none());
+    }
+
+    /// A small stack whose spill record is 18 + 8 + 9 = 35 bytes; `n` makes
+    /// it unique.
+    fn budget_test_stack(n: u64) -> Stack {
+        Stack {
+            kernel_stack: vec![n],
+            user_stack: ips(&[n + 1]),
+            py_stack: vec![],
+        }
+    }
+
+    /// The budget is charged by `spill_record_len` before a record is built,
+    /// so it must equal what `push` serializes, for every kind of frame.
+    #[test]
+    fn test_spill_record_len_matches_the_serialized_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spill = StackSpill::new();
+        spill.set_dir(dir.path());
+
+        let py = vec![PyAddr {
+            addr: crate::pystacks::types::StackWalkerFrame {
+                symbol_id: 7,
+                inst_idx: 1,
+                pad_: 0,
+            },
+        }];
+        let stacks = [
+            Stack {
+                kernel_stack: vec![],
+                user_stack: ips(&[]),
+                py_stack: vec![],
+            },
+            Stack {
+                kernel_stack: vec![1, 2, 3],
+                user_stack: ips(&[4, 5]),
+                py_stack: py.clone(),
+            },
+            Stack {
+                kernel_stack: vec![1],
+                user_stack: vec![bid_frame(9, 0x10), UserFrame::Guest, UserFrame::Ip(3)],
+                py_stack: py,
+            },
+        ];
+        assert_eq!(spill_record_len(&stacks[0]), 18);
+        assert_eq!(spill_record_len(&budget_test_stack(0)), 35);
+        for stack in &stacks {
+            spill.push(stack.clone(), 1, 1);
+            assert_eq!(spill.buf.len() as u64, spill_record_len(stack));
+        }
+    }
+
+    /// Below its budget the store behaves as it always did; the first pair
+    /// that does not fit closes it, and from there on new pairs share one
+    /// placeholder id while the file, the fallback and the dedup map stay
+    /// exactly as they were.
+    #[test]
+    fn test_spill_budget_closes_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let len = spill_record_len(&budget_test_stack(0));
+        // Room for exactly three records; no free-space floor.
+        let budget = SpillBudget::new(3 * len, 0);
+        let mut interner = StackInterner::new(100);
+        interner.set_spill_dir(dir.path());
+        interner.set_spill_budget(budget.clone());
+
+        for n in 0..3 {
+            assert_eq!(interner.intern(budget_test_stack(n), 1), 100 + n as i64);
+        }
+        assert_eq!(interner.total(), 3);
+        assert_eq!(budget.used_bytes(), 3 * len);
+        assert!(!budget.is_closed());
+        assert!(interner.overflow().is_none());
+
+        // The fourth new pair does not fit: it gets the placeholder, the
+        // next id of this interner's own range, and nothing grows.
+        let placeholder = interner.intern(budget_test_stack(3), 1);
+        assert_eq!(placeholder, 103);
+        assert!(budget.is_closed());
+        assert_eq!(budget.used_bytes(), 3 * len);
+
+        // Every later new pair shares it and is not remembered; a pair
+        // stored earlier keeps its own id.
+        for n in 4..50 {
+            assert_eq!(interner.intern(budget_test_stack(n), 1), placeholder);
+        }
+        assert_eq!(interner.intern(budget_test_stack(3), 1), placeholder);
+        assert_eq!(interner.intern(budget_test_stack(1), 1), 101);
+        assert_eq!(interner.overflow(), Some((placeholder, 48)));
+        assert_eq!(interner.total(), 3);
+        assert_eq!(interner.stack_ids.len(), 3);
+        assert!(interner.spill.fallback.is_empty());
+
+        // The file holds the three records and no more.
+        let (mut reader, durable) = interner.spill.take_reader().expect("reader");
+        assert_eq!(durable, 3);
+        for _ in 0..3 {
+            assert!(read_spill_record(&mut reader).unwrap().is_some());
+        }
+        assert!(read_spill_record(&mut reader).unwrap().is_none());
+    }
+
+    /// A cap of zero never closes on size.
+    #[test]
+    fn test_spill_budget_zero_is_unbounded() {
+        let budget = SpillBudget::from_mib(0);
+        assert!(budget.try_take(u64::MAX / 2));
+        assert!(budget.try_take(1));
+        assert!(!budget.is_closed());
+    }
+
+    /// The recorders of one trace share one budget: what one store takes is
+    /// gone for the others, and each hands out a placeholder from its own id
+    /// range once the budget is spent.
+    #[test]
+    fn test_spill_budget_is_shared_between_interners() {
+        let dir = tempfile::tempdir().unwrap();
+        let len = spill_record_len(&budget_test_stack(0));
+        let budget = SpillBudget::new(4 * len, 0);
+        let mut first = StackInterner::new(1);
+        let mut second = StackInterner::new(1_000);
+        for interner in [&mut first, &mut second] {
+            interner.set_spill_dir(dir.path());
+            interner.set_spill_budget(budget.clone());
+        }
+
+        for n in 0..3 {
+            first.intern(budget_test_stack(n), 1);
+        }
+        assert_eq!(second.intern(budget_test_stack(0), 1), 1_000);
+        assert_eq!(budget.used_bytes(), 4 * len);
+
+        assert_eq!(second.intern(budget_test_stack(1), 1), 1_001);
+        assert_eq!(first.intern(budget_test_stack(9), 1), 4);
+        assert_eq!(first.total() + second.total(), 4);
+        assert_eq!(first.overflow(), Some((4, 1)));
+        assert_eq!(second.overflow(), Some((1_001, 1)));
+    }
+
+    /// A failed write used to move the store into memory for the rest of the
+    /// trace. Under a budget it closes the store instead: what was buffered is
+    /// kept, and no further pair is taken.
+    #[test]
+    fn test_failed_spill_write_closes_the_budget() {
+        let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+            eprintln!("skipping: no /dev/full on this system");
+            return;
+        };
+        // No cap and no floor: only the failed write can close this budget.
+        let budget = SpillBudget::new(0, 0);
+        let mut interner = StackInterner::new(1);
+        interner.spill.writer = Some(BufWriter::new(full));
+        interner.set_spill_budget(budget.clone());
+
+        // Records gather in the BufWriter until it has to write, which
+        // /dev/full refuses.
+        let mut stored: u64 = 0;
+        while !budget.is_closed() {
+            assert!(
+                stored < 10 * SPILL_FLUSH_INTERVAL,
+                "/dev/full never refused a write"
+            );
+            interner.intern(budget_test_stack(stored), 1);
+            stored += 1;
+        }
+        // Nothing taken up to here is lost: no flush ever succeeds on
+        // /dev/full, so it all moved to memory. (Stacks that an earlier flush
+        // had put into the file would be lost with it.)
+        assert_eq!(interner.total(), stored);
+        assert_eq!(interner.spill.fallback.len() as u64, stored);
+
+        // And no further pair is taken, so memory stops growing there.
+        let placeholder = interner.intern(budget_test_stack(1_000_000), 1);
+        assert_eq!(
+            interner.intern(budget_test_stack(1_000_001), 1),
+            placeholder
+        );
+        assert_eq!(interner.total(), stored);
+        assert_eq!(interner.spill.fallback.len() as u64, stored);
+        assert_eq!(interner.stack_ids.len() as u64, stored);
+    }
+
+    /// The free-space floor is checked at each periodic flush of the spill
+    /// file, and closes the store like a spent budget.
+    #[test]
+    fn test_spill_budget_free_space_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        if free_bytes(dir.path()).is_none() {
+            // ramfs, or a tmpfs with no size limit: the floor does not apply.
+            eprintln!("skipping: the temp dir's file system reports no size");
+            return;
+        }
+
+        // No cap, and a floor no file system can meet.
+        let budget = SpillBudget::new(0, u64::MAX);
+        let mut interner = StackInterner::new(1);
+        interner.set_spill_dir(dir.path());
+        interner.set_spill_budget(budget.clone());
+        for n in 0..SPILL_FLUSH_INTERVAL - 1 {
+            interner.intern(budget_test_stack(n), 1);
+        }
+        assert!(!budget.is_closed(), "the floor is only read at a flush");
+        interner.intern(budget_test_stack(SPILL_FLUSH_INTERVAL), 1);
+        assert!(budget.is_closed());
+        assert_eq!(interner.total(), SPILL_FLUSH_INTERVAL);
+
+        // A floor of zero switches the check off.
+        let open = SpillBudget::new(0, 0);
+        open.check_free_space(dir.path());
+        assert!(!open.is_closed());
+    }
+
+    /// The placeholder's stack is written at the end of the trace, one frame
+    /// deep, under the id the samples behind the closed store carry: they
+    /// still join to a row of the `stack` table. This holds even when the
+    /// store closed before it took a single stack.
+    #[test]
+    fn test_finish_emits_the_store_full_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        rec.set_spill_dir(dir.path());
+        rec.set_streaming_collector(Box::new(crate::record::InMemoryCollector::new()));
+        // Too small for any record: the store closes at the first stack.
+        rec.set_spill_budget(SpillBudget::new(1, 0));
+
+        let dead_tgid = i32::MAX - 1;
+        let id = rec.interner.intern(budget_test_stack(1), dead_tgid);
+        assert_eq!(rec.interner.intern(budget_test_stack(2), dead_tgid), id);
+        assert_eq!(rec.interner.total(), 0);
+
+        let mut collector = crate::record::InMemoryCollector::new();
+        rec.finish_inner(&mut collector).unwrap();
+        let stacks = &collector.data().stacks;
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].id, id);
+        assert_eq!(
+            stacks[0].frame_names,
+            vec![STORE_FULL_FRAME_NAME.to_string()]
+        );
+        assert_eq!(stacks[0].depth, 1);
+        assert!(stacks[0].frame_files.is_empty());
+    }
+
+    /// A recorder that hands its interner over at the end of the trace (the
+    /// memory and task-stacks recorders do) can meet the closed store at its
+    /// first pair. It has then stored nothing and still owns a placeholder id
+    /// that its samples carry: `has_output` says so where `total` reads zero,
+    /// and `finish` writes that placeholder's row.
+    #[test]
+    fn test_finish_emits_the_store_full_stack_of_a_handed_over_interner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        rec.set_spill_dir(dir.path());
+        rec.set_streaming_collector(Box::new(crate::record::InMemoryCollector::new()));
+        // Too small for any record: closed for every interner that draws on it.
+        let budget = SpillBudget::new(1, 0);
+        rec.set_spill_budget(budget.clone());
+
+        // Another recorder's interner, in an id range of its own.
+        let mut handed_over = StackInterner::new(1_000_000_000);
+        handed_over.set_spill_dir(dir.path());
+        handed_over.set_spill_budget(budget);
+        assert!(!handed_over.has_output());
+        let dead_tgid = i32::MAX - 1;
+        let id = handed_over.intern(budget_test_stack(1), dead_tgid);
+        assert_eq!(id, 1_000_000_000);
+        assert_eq!(handed_over.total(), 0);
+        assert!(handed_over.has_output());
+        rec.merge_external_interner(handed_over);
+
+        let mut collector = crate::record::InMemoryCollector::new();
+        rec.finish_inner(&mut collector).unwrap();
+        let stacks = &collector.data().stacks;
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].id, id);
+        assert_eq!(
+            stacks[0].frame_names,
+            vec![STORE_FULL_FRAME_NAME.to_string()]
+        );
+        assert!(stacks[0].frame_files.is_empty());
     }
 
     #[test]
