@@ -201,7 +201,9 @@ pub fn check(process: &Process, dir: Option<&Path>) -> Result<Facts> {
     };
     let environ = process.read_capped("environ", MAX_ENVIRON_BYTES).ok();
     let conf = environ.as_deref().and_then(Conf::in_environ);
-    let memory_denied = std::fs::File::open(process.file("mem"))
+    let memory_denied = process
+        .file("mem")
+        .and_then(std::fs::File::open)
         .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
     let files = match conf.as_ref().and_then(|c| c.prefix.clone()) {
         None => Files::NoPrefix,

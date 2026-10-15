@@ -2,10 +2,12 @@
 //! `--pid` and `--root-fd` keep the prefix, the binaries, the perf map and the
 //! code map beneath the root, and take prefix inputs only.
 
-use std::os::fd::AsRawFd;
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use common::inheritable;
 use duckdb::Connection;
 
 const BIN: &str = env!("CARGO_BIN_EXE_systing-heap");
@@ -53,20 +55,6 @@ fn run(args: &[&str], db: &Path, input: &str) -> Output {
         .arg(input)
         .output()
         .unwrap()
-}
-
-/// `path` opened so that a child inherits it under the same number; the
-/// file is returned to keep the descriptor open.
-fn inheritable(path: &Path) -> (std::fs::File, String) {
-    let file = std::fs::File::open(path).unwrap();
-    // SAFETY: a descriptor this test owns; without close-on-exec the child
-    // inherits it under the same number.
-    assert_eq!(
-        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
-        0
-    );
-    let number = file.as_raw_fd().to_string();
-    (file, number)
 }
 
 fn loaded(db: &Path) -> Vec<(i32, i64)> {

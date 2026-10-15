@@ -1092,7 +1092,10 @@ pub fn would(process: &Process, root: &Root, dir: &Path) -> Result<Would> {
         return Ok(Would::NotPython);
     }
     let mem = ReadOnly(
-        File::open(process.file("mem")).with_context(|| format!("opening /proc/{pid}/mem"))?,
+        process
+            .file("mem")
+            .and_then(File::open)
+            .with_context(|| format!("opening /proc/{pid}/mem"))?,
     );
     let found = find_runtime(&mem, &maps_text)
         .and_then(|(runtime, offsets)| main_thread(&mem, runtime, &offsets).map(|_| offsets))
@@ -1151,10 +1154,14 @@ pub fn ask(
         );
     }
     let mem = ProcMem(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(process.file("mem"))
+        process
+            .file("mem")
+            .and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+            })
             .with_context(|| {
                 format!(
                     "opening /proc/{pid}/mem to write: that needs the same user as the process \

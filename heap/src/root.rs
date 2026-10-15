@@ -42,16 +42,7 @@ impl Root {
     /// The root at an open directory descriptor inherited from the caller.
     /// The descriptor is duplicated, so the caller's stays as it was.
     pub fn from_fd(fd: RawFd) -> io::Result<Root> {
-        if fd < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "not a file descriptor",
-            ));
-        }
-        // SAFETY: the descriptor is borrowed only for the duplication, and a
-        // number that is not open makes the duplication fail with EBADF.
-        let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
-        Root::from_dir(File::from(owned))
+        Root::from_dir(inherited(fd)?)
     }
 
     /// The root at an open directory. It fails where the kernel cannot resolve
@@ -129,6 +120,22 @@ impl Root {
             }
         }
     }
+}
+
+/// A descriptor inherited from the caller, as a file of this program's own.
+/// It is duplicated, so the caller's stays as it was, and the duplicate is
+/// closed in any program this one goes on to run.
+pub fn inherited(fd: RawFd) -> io::Result<File> {
+    if fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a file descriptor",
+        ));
+    }
+    // SAFETY: the descriptor is borrowed only for the duplication, and a
+    // number that is not open makes the duplication fail with EBADF.
+    let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+    Ok(File::from(owned))
 }
 
 /// Whether `file` is on a filesystem whose files live somewhere else: FUSE, or

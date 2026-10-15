@@ -31,7 +31,8 @@ pub mod mem;
 pub mod walk;
 
 use std::fs::File;
-use std::os::fd::AsRawFd;
+use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -113,42 +114,168 @@ pub struct Report {
 /// files (memory, maps, root, ...) are all opened through that handle: they
 /// are all of the process it was when this was called, or fail if it has since
 /// exited.
+///
+/// Or the caller pinned it: it opened the process's files and handed them
+/// over ([`Process::from_handed`]). Those are then all that is read of the
+/// process, and nothing of it is opened here.
 pub struct Process {
     pid: u32,
-    dir: File,
+    source: Source,
+}
+
+/// Where a pinned process's files are from.
+enum Source {
+    /// The process's `/proc/<pid>` directory: each file is opened through it.
+    Dir(File),
+    /// The caller, who opened them.
+    Handed(Handed),
+}
+
+/// A process's files, opened by the caller and handed over: its root
+/// directory, and whichever files of its `/proc/<pid>` directory the caller
+/// opened. A file that was not handed over is not opened by its name instead,
+/// and no handle on the `/proc/<pid>` directory itself is taken or made.
+pub struct Handed {
+    /// The process's root directory, `/proc/<pid>/root`.
+    pub root: File,
+    pub mem: Option<File>,
+    pub maps: Option<File>,
+    pub status: Option<File>,
+    pub environ: Option<File>,
+}
+
+impl Handed {
+    /// One of a process's files, inherited from the caller as descriptor
+    /// `fd`, which the caller named with `flag`. It is duplicated at once, so
+    /// the caller's stays as it was. A directory is refused: the one directory
+    /// taken of a process is its root.
+    pub fn file(fd: RawFd, flag: &str) -> Result<File> {
+        let file = crate::root::inherited(fd)
+            .with_context(|| format!("taking descriptor {fd} (as {flag})"))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("examining descriptor {fd} ({flag})"))?;
+        if meta.is_dir() {
+            bail!("descriptor {fd} ({flag}) is a directory, not a file of the process's");
+        }
+        Ok(file)
+    }
+
+    /// The file that was handed over for `name`, as the process's
+    /// `/proc/<pid>` directory names it.
+    fn named(&self, name: &str) -> io::Result<&File> {
+        let file = match name {
+            "mem" => self.mem.as_ref(),
+            "maps" => self.maps.as_ref(),
+            "status" => self.status.as_ref(),
+            "environ" => self.environ.as_ref(),
+            _ => None,
+        };
+        let missing = || io::Error::other(format!("the process's {name} was not handed over"));
+        file.ok_or_else(missing)
+    }
+
+    fn try_clone(&self) -> io::Result<Handed> {
+        let again = |file: &Option<File>| file.as_ref().map(File::try_clone).transpose();
+        Ok(Handed {
+            root: self.root.try_clone()?,
+            mem: again(&self.mem)?,
+            maps: again(&self.maps)?,
+            status: again(&self.status)?,
+            environ: again(&self.environ)?,
+        })
+    }
+}
+
+/// Read `file` from its start into `buf`, and no more than `most` bytes of
+/// it. Each read says where it starts: a descriptor that was handed over
+/// shares its offset with the caller's, and `maps` is read more than once.
+fn read_from_start(file: &File, most: u64, buf: &mut Vec<u8>) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    let mut chunk = [0u8; 64 << 10];
+    while (buf.len() as u64) < most {
+        let want = (most - buf.len() as u64).min(chunk.len() as u64) as usize;
+        match file.read_at(&mut chunk[..want], buf.len() as u64) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(buf.len())
 }
 
 impl Process {
     pub fn open(pid: u32) -> Result<Process> {
         let dir =
             File::open(format!("/proc/{pid}")).with_context(|| format!("opening /proc/{pid}"))?;
-        Ok(Process { pid, dir })
+        Ok(Process {
+            pid,
+            source: Source::Dir(dir),
+        })
+    }
+
+    /// A process whose files the caller opened and hands over. `pid` is the
+    /// caller's number for it, and a number only: it names the process in
+    /// messages and is what the peer of its socket is checked against.
+    /// Nothing is opened by it.
+    pub fn from_handed(pid: u32, files: Handed) -> Process {
+        Process {
+            pid,
+            source: Source::Handed(files),
+        }
     }
 
     pub fn pid(&self) -> u32 {
         self.pid
     }
 
-    /// `name` in the process's `/proc` directory, through the handle.
-    pub(crate) fn file(&self, name: &str) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}/{name}", self.dir.as_raw_fd()))
+    /// `name` in the process's `/proc` directory, through the handle. Files
+    /// that were handed over are in no directory this can name: what would
+    /// open one by its name is told so.
+    pub(crate) fn file(&self, name: &str) -> io::Result<PathBuf> {
+        match &self.source {
+            Source::Dir(dir) => {
+                let fd = dir.as_raw_fd();
+                Ok(PathBuf::from(format!("/proc/self/fd/{fd}/{name}")))
+            }
+            Source::Handed(_) => Err(io::Error::other(format!(
+                "the files of pid {} were handed over: its {name} is not opened by name",
+                self.pid
+            ))),
+        }
     }
 
     /// Another handle on the same process.
     pub fn try_clone(&self) -> Result<Process> {
+        let source = match &self.source {
+            Source::Dir(dir) => dir.try_clone().map(Source::Dir),
+            Source::Handed(files) => files.try_clone().map(Source::Handed),
+        };
         Ok(Process {
             pid: self.pid,
-            dir: self
-                .dir
-                .try_clone()
-                .context("duplicating the process handle")?,
+            source: source.context("duplicating the process handle")?,
         })
     }
 
     /// The process's root directory, to read the files it names beneath.
     pub fn root(&self) -> Result<Root> {
-        Root::open(&self.file("root"))
-            .with_context(|| format!("opening the root of pid {}", self.pid))
+        let root = match &self.source {
+            Source::Dir(_) => self.file("root").and_then(|path| Root::open(&path)),
+            Source::Handed(files) => files.root.try_clone().and_then(Root::from_dir),
+        };
+        root.with_context(|| format!("opening the root of pid {}", self.pid))
+    }
+
+    /// The process's memory, to read.
+    fn mem(&self) -> io::Result<ProcMem> {
+        match &self.source {
+            Source::Dir(_) => self.file("mem").and_then(|path| ProcMem::open(&path)),
+            Source::Handed(files) => files
+                .named("mem")
+                .and_then(File::try_clone)
+                .map(ProcMem::from_file),
+        }
     }
 
     /// A file of the process's, no more than `cap` bytes of it: what a process
@@ -156,9 +283,16 @@ impl Process {
     pub(crate) fn read_capped(&self, name: &str, cap: u64) -> Result<Vec<u8>> {
         use std::io::Read;
         let mut buf = Vec::new();
-        File::open(self.file(name))
-            .and_then(|f| f.take(cap + 1).read_to_end(&mut buf))
-            .with_context(|| format!("reading /proc/{}/{name}", self.pid))?;
+        let read = match &self.source {
+            Source::Dir(_) => self
+                .file(name)
+                .and_then(File::open)
+                .and_then(|f| f.take(cap + 1).read_to_end(&mut buf)),
+            Source::Handed(files) => files
+                .named(name)
+                .and_then(|f| read_from_start(f, cap + 1, &mut buf)),
+        };
+        read.with_context(|| format!("reading /proc/{}/{name}", self.pid))?;
         if buf.len() as u64 > cap {
             bail!("/proc/{}/{name} is larger than {cap} bytes", self.pid);
         }
@@ -174,10 +308,16 @@ impl Process {
         self.read_text("maps", MAX_MAPS_BYTES)
     }
 
-    /// The user and group a file the process wrote would belong to.
+    /// The user and group a file the process wrote would belong to. Of files
+    /// that were handed over, `maps` stands in for the directory: both are the
+    /// process's own in `/proc`.
     pub(crate) fn owner(&self) -> Option<(u32, u32)> {
         use std::os::unix::fs::MetadataExt;
-        self.dir.metadata().ok().map(|m| (m.uid(), m.gid()))
+        let of = match &self.source {
+            Source::Dir(dir) => dir,
+            Source::Handed(files) => files.maps.as_ref()?,
+        };
+        of.metadata().ok().map(|m| (m.uid(), m.gid()))
     }
 }
 
@@ -226,7 +366,7 @@ pub(crate) fn run_within<T: Send + 'static>(
 pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
     let pid = process.pid;
     let started = std::time::Instant::now();
-    let mem = ProcMem::open(&process.file("mem")).with_context(|| {
+    let mem = process.mem().with_context(|| {
         format!(
             "opening /proc/{pid}/mem: reading a process's memory needs the same user as the \
              process (any other, root included, needs CAP_SYS_PTRACE), a process that is \
@@ -283,11 +423,7 @@ pub fn read(process: &Process, root: &Root) -> Result<(Snapshot, Report)> {
             .ok()
             .and_then(|d| i64::try_from(d.as_nanos()).ok()),
         // The user a file the process wrote would belong to.
-        owner_uid: process
-            .dir
-            .metadata()
-            .ok()
-            .map(|m| std::os::unix::fs::MetadataExt::uid(&m)),
+        owner_uid: process.owner().map(|(uid, _)| uid),
         sample_period: 1u64 << lg,
         samples,
         maps,

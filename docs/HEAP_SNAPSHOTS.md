@@ -536,6 +536,19 @@ Where to run the tool, and which pid to give it, is in [Step 3](#step-3-collect)
 
 How paths are kept inside the container is in [`HEAP_INTERNALS.md`](HEAP_INTERNALS.md#resolving-paths-inside-a-container).
 
+### Handing over the files of a process
+
+`--ask` and `--snoop` open the process's root and the files of its `/proc/PID` by its pid. A program that has already opened them can hand them to the tool as descriptors instead. That is for a caller that holds the right to open another process's memory, and has checked which process it means.
+
+```bash
+systing-heap -o heap.duckdb --snoop --pid PID --root-fd 3 --mem-fd 4 --maps-fd 5 --status-fd 6 \
+    3< /proc/PID/root 4< /proc/PID/mem 5< /proc/PID/maps 6< /proc/PID/status
+```
+
+`--pid` is then a number only: nothing is opened by it. The tool reads what it was handed, and nothing else of the process. With none of these flags, nothing changes.
+`--ask python`, `--check` and `--snoop` of a Go program open the process by its pid, and take no files that were handed over.
+Which file each flag takes, and what stands in for a file that is not handed over, is in [`heap/README.md`](../heap/README.md#handing-over-the-files-of-a-process).
+
 ### Starting the socket from C, C++ or Rust
 
 In place of the environment variables, link `libsysting_heap_responder.so` and call it:
