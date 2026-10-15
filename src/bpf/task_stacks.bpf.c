@@ -10,8 +10,9 @@
  * first) and py_len bytes of struct pystacks_message. A thread that has not run
  * since its last record, and is in the same non-runnable state as then, gets
  * the header alone, flagged TASK_STACKS_UNCHANGED. The header also carries the
- * thread's task_context id (--include-task-context), read for a full record
- * only: a thread that has not run cannot have changed its context.
+ * thread's task_context id (--include-task-context), the system call it is in
+ * and whether it is blocked on I/O, each read for a full record only: a thread
+ * that has not run cannot have changed any of them.
  *
  * Why this is its own BPF object rather than a program in systing_system.bpf.o:
  *  - STROBELIGHT_SLEEPABLE_BPF selects the sleepable bodies of the pystacks
@@ -101,6 +102,7 @@ struct {
 
 /* task_stacks_event.flags */
 #define TASK_STACKS_UNCHANGED 1	/* the thread's last record still stands */
+#define TASK_STACKS_IN_IOWAIT 2	/* blocked on I/O (task_struct.in_iowait) */
 
 struct task_stacks_event {
 	struct task_info task;
@@ -112,7 +114,7 @@ struct task_stacks_event {
 	u32 kernel_stack_len;	/* frames that follow the event */
 	u32 user_stack_len;	/* frames that follow the kernel frames */
 	u32 py_len;		/* bytes of pystacks_message after the frames */
-	u32 pad;
+	s32 syscall_nr;		/* the system call the thread is in; -1 = none */
 	u64 task_context_id;	/* the thread's task_context id; 0 = none */
 };
 
@@ -226,6 +228,97 @@ static bool status_delta(u32 tid, const struct task_status *now, bool on_cpu,
 	return !on_cpu && now->runtime == prev->runtime &&
 	       now->utime == prev->utime && now->stime == prev->stime &&
 	       now->state && now->state == prev->state;
+}
+
+/*
+ * The system call thread `task` is in, by its number in the kernel's native
+ * table, or -1 for none: what tells a thread parked in epoll_wait, futex or
+ * nanosleep from one blocked in a read. It is read from the thread's saved
+ * user registers, which are as its last entry into the kernel left them, and
+ * every entry that is not a system call (an interrupt, a fault) leaves the
+ * "no system call" mark there: -1 in orig_ax on x86-64 and in syscallno on
+ * arm64. riscv has no such mark; its saved cause says which entry it was.
+ *
+ * So the number is exact for a thread that is off its CPU, blocked or
+ * preempted, and for one that is still on it with its state already set to
+ * sleep: a thread sets that only in the kernel, on its way to schedule(), so
+ * its registers are this entry's. A thread that is on a CPU and runnable may
+ * be back in user space, where the registers still hold the entry before: it
+ * reads as in none (as does one that is in the kernel there). `on_cpu` is
+ * read for this after the state, not the caller's earlier read: a thread that
+ * left its CPU in between would have the state of its sleep and no call,
+ * and keep both for as long as it slept.
+ *
+ * None either, sooner than a number that is not the thread's call:
+ *  - a thread that has exited: its stack, and the registers on it, may be
+ *    freed, and a failed read is zero, which is a call's number;
+ *  - a kernel thread, which has no user registers, and an io_uring or vhost
+ *    worker, which has a copy of those of the thread that made it;
+ *  - a 32-bit task, whose number is one of another table (see
+ *    systing_in_compat_syscall() in systing_system.bpf.c for the three
+ *    tests), and an x32 call, whose number carries __X32_SYSCALL_BIT.
+ */
+#define TASK_STACKS_NO_SYSCALL (-1)
+#define TASK_STACKS_PF_IO_WORKER 0x00000010   /* include/linux/sched.h */
+#define TASK_STACKS_PF_USER_WORKER 0x00004000 /* a hole before Linux 6.4 */
+
+#if defined(__TARGET_ARCH_x86)
+#define TASK_STACKS_TS_COMPAT 0x0002 /* arch/x86/include/asm/thread_info.h */
+#define TASK_STACKS_X32_SYSCALL_BIT 0x40000000 /* arch/x86/include/uapi/asm/unistd.h */
+#elif defined(__TARGET_ARCH_arm64)
+#define TASK_STACKS_TIF_32BIT_MASK (1UL << 22) /* arch/arm64/include/asm/thread_info.h */
+#elif defined(__TARGET_ARCH_riscv)
+#define TASK_STACKS_EXC_SYSCALL 8 /* arch/riscv/include/asm/csr.h */
+#define TASK_STACKS_SR_UXL 0x300000000UL
+#define TASK_STACKS_SR_UXL_32 0x100000000UL
+#endif
+
+static __always_inline s32 task_syscall_nr(struct task_struct *task, u32 state)
+{
+	struct pt_regs *regs;
+	bool on_cpu;
+
+	if (BPF_CORE_READ(task, exit_state) || is_kernel_thread(task) ||
+	    (BPF_CORE_READ(task, flags) &
+	     (TASK_STACKS_PF_IO_WORKER | TASK_STACKS_PF_USER_WORKER)))
+		return TASK_STACKS_NO_SYSCALL;
+	on_cpu = bpf_core_field_exists(task->on_cpu) ?
+			 BPF_CORE_READ(task, on_cpu) : 0;
+	/* TASK_RUNNING is 0. */
+	if (on_cpu && !state)
+		return TASK_STACKS_NO_SYSCALL;
+	regs = (struct pt_regs *)bpf_task_pt_regs(task);
+#if defined(__TARGET_ARCH_x86)
+	unsigned long nr;
+
+	if (BPF_CORE_READ(task, thread_info.status) & TASK_STACKS_TS_COMPAT)
+		return TASK_STACKS_NO_SYSCALL;
+	if (bpf_core_read(&nr, sizeof(nr), &regs->orig_ax) ||
+	    (nr & TASK_STACKS_X32_SYSCALL_BIT))
+		return TASK_STACKS_NO_SYSCALL;
+	return (s32)nr;
+#elif defined(__TARGET_ARCH_arm64)
+	s32 nr;
+
+	if (BPF_CORE_READ(task, thread_info.flags) & TASK_STACKS_TIF_32BIT_MASK)
+		return TASK_STACKS_NO_SYSCALL;
+	if (bpf_core_read(&nr, sizeof(nr), &regs->syscallno))
+		return TASK_STACKS_NO_SYSCALL;
+	return nr;
+#elif defined(__TARGET_ARCH_riscv)
+	unsigned long cause, status, nr;
+
+	if (bpf_core_read(&cause, sizeof(cause), &regs->cause) ||
+	    bpf_core_read(&status, sizeof(status), &regs->status) ||
+	    bpf_core_read(&nr, sizeof(nr), &regs->a7))
+		return TASK_STACKS_NO_SYSCALL;
+	if (cause != TASK_STACKS_EXC_SYSCALL ||
+	    (status & TASK_STACKS_SR_UXL) == TASK_STACKS_SR_UXL_32)
+		return TASK_STACKS_NO_SYSCALL;
+	return (s32)nr;
+#else
+	return TASK_STACKS_NO_SYSCALL;
+#endif
 }
 
 /*
@@ -464,7 +557,7 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	__builtin_memset(e->task.comm, 0, sizeof(e->task.comm));
 	bpf_probe_read_kernel_str(e->task.comm, sizeof(e->task.comm), task->comm);
 	e->flags = 0;
-	e->pad = 0;
+	e->syscall_nr = TASK_STACKS_NO_SYSCALL;
 	e->task_context_id = 0;
 
 	/* Before the status, not after: see status_delta(). A uniprocessor
@@ -484,6 +577,12 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 			__sync_fetch_and_add(&stats->unsent, 1);
 		return 0;
 	}
+
+	/* What the thread waits in, where it waits: both of the kernel's own
+	 * record, with nothing of the thread's memory read. */
+	e->syscall_nr = task_syscall_nr(task, now.state);
+	if (BPF_CORE_READ_BITFIELD_PROBED(task, in_iowait))
+		e->flags |= TASK_STACKS_IN_IOWAIT;
 
 	/* One helper call on the trusted pointer: nothing to gain from a
 	 * global function here. */

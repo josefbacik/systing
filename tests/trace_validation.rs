@@ -5333,11 +5333,41 @@ fn test_e2e_task_stacks_recording() {
             && v.contains("([kernel])")),
         "no stack ends in the kernel's nanosleep"
     );
+    // What the thread was waiting in, without reading its frames: asleep in
+    // a nanosleep call (clock_nanosleep under a current glibc), which is no
+    // wait for I/O; and nothing to say of a GIL, with no Python walk run.
+    assert_eq!(
+        task_stack_events_where(
+            &events_path,
+            "state = 'S' AND syscall LIKE '%nanosleep' AND syscall_nr IS NOT NULL"
+        ),
+        task_stack_events_where(&events_path, "state = 'S'"),
+        "a row of the sleeping thread does not name the nanosleep call it sleeps in"
+    );
+    assert_eq!(
+        task_stack_events_where(&events_path, "in_iowait OR holds_gil IS NOT NULL"),
+        0,
+        "a row of a thread asleep on a timer is in an I/O wait, or knows of a GIL"
+    );
     // Nothing is drawn at record time: the Perfetto converter does that.
     assert!(
         !dir.path().join("slice.parquet").exists(),
         "the task-stacks recorder wrote slices"
     );
+}
+
+/// How many rows of a `task_stack_event.parquet` a SQL condition holds for.
+fn task_stack_events_where(events: &Path, condition: &str) -> i64 {
+    let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+    conn.query_row(
+        &format!(
+            "SELECT count(*) FROM read_parquet('{}') WHERE {condition}",
+            events.display()
+        ),
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or_else(|e| panic!("Failed to count task_stack_event rows where {condition}: {e}"))
 }
 
 /// One task-stacks capture by the binary, so that each has its own
@@ -6526,6 +6556,15 @@ def task_stacks_marker():
         assert_eq!(
             has_kernel_frames, !python_only,
             "[frames={frames:?}] kernel frames present: {has_kernel_frames}"
+        );
+        // The Python walk says who holds the GIL: not a thread asleep in
+        // time.sleep(), which lets go of it for the call. (That no such row
+        // says it does is not asserted: the state and the GIL are read at
+        // two instants of a thread that is not stopped.)
+        let events_path = dir.path().join("task_stack_event.parquet");
+        assert!(
+            task_stack_events_where(&events_path, "state = 'S' AND NOT holds_gil") > 0,
+            "[frames={frames:?}] no row of the sleeping Python thread says it does not hold the GIL"
         );
     }
 }

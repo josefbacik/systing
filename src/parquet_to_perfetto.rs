@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use arrow::array::{
-    Array, Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    Array, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
@@ -1554,8 +1554,12 @@ impl ParquetToPerfettoConverter {
     /// Write the task-stacks recorder's events (task_stack_event.parquet) as a
     /// `Task Stacks: <thread>` track under each thread: the thread's stack over
     /// time, each frame a slice (see [`merge_frames`]), titled with the
-    /// thread's names (see [`task_stacks_title`]). What else an event carries
-    /// (its iterations, CPU-time deltas, state) stays in the table.
+    /// thread's names (see [`task_stacks_title`]). The slice of a thread's
+    /// leaf frame also says what the thread was doing while it stood there
+    /// (see [`TaskState`]): its state, the system call it was in, whether it
+    /// was blocked on I/O and whether it held the GIL, which is what tells a
+    /// thread that is parked from one that is blocked on work. What else an
+    /// event carries (its iterations, CPU-time deltas) stays in the table.
     fn write_task_stack_events(
         &mut self,
         input_dir: &Path,
@@ -1580,6 +1584,7 @@ impl ParquetToPerfettoConverter {
             ts: i64,
             dur: i64,
             stack_id: Option<i64>,
+            state: TaskState,
         }
         // The threads in the order they first appear, each with its events.
         let mut threads: Vec<(i64, Vec<Event>)> = Vec::new();
@@ -1593,6 +1598,17 @@ impl ParquetToPerfettoConverter {
             };
             let (ts, dur, utids, stack_ids) =
                 (int("ts")?, int("dur")?, int("utid")?, int("stack_id")?);
+            // What the leaf frame's slice says of the thread. None of it is
+            // required: a file from before schema 31 has the state alone.
+            let column = |name: &str| batch.column_by_name(name).map(|c| c.as_any());
+            let string = |name: &str| column(name).and_then(|c| c.downcast_ref::<StringArray>());
+            let boolean = |name: &str| column(name).and_then(|c| c.downcast_ref::<BooleanArray>());
+            let (states, syscalls) = (string("state"), string("syscall"));
+            let syscall_nrs = column("syscall_nr").and_then(|c| c.downcast_ref::<Int32Array>());
+            let (in_iowaits, holds_gils) = (boolean("in_iowait"), boolean("holds_gil"));
+            let flag = |column: Option<&BooleanArray>, i: usize| {
+                column.and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
+            };
             for i in 0..batch.num_rows() {
                 let utid = utids.value(i);
                 let idx = *thread_idx.entry(utid).or_insert_with(|| {
@@ -1603,6 +1619,13 @@ impl ParquetToPerfettoConverter {
                     ts: ts.value(i),
                     dur: dur.value(i),
                     stack_id: get_optional_i64(Some(stack_ids), i),
+                    state: TaskState {
+                        state: get_optional_string(states, i),
+                        syscall: get_optional_string(syscalls, i),
+                        syscall_nr: get_optional_i32(syscall_nrs, i),
+                        in_iowait: flag(in_iowaits, i),
+                        holds_gil: flag(holds_gils, i),
+                    },
                 });
             }
         }
@@ -1624,6 +1647,7 @@ impl ParquetToPerfettoConverter {
                     e.ts,
                     e.ts + e.dur,
                     frames.map_or(&[][..], |s| s.frame_names.as_slice()),
+                    &e.state,
                 )
             }));
             if stack.is_empty() {
@@ -1673,11 +1697,16 @@ impl ParquetToPerfettoConverter {
 
             // In begin order, parents first: an end event closes whichever
             // slice of the track began last. A slice is named after the
-            // function alone; where it is from goes in its arguments.
+            // function alone; where it is from goes in its arguments, and
+            // after those, for a leaf, what the thread was doing in it.
             for frame in stack {
                 let mut parts = parse_frame(&frame.name);
                 if let Some(path) = full_paths.get(frame.name.as_str()) {
                     parts.file = Some(path);
+                }
+                let mut annotations = parts.annotations();
+                if let Some(state) = frame.state {
+                    annotations.extend(state.annotations());
                 }
                 write_slice(
                     writer,
@@ -1685,7 +1714,7 @@ impl ParquetToPerfettoConverter {
                     track,
                     parts.function,
                     (frame.start, frame.end),
-                    parts.annotations(),
+                    annotations,
                 )?;
             }
         }
@@ -2718,6 +2747,54 @@ fn task_stacks_title(
     }
 }
 
+/// What a task-stacks event says its thread was doing, beside the stack: the
+/// arguments of its leaf frame's slice, under the columns' own names. Only the
+/// state is in every file; the rest came with schema 31 and is absent before.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TaskState {
+    /// The kernel's one-letter task state.
+    state: Option<String>,
+    /// The system call the thread was in, by name and by number.
+    syscall: Option<String>,
+    syscall_nr: Option<i32>,
+    /// Whether the thread was blocked on I/O.
+    in_iowait: Option<bool>,
+    /// Whether the thread held its interpreter's GIL, where a walk could tell.
+    holds_gil: Option<bool>,
+}
+
+impl TaskState {
+    /// The columns that have a value, as a slice's arguments.
+    fn annotations(&self) -> Vec<DebugAnnotation> {
+        let named = |name: &str| {
+            let mut ann = DebugAnnotation::default();
+            ann.set_name(name.to_string());
+            ann
+        };
+        let mut annotations = Vec::new();
+        for (name, text) in [("state", &self.state), ("syscall", &self.syscall)] {
+            if let Some(text) = text {
+                let mut ann = named(name);
+                ann.set_string_value(text.clone());
+                annotations.push(ann);
+            }
+        }
+        if let Some(nr) = self.syscall_nr {
+            let mut ann = named("syscall_nr");
+            ann.set_int_value(i64::from(nr));
+            annotations.push(ann);
+        }
+        for (name, flag) in [("in_iowait", self.in_iowait), ("holds_gil", self.holds_gil)] {
+            if let Some(flag) = flag {
+                let mut ann = named(name);
+                ann.set_bool_value(flag);
+                annotations.push(ann);
+            }
+        }
+        annotations
+    }
+}
+
 /// The parts of a symbolized frame name as `stack.frame_names` holds it:
 /// `function (module [file:line]) <0xaddress>` for a native or kernel frame
 /// (the location and the address as far as they are known; the kernel's module
@@ -2845,13 +2922,16 @@ fn merge_key(frame: &str) -> &str {
 
 /// One frame of a thread's stack, for as long as it stayed on the stack.
 #[derive(Debug, PartialEq, Eq)]
-struct FrameSlice {
+struct FrameSlice<'a> {
     /// 0 is the root.
     depth: i32,
     /// The frame as the first event that had it named it.
     name: String,
     start: i64,
     end: i64,
+    /// For a leaf, what the thread was doing while it stood in the frame;
+    /// `None` for a frame with a callee under it.
+    state: Option<&'a TaskState>,
 }
 
 /// A thread's stack over time from its task-stacks events, as py-spy's Chrome
@@ -2862,25 +2942,40 @@ struct FrameSlice {
 /// root first. An event that does not start where the one before it ended
 /// (the thread went unseen in between) shares nothing with it. The result is
 /// in begin order, parents before children.
-fn merge_frames<'a>(events: impl Iterator<Item = (i64, i64, &'a [String])>) -> Vec<FrameSlice> {
-    fn close(open: &mut Vec<(&str, i64)>, keep: usize, at: i64, out: &mut Vec<FrameSlice>) {
+///
+/// Each event comes with what it says its thread was doing, and the event's
+/// leaf frame carries that: a state is the thread's, and the leaf is where the
+/// thread stood. A slice says one thing for its whole length, so a leaf stays
+/// open only while it is still the leaf and the state still the same; one that
+/// gets a callee, or whose thread goes from running to asleep in it, ends
+/// there and begins again without, or with the new one. The frames above a
+/// leaf merge as they always have.
+fn merge_frames<'a>(
+    events: impl Iterator<Item = (i64, i64, &'a [String], &'a TaskState)>,
+) -> Vec<FrameSlice<'a>> {
+    /// A frame that is on the stack: its name, since when, and its state if
+    /// it is the leaf.
+    type Open<'a> = (&'a str, i64, Option<&'a TaskState>);
+
+    fn close<'a>(open: &mut Vec<Open<'a>>, keep: usize, at: i64, out: &mut Vec<FrameSlice<'a>>) {
         while open.len() > keep {
-            let (name, start) = open.pop().expect("open is longer than keep");
+            let (name, start, state) = open.pop().expect("open is longer than keep");
             if at > start {
                 out.push(FrameSlice {
                     depth: open.len() as i32,
                     name: name.to_string(),
                     start,
                     end: at,
+                    state,
                 });
             }
         }
     }
 
-    let mut open: Vec<(&str, i64)> = Vec::new();
+    let mut open: Vec<Open> = Vec::new();
     let mut out = Vec::new();
     let mut last_end: Option<i64> = None;
-    for (start, end, frames) in events {
+    for (start, end, frames, state) in events {
         // A gap: the frames end where the last event did. min(): the
         // recorder's events never overlap, but a table that did not come from
         // it may, and frames that outlast the next begin would pair each
@@ -2888,13 +2983,24 @@ fn merge_frames<'a>(events: impl Iterator<Item = (i64, i64, &'a [String])>) -> V
         if let Some(last_end) = last_end.filter(|&e| e != start) {
             close(&mut open, 0, last_end.min(start), &mut out);
         }
+        // The state of the frame at `depth` of this event: the leaf's.
+        let state_at = |depth: usize| (depth + 1 == frames.len()).then_some(state);
         let shared = open
             .iter()
             .zip(frames)
-            .take_while(|((name, _), frame)| merge_key(name) == merge_key(frame))
+            .enumerate()
+            .take_while(|(depth, ((name, _, was), frame))| {
+                merge_key(name) == merge_key(frame) && *was == state_at(*depth)
+            })
             .count();
         close(&mut open, shared, start, &mut out);
-        open.extend(frames[shared..].iter().map(|f| (f.as_str(), start)));
+        open.extend(
+            frames
+                .iter()
+                .enumerate()
+                .skip(shared)
+                .map(|(depth, f)| (f.as_str(), start, state_at(depth))),
+        );
         last_end = Some(end);
     }
     if let Some(last_end) = last_end {
@@ -4228,26 +4334,65 @@ mod tests {
             names(&["write (libc.so.6) <0x40>", "ksys_write ([kernel]) <0x50>"]),
         ]
         .concat();
+        let asleep = task_state("S", None, false, None);
         let events = [
-            (1_000, 2_000, &a[..]),
-            (2_000, 3_000, &a2[..]),
-            (3_000, 4_000, &b[..]),
+            (1_000, 2_000, &a[..], &asleep),
+            (2_000, 3_000, &a2[..], &asleep),
+            (3_000, 4_000, &b[..], &asleep),
         ];
-        let frame = |depth, name: &str, start, end| FrameSlice {
+        let frame = |depth, name: &str, start, end, leaf: bool| FrameSlice {
             depth,
             name: name.to_string(),
             start,
             end,
+            state: leaf.then_some(&asleep),
         };
         assert_eq!(
             merge_frames(events.into_iter()),
             [
-                frame(0, "main (app) <0x10>", 1_000, 4_000),
-                frame(1, "run (app) <0x20>", 1_000, 4_000),
-                // Named as the first event named it.
-                frame(2, "read (libc.so.6) <0x30>", 1_000, 3_000),
-                frame(2, "write (libc.so.6) <0x40>", 3_000, 4_000),
-                frame(3, "ksys_write ([kernel]) <0x50>", 3_000, 4_000),
+                frame(0, "main (app) <0x10>", 1_000, 4_000, false),
+                frame(1, "run (app) <0x20>", 1_000, 4_000, false),
+                // Named as the first event named it. The leaf of two events
+                // that say the same of the thread, and the one with its state.
+                frame(2, "read (libc.so.6) <0x30>", 1_000, 3_000, true),
+                frame(2, "write (libc.so.6) <0x40>", 3_000, 4_000, false),
+                frame(3, "ksys_write ([kernel]) <0x50>", 3_000, 4_000, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_leaf_is_one_slice_only_while_its_thread_does_one_thing_in_it() {
+        let user = names(&["main (app) <0x10>", "work (app) <0x20>"]);
+        let blocked = [user.clone(), names(&["futex_wait ([kernel]) <0x50>"])].concat();
+        let running = task_state("R", None, false, Some(true));
+        let waiting = task_state("R", None, false, Some(false));
+        let parked = task_state("S", Some(("futex", 202)), false, Some(false));
+        let events = [
+            (1_000, 2_000, &user[..], &running),
+            // The same again: nothing ends.
+            (2_000, 3_000, &user[..], &running),
+            // The same stack, without the GIL now: the leaf begins again.
+            (3_000, 4_000, &user[..], &waiting),
+            // The leaf gets a callee: it is a caller from here, with no state.
+            (4_000, 5_000, &blocked[..], &parked),
+            // And is the leaf again.
+            (5_000, 6_000, &user[..], &running),
+        ];
+        let got: Vec<_> = merge_frames(events.into_iter())
+            .into_iter()
+            .map(|f| (f.depth, f.start, f.end, f.state))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                // Its caller is one slice throughout, and says nothing.
+                (0, 1_000, 6_000, None),
+                (1, 1_000, 3_000, Some(&running)),
+                (1, 3_000, 4_000, Some(&waiting)),
+                (1, 4_000, 5_000, None),
+                (2, 4_000, 5_000, Some(&parked)),
+                (1, 5_000, 6_000, Some(&running)),
             ]
         );
     }
@@ -4256,7 +4401,11 @@ mod tests {
     fn a_changed_outer_frame_restarts_everything_under_it() {
         let a = names(&["main (app) <0x10>", "f (app) <0x20>", "leaf (app) <0x30>"]);
         let b = names(&["main (app) <0x10>", "g (app) <0x28>", "leaf (app) <0x30>"]);
-        let events = [(1_000, 2_000, &a[..]), (2_000, 3_000, &b[..])];
+        let state = TaskState::default();
+        let events = [
+            (1_000, 2_000, &a[..], &state),
+            (2_000, 3_000, &b[..], &state),
+        ];
         let got: Vec<(i32, String, i64, i64)> = merge_frames(events.into_iter())
             .into_iter()
             .map(|f| (f.depth, f.name, f.start, f.end))
@@ -4280,12 +4429,13 @@ mod tests {
     fn frames_do_not_carry_over_an_iteration_that_missed_the_thread() {
         let a = names(&["main (app) <0x10>"]);
         let none: [String; 0] = [];
+        let state = TaskState::default();
         let events = [
-            (1_000, 2_000, &a[..]),
+            (1_000, 2_000, &a[..], &state),
             // Seen again at 3000, not at 2000.
-            (3_000, 4_000, &a[..]),
+            (3_000, 4_000, &a[..], &state),
             // An event without a stack ends the frames too.
-            (4_000, 5_000, &none[..]),
+            (4_000, 5_000, &none[..], &state),
         ];
         let got: Vec<(i64, i64)> = merge_frames(events.into_iter())
             .iter()
@@ -4299,7 +4449,11 @@ mod tests {
         let a = names(&["main (app) <0x10>", "f (app) <0x20>"]);
         let b = names(&["main (app) <0x10>", "g (app) <0x30>"]);
         // The first runs on past the second's start: cut there.
-        let events = [(1_000, 3_000, &a[..]), (2_000, 4_000, &b[..])];
+        let state = TaskState::default();
+        let events = [
+            (1_000, 3_000, &a[..], &state),
+            (2_000, 4_000, &b[..], &state),
+        ];
         let got: Vec<(i32, i64, i64)> = merge_frames(events.into_iter())
             .iter()
             .map(|f| (f.depth, f.start, f.end))
@@ -4352,37 +4506,98 @@ mod tests {
         Ok(())
     }
 
-    /// task_stack_event.parquet: (ts, dur, utid, stack id).
+    /// What an event says of its thread: the kernel's letter, the system call
+    /// by name and number, the I/O wait and the GIL.
+    fn task_state(
+        state: &str,
+        syscall: Option<(&str, i32)>,
+        in_iowait: bool,
+        holds_gil: Option<bool>,
+    ) -> TaskState {
+        TaskState {
+            state: Some(state.to_string()),
+            syscall: syscall.map(|(name, _)| name.to_string()),
+            syscall_nr: syscall.map(|(_, nr)| nr),
+            in_iowait: Some(in_iowait),
+            holds_gil,
+        }
+    }
+
+    /// task_stack_event.parquet: (ts, dur, utid, stack id), every thread
+    /// asleep in no system call.
     fn create_test_task_stack_event_parquet(
         dir: &Path,
         events: &[(i64, i64, i64, Option<i64>)],
+    ) -> Result<()> {
+        let asleep = task_state("S", None, false, None);
+        let events: Vec<_> = events.iter().map(|e| (*e, asleep.clone())).collect();
+        create_test_task_stack_event_parquet_in_states(dir, &events, true)
+    }
+
+    /// task_stack_event.parquet: (ts, dur, utid, stack id) and what each event
+    /// says of its thread. `schema_31`: with the columns that came with schema
+    /// 31 (the system call, the I/O wait, the GIL), or as a file from before
+    /// it, which has the state alone.
+    fn create_test_task_stack_event_parquet_in_states(
+        dir: &Path,
+        events: &[((i64, i64, i64, Option<i64>), TaskState)],
+        schema_31: bool,
     ) -> Result<()> {
         let schema = crate::trace::task_stack_event_schema();
         let column = |values: Vec<i64>| -> Arc<dyn arrow::array::Array> {
             Arc::new(Int64Array::from(values))
         };
         let constant = |value: i64| column(vec![value; events.len()]);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                column(events.iter().map(|e| e.0).collect()),
-                column(events.iter().map(|e| e.1).collect()),
-                column(events.iter().map(|e| e.2).collect()),
-                // The iterations, deltas and state: not drawn.
-                constant(1),
-                constant(1),
-                constant(0),
-                constant(0),
-                constant(0),
-                Arc::new(events.iter().map(|_| Some("S")).collect::<StringArray>()),
-                Arc::new(events.iter().map(|e| e.3).collect::<Int64Array>()),
-                // The task_context id: not drawn.
-                Arc::new(arrow::array::UInt64Array::from(vec![
-                    None::<u64>;
-                    events.len()
-                ])),
-            ],
-        )?;
+        let states = events.iter().map(|(_, s)| s);
+        let mut columns = vec![
+            column(events.iter().map(|(e, _)| e.0).collect()),
+            column(events.iter().map(|(e, _)| e.1).collect()),
+            column(events.iter().map(|(e, _)| e.2).collect()),
+            // The iterations and deltas: not drawn.
+            constant(1),
+            constant(1),
+            constant(0),
+            constant(0),
+            constant(0),
+            Arc::new(
+                states
+                    .clone()
+                    .map(|s| s.state.as_deref())
+                    .collect::<StringArray>(),
+            ),
+            Arc::new(events.iter().map(|(e, _)| e.3).collect::<Int64Array>()),
+            // The task_context id: not drawn.
+            Arc::new(arrow::array::UInt64Array::from(vec![
+                None::<u64>;
+                events.len()
+            ])),
+        ];
+        let schema = if schema_31 {
+            columns.push(Arc::new(
+                states.clone().map(|s| s.syscall_nr).collect::<Int32Array>(),
+            ));
+            columns.push(Arc::new(
+                states
+                    .clone()
+                    .map(|s| s.syscall.as_deref())
+                    .collect::<StringArray>(),
+            ));
+            columns.push(Arc::new(
+                states
+                    .clone()
+                    .map(|s| Some(s.in_iowait == Some(true)))
+                    .collect::<BooleanArray>(),
+            ));
+            columns.push(Arc::new(
+                states.map(|s| s.holds_gil).collect::<BooleanArray>(),
+            ));
+            schema
+        } else {
+            Arc::new(arrow::datatypes::Schema::new(
+                schema.fields()[..columns.len()].to_vec(),
+            ))
+        };
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
         let file = File::create(dir.join("task_stack_event.parquet"))?;
         let mut writer = ArrowWriter::try_new(file, schema, None)?;
         writer.write(&batch)?;
@@ -4457,26 +4672,163 @@ mod tests {
         assert_eq!(begins, [("main", 1_000), ("read", 1_000), ("write", 4_000)]);
         assert_eq!(ends, [5_000, 4_000, 5_000]);
 
-        // Where a frame is from is in its arguments.
-        let read = writer
-            .packets
-            .iter()
-            .find(|p| p.has_track_event() && p.track_event().name() == "read")
-            .unwrap();
-        let args: Vec<(&str, &str)> = read
-            .track_event()
-            .debug_annotations
-            .iter()
-            .map(|a| (a.name(), a.string_value()))
-            .collect();
+        // Where a frame is from is in its arguments; a leaf's go on with what
+        // its thread was doing in it, a caller's do not.
+        let args_of = |name: &str| -> Vec<(String, String)> {
+            let slice = writer
+                .packets
+                .iter()
+                .find(|p| p.has_track_event() && p.track_event().name() == name)
+                .unwrap();
+            slice_args(slice.track_event())
+        };
+        let arg = |name: &str, value: &str| (name.to_string(), value.to_string());
         assert_eq!(
-            args,
+            args_of("read"),
             [
-                ("language", "native"),
-                ("module", "libc.so.6"),
-                ("address", "0x30")
+                arg("language", "native"),
+                arg("module", "libc.so.6"),
+                arg("address", "0x30"),
+                arg("state", "S"),
+                arg("in_iowait", "false"),
             ]
         );
+        assert_eq!(
+            args_of("main"),
+            [
+                arg("language", "native"),
+                arg("module", "app"),
+                arg("address", "0x10"),
+            ]
+        );
+    }
+
+    /// A slice's arguments by name, each value as text.
+    fn slice_args(event: &TrackEvent) -> Vec<(String, String)> {
+        event
+            .debug_annotations
+            .iter()
+            .map(|a| {
+                let value = if a.has_int_value() {
+                    a.int_value().to_string()
+                } else if a.has_bool_value() {
+                    a.bool_value().to_string()
+                } else {
+                    a.string_value().to_string()
+                };
+                (a.name().to_string(), value)
+            })
+            .collect()
+    }
+
+    /// The leaf slices a conversion of `events` draws for a thread whose
+    /// stack is `main` alone: each one's begin time and its arguments after
+    /// the frame's own.
+    fn leaf_states_of(
+        events: &[((i64, i64, i64, Option<i64>), TaskState)],
+        schema_31: bool,
+    ) -> Vec<(u64, Vec<(String, String)>)> {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+        create_test_process_parquet(dir.path(), 1, 1000).unwrap();
+        create_test_thread_parquet(dir.path(), 100, 2000, Some(1)).unwrap();
+        create_test_stack_parquet(dir.path(), &[(5, &["main (app) <0x10>"], &[])]).unwrap();
+        create_test_task_stack_event_parquet_in_states(dir.path(), events, schema_31).unwrap();
+
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+        converter
+            .write_process_and_thread_descriptors(dir.path(), &mut writer)
+            .unwrap();
+        writer.packets.clear();
+        converter
+            .write_task_stack_events(dir.path(), &mut writer)
+            .unwrap();
+        writer
+            .packets
+            .iter()
+            .filter(|p| p.has_track_event() && p.track_event().type_() == Type::TYPE_SLICE_BEGIN)
+            .map(|p| {
+                let args = slice_args(p.track_event());
+                // language, module, address: the frame's own.
+                assert_eq!(args[0], ("language".to_string(), "native".to_string()));
+                (p.timestamp(), args[3..].to_vec())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_leaf_slice_says_what_its_thread_was_doing() {
+        let arg = |name: &str, value: &str| (name.to_string(), value.to_string());
+        let parked = task_state("S", Some(("futex", 202)), false, Some(false));
+        let got = leaf_states_of(
+            &[
+                ((1_000, 1_000, 100, Some(5)), parked.clone()),
+                // The same stack and the same state: the slice runs on.
+                ((2_000, 1_000, 100, Some(5)), parked),
+                // Blocked on a page read in the same frame: a new slice.
+                (
+                    (3_000, 1_000, 100, Some(5)),
+                    task_state("D", None, true, None),
+                ),
+                (
+                    (4_000, 1_000, 100, Some(5)),
+                    task_state("R", None, false, Some(true)),
+                ),
+            ],
+            true,
+        );
+        assert_eq!(
+            got,
+            [
+                (
+                    1_000,
+                    vec![
+                        arg("state", "S"),
+                        arg("syscall", "futex"),
+                        arg("syscall_nr", "202"),
+                        arg("in_iowait", "false"),
+                        arg("holds_gil", "false"),
+                    ]
+                ),
+                // No system call, no word of a GIL: no arguments for them.
+                (3_000, vec![arg("state", "D"), arg("in_iowait", "true")]),
+                (
+                    4_000,
+                    vec![
+                        arg("state", "R"),
+                        arg("in_iowait", "false"),
+                        arg("holds_gil", "true"),
+                    ]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_from_before_schema_31_has_the_state_alone() {
+        // What the file cannot say is dropped on the way in, so the first two
+        // events differ in nothing: one slice.
+        let got = leaf_states_of(
+            &[
+                (
+                    (1_000, 1_000, 100, Some(5)),
+                    task_state("S", Some(("futex", 202)), true, Some(true)),
+                ),
+                (
+                    (2_000, 1_000, 100, Some(5)),
+                    task_state("S", Some(("read", 0)), false, None),
+                ),
+                (
+                    (3_000, 1_000, 100, Some(5)),
+                    task_state("R", None, false, None),
+                ),
+            ],
+            false,
+        );
+        let state = |letter: &str| vec![("state".to_string(), letter.to_string())];
+        assert_eq!(got, [(1_000, state("S")), (3_000, state("R"))]);
     }
 
     #[test]
@@ -4612,31 +4964,22 @@ mod tests {
         assert_ne!(stack.parent_uuid(), process_uuid);
 
         // The slice is the function; its file is the full path, which the
-        // frame's name does not have.
+        // frame's name does not have. It is the thread's leaf, so what the
+        // thread was doing follows.
         let f = writer
             .packets
             .iter()
             .find(|p| p.has_track_event() && p.track_event().name() == "f")
             .unwrap();
-        let args: Vec<(&str, String)> = f
-            .track_event()
-            .debug_annotations
-            .iter()
-            .map(|a| {
-                let value = if a.has_int_value() {
-                    a.int_value().to_string()
-                } else {
-                    a.string_value().to_string()
-                };
-                (a.name(), value)
-            })
-            .collect();
+        let arg = |name: &str, value: &str| (name.to_string(), value.to_string());
         assert_eq!(
-            args,
+            slice_args(f.track_event()),
             [
-                ("language", "python".to_string()),
-                ("file", "/srv/app/app.py".to_string()),
-                ("line", "3".to_string()),
+                arg("language", "python"),
+                arg("file", "/srv/app/app.py"),
+                arg("line", "3"),
+                arg("state", "S"),
+                arg("in_iowait", "false"),
             ]
         );
     }

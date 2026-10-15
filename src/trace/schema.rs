@@ -577,7 +577,11 @@ pub fn memory_thp_schema() -> Arc<Schema> {
 ///
 /// `task_context_id` is the thread's task_context id at the record that opened
 /// the event (`--include-task-context`), NULL when there was none; its values
-/// are the `task_context` rows with the same `utid` and `id`.
+/// are the `task_context` rows with the same `utid` and `id`. `syscall_nr` /
+/// `syscall`, `in_iowait` and `holds_gil` are what that record read of what
+/// the thread was waiting in (schema 31): the system call it was in (NULL for
+/// none, or not known), whether it was blocked on I/O, and whether it held its
+/// interpreter's GIL (NULL where no Python walk could tell).
 pub fn task_stack_event_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),
@@ -591,6 +595,10 @@ pub fn task_stack_event_schema() -> Arc<Schema> {
         Field::new("state", DataType::Utf8, false),
         Field::new("stack_id", DataType::Int64, true),
         Field::new("task_context_id", DataType::UInt64, true),
+        Field::new("syscall_nr", DataType::Int32, true),
+        Field::new("syscall", DataType::Utf8, true),
+        Field::new("in_iowait", DataType::Boolean, false),
+        Field::new("holds_gil", DataType::Boolean, true),
     ]))
 }
 

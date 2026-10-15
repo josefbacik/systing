@@ -383,6 +383,10 @@ pub struct ObjectOffsets {
     pub runtime_debug_offsets: usize,
     pub debug_interpreters_head: usize,
     pub debug_imports_modules: usize,
+    // Where the same table says the GIL's `locked` and `last_holder` are in
+    // an interpreter's state (discovery.rs).
+    pub debug_gil_locked: usize,
+    pub debug_gil_holder: usize,
 
     // PyObject, and the bytes ahead of it where its managed dict pointer sits
     pub ob_type: usize,
@@ -440,6 +444,8 @@ macro_rules! object_offsets {
             runtime_debug_offsets: PYRUNTIME_DEBUG_OFFSETS_OFFSET,
             debug_interpreters_head: PY_DEBUG_OFFSETS_RUNTIME_INTERPRETERS_HEAD,
             debug_imports_modules: PY_DEBUG_OFFSETS_INTERP_IMPORTS_MODULES,
+            debug_gil_locked: PY_DEBUG_OFFSETS_INTERP_GIL_LOCKED,
+            debug_gil_holder: PY_DEBUG_OFFSETS_INTERP_GIL_HOLDER,
             ob_type: PY_OBJECT_OB_TYPE,
             managed_dict_before: PY_OBJECT_MANAGED_DICT_BEFORE,
             type_basicsize: PY_TYPE_OBJECT_TP_BASICSIZE,
@@ -527,6 +533,8 @@ mod tests {
         assert_eq!(p.interp_modules, 7664);
         // Nor is the process's own table of offsets laid out the same.
         assert_eq!((o.debug_imports_modules, p.debug_imports_modules), (88, 96));
+        assert_eq!((o.debug_gil_locked, o.debug_gil_holder), (136, 144));
+        assert_eq!((p.debug_gil_locked, p.debug_gil_holder), (144, 152));
         assert_eq!(p.heap_type_cached_keys, o.heap_type_cached_keys);
         assert_eq!(object_offsets_for_version(3, 15), Some(p));
     }
