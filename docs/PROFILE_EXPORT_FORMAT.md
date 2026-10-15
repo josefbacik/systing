@@ -132,6 +132,13 @@ Frame strings are exactly systing's symbolized frame names:
   samples), so there is never an `<0xaddr>` suffix; the frame exists so that
   CPU time spent inside VMs is counted and attributed to the VMM process
   rather than dropped. It is emitted regardless of `--no-frame-labels`.
+- Closed stack store: `unknown ([stack-store-full])` — a one-frame stack that
+  stands for every stack first seen after the recorder's unique-stack store
+  closed (`--stack-spill-budget-mib`, its file system ran low on free space,
+  or a write to one of the spill files failed). Each recorder that interns
+  stacks has one such stack of its own, so a trace holds at most one per
+  recorder. There is no address suffix, and it is emitted regardless of
+  `--no-frame-labels`.
 - Python (pystacks): `name (python) [file.py:line]` — no address suffix.
 - With `--no-frame-labels`: bare hex addresses (`0x7f95bfdb6e12`).
 

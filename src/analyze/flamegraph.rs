@@ -492,8 +492,8 @@ fn format_folded_stack_into(
 /// mapping rather than reading left to right. `mapping` is a real object
 /// name (`vmlinux`, `myapp`) or one of the recorder's bracketed pseudo-mapping
 /// labels (`[kernel]`, `[guest]`, `[exited]`, `[gvisor:*]`, `[jit:*]`,
-/// `[anon]`, `[buildid:…]`); the label's own brackets are the only ones it
-/// ever gets.
+/// `[anon]`, `[buildid:…]`, `[stack-store-full]`); the label's own brackets
+/// are the only ones it ever gets.
 static MAPPING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r" \(([^()]+?)(?: \[([^\[\]:]+)(?::(\d+))?\])?\)$").unwrap());
 
@@ -737,6 +737,7 @@ mod tests {
             "[anon]",
             "[anon:exec]",
             "[buildid:5a5a5a5a]",
+            "[stack-store-full]",
         ] {
             assert_eq!(
                 format_frame(&format!("unknown ({label}) <0x7f0000000100>")),
@@ -745,6 +746,11 @@ mod tests {
             );
         }
         assert_eq!(format_frame("unknown ([guest])"), "[guest]:unknown");
+        // The closed stack store's placeholder frame carries no address.
+        assert_eq!(
+            format_frame("unknown ([stack-store-full])"),
+            "[stack-store-full]:unknown"
+        );
     }
 
     #[test]
