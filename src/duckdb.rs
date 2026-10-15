@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 30;
+pub const SCHEMA_VERSION: u32 = 31;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -769,7 +769,19 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- --include-task-context: the thread's task_context id as the
             -- record that opened the event found it, NULL when none; its
             -- values are the task_context rows with the same utid and id.
-            task_context_id UBIGINT
+            task_context_id UBIGINT,
+            -- What tells a parked thread from one blocked on work, as the
+            -- record that opened the event read it (schema 31). The system
+            -- call the thread was in, by number (the recording kernel's
+            -- native table) and by name: NULL when it was in none, was on a
+            -- CPU, is a kernel thread or a 32-bit task.
+            syscall_nr INTEGER,
+            syscall VARCHAR,
+            -- The kernel's mark of a thread blocked on I/O.
+            in_iowait BOOLEAN,
+            -- Whether the thread held its Python interpreter's GIL; NULL for
+            -- a thread with no Python frames walked.
+            holds_gil BOOLEAN
         );
 
         -- --include-task-context: one named value of one task_context id
@@ -2988,6 +3000,139 @@ mod tests {
             err.contains("wchan") && !err.contains("thread_name"),
             "{err}"
         );
+    }
+
+    /// A `task_stack_event.parquet` written before schema 31 has none of the
+    /// columns that say what its thread was waiting in: it imports whole,
+    /// under strict_schema too, with all four NULL, which is "not recorded"
+    /// and never "in no system call" or "not blocked on I/O". One written at
+    /// schema 31 carries them, and the questions they answer are plain
+    /// filters.
+    #[test]
+    fn test_a_task_stack_event_file_without_the_wait_columns_imports_with_nulls() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        let parquet = |name: &str, select: &str| -> String {
+            let path = temp_dir.path().join(name).to_string_lossy().into_owned();
+            conn.execute_batch(&format!("COPY ({select}) TO '{path}' (FORMAT PARQUET)"))
+                .unwrap();
+            format!("read_parquet('{path}')")
+        };
+        let strict = ImportOptions {
+            strict_schema: true,
+        };
+        let mut report = ImportReport::default();
+        let event = |utid: i64, state: &str| {
+            format!(
+                "10::BIGINT AS ts, 5::BIGINT AS dur, {utid}::BIGINT AS utid, \
+                 1::BIGINT AS start_iteration, 1::BIGINT AS end_iteration, \
+                 0::BIGINT AS utime_delta_ns, 0::BIGINT AS stime_delta_ns, \
+                 0::BIGINT AS runtime_delta_ns, '{state}' AS state, 7::BIGINT AS stack_id, \
+                 NULL::UBIGINT AS task_context_id"
+            )
+        };
+        let wait = |nr: &str, name: &str, iowait: bool, gil: &str| {
+            format!(
+                "{nr}::INTEGER AS syscall_nr, {name}::VARCHAR AS syscall, \
+                 {iowait} AS in_iowait, {gil}::BOOLEAN AS holds_gil"
+            )
+        };
+
+        let older = parquet("older.parquet", &format!("SELECT {}", event(1, "S")));
+        let newer = parquet(
+            "newer.parquet",
+            &format!(
+                "SELECT {}, {} UNION ALL SELECT {}, {} UNION ALL SELECT {}, {}",
+                // Parked in a futex wait.
+                event(1, "S"),
+                wait("202", "'futex'", false, "false"),
+                // Blocked on a read from disk.
+                event(2, "D"),
+                wait("17", "'pread64'", true, "NULL"),
+                // Running Python, in no system call.
+                event(3, "R"),
+                wait("NULL", "NULL", false, "true"),
+            ),
+        );
+        for (trace, file) in [("older", &older), ("newer", &newer)] {
+            let columns = import_column_list(&conn, "task_stack_event", file, strict, &mut report)
+                .unwrap()
+                .unwrap();
+            assert_eq!(columns, "*");
+            conn.execute_batch(&format!(
+                "INSERT INTO task_stack_event BY NAME SELECT '{trace}' AS trace_id, {columns} FROM {file}"
+            ))
+            .unwrap();
+        }
+        assert_eq!(report, ImportReport::default());
+
+        type Row = (
+            String,
+            i64,
+            Option<i32>,
+            Option<String>,
+            Option<bool>,
+            Option<bool>,
+        );
+        let mut stmt = conn
+            .prepare(
+                "SELECT trace_id, utid, syscall_nr, syscall, in_iowait, holds_gil \
+                 FROM task_stack_event ORDER BY trace_id DESC, utid",
+            )
+            .unwrap();
+        let rows: Vec<Row> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let (older, newer) = ("older".to_string(), "newer".to_string());
+        assert_eq!(
+            rows,
+            vec![
+                (older, 1, None, None, None, None),
+                (
+                    newer.clone(),
+                    1,
+                    Some(202),
+                    Some("futex".to_string()),
+                    Some(false),
+                    Some(false)
+                ),
+                (
+                    newer.clone(),
+                    2,
+                    Some(17),
+                    Some("pread64".to_string()),
+                    Some(true),
+                    None
+                ),
+                (newer, 3, None, None, Some(false), Some(true)),
+            ]
+        );
+
+        // The thread that holds the GIL, and the threads blocked on I/O.
+        let utids = |filter: &str| -> Vec<i64> {
+            conn.prepare(&format!(
+                "SELECT utid FROM task_stack_event WHERE {filter} ORDER BY utid"
+            ))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+        };
+        assert_eq!(utids("holds_gil"), [3]);
+        assert_eq!(utids("in_iowait"), [2]);
     }
 
     /// A `task_stack_event.parquet` written before schema 27 has no

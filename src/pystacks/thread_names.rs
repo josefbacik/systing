@@ -41,9 +41,9 @@ const REFRESH_AFTER: Duration = Duration::from_secs(1);
 const MAX_THREADS: usize = 1 << 16;
 
 /// What `_PyRuntime` starts with in a Python that publishes its offsets.
-const DEBUG_OFFSETS_COOKIE: &[u8; 8] = b"xdebugpy";
+pub(super) const DEBUG_OFFSETS_COOKIE: &[u8; 8] = b"xdebugpy";
 /// No struct the offsets are into is anywhere near this big.
-const MAX_DEBUG_OFFSET: usize = 1 << 20;
+pub(super) const MAX_DEBUG_OFFSET: usize = 1 << 20;
 
 /// Where the main interpreter is in `_PyRuntime`, and sys.modules in an
 /// interpreter: what the process's own `_Py_DebugOffsets` says, else what the

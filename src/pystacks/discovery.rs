@@ -322,10 +322,22 @@ fn try_python_module(
         if process::read_process_memory(pid, interp_head_addr, &mut interp_addr_buf).is_ok() {
             let interp_addr = usize::from_ne_bytes(interp_addr_buf);
             if interp_addr != 0 {
-                pid_data.gil_locked_addr =
-                    interp_addr + pid_data.offsets.py_interpreter_state_gil_locked;
-                pid_data.gil_last_holder_addr =
-                    interp_addr + pid_data.offsets.py_interpreter_state_gil_last_holder;
+                // The process's own word first: the bindings have where the
+                // GIL was in the release they were generated from.
+                let word = |addr: usize| {
+                    let mut buf = [0u8; 8];
+                    process::read_process_memory(pid, addr, &mut buf)
+                        .ok()
+                        .map(|_| usize::from_ne_bytes(buf))
+                };
+                let (locked, last_holder) = offsets::object_offsets_for_version(major, minor)
+                    .and_then(|o| own_gil_offsets(word, &o, effective_runtime_addr))
+                    .unwrap_or((
+                        pid_data.offsets.py_interpreter_state_gil_locked,
+                        pid_data.offsets.py_interpreter_state_gil_last_holder,
+                    ));
+                pid_data.gil_locked_addr = interp_addr + locked;
+                pid_data.gil_last_holder_addr = interp_addr + last_holder;
             }
         }
     }
@@ -346,6 +358,30 @@ fn try_python_module(
 }
 
 /// Resolve a path through /proc/pid/root for containerized processes.
+/// Where the GIL's `locked` and `last_holder` are in an interpreter's state,
+/// as the process's own `_Py_DebugOffsets` has them (3.13+): `word` reads
+/// eight bytes of the process at an address, `runtime_addr` is its
+/// `_PyRuntime`. An interpreter's state grows in patch releases, the GIL
+/// with what is ahead of it (24 bytes between 3.14.0 and 3.14.7), and at the
+/// bindings' offsets a later release has other fields: one that reads 1 where
+/// `locked` was and 0 where the holder was makes every walk find the GIL
+/// held by no thread it knows. `None` without the table, or with a value in
+/// it that no offset can be: the caller has the bindings'.
+fn own_gil_offsets(
+    word: impl Fn(usize) -> Option<usize>,
+    o: &offsets::ObjectOffsets,
+    runtime_addr: usize,
+) -> Option<(usize, usize)> {
+    use super::thread_names::{DEBUG_OFFSETS_COOKIE, MAX_DEBUG_OFFSET};
+
+    let table = runtime_addr + o.runtime_debug_offsets;
+    if &word(table)?.to_ne_bytes() != DEBUG_OFFSETS_COOKIE {
+        return None;
+    }
+    let own = |at: usize| word(table + at).filter(|offset| (1..MAX_DEBUG_OFFSET).contains(offset));
+    Some((own(o.debug_gil_locked)?, own(o.debug_gil_holder)?))
+}
+
 fn resolve_proc_path(pid: i32, path: &str) -> String {
     let proc_root = format!("/proc/{pid}/root{path}");
     if Path::new(&proc_root).exists() {
@@ -559,6 +595,43 @@ fn find_module_base_address(maps: &[MemoryMapping], module_path: &str) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GIL's offsets come from the process's own table, wherever its
+    /// release put the GIL; without a table that can be believed there are
+    /// none, and the caller keeps the bindings'.
+    #[test]
+    fn test_gil_offsets_are_the_processs_own() {
+        let o = offsets::object_offsets_for_version(3, 14).unwrap();
+        let runtime = 0x7f00_0000_1000usize;
+        // A table as 3.14.7 fills it: the GIL 24 bytes past the bindings'.
+        let table = |cookie: &[u8; 8], locked: usize, holder: usize| {
+            HashMap::from([
+                (
+                    runtime + o.runtime_debug_offsets,
+                    usize::from_ne_bytes(*cookie),
+                ),
+                (
+                    runtime + o.runtime_debug_offsets + o.debug_gil_locked,
+                    locked,
+                ),
+                (
+                    runtime + o.runtime_debug_offsets + o.debug_gil_holder,
+                    holder,
+                ),
+            ])
+        };
+        let read = |mem: HashMap<usize, usize>| {
+            own_gil_offsets(|addr| mem.get(&addr).copied(), &o, runtime)
+        };
+
+        assert_eq!(read(table(b"xdebugpy", 7800, 7792)), Some((7800, 7792)));
+        // No table at the head of the runtime, a read that fails, and values
+        // that are no offsets into an interpreter's state.
+        assert_eq!(read(table(b"\0\0\0\0\0\0\0\0", 7800, 7792)), None);
+        assert_eq!(read(HashMap::new()), None);
+        assert_eq!(read(table(b"xdebugpy", 0, 7792)), None);
+        assert_eq!(read(table(b"xdebugpy", 7800, 1 << 20)), None);
+    }
 
     #[test]
     fn test_parse_cpython_version() {

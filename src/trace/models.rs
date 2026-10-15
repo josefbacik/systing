@@ -891,6 +891,17 @@ pub struct MemoryThpRecord {
 /// when it had none; its values are the `task_context` rows with the same
 /// `utid` and `id`. The thread's names, the kernel's and its Python
 /// process's, are on `thread`: join it on `utid`.
+///
+/// The last four are what tells a thread that is parked from one that is
+/// blocked on work, each as the record that opened the event read it.
+/// `syscall_nr` / `syscall` are the system call the thread was in, by its
+/// number in the recording kernel's native table and by name (`futex`,
+/// `epoll_wait`, `read`): `None` when it was in none (a fault, user code), was
+/// on a CPU (its saved registers say nothing then), is a kernel thread or a
+/// 32-bit task. `in_iowait` is the kernel's own mark of a thread blocked on
+/// I/O. `holds_gil` is whether the thread held its Python interpreter's GIL:
+/// `None` for a thread with no Python frames walked, or whose walk could not
+/// tell.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TaskStackEventRecord {
     pub ts: i64,
@@ -904,6 +915,10 @@ pub struct TaskStackEventRecord {
     pub state: String,
     pub stack_id: Option<i64>,
     pub task_context_id: Option<u64>,
+    pub syscall_nr: Option<i32>,
+    pub syscall: Option<String>,
+    pub in_iowait: bool,
+    pub holds_gil: Option<bool>,
 }
 
 /// One named value of one task_context id of one thread

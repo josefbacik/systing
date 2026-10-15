@@ -56,6 +56,8 @@ pub const PY_DICT_VALUES_VALUES: usize = 8;
 // _Py_DebugOffsets
 pub const PY_DEBUG_OFFSETS_RUNTIME_INTERPRETERS_HEAD: usize = 40;
 pub const PY_DEBUG_OFFSETS_INTERP_IMPORTS_MODULES: usize = 88;
+pub const PY_DEBUG_OFFSETS_INTERP_GIL_LOCKED: usize = 136;
+pub const PY_DEBUG_OFFSETS_INTERP_GIL_HOLDER: usize = 144;
 
 // PyTupleObject
 pub const PY_TUPLE_OBJECT_OB_ITEM: usize = 24;

@@ -43,7 +43,7 @@ fn convert_arg(arg: &(String, ArgValue)) -> (String, Option<i64>, Option<String>
 }
 
 /// Get the name for a syscall number.
-fn syscall_name(nr: u64) -> String {
+pub(crate) fn syscall_name(nr: u64) -> String {
     use syscalls::Sysno;
     Sysno::new(nr as usize)
         .map(|sysno| sysno.name().to_string())

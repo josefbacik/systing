@@ -445,6 +445,88 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 31 (systing 1.28.0) — 2026-10-14
+
+The task-stacks recorder says what each thread was waiting in, beside where
+its stack shows it. A snapshot records every targeted thread, the blocked ones
+included, and most of those are parked: a pool worker waiting for work, an
+event loop in `epoll_wait`. A profiler that samples processes from outside
+tells them from threads that are busy by the thread's state, and for Python
+by the GIL (py-spy's idle test is the state alone: `R` or not); a task-stacks
+row had the state and nothing more. It now carries the three things that tell
+a parked thread from one blocked on work without reading its frames: the
+system call it is in, whether the kernel counts it as waiting for I/O, and
+whether it holds its interpreter's GIL. Nothing is filtered: every thread is
+recorded as before, and the columns are there to filter on.
+
+### Added columns
+- `task_stack_event.syscall_nr` (INTEGER) and `task_stack_event.syscall`
+  (VARCHAR): the system call the thread was in when the record that opened
+  the event was taken, by its number in the recording kernel's native table
+  and by name (`futex`, `epoll_wait`, `read`; `syscall_<nr>` for a number
+  this build has no name for). Read from the thread's saved user registers
+  (`orig_ax` on x86-64, `syscallno` on arm64, `a7` when the saved cause is a
+  system call on riscv), so it reads no memory of the thread's and is there
+  on a kernel where the recorder may not read other tasks' memory
+  (`sysinfo.task_stacks_remote_reads = 'off:...'`). Exact for a thread that
+  is off its CPU, blocked or preempted. NULL when the thread was in no system
+  call (blocked in a page fault, preempted in user code), when it was on a
+  CPU as the snapshot reached it (its saved registers are then those of its
+  last kernel entry and say nothing of now: most `R` rows), for a kernel
+  thread, and for a 32-bit task, whose numbers are another table's.
+- `task_stack_event.in_iowait` (BOOLEAN): the kernel's own mark of a thread
+  blocked on I/O (`task_struct.in_iowait`, what the `iowait` CPU time is
+  counted from): true while the thread sleeps in `io_schedule()`, on a page
+  read, a direct read or write, a block-layer wait. A thread asleep on a
+  socket, a pipe, a futex or a timer is not in it.
+- `task_stack_event.holds_gil` (BOOLEAN): whether the thread held its Python
+  interpreter's GIL: true when the GIL was locked and the thread was its
+  holder, false when it was free or another thread's. NULL where no Python
+  walk could tell: a thread with no Python frames, `--task-stacks-frames
+  native`, a capture that may not read other tasks' memory, an interpreter
+  whose GIL the walker did not find. `R` and not holding the GIL is a thread
+  waiting for it or running native code that released it; blocked and holding
+  it is a call that sleeps without releasing it, with every other Python
+  thread of the process waiting behind it.
+
+  ```sql
+  -- py-spy's default view: the threads that were not idle
+  SELECT * FROM task_stack_event WHERE state = 'R';
+  -- py-spy --gil: the thread that held the GIL
+  SELECT * FROM task_stack_event WHERE holds_gil;
+
+  -- Where the blocked time went, by what the threads were waiting in
+  SELECT coalesce(e.syscall, '(no system call)') AS waiting_in, e.in_iowait,
+         count(DISTINCT e.utid) AS threads, sum(e.dur) / 1e9 AS seconds
+  FROM task_stack_event e
+  WHERE e.state <> 'R'
+  GROUP BY 1, 2 ORDER BY seconds DESC;
+  ```
+
+### Notes
+- All three are read by the record that opens an event, and an event runs on
+  only while its thread has not been on a CPU: a thread that has not run has
+  left no system call, come out of no I/O wait, and neither taken nor dropped
+  the GIL. So they hold for the whole of `dur`.
+- A thread in `futex` is parked on a condition variable as often as it is
+  blocked on a contended lock: the call does not say which, the frames above
+  it do (`stack.frame_names`).
+- The Perfetto trace shows them where the stack is, as arguments: on a
+  thread's `Task Stacks: <thread>` track the slice of its leaf frame (the
+  innermost one, at the bottom) has `state`, `syscall`, `syscall_nr`,
+  `in_iowait` and `holds_gil` after the frame's own arguments, each where the
+  row has a value. They are on the leaf alone because they are the thread's,
+  not a frame's, and the leaf is where the thread stood. So that a slice says
+  one thing for its whole length, a leaf's slice now ends, and begins again,
+  where the thread's state changes in it or it gets a callee; its callers
+  merge across events as before.
+- Backward compatible: a reader at this version imports an older
+  `task_stack_event.parquet` with all four columns NULL, which is "not
+  recorded" and never "none", and its Perfetto trace has `state` alone on the
+  leaf slices. A reader from before this version imports a newer file without
+  the columns and warns once that it left them out (under `strict_schema`, an
+  error).
+
 ## Schema Version 30 (systing 1.27.0) — 2026-10-09
 
 `--include-go-context`: for a running-stack sample of a Go program, the

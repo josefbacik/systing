@@ -250,6 +250,47 @@ fn state_name(state: u32) -> &'static str {
 /// `task_stacks_event.flags`: the thread's last record still stands, and no
 /// stacks follow this one (TASK_STACKS_UNCHANGED).
 const FLAG_UNCHANGED: u32 = 1;
+/// `task_stacks_event.flags`: the thread is blocked on I/O
+/// (TASK_STACKS_IN_IOWAIT).
+const FLAG_IN_IOWAIT: u32 = 2;
+
+/// What a walk found of the GIL, as pystacks' message has it
+/// (`PYSTACKS_GIL_STATE_*`, pystacks.bpf.h): free, held by the walked thread,
+/// or held by another, which pystacks tells three ways.
+const GIL_STATE_NOT_LOCKED: u8 = 3;
+const GIL_STATE_THIS_THREAD: u8 = 4;
+const GIL_STATE_GLOBAL_CURRENT_THREAD: u8 = 5;
+const GIL_STATE_OTHER_THREAD: u8 = 6;
+const GIL_STATE_NULL: u8 = 7;
+
+/// Whether a thread whose walk read `gil_state` held its interpreter's GIL;
+/// `None` when the walk could not tell (no GIL found, a failed read).
+fn holds_gil(gil_state: u8) -> Option<bool> {
+    match gil_state {
+        GIL_STATE_THIS_THREAD => Some(true),
+        GIL_STATE_NOT_LOCKED
+        | GIL_STATE_GLOBAL_CURRENT_THREAD
+        | GIL_STATE_OTHER_THREAD
+        | GIL_STATE_NULL => Some(false),
+        _ => None,
+    }
+}
+
+/// What tells a thread that is parked from one that is blocked on work, as
+/// its record read it; with the state and the stack, all there is to judge a
+/// thread idle by. An event keeps the one it opened with: a thread that has
+/// not run has changed none of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskActivity {
+    /// The system call the thread was in, by its number; `None` when it was
+    /// in none, or on a CPU, where its saved registers say nothing.
+    pub syscall_nr: Option<i32>,
+    /// The thread was blocked on I/O (`task_struct.in_iowait`).
+    pub in_iowait: bool,
+    /// Whether the thread held its interpreter's GIL; `None` for a thread
+    /// with no Python frames walked, or whose walk could not tell.
+    pub holds_gil: Option<bool>,
+}
 
 /// One thread as an iteration saw it.
 pub struct TaskSample {
@@ -265,6 +306,11 @@ pub struct TaskSample {
     pub runtime_delta: u64,
     /// `__state | exit_state`.
     pub state: u32,
+    /// The system call the thread was in, by its number; `None` when it was
+    /// in none or on a CPU, and always for an unchanged record.
+    pub syscall_nr: Option<i32>,
+    /// The thread was blocked on I/O; never set in an unchanged record.
+    pub in_iowait: bool,
     /// The thread's task_context id (`--include-task-context`); `None` for
     /// none, and always for an unchanged record, which reads none.
     pub task_context_id: Option<u64>,
@@ -293,6 +339,21 @@ impl TaskSample {
             && stack.user_stack.is_empty()
             && stack.py_stack.is_empty();
         (!empty).then_some(stack)
+    }
+
+    /// What the record says of the thread beside its state and stack. The
+    /// GIL is the Python walk's to tell, so it is known only where `mode`
+    /// collects Python frames and the thread had some: a walk that found no
+    /// thread state compares the GIL's holder with nothing.
+    fn activity(&self, mode: TaskStackFrames) -> TaskActivity {
+        TaskActivity {
+            syscall_nr: self.syscall_nr,
+            in_iowait: self.in_iowait,
+            holds_gil: match &self.py_msg {
+                Some(msg) if mode.python() && msg.stack_len > 0 => holds_gil(msg.gil_state),
+                _ => None,
+            },
+        }
     }
 }
 
@@ -373,6 +434,8 @@ fn parse_records(buf: &[u8]) -> Result<Vec<TaskSample>> {
             stime_delta: e.stime_delta,
             runtime_delta: e.runtime_delta,
             state: e.state,
+            syscall_nr: (e.syscall_nr >= 0).then_some(e.syscall_nr),
+            in_iowait: e.flags & FLAG_IN_IOWAIT != 0,
             task_context_id: convert_task_context_id(e.task_context_id),
             kernel_stack,
             user_stack,
@@ -1758,6 +1821,7 @@ impl TaskStacksThread {
                                         stime_delta: sample.stime_delta,
                                         runtime_delta: sample.runtime_delta,
                                         state: sample.state,
+                                        activity: sample.activity(mode),
                                         stack,
                                         task_context_id: sample.task_context_id,
                                     }))
@@ -1849,6 +1913,7 @@ pub struct TaskEntry {
     pub stime_delta: u64,
     pub runtime_delta: u64,
     pub state: u32,
+    pub activity: TaskActivity,
     pub stack: Option<Stack>,
     pub task_context_id: Option<u64>,
 }
@@ -1877,6 +1942,7 @@ struct TaskEvent {
     stime_delta: u64,
     runtime_delta: u64,
     state: u32,
+    activity: TaskActivity,
     stack_id: Option<i64>,
     task_context_id: Option<u64>,
 }
@@ -1949,6 +2015,7 @@ impl TaskStacksRecorder {
                         stime_delta: entry.stime_delta,
                         runtime_delta: entry.runtime_delta,
                         state: entry.state,
+                        activity: entry.activity,
                         stack_id,
                         task_context_id: entry.task_context_id,
                     });
@@ -1992,6 +2059,13 @@ impl TaskStacksRecorder {
                 state: state_name(event.state).to_string(),
                 stack_id: event.stack_id,
                 task_context_id: event.task_context_id,
+                syscall_nr: event.activity.syscall_nr,
+                syscall: event
+                    .activity
+                    .syscall_nr
+                    .map(|nr| crate::events::syscall_name(nr as u64)),
+                in_iowait: event.activity.in_iowait,
+                holds_gil: event.activity.holds_gil,
             })?;
         }
         Ok(())
@@ -2251,6 +2325,7 @@ mod tests {
         e.runtime_delta = deltas.0 + deltas.1;
         e.state = 1;
         e.flags = flags;
+        e.syscall_nr = -1;
         e.kernel_stack_len = kernel.len() as u32;
         e.user_stack_len = user.len() as u32;
         e.py_len = py.len() as u32;
@@ -2277,6 +2352,7 @@ mod tests {
             stime_delta: 0,
             runtime_delta: 0,
             state: 0,
+            activity: TaskActivity::default(),
             stack,
             task_context_id,
         })
@@ -2829,6 +2905,101 @@ mod tests {
         assert!(samples[2].unchanged);
     }
 
+    /// A record of a thread in system call `syscall_nr` (-1: in none): the
+    /// header alone.
+    fn record_bytes_in_syscall(t: &task_info, flags: u32, syscall_nr: i32) -> Vec<u8> {
+        let mut e = task_stacks_event::default();
+        e.task.tgidpid = t.tgidpid;
+        e.task.comm = t.comm;
+        e.flags = flags;
+        e.syscall_nr = syscall_nr;
+        unsafe { plain::as_bytes(&e) }.to_vec()
+    }
+
+    #[test]
+    fn parse_records_reads_the_system_call_and_the_io_wait() {
+        let t = task(100, 100, "main");
+        let mut buf = record_bytes_in_syscall(&t, 0, 202);
+        buf.extend(record_bytes_in_syscall(&t, FLAG_IN_IOWAIT, 0));
+        buf.extend(record_bytes_in_syscall(&t, 0, -1));
+        let read: Vec<_> = parse_records(&buf)
+            .unwrap()
+            .iter()
+            .map(|s| (s.syscall_nr, s.in_iowait, s.unchanged))
+            .collect();
+        // 0 is a system call (x86-64's read): only a negative number is none.
+        assert_eq!(
+            read,
+            [
+                (Some(202), false, false),
+                (Some(0), true, false),
+                (None, false, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_gils_holder_holds_it() {
+        assert_eq!(holds_gil(GIL_STATE_THIS_THREAD), Some(true));
+        for other in [
+            GIL_STATE_NOT_LOCKED,
+            GIL_STATE_GLOBAL_CURRENT_THREAD,
+            GIL_STATE_OTHER_THREAD,
+            GIL_STATE_NULL,
+        ] {
+            assert_eq!(holds_gil(other), Some(false), "gil_state {other}");
+        }
+        // No GIL found (0), a failed read (1), an interpreter that has not
+        // made one yet (2), a value this build does not know.
+        for unknown in [0, 1, 2, 8, u8::MAX] {
+            assert_eq!(holds_gil(unknown), None, "gil_state {unknown}");
+        }
+    }
+
+    #[test]
+    fn the_gil_is_known_only_where_python_frames_are_walked() {
+        let t = task(100, 100, "main");
+        // SAFETY: all-zero bytes are a valid pystacks_message (read_py_msg).
+        let mut msg: pystacks_message = unsafe { std::mem::zeroed() };
+        msg.gil_state = GIL_STATE_THIS_THREAD;
+        msg.stack_len = 1;
+        let header = std::mem::offset_of!(pystacks_message, buffer);
+        let mut buf = record_bytes(
+            &t,
+            0,
+            (0, 0),
+            &[],
+            &[0x401000],
+            &unsafe { plain::as_bytes(&msg) }[..header],
+        );
+        buf.extend(record_bytes(&t, 0, (0, 0), &[], &[0x401000], &[]));
+        // A message with no frames: the walk had no thread state to compare.
+        msg.stack_len = 0;
+        buf.extend(record_bytes(
+            &t,
+            0,
+            (0, 0),
+            &[],
+            &[0x401000],
+            &unsafe { plain::as_bytes(&msg) }[..header],
+        ));
+        let samples = parse_records(&buf).unwrap();
+
+        assert_eq!(
+            samples[0].activity(TaskStackFrames::All).holds_gil,
+            Some(true)
+        );
+        assert_eq!(
+            samples[0].activity(TaskStackFrames::Python).holds_gil,
+            Some(true)
+        );
+        // The Python walk did not run for this capture's records, whatever
+        // bytes one carries; and a thread it found no frames of has none.
+        assert_eq!(samples[0].activity(TaskStackFrames::Native).holds_gil, None);
+        assert_eq!(samples[1].activity(TaskStackFrames::All).holds_gil, None);
+        assert_eq!(samples[2].activity(TaskStackFrames::All).holds_gil, None);
+    }
+
     #[test]
     fn parse_records_rejects_truncated_records() {
         let t = task(1, 1, "x");
@@ -2920,6 +3091,11 @@ mod tests {
                 stime_delta: 40,
                 runtime_delta: 345,
                 state: 0x2,
+                activity: TaskActivity {
+                    syscall_nr: Some(syscalls::Sysno::read as i32),
+                    in_iowait: true,
+                    holds_gil: Some(false),
+                },
                 stack: stack(),
                 task_context_id: Some(0x2a),
             })],
@@ -2943,7 +3119,21 @@ mod tests {
                 state: "D".to_string(),
                 stack_id: Some(TASK_STACKS_STACK_ID_OFFSET),
                 task_context_id: Some(0x2a),
+                syscall_nr: Some(syscalls::Sysno::read as i32),
+                syscall: Some("read".to_string()),
+                in_iowait: true,
+                holds_gil: Some(false),
             }
+        );
+        // In no system call, and nothing known of a GIL: no values.
+        assert_eq!(
+            (
+                events[1].syscall_nr,
+                events[1].syscall.as_deref(),
+                events[1].in_iowait,
+                events[1].holds_gil
+            ),
+            (None, None, false, None)
         );
         assert_eq!(events[1].stack_id, Some(TASK_STACKS_STACK_ID_OFFSET));
         assert_eq!(events[2].stack_id, None);

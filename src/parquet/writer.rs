@@ -3312,6 +3312,10 @@ fn build_task_stack_event_batch(
     let mut state = StringBuilder::with_capacity(n, n);
     let mut stack_id = Int64Builder::with_capacity(n);
     let mut task_context_id = UInt64Builder::with_capacity(n);
+    let mut syscall_nr = Int32Builder::with_capacity(n);
+    let mut syscall = StringBuilder::with_capacity(n, n * 8);
+    let mut in_iowait = BooleanBuilder::with_capacity(n);
+    let mut holds_gil = BooleanBuilder::with_capacity(n);
     for r in records {
         ts.append_value(r.ts);
         dur.append_value(r.dur);
@@ -3324,6 +3328,10 @@ fn build_task_stack_event_batch(
         state.append_value(&r.state);
         stack_id.append_option(r.stack_id);
         task_context_id.append_option(r.task_context_id);
+        syscall_nr.append_option(r.syscall_nr);
+        syscall.append_option(r.syscall.as_deref());
+        in_iowait.append_value(r.in_iowait);
+        holds_gil.append_option(r.holds_gil);
     }
     Ok(RecordBatch::try_new(
         schema.clone(),
@@ -3339,6 +3347,10 @@ fn build_task_stack_event_batch(
             Arc::new(state.finish()),
             Arc::new(stack_id.finish()),
             Arc::new(task_context_id.finish()),
+            Arc::new(syscall_nr.finish()),
+            Arc::new(syscall.finish()),
+            Arc::new(in_iowait.finish()),
+            Arc::new(holds_gil.finish()),
         ],
     )?)
 }

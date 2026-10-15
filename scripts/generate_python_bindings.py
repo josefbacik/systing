@@ -276,6 +276,14 @@ def get_offset_program(cpython_path, version):
             "PY_DEBUG_OFFSETS_INTERP_IMPORTS_MODULES",
             "offsetof(_Py_DebugOffsets, interpreter_state.imports_modules)",
         )
+        emit(
+            "PY_DEBUG_OFFSETS_INTERP_GIL_LOCKED",
+            "offsetof(_Py_DebugOffsets, interpreter_state.gil_runtime_state_locked)",
+        )
+        emit(
+            "PY_DEBUG_OFFSETS_INTERP_GIL_HOLDER",
+            "offsetof(_Py_DebugOffsets, interpreter_state.gil_runtime_state_holder)",
+        )
 
     # --- _PyRuntimeState / PyInterpreterState compound offsets ---
 

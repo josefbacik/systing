@@ -361,6 +361,18 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   after the function alone; `language`, `file` (the full path, for Python frames
   and for native frames with debug info), `line`, `module` and `address` are
   its arguments.
+- Each row also says what its thread was waiting in (schema 31), which is what
+  tells a thread that is parked (a pool worker in `futex`, an event loop in
+  `epoll_wait`) from one that is blocked on work: `syscall` / `syscall_nr`,
+  the system call it was in (NULL in none, and for a thread that was on a
+  CPU); `in_iowait`, the kernel's mark of a thread blocked on I/O; and
+  `holds_gil`, whether it held its Python interpreter's GIL (NULL without
+  Python frames). No thread is left out for any of them: `WHERE state = 'R'`
+  is py-spy's default view (its idle threads are the ones in another state),
+  `WHERE holds_gil` its `--gil`. In the Perfetto trace they are arguments,
+  with `state`, of the slice of the thread's leaf frame (the innermost one, at
+  the bottom of the stack): click it to see what the thread was doing there.
+  A leaf's slice ends, and begins again, where that changes.
 
 What to keep in mind: a row's `ts` is the start of its iteration's walk, which
 reaches a given thread up to one walk later. A blocked thread's stack is exact;
