@@ -3,13 +3,14 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use systing_heap::perfmap::{self, PerfMap};
 use systing_heap::pycode::{self, CodeMap};
-use systing_heap::root::Root;
+use systing_heap::root::{self, Root};
 use systing_heap::{
     ask, check, db, golang, jemalloc, perfetto, retention, snoop, symbolize, Format, Snapshot,
 };
@@ -34,7 +35,9 @@ use systing_heap::{
 struct Cli {
     /// jemalloc prof_prefixes, snapshot files, or folders of snapshot files
     /// (not searched recursively).
-    #[arg(required_unless_present_any = ["snoop", "ask", "check"])]
+    #[arg(required_unless_present_any = [
+        "snoop", "ask", "check", "mem_fd", "maps_fd", "status_fd", "environ_fd"
+    ])]
     inputs: Vec<PathBuf>,
 
     /// The output file, replaced on every run. A DuckDB database, or a
@@ -78,14 +81,79 @@ struct Cli {
     /// Symlinks and ".." cannot lead out of the root. Takes prefix inputs
     /// only. Native frames get function names without file and line. The
     /// output path is not inside the root. Needs Linux 5.6 or newer.
-    #[arg(short, long, value_name = "PID", conflicts_with = "root_fd")]
+    ///
+    /// Beside --mem-fd, --maps-fd, --status-fd or --environ-fd, PID is a
+    /// number only: it names the process, nothing is opened by it, and the
+    /// root is the one --root-fd gives.
+    #[arg(short, long, value_name = "PID")]
     pid: Option<u32>,
 
     /// Like --pid, but the root is a folder the caller has already opened, as
     /// file descriptor N. For a program that has checked which process it
     /// means: a pid can be reused, an open folder cannot.
+    ///
+    /// With --snoop or --ask it is the root of the process whose files are
+    /// handed over beside it: --mem-fd, --maps-fd, --status-fd, --environ-fd.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..))]
     root_fd: Option<i32>,
+
+    /// With --snoop: the process's memory, /proc/PID/mem, which the caller
+    /// has already opened to read, as file descriptor N.
+    ///
+    /// For a caller that holds the right to open another process's memory and
+    /// has checked which process it means. It goes with --root-fd (the
+    /// process's /proc/PID/root), --maps-fd and --pid, which is then a number
+    /// only. Each descriptor is duplicated at once, so the caller's stays as
+    /// it was. Nothing of the process is opened by its pid, and nothing of it
+    /// is read but what was handed over.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(i32).range(0..),
+        requires = "root_fd",
+        requires = "maps_fd",
+        requires = "snoop",
+        conflicts_with_all = ["inputs", "ask", "check"]
+    )]
+    mem_fd: Option<i32>,
+
+    /// The process's /proc/PID/maps, already opened, as file descriptor N:
+    /// what it maps, and whose process it is. With --mem-fd, or with --ask
+    /// and --root-fd.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(i32).range(0..),
+        requires = "root_fd",
+        conflicts_with_all = ["inputs", "check"]
+    )]
+    maps_fd: Option<i32>,
+
+    /// The process's /proc/PID/status, already opened, as file descriptor N:
+    /// for the pid the process knows itself by, which the snapshot and the
+    /// socket are named after. Without it --pid's number is used. With
+    /// --mem-fd, or with --ask and --root-fd.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(i32).range(0..),
+        requires = "root_fd",
+        conflicts_with_all = ["inputs", "check"]
+    )]
+    status_fd: Option<i32>,
+
+    /// The process's /proc/PID/environ, already opened, as file descriptor N:
+    /// read for the socket's folder when --ask-dir is not given, and for the
+    /// sampling period when the library does not say. With --mem-fd, or with
+    /// --ask and --root-fd.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(i32).range(0..),
+        requires = "root_fd",
+        conflicts_with_all = ["inputs", "check"]
+    )]
+    environ_fd: Option<i32>,
 
     /// With --pid: ask the process for a heap dump now.
     ///
@@ -158,13 +226,81 @@ struct Cli {
     check: bool,
 }
 
+impl Cli {
+    /// Whether the caller hands over any of the process's own files.
+    fn hands_files_over(&self) -> bool {
+        [self.mem_fd, self.maps_fd, self.status_fd, self.environ_fd]
+            .iter()
+            .any(Option::is_some)
+    }
+
+    /// What clap's own rules cannot refuse, since each turns on more than the
+    /// presence of two arguments: how it is refused, and why.
+    ///
+    /// `--pid` opens the process it names, so it does not go with a root that
+    /// was handed over. Beside files of the process's own that were handed
+    /// over too, it is a number only, and the two go together. So that
+    /// conflict is not declared: it is refused here, in the words clap has
+    /// for one.
+    fn refused(&self) -> Option<(ErrorKind, &'static str)> {
+        let two_roots = self.pid.is_some() && self.root_fd.is_some();
+        match (self.hands_files_over(), self.ask, self.snoop, self.mem_fd) {
+            (false, _, _, _) if two_roots => Some((
+                ErrorKind::ArgumentConflict,
+                "the argument '--pid <PID>' cannot be used with '--root-fd <N>'",
+            )),
+            (true, Some(ask::How::Python), _, _) => Some((
+                ErrorKind::ArgumentConflict,
+                "--ask python opens the process's memory by its pid, to write to it: it cannot \
+                 be used with files of the process's that were handed over",
+            )),
+            (true, _, true, None) => Some((
+                ErrorKind::MissingRequiredArgument,
+                "--snoop of a process whose files were handed over needs --mem-fd and --maps-fd",
+            )),
+            (true, None, false, _) => Some((
+                ErrorKind::MissingRequiredArgument,
+                "the files of a process that were handed over go with --snoop or --ask, and \
+                 neither was given",
+            )),
+            _ => None,
+        }
+    }
+
+    /// The process's files as the caller handed them over, when it handed
+    /// any. Each number is duplicated at once, so the caller's stays as it was.
+    fn handed(&self) -> Result<Option<snoop::Handed>> {
+        let Some(fd) = self.root_fd.filter(|_| self.hands_files_over()) else {
+            return Ok(None);
+        };
+        let dir =
+            root::inherited(fd).with_context(|| format!("taking descriptor {fd} as the root"))?;
+        let file = |fd: Option<i32>, flag: &'static str| {
+            fd.map(|fd| snoop::Handed::file(fd, flag)).transpose()
+        };
+        Ok(Some(snoop::Handed {
+            root: dir,
+            mem: file(self.mem_fd, "--mem-fd")?,
+            maps: file(self.maps_fd, "--maps-fd")?,
+            status: file(self.status_fd, "--status-fd")?,
+            environ: file(self.environ_fd, "--environ-fd")?,
+        }))
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some((kind, why)) = cli.refused() {
+        Cli::command().error(kind, why).exit();
+    }
 
     // A snoop pins the process once, and takes the root from that handle, so
-    // its memory and its root are surely one process. So does asking.
-    let pinned = match (cli.snoop || cli.ask.is_some() || cli.check, cli.pid) {
-        (true, Some(pid)) => Some(snoop::Process::open(pid)?),
+    // its memory and its root are surely one process. So does asking. With
+    // files that were handed over, it is the caller that pinned the process.
+    let live = cli.snoop || cli.ask.is_some() || cli.check;
+    let pinned = match (live, cli.pid, cli.handed()?) {
+        (true, Some(pid), Some(files)) => Some(snoop::Process::from_handed(pid, files)),
+        (true, Some(pid), None) => Some(snoop::Process::open(pid)?),
         _ => None,
     };
     if let (true, Some(process)) = (cli.check, pinned.as_ref()) {

@@ -580,6 +580,83 @@ fn a_pinned_process_that_has_exited_is_not_read() {
     assert!(snoop::read_within(&process, snoop::TIMEOUT).is_err());
 }
 
+/// A caller that has opened the process's root and its files hands them over,
+/// and the tool opens nothing by pid: the pid it is told is above any id the
+/// kernel gives out, and names no process that could be opened. What it reads
+/// is what a read by pid of the same parked process gives.
+#[test]
+fn files_handed_over_give_the_stacks_a_read_by_pid_gives() {
+    for lib in libs() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(bin) = build_target(dir.path()) else {
+            return;
+        };
+        let conf = "prof:true,lg_prof_sample:12";
+        let target = Target::start(&bin, Some(&lib), Some(conf), "-");
+
+        let by_pid = dir.path().join("by-pid.duckdb");
+        let run = snoop_cli(target.pid(), &by_pid, dir.path());
+        assert!(
+            run.status.success(),
+            "{lib:?}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        let of_target = |name: &str| PathBuf::from(format!("/proc/{}/{name}", target.pid()));
+        let (_root, root) = common::inheritable(&of_target("root"));
+        let (_mem, mem) = common::inheritable(&of_target("mem"));
+        let (_maps, maps) = common::inheritable(&of_target("maps"));
+        let (_status, status) = common::inheritable(&of_target("status"));
+        let (_environ, environ) = common::inheritable(&of_target("environ"));
+        let handed = dir.path().join("handed.duckdb");
+        let run = Command::new(BIN)
+            .args(["--snoop", "--pid", "4294967295"])
+            .args(["--root-fd", &root, "--mem-fd", &mem, "--maps-fd", &maps])
+            .args(["--status-fd", &status, "--environ-fd", &environ, "-o"])
+            .arg(&handed)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "{lib:?}: {stderr}");
+
+        let stacks = |db: &Path| {
+            let mut named = names_of_stacks(&Connection::open(db).unwrap());
+            named.sort();
+            named
+        };
+        let read_by_pid = stacks(&by_pid);
+        assert!(
+            read_by_pid.len() > 50,
+            "{lib:?}: {} stacks",
+            read_by_pid.len()
+        );
+        assert_eq!(stacks(&handed), read_by_pid, "{lib:?}");
+        target.stop();
+    }
+}
+
+/// Of a process's directories only its root is taken, and that as the root: a
+/// directory handed over as one of its files is refused, and named.
+#[test]
+fn a_directory_handed_over_as_the_memory_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_root, root) = common::inheritable(Path::new("/"));
+    let (_dir, number) = common::inheritable(dir.path());
+    let (_maps, maps) = common::inheritable(Path::new("/proc/self/maps"));
+    let out = dir.path().join("heap.duckdb");
+    let run = Command::new(BIN)
+        .args(["--snoop", "--pid", "1", "--root-fd", &root])
+        .args(["--mem-fd", &number, "--maps-fd", &maps, "-o"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success());
+    assert!(stderr.contains("(--mem-fd) is a directory"), "{stderr}");
+    assert!(!out.exists());
+}
+
 #[test]
 fn snoop_needs_a_pid_and_takes_no_inputs() {
     let out = |args: &[&str]| {

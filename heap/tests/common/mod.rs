@@ -56,6 +56,21 @@ pub fn have_libunwind() -> bool {
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("libunwind.so.8 "))
 }
 
+/// `path` opened so that a child inherits it under the same number; the
+/// file is returned to keep the descriptor open.
+pub fn inheritable(path: &Path) -> (std::fs::File, String) {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap();
+    // SAFETY: a descriptor this test owns; without close-on-exec the child
+    // inherits it under the same number.
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
+        0
+    );
+    let number = file.as_raw_fd().to_string();
+    (file, number)
+}
+
 /// Where the hooks' sources are.
 pub const HOOKS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks");
 
