@@ -1398,6 +1398,36 @@ pub fn import_order_by(table_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Import one parquet source into `table_name`, with `trace_id` on every row and
+/// the rows in the table's [`import_order_by`] order if it has one. `columns` is
+/// what [`import_column_list`] returned for `source_sql`, the `FROM` operand.
+/// Only `trace_id` is escaped here.
+pub fn import_table_from_parquet(
+    conn: &Connection,
+    table_name: &str,
+    trace_id: &str,
+    columns: &str,
+    source_sql: &str,
+) -> Result<()> {
+    conn.execute_batch(&import_table_sql(table_name, trace_id, columns, source_sql))?;
+    Ok(())
+}
+
+fn import_table_sql(table_name: &str, trace_id: &str, columns: &str, source_sql: &str) -> String {
+    let escaped_trace_id = trace_id.replace('\'', "''");
+    let order = import_order_by(table_name)
+        .map(|o| format!(" ORDER BY {o}"))
+        .unwrap_or_default();
+    // trace_id is added outside the sorted subquery: inside it, DuckDB would copy
+    // the constant through the sort for every row, and that sort is the import's
+    // peak memory. The stored order relies on the INSERT keeping the subquery's order.
+    format!(
+        "INSERT INTO {table_name} BY NAME \
+         SELECT '{escaped_trace_id}' AS trace_id, * \
+         FROM (SELECT {columns} FROM {source_sql}{order})"
+    )
+}
+
 /// How a parquet→DuckDB import treats a source column, or a whole source
 /// file, this systing's schema does not have — a trace written by a newer
 /// systing than the one reading it.
@@ -1679,14 +1709,12 @@ fn import_tables(
     options: ImportOptions,
     report: &mut ImportReport,
 ) -> Result<()> {
-    let escaped_trace_id = trace_id.replace('\'', "''");
-
     // Helper to import a single table with trace_id injection.
     //
     // Note on SQL safety: We use string interpolation here because DuckDB's execute_batch
     // does not support parameterized queries. The escaping (replacing ' with '') is the
-    // standard SQL escape for single quotes and is safe for the path and trace_id values
-    // we're inserting. The table_name is always a literal from this code, not user input.
+    // standard SQL escape for single quotes: the path is escaped here and the trace id in
+    // import_table_sql. The table_name is always a literal from this code, not user input.
     let mut import_table = |table_name: &str, path: &Path| -> Result<()> {
         if !path.exists() {
             return Ok(());
@@ -1700,26 +1728,20 @@ fn import_tables(
 
         let escaped_path = path.to_string_lossy().replace('\'', "''");
         let source_sql = format!("read_parquet('{escaped_path}')");
-        let order = import_order_by(table_name)
-            .map(|o| format!(" ORDER BY {o}"))
-            .unwrap_or_default();
         let Some(columns) = import_column_list(conn, table_name, &source_sql, options, report)?
         else {
             return Ok(());
         };
 
-        conn.execute_batch(&format!(
-            "INSERT INTO {table_name} BY NAME \
-             SELECT '{escaped_trace_id}' as trace_id, {columns} \
-             FROM {source_sql}{order}"
-        ))
-        .with_context(|| {
-            format!(
-                "Failed to import table '{}' from '{}'",
-                table_name,
-                path.display()
-            )
-        })?;
+        import_table_from_parquet(conn, table_name, trace_id, &columns, &source_sql).with_context(
+            || {
+                format!(
+                    "Failed to import table '{}' from '{}'",
+                    table_name,
+                    path.display()
+                )
+            },
+        )?;
 
         Ok(())
     };
@@ -2685,6 +2707,105 @@ mod tests {
             tables, 0,
             "the transaction rolled back: no table survives on the import's own connection"
         );
+    }
+
+    const TEST_TRACE_ID: &str = "3f2b8c1e-7a54-4d09-9c6b-1e0f5a7d2b43";
+
+    /// Writes `rows` rows of `table` to a parquet file in `dir`, not in sort order,
+    /// and returns its `read_parquet(...)` call. `key` is SQL over the row number
+    /// `i` for the leading sort key. No two rows have the same `ts`.
+    fn write_unsorted_rows(dir: &Path, table: &str, key: &str, rows: i64) -> String {
+        let columns = match table {
+            "sched_slice" => format!(
+                "1::BIGINT AS dur, ({key})::INTEGER AS cpu, i % 1000 AS utid, \
+                 NULL::INTEGER AS end_state, 120 AS priority"
+            ),
+            "thread_state" => format!(
+                "0::BIGINT AS dur, ({key})::BIGINT AS utid, 0 AS state, NULL::INTEGER AS cpu"
+            ),
+            _ => panic!("no fixture for {table}"),
+        };
+        // 7919 is prime, so ts is a permutation of 0..rows unless 7919 divides rows.
+        assert_ne!(rows % 7919, 0, "ts would repeat");
+        let path = dir.join(format!("{table}.parquet"));
+        let path = path.to_string_lossy().replace('\'', "''");
+        Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT (i * 7919) % {rows} AS ts, {columns} FROM range({rows}) t(i)) \
+                 TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 50000)"
+            ))
+            .unwrap();
+        format!("read_parquet('{path}')")
+    }
+
+    /// Asserts that `table` holds the rows of `source_sql` under `trace_id`, stored
+    /// in the table's sort order. No two rows may have the same sort key.
+    fn assert_stored_like_the_sorted_source(
+        conn: &Connection,
+        table: &str,
+        trace_id: &str,
+        source_sql: &str,
+    ) {
+        let key = import_order_by(table).unwrap();
+        // Every row has to turn up twice: stored, and at the same place in the sorted source.
+        let differing: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) AS differing FROM ( \
+                       SELECT * FROM ( \
+                         SELECT row_number() OVER (ORDER BY rowid) AS place, * EXCLUDE (trace_id) \
+                         FROM {table} WHERE trace_id = '{trace_id}' \
+                         UNION ALL BY NAME \
+                         SELECT row_number() OVER (ORDER BY {key}) AS place, * FROM {source_sql}) \
+                       GROUP BY ALL HAVING count(*) <> 2)"
+                ),
+                [],
+                |r| r.get("differing"),
+            )
+            .unwrap();
+        assert_eq!(
+            differing, 0,
+            "{table}: rows that differ between the table as stored and the source in ({key}) order"
+        );
+    }
+
+    #[test]
+    fn test_parquet_to_duckdb_stores_sorted_tables_in_key_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_dir = temp_dir.path().join("traces");
+        fs::create_dir(&parquet_dir).unwrap();
+        let slices = write_unsorted_rows(&parquet_dir, "sched_slice", "i % 8", 500_000);
+        let states = write_unsorted_rows(&parquet_dir, "thread_state", "i % 1000", 500_000);
+
+        let db_path = temp_dir.path().join("test.duckdb");
+        parquet_to_duckdb(&parquet_dir, &db_path, TEST_TRACE_ID).unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        for (table, source_sql) in [("sched_slice", slices), ("thread_state", states)] {
+            assert_stored_like_the_sorted_source(&conn, table, TEST_TRACE_ID, &source_sql);
+        }
+    }
+
+    #[test]
+    fn test_import_table_under_memory_limit() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let source_sql = write_unsorted_rows(dir, "sched_slice", "i % 8", 2_000_000);
+        let conn = Connection::open(dir.join("test.duckdb")).unwrap();
+        // Without spilling the sort has to fit in memory_limit. On DuckDB 1.5 it fits in
+        // 64 MiB, and with the trace id inside the sorted SELECT it does not fit in 192 MiB.
+        conn.execute_batch(
+            "SET memory_limit = '128MiB'; \
+             SET threads TO 2; \
+             SET preserve_insertion_order = false; \
+             SET max_temp_directory_size = '0MiB';",
+        )
+        .unwrap();
+        create_schema(&conn).unwrap();
+
+        import_table_from_parquet(&conn, "sched_slice", TEST_TRACE_ID, "*", &source_sql)
+            .expect("the import's sort does not fit in memory_limit");
     }
 
     #[test]
