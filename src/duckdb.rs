@@ -1398,10 +1398,18 @@ pub fn import_order_by(table_name: &str) -> Option<&'static str> {
     }
 }
 
+/// A sorted table with more rows than this can be imported in several ranges of
+/// its leading sort key, so that one sort holds fewer rows.
+const IMPORT_ROWS_PER_RANGE: u64 = 20_000_000;
+
+/// Every range reads the parquet file once more, so a table gets at most this many.
+const IMPORT_MAX_RANGES: u64 = 8;
+
 /// Import one parquet source into `table_name`, with `trace_id` on every row and
 /// the rows in the table's [`import_order_by`] order if it has one. `columns` is
 /// what [`import_column_list`] returned for `source_sql`, the `FROM` operand.
-/// Only `trace_id` is escaped here.
+/// Only `trace_id` is escaped here. Call this in a transaction: a big table takes
+/// several `INSERT`s, and a failure between them would leave a part of the table.
 pub fn import_table_from_parquet(
     conn: &Connection,
     table_name: &str,
@@ -1409,8 +1417,69 @@ pub fn import_table_from_parquet(
     columns: &str,
     source_sql: &str,
 ) -> Result<()> {
-    conn.execute_batch(&import_table_sql(table_name, trace_id, columns, source_sql))?;
+    import_table_in_ranges(
+        conn,
+        table_name,
+        trace_id,
+        columns,
+        source_sql,
+        IMPORT_ROWS_PER_RANGE,
+    )?;
     Ok(())
+}
+
+/// [`import_table_from_parquet`] with the range size as an argument, so that
+/// tests can split small tables. Returns the number of `INSERT`s it ran.
+fn import_table_in_ranges(
+    conn: &Connection,
+    table_name: &str,
+    trace_id: &str,
+    columns: &str,
+    source_sql: &str,
+    rows_per_range: u64,
+) -> Result<usize> {
+    let import_whole = || -> Result<usize> {
+        conn.execute_batch(&import_table_sql(table_name, trace_id, columns, source_sql))?;
+        Ok(1)
+    };
+    let Some(key) = import_order_by(table_name).map(leading_sort_key) else {
+        return import_whole();
+    };
+    // DuckDB answers this from the parquet footer.
+    let rows: u64 = conn
+        .query_row(
+            &format!("SELECT count(*) AS source_rows FROM {source_sql}"),
+            [],
+            |r| r.get("source_rows"),
+        )
+        .with_context(|| format!("Failed to count the parquet rows of table '{table_name}'"))?;
+    if rows <= rows_per_range {
+        return import_whole();
+    }
+    let ranges = rows.div_ceil(rows_per_range).min(IMPORT_MAX_RANGES);
+    let bounds = range_bounds(conn, key, source_sql, ranges)
+        .with_context(|| format!("Failed to find where to split table '{table_name}' by {key}"))?;
+    if bounds.is_empty() {
+        return import_whole();
+    }
+
+    let conditions = range_conditions(key, &bounds);
+    let parts = conditions.len();
+    eprintln!("  duckdb: importing {table_name} in {parts} parts by {key}, to limit memory");
+    let mut imported = 0;
+    for condition in &conditions {
+        let range_sql = format!("{source_sql} WHERE {condition}");
+        let insert = import_table_sql(table_name, trace_id, columns, &range_sql);
+        imported += conn.execute(&insert, [])? as u64;
+    }
+    // A range's WHERE lets DuckDB skip parquet row groups by their statistics, which
+    // the whole import never does, so make sure that no row was skipped.
+    anyhow::ensure!(
+        imported == rows,
+        "importing table '{table_name}' in {parts} parts by {key} inserted {imported} rows, \
+         but its parquet file has {rows}"
+    );
+    Ok(parts)
 }
 
 fn import_table_sql(table_name: &str, trace_id: &str, columns: &str, source_sql: &str) -> String {
@@ -1426,6 +1495,60 @@ fn import_table_sql(table_name: &str, trace_id: &str, columns: &str, source_sql:
          SELECT '{escaped_trace_id}' AS trace_id, * \
          FROM (SELECT {columns} FROM {source_sql}{order})"
     )
+}
+
+/// The first column of an [`import_order_by`] key.
+fn leading_sort_key(order: &str) -> &str {
+    order
+        .split_once(',')
+        .map_or(order, |(first, _)| first)
+        .trim()
+}
+
+/// Ascending values of `key` that split `source_sql` into at most `ranges` ranges,
+/// or none if it cannot be split. Each is a key that has rows, and not the largest,
+/// so that no range is empty: after a sorted `INSERT` of no rows, DuckDB 1.5 can hide
+/// the rows that the transaction inserts into that table next, until a checkpoint.
+fn range_bounds(conn: &Connection, key: &str, source_sql: &str, ranges: u64) -> Result<Vec<i64>> {
+    let fractions = (1..ranges)
+        .map(|i| (i as f64 / ranges as f64).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // approx_quantile's value can lie between two keys. The largest key at or below it splits the
+    // rows in the same place. Keys with a fraction, which only a file not written by systing has,
+    // are left out: cast to an integer, such a bound would be no key, and its range could be empty.
+    let keys_below = (1..ranges)
+        .map(|i| format!("max({key}) FILTER (WHERE {key} <= q.approx[{i}])"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT key_below::BIGINT AS bound FROM ( \
+           SELECT unnest([{keys_below}]) AS key_below, max({key}) AS largest \
+           FROM {source_sql}, \
+                (SELECT approx_quantile({key}, [{fractions}]) AS approx FROM {source_sql}) q) \
+         WHERE key_below < largest AND key_below = key_below::BIGINT ORDER BY bound"
+    ))?;
+    let bounds = stmt
+        .query_map([], |r| r.get("bound"))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(bounds)
+}
+
+/// One condition on `key` per range, for strictly ascending `bounds`: every row meets
+/// exactly one, and NULL keys, which sort last, meet the last. Empty if `bounds` is empty.
+fn range_conditions(key: &str, bounds: &[i64]) -> Vec<String> {
+    let (Some(first), Some(last)) = (bounds.first(), bounds.last()) else {
+        return Vec::new();
+    };
+    let mut conditions = vec![format!("{key} <= {first}")];
+    conditions.extend(
+        bounds
+            .iter()
+            .zip(bounds.iter().skip(1))
+            .map(|(low, high)| format!("{key} > {low} AND {key} <= {high}")),
+    );
+    conditions.push(format!("({key} > {last} OR {key} IS NULL)"));
+    conditions
 }
 
 /// How a parquet→DuckDB import treats a source column, or a whole source
@@ -2806,6 +2929,210 @@ mod tests {
 
         import_table_from_parquet(&conn, "sched_slice", TEST_TRACE_ID, "*", &source_sql)
             .expect("the import's sort does not fit in memory_limit");
+    }
+
+    /// Imports `rows` rows with `key` in ranges, as the recorder imports: into a file
+    /// database, in one transaction with the schema. Returns the number of `INSERT`s.
+    fn import_in_ranges_and_check(table: &str, key: &str, rows: i64, rows_per_range: u64) -> usize {
+        let temp_dir = TempDir::new().unwrap();
+        let source_sql = write_unsorted_rows(temp_dir.path(), table, key, rows);
+        let check = |conn: &Connection| {
+            assert_stored_like_the_sorted_source(conn, table, TEST_TRACE_ID, &source_sql)
+        };
+        let db_path = temp_dir.path().join("test.duckdb");
+        let mut conn = Connection::open(&db_path).unwrap();
+        configure_for_bulk_io(&conn, temp_dir.path()).unwrap();
+        let tx = conn.transaction().unwrap();
+        create_schema(&tx).unwrap();
+        let inserts =
+            import_table_in_ranges(&tx, table, TEST_TRACE_ID, "*", &source_sql, rows_per_range)
+                .unwrap();
+
+        // Read on the importing connection first: rows that DuckDB hides after a sorted INSERT of
+        // no rows come back once the database is closed, so only a read before the close can show
+        // them missing.
+        check(&tx);
+        tx.commit().unwrap();
+        check(&conn);
+        drop(conn);
+        check(&Connection::open(&db_path).unwrap());
+        inserts
+    }
+
+    #[test]
+    fn test_an_import_in_ranges_stores_the_rows_in_key_order() {
+        for (key, rows, rows_per_range, inserts_wanted) in [
+            // A range of 150,000 rows ends inside a DuckDB row group of 122,880.
+            ("i % 8", 600_000, 150_000, 2..=4),
+            ("i % 1000", 600_000, 150_000, 4..=4),
+            // approx_quantile returns a value between these two keys.
+            ("(i % 2) * 1000000", 600_000, 150_000, 2..=2),
+            // Each parquet row group has a few of the keys, and rows without a key.
+            ("if(i % 10 > 0, i // 25000, NULL)", 200_000, 50_000, 2..=4),
+            // Four rows in five have the same key: a middle one, then the largest.
+            ("if(i % 5 > 0, 3, i % 8)", 40_000, 10_000, 2..=2),
+            ("if(i % 5 > 0, 7, i % 8)", 40_000, 10_000, 1..=2),
+            // Only one key, then no key at all: there is nothing to split.
+            ("5", 40_000, 10_000, 1..=1),
+            ("NULL", 40_000, 10_000, 1..=1),
+            // Exactly one range's rows, then rows for 40 ranges.
+            ("i % 1000", 40_000, 40_000, 1..=1),
+            ("i % 1000", 40_000, 1_000, 8..=8),
+        ] {
+            for table in ["sched_slice", "thread_state"] {
+                let inserts = import_in_ranges_and_check(table, key, rows, rows_per_range);
+                assert!(
+                    inserts_wanted.contains(&inserts),
+                    "{table} with key {key}: {inserts} INSERTs, not {inserts_wanted:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_table_in_ranges_under_memory_limit() {
+        let temp_dir = TempDir::new().unwrap();
+        let (dir, table) = (temp_dir.path(), "thread_state");
+        let source_sql = write_unsorted_rows(dir, table, "i % 1000", 4_000_000);
+        let mut conn = Connection::open(dir.join("test.duckdb")).unwrap();
+        // Without spilling each sort has to fit in memory_limit. One sort of all rows does not.
+        conn.execute_batch(
+            "SET memory_limit = '64MiB'; \
+             SET threads TO 2; \
+             SET preserve_insertion_order = false; \
+             SET max_temp_directory_size = '0MiB';",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        create_schema(&tx).unwrap();
+
+        import_table_in_ranges(&tx, table, TEST_TRACE_ID, "*", &source_sql, 500_000)
+            .expect("the sort of one range does not fit in memory_limit");
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_every_range_has_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (key, column) in [
+            ("(i % 2) * 1000000", "utid"),
+            ("(i % 3) * 1000000", "utid"),
+            ("CASE WHEN i % 3 > 0 THEN (i % 2) * 777 END", "utid"),
+            (
+                "CASE WHEN i % 10 < 5 THEN -5 ELSE (i % 20) * 1000 END",
+                "utid",
+            ),
+            (
+                "CASE WHEN i % 2 = 0 THEN -9223372036854775807 - 1 ELSE 9223372036854775807 END",
+                "utid",
+            ),
+            // Most rows share the smallest key, and only that key has a fraction.
+            (
+                "if(i % 3 > 0, 0, i % 8)",
+                "CASE WHEN utid = 0 THEN 0.4 ELSE utid END",
+            ),
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let source_sql = write_unsorted_rows(temp_dir.path(), "thread_state", key, 40_000);
+            for ranges in 2..=IMPORT_MAX_RANGES {
+                let bounds = range_bounds(&conn, column, &source_sql, ranges).unwrap();
+                for condition in range_conditions(column, &bounds) {
+                    let rows: i64 = conn
+                        .query_row(
+                            &format!("SELECT count(*) AS rows FROM {source_sql} WHERE {condition}"),
+                            [],
+                            |r| r.get("rows"),
+                        )
+                        .unwrap();
+                    assert!(rows > 0, "{key}, {ranges} ranges: no rows with {condition}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_every_leading_sort_key_is_an_integer_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        for table in DATA_TABLES {
+            let Some(key) = import_order_by(table).map(leading_sort_key) else {
+                continue;
+            };
+            let data_type: String = conn
+                .query_row(
+                    &format!(
+                        "SELECT data_type FROM duckdb_columns() \
+                         WHERE table_name = '{table}' AND column_name = '{key}'"
+                    ),
+                    [],
+                    |r| r.get("data_type"),
+                )
+                .unwrap_or_else(|e| panic!("{table} has no column '{key}': {e}"));
+            assert!(
+                matches!(data_type.as_str(), "INTEGER" | "BIGINT"),
+                "{table}.{key} is {data_type}, not INTEGER or BIGINT: \
+                 the import's ranges compare it with integers"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_second_import_in_ranges_appends_after_the_first() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_sql = write_unsorted_rows(temp_dir.path(), "thread_state", "i % 1000", 300_000);
+        // As systing-util convert imports: several traces into the same tables in one
+        // transaction, with preserve_insertion_order left on.
+        let mut conn = Connection::open(temp_dir.path().join("test.duckdb")).unwrap();
+        create_schema(&conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        for trace_id in ["a", "b"] {
+            let inserts =
+                import_table_in_ranges(&tx, "thread_state", trace_id, "*", &source_sql, 150_000)
+                    .unwrap();
+            assert_eq!(inserts, 2);
+        }
+        tx.commit().unwrap();
+
+        for trace_id in ["a", "b"] {
+            assert_stored_like_the_sorted_source(&conn, "thread_state", trace_id, &source_sql);
+        }
+    }
+
+    #[test]
+    fn test_an_import_in_ranges_that_loses_rows_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_sql = write_unsorted_rows(temp_dir.path(), "thread_state", "i % 1000", 40_000);
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        // Stands in for a scan that skips rows: unnest of an empty list drops the row.
+        let columns = "* REPLACE (unnest(if(ts % 2 = 0, [ts], [])) AS ts)";
+
+        let error =
+            import_table_in_ranges(&conn, "thread_state", "t", columns, &source_sql, 10_000)
+                .unwrap_err()
+                .to_string();
+
+        assert!(
+            error.contains("inserted 20000 rows, but its parquet file has 40000"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_a_key_that_cannot_be_split_fails_the_import() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_sql = write_unsorted_rows(temp_dir.path(), "thread_state", "i % 1000", 40_000);
+        let text_key = format!("(SELECT * REPLACE (utid::VARCHAR AS utid) FROM {source_sql})");
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let error =
+            import_table_in_ranges(&conn, "thread_state", "t", "*", &text_key, 10_000).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("split table 'thread_state' by utid"),
+            "{error:#}"
+        );
     }
 
     #[test]
