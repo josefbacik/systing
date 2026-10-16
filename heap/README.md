@@ -13,7 +13,7 @@ It explains how heap profiling works and how to set a service up. This page is t
 | [Commands](#commands) | Every way to run it |
 | [Options](#options) | Every flag |
 | [Snapshot files: what is loaded and deleted](#snapshot-files-what-is-loaded-and-deleted) | The rules for a prefix input |
-| [Reading a container from outside](#reading-a-container-from-outside) | `--pid` and `--root-fd` |
+| [Reading a container from outside](#reading-a-container-from-outside) | `--pid` and `--root-fd`, and a process whose files are handed over |
 | [How frames get their names](#how-frames-get-their-names) | Symbolization |
 | [Perfetto output](#perfetto-output) | What the trace holds |
 | [Sampling and estimates](#sampling-and-estimates) | Why to use the `est_*` columns |
@@ -65,6 +65,7 @@ cargo build --release -p systing-heap
 | A container's files, read from the host | `systing-heap -o heap.duckdb --pid PID --latest-only PREFIX` |
 | A dump now from CPython 3.14, nothing added to it | `systing-heap -o heap.duckdb --pid PID --ask python` |
 | The profile read from memory (jemalloc, or a Go program's own heap profile) | `systing-heap -o heap.duckdb --pid PID --snoop` |
+| `--ask`, or `--snoop` of a jemalloc program, from files the caller has already opened | See [Handing over the files of a process](#handing-over-the-files-of-a-process) |
 | Which of these will work on a process | `systing-heap --pid PID --check` |
 
 `PREFIX` is the `prof_prefix` given to jemalloc, such as `/heap-dumps/jeprof`.
@@ -87,8 +88,12 @@ cargo build --release -p systing-heap
 | `--latest-only` | Load the newest snapshot per process and delete nothing | A prefix. Not with `--keep-all`. |
 | `--keep-all` | Load every snapshot and delete nothing | A prefix. Not with `--latest-only`. |
 | `--perf-map-dir DIR` | Where to look first for the files that name Python frames: `pycode-<pid>-<token>.map` and `perf-<pid>.map` | Anything but `--check` |
-| `-p, --pid PID` | Resolve every path inside this process's root (`/proc/PID/root`) | Required by `--ask`, `--snoop` and `--check`. Not with `--root-fd`. |
-| `--root-fd N` | Like `--pid`, with a folder the caller has already opened as descriptor `N` | A prefix. Not with `--pid`. |
+| `-p, --pid PID` | Resolve every path inside this process's root (`/proc/PID/root`) | Required by `--ask`, `--snoop` and `--check`. Not with `--root-fd`, unless the process's files are [handed over](#handing-over-the-files-of-a-process) too: then it is a number only. |
+| `--root-fd N` | Like `--pid`, with a folder the caller has already opened as descriptor `N` | A prefix. Not with `--pid`, unless the process's files are handed over too. |
+| `--mem-fd N` | The process's `/proc/PID/mem`, which the caller has already opened to read, as descriptor `N` | `--snoop`, with `--root-fd`, `--maps-fd` and `--pid` |
+| `--maps-fd N` | The process's `/proc/PID/maps`, already opened, as descriptor `N` | `--root-fd`, with `--mem-fd` or `--ask` |
+| `--status-fd N` | The process's `/proc/PID/status`, already opened, as descriptor `N` | `--root-fd`, with `--mem-fd` or `--ask` |
+| `--environ-fd N` | The process's `/proc/PID/environ`, already opened, as descriptor `N` | `--root-fd`, with `--mem-fd` or `--ask` |
 | `--ask [responder\|python]` | Ask the process for a dump now. Alone it means `responder`, the socket. | `--pid`. No inputs. |
 | `--ask-dir DIR` | The folder with the socket, or for `python` the folder to put the script in, as the process sees it. See below for the default. | `--ask` or `--check` |
 | `--ask-wait SECONDS` | How long to wait for an answer, 1 to 3600. Default 30. | `--ask` |
@@ -108,7 +113,7 @@ Pass `--ask-dir` when the service gave `listen()` another folder in a call. Pass
 
 **`--ask` never falls back to `--ask python`.** The Python way writes to the process's memory, so it has to be asked for by name. A process with no socket gets an error that says what else to try.
 
-**Who may run it.** Everything with `--pid` opens `/proc/PID/root`, which the kernel allows to the process's own user or to a user with `CAP_SYS_PTRACE`. Root on the host has it. Root in another container usually does not. The socket itself answers the service's own user and root. `--ask python`, `--snoop` and `--check` also read the process's memory, which the kernel allows to the same user (subject to `kernel.yama.ptrace_scope`, and only for a dumpable process) or to a user with `CAP_SYS_PTRACE`. Details are in [`docs/HEAP_INTERNALS.md`](../docs/HEAP_INTERNALS.md).
+**Who may run it.** Everything with `--pid` opens `/proc/PID/root`, which the kernel allows to the process's own user or to a user with `CAP_SYS_PTRACE`. Root on the host has it. Root in another container usually does not. The socket itself answers the service's own user and root. `--ask python`, `--snoop` and `--check` also read the process's memory, which the kernel allows to the same user (subject to `kernel.yama.ptrace_scope`, and only for a dumpable process) or to a user with `CAP_SYS_PTRACE`. Details are in [`docs/HEAP_INTERNALS.md`](../docs/HEAP_INTERNALS.md). A caller that may open these files can open them and hand them over, and the tool then opens none of them itself: see [Handing over the files of a process](#handing-over-the-files-of-a-process).
 
 ## Snapshot files: what is loaded and deleted
 
@@ -162,6 +167,35 @@ systing-heap -o heap.pb --root-fd 3 --latest-only /data/heap/jeprof 3< /mnt/kept
 
 It needs Linux 5.6 or newer (`openat2`). On an older kernel the run fails. It does not fall back to plain opens.
 Why these rules exist is in [`docs/HEAP_INTERNALS.md`](../docs/HEAP_INTERNALS.md).
+
+### Handing over the files of a process
+
+`--ask` and `--snoop` open the process's files by its pid: its root, and `mem`, `maps`, `status` and `environ` in `/proc/PID`.
+A caller that has already opened them can hand them over, as descriptors the tool inherits. The tool then opens nothing of the process by its pid.
+
+```bash
+systing-heap -o heap.duckdb --snoop --pid 4242 --root-fd 3 --mem-fd 4 --maps-fd 5 --status-fd 6 --environ-fd 7 \
+    3< /proc/4242/root 4< /proc/4242/mem 5< /proc/4242/maps 6< /proc/4242/status 7< /proc/4242/environ
+systing-heap -o heap.duckdb --ask --pid 4242 --root-fd 3 --status-fd 6 --environ-fd 7 \
+    3< /proc/4242/root 6< /proc/4242/status 7< /proc/4242/environ
+```
+
+| Flag | The file, as the caller opened it | Read for | Needed by |
+|---|---|---|---|
+| `--root-fd N` | `/proc/PID/root`, a folder | The binaries, the socket, the Python maps | Both |
+| `--mem-fd N` | `/proc/PID/mem`, to read | The profile | `--snoop`. Not taken by `--ask`. |
+| `--maps-fd N` | `/proc/PID/maps` | What the process maps. Whose process it is, which decides whether a map that user owns in a world-writable folder is used. | `--snoop`. Optional with `--ask`. |
+| `--status-fd N` | `/proc/PID/status` | The pid the process knows itself by, which the snapshot and the socket are named after | Optional. Without it `--pid`'s number is used, which is the process's own number only where it has no pid namespace of its own. |
+| `--environ-fd N` | `/proc/PID/environ` | The socket's folder when `--ask-dir` is not given. The sampling period when the library does not say it. | Optional. Without it the socket is looked for in the process's `/tmp` alone, and a period the library does not say is taken to be jemalloc's default. |
+
+| Question | Answer |
+|---|---|
+| Who opens the files? | The caller: a program that holds the right to open another process's memory, and has checked which process it means. What it checked is then what is read. |
+| What is `--pid` then? | A number only. It names the process in messages, and in the output where `--status-fd` is not handed over. `--ask` checks that the socket's peer is that pid. Nothing is opened by it. `--pid` and `--root-fd` go together only beside at least one of the other four flags. |
+| What does the tool read? | Only what it was handed. A file that was not handed over is not opened by its name instead: the table above says what stands in for it. No handle on `/proc/PID` itself is taken or made. |
+| What happens to the descriptors? | Each is duplicated at once, so the caller's stays as it was. Every read says where it starts, so where a descriptor's own offset stands does not matter and is not moved. A folder is taken as the root only: handed over as any other file it is refused. |
+| What does not take them? | `--ask python`, `--check` and `--snoop` of a Go program, which open the process by its pid. Files that were handed over are read as a jemalloc program's, whatever the program is. |
+| And with none of these flags? | Nothing changes. |
 
 ## How frames get their names
 

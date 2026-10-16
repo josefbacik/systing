@@ -13,9 +13,14 @@ use crate::{Format, LiveRead, Sample, Snapshot};
 /// The value `Snapshot::trigger` has for a heap read this way.
 pub const TRIGGER: &str = "go-snoop";
 
-/// Whether the process runs a Go program.
+/// Whether the process runs a Go program. A process whose files were handed
+/// over is never taken for one: its executable is not among them, and
+/// [`read`] opens a process by its pid, which is not done for such a process.
 pub fn is_go(process: &Process) -> bool {
-    golang::is_go(&process.file("exe"))
+    match process.file("exe") {
+        Ok(exe) => golang::is_go(&exe),
+        Err(_) => false,
+    }
 }
 
 /// [`read`] on a thread of its own, given up after `limit`: as jemalloc's
@@ -37,7 +42,7 @@ pub fn read_within(process: &Process, limit: std::time::Duration) -> Result<(Sna
 /// Read the process's heap profile; also returns a line saying how.
 pub fn read(process: &Process) -> Result<(Snapshot, String)> {
     let pid = process.pid();
-    let go = GoProcess::open(pid, &process.file(""))?;
+    let go = GoProcess::open(pid, &process.file("")?)?;
     let mut stats = ReadStats::default();
     let heap = go.heap(&mut stats)?;
     if heap.records.is_empty() {

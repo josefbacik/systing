@@ -55,11 +55,18 @@ impl ProcMem {
     /// CAP_SYS_PTRACE, which root needs too), and `kernel.yama.ptrace_scope`
     /// permitting it.
     pub fn open(mem_path: &std::path::Path) -> io::Result<ProcMem> {
-        Ok(ProcMem {
-            file: File::open(mem_path)?,
+        Ok(ProcMem::from_file(File::open(mem_path)?))
+    }
+
+    /// A process's `mem` file that is already open, such as one the caller
+    /// opened and handed over. Every read says the address it is for, so where
+    /// the descriptor's own offset stands does not matter.
+    pub fn from_file(file: File) -> ProcMem {
+        ProcMem {
+            file,
             reads: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
-        })
+        }
     }
 
     /// (reads made, bytes read) so far.
