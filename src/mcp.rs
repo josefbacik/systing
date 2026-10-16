@@ -606,13 +606,13 @@ struct NetworkSocketPairsToolParams {
 // -- Helper functions --
 
 fn make_tool_result(value: serde_json::Value) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(
+    CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&value).unwrap_or_default(),
     )])
 }
 
 fn make_error_result(msg: &str) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![Content::text(msg.to_string())]);
+    let mut result = CallToolResult::success(vec![ContentBlock::text(msg.to_string())]);
     result.is_error = Some(true);
     result
 }
@@ -982,7 +982,7 @@ This server was started with --restrict-to-database: it serves the one database 
 it was started with and no other. Omit `path` on every call (that database's own \
 path is accepted too); any other path is refused.";
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for SystingMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.db.restricted {
@@ -990,11 +990,8 @@ impl ServerHandler for SystingMcpServer {
         } else {
             SERVER_INSTRUCTIONS.to_string()
         };
-        ServerInfo {
-            instructions: Some(instructions),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(instructions)
     }
 }
 
@@ -1397,6 +1394,123 @@ mod tests {
              If you added a new analysis subcommand, add a corresponding MCP tool \
              in src/mcp.rs and add its name to the expected list in this test."
         );
+    }
+
+    /// A client's handshake and tool calls, through the handler the macros
+    /// generate and an in-memory transport. What the server offers a client
+    /// comes from the library's defaults, so a library update that moves them
+    /// fails here instead of passing unseen.
+    #[test]
+    fn test_handshake_and_tool_calls_through_the_handler() {
+        use serde_json::{json, Value};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
+        use tokio::io::{ReadHalf, WriteHalf};
+
+        async fn send(to: &mut WriteHalf<DuplexStream>, message: Value) {
+            to.write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        async fn ask(
+            to: &mut WriteHalf<DuplexStream>,
+            from: &mut Lines<BufReader<ReadHalf<DuplexStream>>>,
+            id: u64,
+            method: &str,
+            params: Value,
+        ) -> Value {
+            let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+            send(to, request).await;
+            let answer = async {
+                loop {
+                    let line = from.next_line().await.unwrap().expect("the server hung up");
+                    let answer: Value = serde_json::from_str(&line).unwrap();
+                    if answer["id"] == json!(id) {
+                        return answer;
+                    }
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(30), answer)
+                .await
+                .unwrap_or_else(|_| panic!("no answer to {method} within 30 s"))
+        }
+
+        let server = SystingMcpServer::new(DbHandle::new(None, None, false).unwrap());
+        assert_eq!(
+            server.get_info().protocol_version,
+            ProtocolVersion::V_2025_11_25,
+            "the protocol version the server offers moved: say so in the release"
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (client, served) = tokio::io::duplex(1 << 20);
+            let serving = tokio::spawn(async move {
+                let service = server.serve(served).await.unwrap();
+                service.waiting().await.unwrap();
+            });
+            let (from, mut to) = tokio::io::split(client);
+            let mut from = BufReader::new(from).lines();
+
+            // A client that asks for an older version it knows is answered with it.
+            let hello = ask(
+                &mut to,
+                &mut from,
+                1,
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0"},
+                }),
+            )
+            .await;
+            assert_eq!(hello["result"]["protocolVersion"], json!("2025-03-26"));
+            assert!(hello["result"]["capabilities"]["tools"].is_object());
+            assert_eq!(hello["result"]["instructions"], json!(SERVER_INSTRUCTIONS));
+            send(
+                &mut to,
+                json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            )
+            .await;
+
+            let listed = ask(&mut to, &mut from, 2, "tools/list", json!({})).await;
+            let listed: BTreeSet<String> = listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_string())
+                .collect();
+            let registered: BTreeSet<String> = SystingMcpServer::tool_router()
+                .list_all()
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .collect();
+            assert_eq!(listed, registered);
+
+            // A tool's own failure is a result the client reads, not a protocol error.
+            let query = json!({"name": "query", "arguments": {"sql": "SELECT 1"}});
+            let answer = ask(&mut to, &mut from, 3, "tools/call", query).await;
+            assert_eq!(answer["result"]["isError"], json!(true));
+            let text = answer["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("No database path provided"), "{text}");
+
+            let wrong_type = json!({"name": "query", "arguments": {"sql": 5}});
+            let answer = ask(&mut to, &mut from, 4, "tools/call", wrong_type).await;
+            assert_eq!(answer["result"]["isError"], json!(true));
+
+            let unknown = json!({"name": "no_such_tool", "arguments": {}});
+            let answer = ask(&mut to, &mut from, 5, "tools/call", unknown).await;
+            assert_eq!(answer["error"]["code"], json!(-32602));
+
+            // The client leaves, and the server ends.
+            drop(to);
+            drop(from);
+            tokio::time::timeout(std::time::Duration::from_secs(30), serving)
+                .await
+                .expect("the server did not end within 30 s of its client leaving")
+                .unwrap();
+        });
     }
 
     // -- string_or_number deserialization tests --

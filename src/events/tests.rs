@@ -2,8 +2,42 @@ use super::*;
 use crate::record::collector::InMemoryCollector;
 use crate::systing_core::types::task_info;
 use crate::utid::{TrackEventIdGenerator, UtidGenerator};
-use rand::rngs::mock::StepRng;
 use std::sync::Arc;
+
+/// A generator whose values count up from `v` in steps of `a`, so the cookies
+/// the events get are known. It stands in for rand's own `StepRng`, which is
+/// deprecated without a replacement.
+struct StepRng {
+    v: u64,
+    a: u64,
+}
+
+impl StepRng {
+    fn new(initial: u64, increment: u64) -> Self {
+        StepRng {
+            v: initial,
+            a: increment,
+        }
+    }
+}
+
+impl rand::RngCore for StepRng {
+    fn next_u32(&mut self) -> u32 {
+        self.next_u64() as u32
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let res = self.v;
+        self.v = self.v.wrapping_add(self.a);
+        res
+    }
+
+    fn fill_bytes(&mut self, dst: &mut [u8]) {
+        for chunk in dst.chunks_mut(8) {
+            chunk.copy_from_slice(&self.next_u64().to_le_bytes()[..chunk.len()]);
+        }
+    }
+}
 
 fn new_recorder() -> SystingProbeRecorder {
     SystingProbeRecorder::new(
