@@ -157,7 +157,7 @@ pub struct RecorderInfo {
     /// need BPF programs (e.g., tpu, tpu-metrics).
     pub bpf_programs: &'static [&'static str],
     /// Ringbuf ARRAY_OF_MAPS families this recorder's programs write to.
-    /// Drives autocreate in `configure_bpf_skeleton` and consumption in
+    /// Drives the inner rings in `create_ring_shards` and their consumption in
     /// `setup_ringbuffers`.
     pub ringbuf_families: &'static [&'static str],
 }
@@ -194,9 +194,11 @@ const IRQ_BPF_PROGRAMS: &[&str] = &[
 /// the scheduler itself is gated separately in BPF by `tool_config.no_sched`,
 /// so loading the program here does not produce sched events.
 ///
-/// Because the program references the `ringbufs` map, that family must also
-/// be autocreated whenever this program is loaded (see
-/// `get_required_ringbuf_families`).
+/// The program references the `ringbufs` map but writes it only for the
+/// scheduler recorder, so the stack recorders list no ring family of their own
+/// (their stacks go to the always-on `stack_ringbufs`). The `ringbufs` outer
+/// is still created whenever this program loads, and gets rings only when the
+/// `sched` or `irq` recorder is on (see `get_autocreated_ringbuf_families`).
 const SCHED_SWITCH_FOR_STACKS: &[&str] = &["systing_sched_switch"];
 
 const SYSCALL_BPF_PROGRAMS: &[&str] = &[
@@ -491,21 +493,21 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "Sleep stack traces",
             default_enabled: true,
             bpf_programs: SCHED_SWITCH_FOR_STACKS,
-            ringbuf_families: &["ringbufs"],
+            ringbuf_families: &[],
         },
         RecorderInfo {
             name: "interruptible-stacks",
             description: "Interruptible sleep stack traces",
             default_enabled: true,
             bpf_programs: SCHED_SWITCH_FOR_STACKS,
-            ringbuf_families: &["ringbufs"],
+            ringbuf_families: &[],
         },
         RecorderInfo {
             name: "cpu-stacks",
             description: "CPU perf stack traces",
             default_enabled: true,
             bpf_programs: SCHED_SWITCH_FOR_STACKS,
-            ringbuf_families: &["ringbufs"],
+            ringbuf_families: &[],
         },
         RecorderInfo {
             name: "network",
@@ -650,10 +652,10 @@ const DEFAULT_RINGBUF_SIZE_MIB: u32 = 50;
 
 /// Per-CPU ringbuf ARRAY_OF_MAPS families: (outer map name, inner-ring name
 /// prefix, always-on). The stack family backs the cpu-stacks recorder and the
-/// sleep-stack path of sched_switch, so it is created on every run; the rest
-/// follow `get_required_ringbuf_families`. Inner names are cosmetic (the
-/// kernel keeps 15 bytes): they exist so `bpftool map` and the
-/// `SYSTING_DIAG_RINGBUFS` dump can tell the families apart.
+/// sleep-stack path of sched_switch, so its rings are created on every run; the
+/// rest get rings only when `get_required_ringbuf_families` names them. Inner
+/// names are cosmetic (the kernel keeps 15 bytes): they exist so `bpftool map`
+/// and the `SYSTING_DIAG_RINGBUFS` dump can tell the families apart.
 const RINGBUF_FAMILIES: &[(&str, &str, bool)] = &[
     ("ringbufs", "rb_ev_", false),
     ("stack_ringbufs", "rb_stk_", true),
@@ -787,9 +789,8 @@ pub(crate) struct RingShards {
 }
 
 /// Collect ringbuf ARRAY_OF_MAPS families written by any enabled recorder or
-/// probe. Drives both autocreate in `configure_bpf_skeleton` and mmap/consume
-/// in `setup_ringbuffers`; derived from `RecorderInfo::ringbuf_families` so it
-/// cannot drift from `get_required_bpf_programs`.
+/// probe. Drives the inner rings in `create_ring_shards` and mmap/consume in
+/// `setup_ringbuffers`; derived from `RecorderInfo::ringbuf_families`.
 fn get_required_ringbuf_families(opts: &Config) -> HashSet<&'static str> {
     let mut required = HashSet::new();
     for recorder in get_available_recorders() {
@@ -804,6 +805,22 @@ fn get_required_ringbuf_families(opts: &Config) -> HashSet<&'static str> {
         required.insert("perf_counter_ringbufs");
     }
     required
+}
+
+/// The families whose outer map is created: the written ones, plus `ringbufs`
+/// whenever `systing_sched_switch` loads, which references it even when
+/// nothing writes it (see `SCHED_SWITCH_FOR_STACKS`). Drives autocreate in
+/// `configure_bpf_skeleton`.
+fn get_autocreated_ringbuf_families(opts: &Config) -> HashSet<&'static str> {
+    let mut autocreated = get_required_ringbuf_families(opts);
+    let sched_switch_loaded = get_available_recorders().iter().any(|recorder| {
+        is_recorder_enabled(recorder.name, opts)
+            && recorder.bpf_programs.contains(&"systing_sched_switch")
+    });
+    if sched_switch_loaded {
+        autocreated.insert("ringbufs");
+    }
+    autocreated
 }
 
 /// Collect the set of BPF programs required by all enabled recorders.
@@ -3300,7 +3317,8 @@ fn discover_processes_with_mapping(
 
 /// Create the inner rings of every family this run writes and insert them
 /// into their outer ARRAY_OF_MAPS. Runs after `skel.load()` (the outers must
-/// exist) and before `skel.attach()` (no program may look up an empty slot).
+/// exist) and before `skel.attach()` (no program may find an empty slot in a
+/// family it writes).
 ///
 /// One BPF_MAP_UPDATE_BATCH per family: the kernel waits an RCU grace period
 /// after map-of-maps updates (`maybe_wait_bpf_programs`). From 6.8 that wait
@@ -3426,13 +3444,12 @@ fn setup_ringbuffers<'a>(
 
     let object = skel.object();
 
-    // Families a disabled recorder would write were never created (see
-    // configure_bpf_skeleton / create_ring_shards); only the shards that exist
-    // get a poller. Each inner ring gets its own RingBuffer and poller thread,
-    // as the eight static rings did. The poller is named after the ring it
-    // drains (`rb_stk_17`): the kernel keeps 15 bytes of a thread name, so a
-    // family-name prefix would leave every poller of a family looking alike
-    // in ps and in systing's own traces.
+    // Rings of families no enabled recorder writes were never created (see
+    // create_ring_shards); only rings that exist get a poller. Each inner ring
+    // gets its own RingBuffer and poller thread, as the eight static rings did.
+    // The poller is named after the ring it drains (`rb_stk_17`): the kernel
+    // keeps 15 bytes of a thread name, so a family-name prefix would leave
+    // every poller of a family looking alike in ps and in systing's own traces.
     for (outer, prefix, inners) in &shards.families {
         for (i, inner) in inners.iter().enumerate() {
             let poller = format!("{prefix}{i}");
@@ -3771,13 +3788,15 @@ fn configure_bpf_skeleton(
     // busy many-core host a grace period is ~100 ms -- 64 per-slot updates per
     // family would be a multi-second startup. Families no enabled recorder
     // writes are `autocreate(false)` so the outer (and its transient template
-    // ring) is never created; every program that references a skipped outer
-    // is already `autoload=false` via `required_programs` below, so the
-    // verifier never sees the dangling reference.
+    // ring) is never created; a program that references a skipped outer is
+    // either `autoload=false` via `required_programs` below or reaches it only
+    // behind a frozen rodata gate that the verifier prunes. `ringbufs` keeps
+    // its outer whenever `systing_sched_switch` loads, so that program loads
+    // as it always has; it gets rings only with `sched` or `irq`.
     //
     // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
-    let required = get_required_ringbuf_families(opts);
+    let required = get_autocreated_ringbuf_families(opts);
     for mut map in open_skel.open_object_mut().maps_mut() {
         let name = map.name().to_str().unwrap().to_owned();
         if let Some((outer, _, always_on)) = RINGBUF_FAMILIES.iter().find(|(o, _, _)| *o == name) {
@@ -6182,8 +6201,8 @@ pub fn systing(
         }
 
         // Inner rings: created here, after load (the outers exist) and before
-        // attach (no program may find an empty slot). The handles live in
-        // ThreadHandles until the poller threads are joined.
+        // attach (no program may find an empty slot in a family it writes). The
+        // handles live in ThreadHandles until the poller threads are joined.
         let t_rings = std::time::Instant::now();
         let ring_shards = create_ring_shards(&skel, &opts, ring_plan)?;
         if diag {
@@ -7540,6 +7559,36 @@ mod tests {
         }
         // The old layout on a small host stays well under a 1024 soft limit.
         assert!(projected_fd_need(8, 2, 8, false) < 1024);
+    }
+
+    #[test]
+    fn task_event_rings_exist_only_for_sched_or_irq() {
+        let legs = MemoryKernelLegs::default();
+        for bits in 0..32u32 {
+            let on = |i: u32| bits & (1 << i) != 0;
+            let opts = Config {
+                no_sched: !on(0),
+                no_irq: !on(1),
+                no_cpu_stack_traces: !on(2),
+                no_sleep_stack_traces: !on(3),
+                no_interruptible_stack_traces: !on(4),
+                ..Config::default()
+            };
+            let rings = on(0) || on(1);
+            let sched_switch_loads = get_required_bpf_programs(&opts, false, false, false, &legs)
+                .contains("systing_sched_switch");
+            assert_eq!(sched_switch_loads, on(0) || on(2) || on(3) || on(4));
+            assert_eq!(
+                get_required_ringbuf_families(&opts).contains("ringbufs"),
+                rings,
+                "{opts:?}"
+            );
+            assert_eq!(
+                get_autocreated_ringbuf_families(&opts).contains("ringbufs"),
+                rings || sched_switch_loads,
+                "{opts:?}"
+            );
+        }
     }
 
     #[test]
