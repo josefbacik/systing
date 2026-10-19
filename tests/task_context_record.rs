@@ -818,8 +818,9 @@ fn check_task_stacks_trace(dir: &Path, how: &str) {
             said, "off:kernel-release",
             "[{how}] sysinfo.task_stacks_remote_reads has a value this test does not know"
         );
-        assert!(
-            cfg!(target_arch = "aarch64"),
+        assert_eq!(
+            std::env::consts::ARCH,
+            "aarch64",
             "[{how}] the capture says {said}: only an aarch64 capture can"
         );
         check_task_stacks_trace_without_remote_reads(dir, how, &said);

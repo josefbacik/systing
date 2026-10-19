@@ -4534,13 +4534,17 @@ mod tests {
         create_test_task_stack_event_parquet_in_states(dir, &events, true)
     }
 
+    /// One task_stack_event row for the test files: (ts, dur, utid, stack id)
+    /// and what the event says of its thread.
+    type TestTaskStackEvent = ((i64, i64, i64, Option<i64>), TaskState);
+
     /// task_stack_event.parquet: (ts, dur, utid, stack id) and what each event
     /// says of its thread. `schema_31`: with the columns that came with schema
     /// 31 (the system call, the I/O wait, the GIL), or as a file from before
     /// it, which has the state alone.
     fn create_test_task_stack_event_parquet_in_states(
         dir: &Path,
-        events: &[((i64, i64, i64, Option<i64>), TaskState)],
+        events: &[TestTaskStackEvent],
         schema_31: bool,
     ) -> Result<()> {
         let schema = crate::trace::task_stack_event_schema();
@@ -4725,7 +4729,7 @@ mod tests {
     /// stack is `main` alone: each one's begin time and its arguments after
     /// the frame's own.
     fn leaf_states_of(
-        events: &[((i64, i64, i64, Option<i64>), TaskState)],
+        events: &[TestTaskStackEvent],
         schema_31: bool,
     ) -> Vec<(u64, Vec<(String, String)>)> {
         use crate::perfetto::VecTraceWriter;
