@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 31;
+pub const SCHEMA_VERSION: u32 = 32;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -192,6 +192,7 @@ pub const DATA_TABLES: &[&str] = &[
     "clock_snapshot",
     "sysinfo",
     "cpu_info",
+    "stack_sample_event",
     "tpu_device",
     "tpu_op",
     "tpu_metric",
@@ -253,6 +254,7 @@ pub const PARQUET_TABLES: &[(&str, ParquetFileOf)] = &[
     ("clock_snapshot", |p| &p.clock_snapshot),
     ("sysinfo", |p| &p.sysinfo),
     ("cpu_info", |p| &p.cpu_info),
+    ("stack_sample_event", |p| &p.stack_sample_event),
     ("tpu_device", |p| &p.tpu_device),
     ("tpu_op", |p| &p.tpu_op),
     ("tpu_metric", |p| &p.tpu_metric),
@@ -518,6 +520,10 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             utid BIGINT,
             cpu INTEGER,
             stack_id BIGINT,
+            -- 0 uninterruptible sleep, 1 running (the CPU sampler: see
+            -- sysinfo.sample_event), 2 interruptible sleep, 3 and up the
+            -- hardware:/software: trace event with that
+            -- stack_sample_event.stack_event_type.
             stack_event_type TINYINT,
             -- The sampled thread's task_context id (--include-task-context),
             -- NULL when none: its values are the task_context rows with the
@@ -1002,6 +1008,19 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             min_freq_khz BIGINT,
             max_freq_khz BIGINT,
             base_freq_khz BIGINT
+        );
+
+        -- hardware:/software: trace events with a period: which
+        -- stack_sample.stack_event_type (3 and up) each one's samples carry,
+        -- its name in the trace configuration, the perf event, and the
+        -- events one sample stands for. Its per-CPU counts are the counter
+        -- tracks named '<event> CPU <n>'. Empty when none was configured.
+        CREATE TABLE IF NOT EXISTS stack_sample_event (
+            trace_id VARCHAR,
+            stack_event_type TINYINT,
+            name VARCHAR,
+            event VARCHAR,
+            period BIGINT
         );
 
         -- TPU profiling tables

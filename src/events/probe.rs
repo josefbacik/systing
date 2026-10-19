@@ -64,12 +64,33 @@ pub struct TracepointEvent {
     pub name: String,
 }
 
+// Format is
+// hardware:<name>
+// hardware:<name>:<period>
+// software:<name>
+// software:<name>:<period>
+// One of the kernel's generic perf events (`systing --list-events`). It is
+// counted per CPU into a counter track on every tick of the stack sampler;
+// with a period it also records the running stack every <period> events,
+// as stack_sample rows of its own stack_event_type.
+#[derive(Clone, Default)]
+pub struct PerfSampleEvent {
+    /// "hardware" or "software".
+    pub kind: String,
+    pub name: String,
+    pub event_type: u32,
+    pub config: u64,
+    /// 0: counted only.
+    pub period: u64,
+}
+
 #[derive(Clone, Default)]
 pub enum EventProbe {
     UProbe(UProbeEvent),
     Usdt(UsdtProbeEvent),
     KProbe(KProbeEvent),
     Tracepoint(TracepointEvent),
+    Perf(PerfSampleEvent),
     #[default]
     Undefined,
 }
@@ -257,6 +278,74 @@ impl UsdtProbeEvent {
     }
 }
 
+impl PerfSampleEvent {
+    pub(super) fn from_parts(parts: Vec<&str>) -> Result<Self, anyhow::Error> {
+        // Format is
+        // hardware:<name>
+        // hardware:<name>:<period>
+        // software:<name>
+        // software:<name>:<period>
+        if parts.len() != 2 && parts.len() != 3 {
+            return Err(anyhow::anyhow!(
+                "Invalid {} event format: {} (expected {}:<name> or {}:<name>:<period>)",
+                parts[0],
+                parts.join(":"),
+                parts[0],
+                parts[0]
+            ));
+        }
+        let spec = format!("{}:{}", parts[0], parts[1]);
+        let (event_type, config) = crate::perf::generic_event(&spec).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown {} event '{}'; systing --list-events shows the names",
+                parts[0],
+                parts[1]
+            )
+        })?;
+        let period = match parts.get(2) {
+            Some(period) => period
+                .parse::<u64>()
+                .ok()
+                .filter(|p| *p > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Invalid period '{}' in {}", period, parts.join(":"))
+                })?,
+            None => 0,
+        };
+        Ok(PerfSampleEvent {
+            kind: parts[0].to_string(),
+            name: parts[1].to_string(),
+            event_type,
+            config,
+            period,
+        })
+    }
+
+    /// The event without its period: `hardware:cache-misses`.
+    pub fn spec(&self) -> String {
+        format!("{}:{}", self.kind, self.name)
+    }
+}
+
+impl fmt::Display for PerfSampleEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.period > 0 {
+            write!(f, "{}:{}:{}", self.kind, self.name, self.period)
+        } else {
+            write!(f, "{}:{}", self.kind, self.name)
+        }
+    }
+}
+
+impl SystingEvent {
+    /// A hardware:/software: event: it produces counters and stack samples,
+    /// never probe events, so it cannot be an instant, bound a range or
+    /// trigger a stop.
+    pub fn is_perf(&self) -> bool {
+        matches!(self.event, EventProbe::Perf(_))
+    }
+}
+
 impl fmt::Display for SystingEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.event {
@@ -264,6 +353,7 @@ impl fmt::Display for SystingEvent {
             EventProbe::Usdt(usdt) => write!(f, "{usdt}"),
             EventProbe::KProbe(kprobe) => write!(f, "{kprobe}"),
             EventProbe::Tracepoint(tracepoint) => write!(f, "{tracepoint}"),
+            EventProbe::Perf(perf) => write!(f, "{perf}"),
             _ => write!(f, "Invalid event"),
         }
     }

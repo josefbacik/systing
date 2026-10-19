@@ -281,6 +281,15 @@ The following is an exhaustive list of the supported formats
 * `kretprobe:kernel_function_name`
 * `kretprobe:offset`
 * `tracepoint:subystem:tracepoint_name`
+* `hardware:event_name` or `hardware:event_name:period`
+* `software:event_name` or `software:event_name:period`
+
+The last two are the kernel's generic perf events (`cache-misses`, `context-switches`, ...; *--list-events* prints the names).
+Each is counted per CPU into a counter track like *--perf-counter*; with a period it also records the running stack every _period_ events, as stack samples with a `stack_event_type` of their own (the `stack_sample_event` table says which).
+
+=== *--list-events*
+
+Print the event names `hardware:` and `software:` trace events take, each checked against this host (a VM without a PMU has no hardware events), and the PMU events *--perf-counter* takes, then exit.
 
 === *--trace-event-pid* _PID_
 

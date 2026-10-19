@@ -15,9 +15,9 @@ use crate::trace::{
     MemoryThpRecord, MemoryVfioRecord, MemoryVmstatRecord, NetworkDnsRecord,
     NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord,
     NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord,
-    SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
-    SysInfoRecord, TaskContextRecord, TaskStackEventRecord, ThreadRecord, ThreadStateRecord,
-    TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleEventRecord,
+    StackSampleRecord, SysInfoRecord, TaskContextRecord, TaskStackEventRecord, ThreadRecord,
+    ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -173,6 +173,9 @@ pub trait RecordCollector {
 
     /// Add a per-CPU frequency-limit record (one per CPU with cpufreq data).
     fn add_cpu_info(&mut self, record: CpuInfoRecord) -> Result<()>;
+
+    /// Add a hardware:/software: sampler and its stack_event_type.
+    fn add_stack_sample_event(&mut self, record: StackSampleEventRecord) -> Result<()>;
 
     // TPU profiling records
 
@@ -398,6 +401,7 @@ impl RecordCollector for SharedCollector {
         add_go_label(GoLabelRecord),
         set_sysinfo(SysInfoRecord),
         add_cpu_info(CpuInfoRecord),
+        add_stack_sample_event(StackSampleEventRecord),
         add_tpu_device(TpuDeviceRecord),
         add_tpu_op(TpuOpRecord),
         add_tpu_metric(TpuMetricRecord),
@@ -661,6 +665,11 @@ impl RecordCollector for InMemoryCollector {
         Ok(())
     }
 
+    fn add_stack_sample_event(&mut self, record: StackSampleEventRecord) -> Result<()> {
+        self.data.stack_sample_events.push(record);
+        Ok(())
+    }
+
     fn add_tpu_device(&mut self, record: TpuDeviceRecord) -> Result<()> {
         self.data.tpu_devices.push(record);
         Ok(())
@@ -748,6 +757,7 @@ mod tests {
                 add_go_label(GoLabelRecord),
                 set_sysinfo(SysInfoRecord),
                 add_cpu_info(CpuInfoRecord),
+                add_stack_sample_event(StackSampleEventRecord),
                 add_tpu_device(TpuDeviceRecord),
                 add_tpu_op(TpuOpRecord),
                 add_tpu_metric(TpuMetricRecord),

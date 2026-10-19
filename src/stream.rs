@@ -76,6 +76,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "clock_snapshot",
     "sysinfo",
     "cpu_info",
+    "stack_sample_event",
     "tpu_device",
     "tpu_op",
     "tpu_metric",

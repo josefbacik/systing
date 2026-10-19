@@ -7,8 +7,8 @@ use config::ThresholdStopTrigger;
 mod tests;
 
 pub use probe::{
-    EventKey, EventKeyType, EventProbe, EventScope, KProbeEvent, SystingEvent, TracepointEvent,
-    UProbeEvent, UsdtProbeEvent,
+    EventKey, EventKeyType, EventProbe, EventScope, KProbeEvent, PerfSampleEvent, SystingEvent,
+    TracepointEvent, UProbeEvent, UsdtProbeEvent,
 };
 
 use std::collections::{HashMap, HashSet};

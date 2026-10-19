@@ -58,6 +58,10 @@ pub struct ExportMeta {
     pub source_recorder_version: Option<String>,
     pub sample_event: Option<String>,
     pub sample_period: Option<i64>,
+    /// `stack_event_type` 3 and up: the hardware:/software: trace event each
+    /// one's samples were taken by (`stack_sample_event`), as
+    /// `<event>:<period>`, added to the `event_types` legend.
+    pub perf_event_types: Vec<(i8, String)>,
     pub start_ts: i64,
     pub end_ts: i64,
     pub sysname: Option<String>,
@@ -93,6 +97,13 @@ impl ExportWriter {
         sys_field("product_name", &meta.product_name);
         sys_field("cpufreq_driver", &meta.cpufreq_driver);
 
+        let mut event_types = serde_json::Map::new();
+        event_types.insert("0".into(), json!("uninterruptible_sleep"));
+        event_types.insert("1".into(), json!("cpu"));
+        event_types.insert("2".into(), json!("interruptible_sleep"));
+        for (t, event) in &meta.perf_event_types {
+            event_types.insert(t.to_string(), json!(event));
+        }
         let header = json!({
             "systing_profile_export": PROFILE_EXPORT_VERSION,
             "producer": format!("systing {}", env!("CARGO_PKG_VERSION")),
@@ -102,11 +113,7 @@ impl ExportWriter {
             "source_recorder_version": meta.source_recorder_version,
             "sample_event": meta.sample_event,
             "sample_period": meta.sample_period,
-            "event_types": {
-                "0": "uninterruptible_sleep",
-                "1": "cpu",
-                "2": "interruptible_sleep",
-            },
+            "event_types": event_types,
             "stack_order": "leaf_first",
             "start_ts": meta.start_ts,
             "end_ts": meta.end_ts,
@@ -419,6 +426,17 @@ pub fn duckdb_to_profile_export(
         meta.sample_event = row.get(7)?;
         meta.sample_period = row.get(8)?;
     }
+    // Absent before schema 32.
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT stack_event_type, event, period FROM stack_sample_event \
+         WHERE trace_id = ? ORDER BY stack_event_type",
+    ) {
+        let mut rows = stmt.query([&trace_id])?;
+        while let Some(row) = rows.next()? {
+            let (t, event, period): (i8, String, i64) = (row.get(0)?, row.get(1)?, row.get(2)?);
+            meta.perf_event_types.push((t, format!("{event}:{period}")));
+        }
+    }
     let (start_ts, end_ts): (i64, i64) = conn.query_row(
         "SELECT min(ts), max(ts) FROM stack_sample WHERE trace_id = ?",
         [&trace_id],
@@ -653,6 +671,26 @@ pub fn parquet_to_profile_export(input_dir: &Path, output: &Path, trace_id: &str
                 .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                 .filter(|a| !a.is_null(0))
                 .map(|a| a.value(0));
+        }
+        Ok(())
+    })?;
+    for_each_batch("stack_sample_event.parquet", &mut |batch| {
+        let types = batch
+            .column_by_name("stack_event_type")
+            .and_then(|c| c.as_any().downcast_ref::<Int8Array>());
+        let events = batch
+            .column_by_name("event")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let periods = batch
+            .column_by_name("period")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+        if let (Some(types), Some(events), Some(periods)) = (types, events, periods) {
+            for i in 0..batch.num_rows() {
+                meta.perf_event_types.push((
+                    types.value(i),
+                    format!("{}:{}", events.value(i), periods.value(i)),
+                ));
+            }
         }
         Ok(())
     })?;

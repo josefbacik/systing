@@ -214,6 +214,33 @@ ls /sys/kernel/debug/tracing/events/<category>/
 cat /sys/kernel/debug/tracing/events/<category>/<name>/format
 ```
 
+---
+
+#### 5. hardware / software
+
+The kernel's generic perf events: counted, and optionally sampled with stacks.
+
+**Format:** `hardware:<name>`, `hardware:<name>:<period>`, `software:<name>`, `software:<name>:<period>`
+
+```json
+{ "name": "llc_miss", "event": "hardware:cache-misses:100000" }
+```
+
+**Components:**
+- `<name>` - A `perf list` name: `cache-misses`, `instructions`, `branch-misses`, ... (hardware); `context-switches`, `page-faults`, `cpu-migrations`, `major-faults`, ... (software). `systing --list-events` prints them all and checks each against the host.
+- `<period>` - Optional. With it the event also records the running stack every `<period>` events.
+
+**What it records:**
+- Always: the event's count per CPU, read on every tick of the stack sampler, as the counter tracks `<kind>:<name> CPU <n>` (the `counter` / `counter_track` tables) — the same as `--perf-counter`.
+- With a period: `stack_sample` rows with a `stack_event_type` of the event's own (3 and up); the `stack_sample_event` table maps each type to its event and period. The CPU flame graph (`stack_event_type = 1`) does not include them; ask for the type by number (`systing-analyze` MCP `flamegraph` with `stack_type: "3"`).
+
+**Restrictions:**
+- No `args`; `"stack": true` needs a period (and is implied by one); `scope` has no effect.
+- Cannot be referenced from `tracks` or `stop_triggers`: it produces no instant events.
+- A hardware event needs a PMU: bare metal, or a VM that exposes one. The CPU stack sampler already uses one hardware counter (`cpu-cycles`) outside a VM; a CPU has a handful, and the kernel multiplexes beyond that.
+- A short period on a frequent event is throttled by the kernel (`perf_event_max_sample_rate`) and costs accordingly; start around what `perf record -c` would use (100000+ for cache-misses, 1000000+ for instructions).
+- At most 64 counters in all, `--perf-counter` included.
+
 **⚠️ Kernel Version Requirement:**
 
 **Capturing arguments from tracepoint events requires Linux kernel 6.10 or newer.**
@@ -840,6 +867,7 @@ Creates a separate "Context Switches" track for each CPU in the system.
    - uprobe/uretprobe: `<type>:<path>:<symbol_or_offset>` (3 parts)
    - kprobe/kretprobe: `<type>:<symbol_or_offset>` (2 parts)
    - tracepoint: `tracepoint:<category>:<name>` (3 parts)
+   - hardware/software: `<type>:<name>` or `<type>:<name>:<period>` (2 or 3 parts)
 
 ### Track Validation
 

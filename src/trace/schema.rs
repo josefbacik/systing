@@ -284,6 +284,20 @@ pub fn sysinfo_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Schema for stack_sample_event.parquet
+///
+/// One row per hardware:/software: trace event with a period: the
+/// `stack_sample.stack_event_type` its samples carry (3 and up), its name in
+/// the configuration, the perf event, and the events one sample stands for.
+pub fn stack_sample_event_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("stack_event_type", DataType::Int8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("event", DataType::Utf8, false),
+        Field::new("period", DataType::Int64, false),
+    ]))
+}
+
 /// Schema for cpu_info.parquet
 ///
 /// Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on systems

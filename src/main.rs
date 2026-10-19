@@ -236,6 +236,10 @@ struct Command {
     /// List all available recorders and their default states
     #[arg(long)]
     list_recorders: bool,
+    /// List the generic perf events the hardware: and software: trace events
+    /// take, checked against this host, and the PMU events --perf-counter takes
+    #[arg(long)]
+    list_events: bool,
     /// Enable a specific recorder by name (can be specified multiple times)
     #[arg(long)]
     add_recorder: Vec<String>,
@@ -584,6 +588,10 @@ fn main() -> Result<()> {
         let name = cmd.get_name().to_string();
         generate(shell, &mut cmd, name, &mut std::io::stdout());
         return Ok(());
+    }
+
+    if opts.list_events {
+        return systing::perf::list_events();
     }
 
     if opts.list_recorders {

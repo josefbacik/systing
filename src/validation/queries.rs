@@ -14,6 +14,8 @@ pub const STACK_RUNNING: i8 = 1;
 
 /// Stack event type: captured when task went to interruptible sleep.
 pub const STACK_SLEEP_INTERRUPTIBLE: i8 = 2;
+/// This and up: taken by a hardware:/software: trace event's sampler.
+pub const STACK_PERF_EVENT_FIRST: i8 = crate::systing_core::STACK_PERF_EVENT_FIRST;
 
 /// Trait for validation queries - each format implements using its native mechanism.
 ///
