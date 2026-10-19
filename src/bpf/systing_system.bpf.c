@@ -770,11 +770,15 @@ struct {
 	__uint(max_entries, MISSED_EVENT_MAX);
 } missed_events SEC(".maps");
 
+/* read_counters() keeps each counter's last value here, by counter index,
+ * to turn the running count into a per-tick delta. MAX_PERF_COUNTERS is
+ * the most counters a capture may configure; userspace refuses more. */
+#define MAX_PERF_COUNTERS 64
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, u64);
-	__uint(max_entries, 1);
+	__uint(max_entries, MAX_PERF_COUNTERS);
 } last_perf_counter_value SEC(".maps");
 
 /*
