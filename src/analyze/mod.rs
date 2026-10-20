@@ -452,7 +452,14 @@ impl AnalyzeDb {
         let (mem_limit_mib, threads) = crate::duckdb::duckdb_resource_limits(50, 512);
         let tmp = std::env::temp_dir();
         sweep_stale_spill_dirs(&tmp);
-        let mut config = duckdb::Config::default().threads(threads as i64)?;
+        let mut config = duckdb::Config::default()
+            .threads(threads as i64)?
+            // By default DuckDB binds worker i to CPU i on hosts with more
+            // than 64 CPUs. Closing joins every worker, so one busy CPU can
+            // hold up the close while the rest of the host idles, and the
+            // bounded pool above lands on the lowest-numbered CPUs only. Set
+            // at open: a later SET leaves already-running workers bound.
+            .with("pin_threads", "off")?;
         // temp_directory must be set before enable_external_access(false):
         // DuckDB refuses to modify it once external access is disabled, even
         // on a Config that has not opened a database yet. An empty value
@@ -1408,6 +1415,51 @@ mod tests {
             .query_row("SELECT current_setting('temp_directory')", [], |r| r.get(0))
             .unwrap();
         assert_eq!(temp_directory, "");
+    }
+
+    /// DuckDB's workers inherit the opener's thread name, which tells them
+    /// from the pools other tests in this process open. By default DuckDB
+    /// binds workers only on hosts with more than 64 CPUs: on smaller hosts
+    /// this checks the setting alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_open_binds_no_worker_to_a_cpu() {
+        // 15 bytes: the longest thread name the kernel keeps.
+        const OPENER: &str = "analyze-nopin-t";
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x INTEGER)")
+            .unwrap();
+        let masks = std::thread::Builder::new()
+            .name(OPENER.into())
+            .spawn(move || {
+                let db = AnalyzeDb::open(&db_path, true).unwrap();
+                let pin = db.query("SELECT current_setting('pin_threads')").unwrap();
+                assert_eq!(pin.rows[0][0], serde_json::json!("off"));
+                std::fs::read_dir("/proc/self/task")
+                    .unwrap()
+                    .filter_map(|t| {
+                        // A thread of another test may exit mid-scan.
+                        let status = std::fs::read_to_string(t.ok()?.path().join("status")).ok()?;
+                        let field = |k: &str| {
+                            status
+                                .lines()
+                                .find_map(|l| l.strip_prefix(k))
+                                .map(|v| v.trim().to_owned())
+                        };
+                        (field("Name:")? == OPENER).then(|| field("Cpus_allowed_list:"))?
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        // The opener plus its workers: the scan did see the pool.
+        let (_, threads) = crate::duckdb::duckdb_resource_limits(50, 512);
+        assert!(masks.len() as u64 >= threads, "{masks:?}");
+        assert!(masks.iter().all(|m| *m == masks[0]), "{masks:?}");
     }
 
     #[test]
