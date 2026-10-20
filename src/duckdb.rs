@@ -93,13 +93,27 @@ pub(crate) fn duckdb_resource_limits(mem_fraction_pct: u64, min_mib: u64) -> (Op
     (mem_limit_mib, threads)
 }
 
+/// The `(memory_limit in MiB, threads)` budget of a bulk import or export.
+fn bulk_io_limits() -> (Option<u64>, u64) {
+    // Leave 25% of the container for everything that is not DuckDB's buffer
+    // pool (our own heap, resident BPF maps, kernel page cache pressure),
+    // clamped to at least 1 GiB so tiny containers still get a working import.
+    duckdb_resource_limits(75, 1024)
+}
+
 /// Open a database file for a bulk import or export.
 fn open_for_bulk_io(db_path: &Path) -> duckdb::Result<Connection> {
     // Above 64 CPUs DuckDB by default pins worker i to CPU i, so whatever
     // waits for that worker waits for CPU i, however idle the others are.
     // The open itself starts the workers, and a later SET pin_threads leaves
     // them pinned, so the setting goes on the Config.
-    let config = duckdb::Config::default().with("pin_threads", "off")?;
+    // `threads` goes there too: without it the open starts about one worker
+    // per CPU, which the SET threads in configure_for_bulk_io then stops and
+    // replaces.
+    let (_, threads) = bulk_io_limits();
+    let config = duckdb::Config::default()
+        .threads(threads as i64)?
+        .with("pin_threads", "off")?;
     Connection::open_with_flags(db_path, config)
 }
 
@@ -112,10 +126,7 @@ fn open_for_bulk_io(db_path: &Path) -> duckdb::Result<Connection> {
 /// without reorder buffering, and points `temp_directory` at `spill_dir` so
 /// DuckDB can spill instead of OOMing if it still hits the cap.
 fn configure_for_bulk_io(conn: &Connection, spill_dir: &Path) -> Result<()> {
-    // Leave 25% of the container for everything that is not DuckDB's buffer
-    // pool (our own heap, resident BPF maps, kernel page cache pressure),
-    // clamped to at least 1 GiB so tiny containers still get a working import.
-    let (mem_limit_mib, threads) = duckdb_resource_limits(75, 1024);
+    let (mem_limit_mib, threads) = bulk_io_limits();
 
     let escaped_spill = spill_dir.to_string_lossy().replace('\'', "''");
     let mut pragmas = format!(
@@ -2315,6 +2326,25 @@ mod tests {
             pin_threads.to_lowercase(),
             "off",
             "pin_threads after open_for_bulk_io"
+        );
+    }
+
+    /// Can fail only where DuckDB's default thread count differs from
+    /// `bulk_io_limits()`.
+    #[test]
+    fn test_open_for_bulk_io_sets_threads() {
+        let tmp = TempDir::new().unwrap();
+        let conn = open_for_bulk_io(&tmp.path().join("test.duckdb")).unwrap();
+
+        let threads: u64 = conn
+            .query_row("SELECT current_setting('threads') AS threads", [], |r| {
+                r.get("threads")
+            })
+            .unwrap();
+        assert_eq!(
+            threads,
+            bulk_io_limits().1,
+            "threads after open_for_bulk_io"
         );
     }
 
