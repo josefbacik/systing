@@ -25,6 +25,14 @@ pub struct Written {
     pub frames: usize,
 }
 
+/// Create the database at `out`.
+fn create(out: &Path) -> Result<Connection> {
+    // Above 64 CPUs DuckDB by default pins worker i to CPU i, so whatever
+    // waits for that worker waits for CPU i, however idle the others are.
+    let config = duckdb::Config::default().with("pin_threads", "off")?;
+    Connection::open_with_flags(out, config).with_context(|| format!("creating {}", out.display()))
+}
+
 /// Write `snapshots`, named by `symbolized`, as trace `trace_id` of a new
 /// database at `out`.
 pub fn write(
@@ -34,7 +42,7 @@ pub fn write(
     snapshots: &[Snapshot],
     symbolized: &Symbolized,
 ) -> Result<Written> {
-    let mut conn = Connection::open(out).with_context(|| format!("creating {}", out.display()))?;
+    let mut conn = create(out)?;
     let tx = conn.transaction()?;
     create_schema(&tx)?;
     // This systing both "recorded" (read the dumps) and imported the trace,
@@ -201,4 +209,23 @@ pub fn write(
     written.stacks = stack_ids.len();
     written.frames = frame_ids.len();
     Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_database_is_created_with_thread_pinning_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = create(&dir.path().join("heap.duckdb")).unwrap();
+        let pin_threads: String = conn
+            .query_row(
+                "SELECT current_setting('pin_threads') AS pin_threads",
+                [],
+                |r| r.get("pin_threads"),
+            )
+            .unwrap();
+        assert_eq!(pin_threads.to_lowercase(), "off");
+    }
 }
