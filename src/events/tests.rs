@@ -67,6 +67,112 @@ fn test_add_event() {
 }
 
 #[test]
+fn test_add_perf_event() {
+    let mut rng = StepRng::new(0, 1);
+    let mut recorder = new_recorder();
+    recorder
+        .add_event_from_str("hardware:cache-misses", &mut rng)
+        .unwrap();
+    recorder
+        .add_event_from_str("software:context-switches:1000", &mut rng)
+        .unwrap();
+    // Counted and sampled, never an instant.
+    assert_eq!(recorder.config_events.len(), 2);
+    assert!(recorder.instant_events.is_empty());
+
+    let counted = &recorder.config_events["hardware:cache-misses"];
+    assert!(counted.is_perf() && !counted.stack);
+    let EventProbe::Perf(perf) = &counted.event else {
+        panic!("not a perf event");
+    };
+    assert_eq!(
+        (perf.event_type, perf.config, perf.period),
+        (crate::perf::PERF_TYPE_HARDWARE, 3, 0)
+    );
+
+    let sampled = &recorder.config_events["software:context-switches:1000"];
+    assert!(sampled.stack, "a period means stacks");
+    let EventProbe::Perf(perf) = &sampled.event else {
+        panic!("not a perf event");
+    };
+    assert_eq!(
+        (
+            perf.event_type,
+            perf.config,
+            perf.period,
+            perf.spec().as_str()
+        ),
+        (
+            crate::perf::PERF_TYPE_SOFTWARE,
+            3,
+            1000,
+            "software:context-switches"
+        )
+    );
+
+    // perf's aliases resolve to the same event.
+    recorder
+        .add_event_from_str("software:cs", &mut rng)
+        .unwrap();
+
+    for bad in [
+        "hardware:no-such-event",
+        "hardware:cache-misses:0",
+        "hardware:cache-misses:fast",
+        "hardware",
+        "software:cs:1:2",
+    ] {
+        assert!(
+            recorder.add_event_from_str(bad, &mut rng).is_err(),
+            "{bad} must be refused"
+        );
+    }
+}
+
+#[test]
+fn test_perf_event_json_rules() {
+    let mut rng = StepRng::new(0, 1);
+    let load = |json: &str| new_recorder().load_config_from_json(json, &mut StepRng::new(0, 1));
+
+    // A period implies "stack"; "stack": true without one is refused, and so
+    // are args.
+    let mut recorder = new_recorder();
+    recorder
+        .load_config_from_json(
+            r#"{"events": [{"name": "llc", "event": "hardware:cache-misses:100000"}]}"#,
+            &mut rng,
+        )
+        .unwrap();
+    assert!(recorder.config_events["llc"].stack);
+    assert!(load(
+        r#"{"events": [{"name": "llc", "event": "hardware:cache-misses", "stack": true}]}"#
+    )
+    .is_err());
+    assert!(load(
+        r#"{"events": [{"name": "llc", "event": "hardware:cache-misses:1000",
+            "args": [{"arg_index": 0, "arg_type": "long", "arg_name": "x"}]}]}"#
+    )
+    .is_err());
+
+    // It produces no probe events, so tracks and stop triggers cannot use it.
+    assert!(load(
+        r#"{"events": [{"name": "cs", "event": "software:context-switches:100"}],
+            "tracks": [{"track_name": "t", "instants": [{"event": "cs"}]}]}"#
+    )
+    .is_err());
+    assert!(load(
+        r#"{"events": [{"name": "cs", "event": "software:context-switches:100"}],
+            "stop_triggers": {"instants": [{"event": "cs"}]}}"#
+    )
+    .is_err());
+    assert!(load(
+        r#"{"events": [{"name": "cs", "event": "software:cs"}, {"name": "end", "event": "kprobe:foo"}],
+            "tracks": [{"track_name": "t", "ranges": [{"name": "r", "start": "cs", "end": "end"}]}]}"#
+    )
+    .is_err());
+}
+
+#[test]
 fn test_add_event_invalid() {
     let mut rng = StepRng::new(0, 1);
     let mut recorder = new_recorder();

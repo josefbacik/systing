@@ -296,7 +296,8 @@ pub struct StackRecord {
 /// - `utid`: Unique thread ID (references ThreadRecord.utid)
 /// - `cpu`: CPU core number (optional)
 /// - `stack_id`: Reference to StackRecord.id
-/// - `stack_event_type`: Type of stack capture (0=STACK_SLEEP_UNINTERRUPTIBLE, 1=STACK_RUNNING, 2=STACK_SLEEP_INTERRUPTIBLE)
+/// - `stack_event_type`: Type of stack capture (0=STACK_SLEEP_UNINTERRUPTIBLE, 1=STACK_RUNNING, 2=STACK_SLEEP_INTERRUPTIBLE,
+///   3 and up = taken by the hardware:/software: trace event with that `stack_sample_event.stack_event_type`)
 /// - `task_context_id`: The sampled thread's task_context id at the sample
 ///   (`--include-task-context`), `None` when the thread had none, the read
 ///   missed, or the capture ran without the flag. Its values are the
@@ -709,6 +710,20 @@ pub struct CpuInfoRecord {
     pub base_freq_khz: Option<i64>,
 }
 
+/// A hardware:/software: trace event with a period, and the
+/// `stack_sample.stack_event_type` its samples are stored under (3 and up).
+/// `name` is the event's name in the trace configuration (the spec itself
+/// for `--trace-event`), `event` the perf event (`hardware:cache-misses`),
+/// `period` the events one sample stands for. The event's per-CPU counts are
+/// the counter tracks named "`event` CPU N".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StackSampleEventRecord {
+    pub stack_event_type: i8,
+    pub name: String,
+    pub event: String,
+    pub period: i64,
+}
+
 /// Container for all extracted trace data.
 /// Per-process RSS / VM counter sample.
 ///
@@ -1017,6 +1032,7 @@ pub struct ExtractedData {
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
     pub cpu_infos: Vec<CpuInfoRecord>,
+    pub stack_sample_events: Vec<StackSampleEventRecord>,
     pub tpu_devices: Vec<TpuDeviceRecord>,
     pub tpu_ops: Vec<TpuOpRecord>,
     pub tpu_metrics: Vec<TpuMetricRecord>,

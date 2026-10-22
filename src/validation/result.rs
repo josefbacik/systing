@@ -150,6 +150,7 @@ impl fmt::Display for ValidationError {
                     0 => "STACK_SLEEP_UNINTERRUPTIBLE",
                     1 => "STACK_RUNNING",
                     2 => "STACK_SLEEP_INTERRUPTIBLE",
+                    t if t >= 3 => "STACK_PERF_EVENT",
                     _ => "UNKNOWN",
                 };
                 write!(

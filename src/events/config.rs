@@ -52,6 +52,13 @@ pub(super) struct ThresholdStopTrigger {
 //     - "kprobe:<symbol>" or "kprobe:<symbol>+<offset>" - Kernel probe
 //     - "kretprobe:<symbol>" - Kernel return probe
 //     - "tracepoint:<category>:<name>" - Kernel tracepoint
+//     - "hardware:<name>" or "hardware:<name>:<period>" - Generic hardware perf event
+//     - "software:<name>" or "software:<name>:<period>" - Kernel software perf event
+//
+//   A hardware or software event (`systing --list-events` names them) is counted per CPU
+//   into a counter track; with a period it also records the running stack every <period>
+//   events ("stack" is then implied, and an error without a period). It takes no args and
+//   cannot appear in tracks or stop_triggers.
 //
 //   "tracks": [
 //     {
@@ -181,6 +188,12 @@ impl SystingProbeRecorder {
                 systing_event.name = format!("{}:{}", tracepoint.category, tracepoint.name);
                 systing_event.event = EventProbe::Tracepoint(tracepoint);
             }
+            "hardware" | "software" => {
+                let perf = PerfSampleEvent::from_parts(parts)?;
+                systing_event.name = perf.to_string();
+                systing_event.stack = perf.period > 0;
+                systing_event.event = EventProbe::Perf(perf);
+            }
             _ => {
                 return Err(anyhow::anyhow!("Invalid event type: {}", parts[0]));
             }
@@ -193,8 +206,10 @@ impl SystingProbeRecorder {
         }
         self.cookies
             .insert(systing_event.cookie, systing_event.clone());
-        self.instant_events
-            .insert(systing_event.name.clone(), systing_event.name.clone());
+        if !systing_event.is_perf() {
+            self.instant_events
+                .insert(systing_event.name.clone(), systing_event.name.clone());
+        }
         self.config_events
             .insert(systing_event.name.clone(), systing_event);
         Ok(())
@@ -242,8 +257,28 @@ impl SystingProbeRecorder {
             "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
             "kprobe" | "kretprobe" => EventProbe::KProbe(KProbeEvent::from_parts(parts)?),
             "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
+            "hardware" | "software" => EventProbe::Perf(PerfSampleEvent::from_parts(parts)?),
             _ => return Err(anyhow::anyhow!("Invalid event type")),
         };
+
+        let mut stack = event.stack.unwrap_or(false);
+        if let EventProbe::Perf(perf) = &probe {
+            if !args.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "args are not supported for {} events: {}",
+                    perf.kind,
+                    event.name
+                ));
+            }
+            if stack && perf.period == 0 {
+                return Err(anyhow::anyhow!(
+                    "\"stack\": true needs a period for event {}: {}:<period>",
+                    event.name,
+                    perf.spec()
+                ));
+            }
+            stack = perf.period > 0;
+        }
 
         // Validate retval args are only used with retprobes
         for arg in args.iter() {
@@ -269,7 +304,7 @@ impl SystingProbeRecorder {
                             event.name
                         ));
                     }
-                    EventProbe::Tracepoint(_) => {
+                    EventProbe::Tracepoint(_) | EventProbe::Perf(_) => {
                         return Err(anyhow::anyhow!(
                             "retval arg type is not supported for tracepoint events: {}",
                             event.name
@@ -291,7 +326,7 @@ impl SystingProbeRecorder {
             event: probe,
             args,
             scope: event.scope.unwrap_or_default(),
-            stack: event.stack.unwrap_or(false),
+            stack,
         };
         if self.config_events.contains_key(&event.name) {
             return Err(anyhow::anyhow!("Event {} already exists", event.name));
@@ -301,40 +336,43 @@ impl SystingProbeRecorder {
         Ok(())
     }
 
+    /// The configured event `name` as something a track or stop trigger may
+    /// reference: it must exist and must produce probe events.
+    fn probe_event_for(&self, name: &str, role: &str) -> Result<&SystingEvent> {
+        let event = self
+            .config_events
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("{role} event {name} does not exist"))?;
+        if event.is_perf() {
+            return Err(anyhow::anyhow!(
+                "{role} event {name} is a hardware/software counter event: it produces counters and stack samples, not events a track or stop trigger can use"
+            ));
+        }
+        Ok(event)
+    }
+
     fn add_trigger(&mut self, trigger: &SystingJSONStopTrigger) -> Result<()> {
         if let Some(thresholds) = &trigger.thresholds {
             for t in thresholds.iter() {
-                if !self.config_events.contains_key(&t.start) {
-                    return Err(anyhow::anyhow!("Start event {} does not exist", t.start));
-                }
-                if !self.config_events.contains_key(&t.end) {
-                    return Err(anyhow::anyhow!("Stop event {} does not exist", t.end));
-                }
-                let start_event = self.config_events.get(&t.start).unwrap();
-                let stop_event = self.config_events.get(&t.end).unwrap();
-                if self.start_triggers.contains(&start_event.cookie) {
+                let start_cookie = self.probe_event_for(&t.start, "Start")?.cookie;
+                let stop_cookie = self.probe_event_for(&t.end, "Stop")?.cookie;
+                if self.start_triggers.contains(&start_cookie) {
                     return Err(anyhow::anyhow!("Start event {} already exists", t.start));
                 }
-                if self.end_triggers.contains_key(&stop_event.cookie) {
+                if self.end_triggers.contains_key(&stop_cookie) {
                     return Err(anyhow::anyhow!("Stop event {} already exists", t.end));
                 }
-                self.start_triggers.insert(start_event.cookie);
+                self.start_triggers.insert(start_cookie);
                 self.stop_triggers.push(ThresholdStopTrigger {
-                    start_cookie: start_event.cookie,
+                    start_cookie,
                     duration_us: t.duration_us,
                 });
                 self.end_triggers
-                    .insert(stop_event.cookie, self.stop_triggers.len() - 1);
+                    .insert(stop_cookie, self.stop_triggers.len() - 1);
             }
         } else if let Some(instants) = &trigger.instants {
             for instant in instants.iter() {
-                if !self.config_events.contains_key(&instant.event) {
-                    return Err(anyhow::anyhow!(
-                        "Instant event {} does not exist",
-                        instant.event
-                    ));
-                }
-                let event = self.config_events.get(&instant.event).unwrap();
+                let cookie = self.probe_event_for(&instant.event, "Instant")?.cookie;
                 if self.instant_events.contains_key(&instant.event) {
                     return Err(anyhow::anyhow!(
                         "Instant event {} already exists",
@@ -353,7 +391,7 @@ impl SystingProbeRecorder {
                         instant.event
                     ));
                 }
-                if !self.instant_triggers.insert(event.cookie) {
+                if !self.instant_triggers.insert(cookie) {
                     return Err(anyhow::anyhow!(
                         "Instant trigger for event {} already exists",
                         instant.event
@@ -386,15 +424,8 @@ impl SystingProbeRecorder {
                 for range in ranges.iter() {
                     let start_event = range.start.clone();
                     let end_event = range.end.clone();
-                    if !self.config_events.contains_key(&start_event) {
-                        Err(anyhow::anyhow!(
-                            "Start event {} does not exist",
-                            start_event
-                        ))?;
-                    }
-                    if !self.config_events.contains_key(&end_event) {
-                        Err(anyhow::anyhow!("Stop event {} does not exist", end_event))?;
-                    }
+                    let start_scope = self.probe_event_for(&start_event, "Start")?.scope;
+                    let end_scope = self.probe_event_for(&end_event, "Stop")?.scope;
                     if self.start_events.contains_key(&start_event) {
                         Err(anyhow::anyhow!(
                             "Start event {} already exists",
@@ -404,8 +435,6 @@ impl SystingProbeRecorder {
                     if self.stop_events.contains_key(&end_event) {
                         Err(anyhow::anyhow!("Stop event {} already exists", end_event))?;
                     }
-                    let start_scope = self.config_events.get(&start_event).unwrap().scope;
-                    let end_scope = self.config_events.get(&end_event).unwrap().scope;
                     if start_scope != end_scope {
                         Err(anyhow::anyhow!(
                             "Range '{}': start event '{}' has scope {:?} but end event '{}' has scope {:?}; they must match",
@@ -423,12 +452,7 @@ impl SystingProbeRecorder {
             }
             if let Some(instants) = &track.instants {
                 for instant in instants.iter() {
-                    if !self.config_events.contains_key(&instant.event) {
-                        Err(anyhow::anyhow!(
-                            "Instant event {} does not exist",
-                            instant.event
-                        ))?;
-                    }
+                    self.probe_event_for(&instant.event, "Instant")?;
                     if self.instant_events.contains_key(&instant.event) {
                         Err(anyhow::anyhow!(
                             "Instant event {} already exists",

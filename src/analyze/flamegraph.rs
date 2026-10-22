@@ -16,23 +16,21 @@ pub enum StackTypeFilter {
     UninterruptibleSleep,
     AllSleep,
     All,
-}
-
-impl StackTypeFilter {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::InterruptibleSleep => "interruptible-sleep",
-            Self::UninterruptibleSleep => "uninterruptible-sleep",
-            Self::AllSleep => "all-sleep",
-            Self::All => "all",
-        }
-    }
+    /// One `stack_event_type` by number: 3 and up are the hardware:/software:
+    /// trace events (the stack_sample_event table says which).
+    Type(i8),
 }
 
 impl fmt::Display for StackTypeFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            Self::Cpu => f.write_str("cpu"),
+            Self::InterruptibleSleep => f.write_str("interruptible-sleep"),
+            Self::UninterruptibleSleep => f.write_str("uninterruptible-sleep"),
+            Self::AllSleep => f.write_str("all-sleep"),
+            Self::All => f.write_str("all"),
+            Self::Type(t) => write!(f, "{t}"),
+        }
     }
 }
 
@@ -46,10 +44,13 @@ impl FromStr for StackTypeFilter {
             "uninterruptible-sleep" => Ok(Self::UninterruptibleSleep),
             "all-sleep" => Ok(Self::AllSleep),
             "all" => Ok(Self::All),
-            _ => bail!(
-                "Invalid stack type: {s}. Must be one of: cpu, interruptible-sleep, \
-                 uninterruptible-sleep, all-sleep, all"
-            ),
+            _ => match s.parse::<i8>() {
+                Ok(t) if t >= 0 => Ok(Self::Type(t)),
+                _ => bail!(
+                    "Invalid stack type: {s}. Must be one of: cpu, interruptible-sleep, \
+                     uninterruptible-sleep, all-sleep, all, or a stack_event_type number"
+                ),
+            },
         }
     }
 }
@@ -357,6 +358,9 @@ fn build_flamegraph_query(q: &FlamegraphQuery<'_>) -> String {
             conditions.push("ss.stack_event_type IN (0, 2)".to_string());
         }
         StackTypeFilter::All => {}
+        StackTypeFilter::Type(t) => {
+            conditions.push(format!("ss.stack_event_type = {t}"));
+        }
     }
 
     if pid.is_some() || tid.is_some() {
@@ -1155,8 +1159,9 @@ mod tests {
             StackTypeFilter::UninterruptibleSleep,
             StackTypeFilter::AllSleep,
             StackTypeFilter::All,
+            StackTypeFilter::Type(3),
         ] {
-            let s = st.as_str();
+            let s = st.to_string();
             let parsed: StackTypeFilter = s.parse().unwrap();
             assert_eq!(*st, parsed);
         }
@@ -1166,6 +1171,7 @@ mod tests {
     fn test_stack_type_filter_invalid() {
         let result: Result<StackTypeFilter> = "invalid".parse();
         assert!(result.is_err());
+        assert!("-1".parse::<StackTypeFilter>().is_err());
     }
 
     #[test]

@@ -276,6 +276,10 @@ pub struct SessionRecorder {
     /// The perf event/period driving CPU stack sampling, set once perf events
     /// are opened. Unset until then (or in unit tests that never open them).
     pub clock_sampling: OnceLock<ClockSamplingConfig>,
+    /// The hardware:/software: trace events with a period and the
+    /// stack_event_type each one's samples carry; set once beside
+    /// `clock_sampling`, written as the stack_sample_event table.
+    pub stack_sample_events: OnceLock<Vec<crate::trace::StackSampleEventRecord>>,
     /// The memory recorder's capture-time configuration and fault-leg
     /// status, set once BPF is attached. Unset when the memory recorder is
     /// not enabled (the sysinfo columns are then NULL).
@@ -1024,6 +1028,7 @@ impl SessionRecorder {
             kernel_threads: RwLock::new(HashSet::new()),
             utid_generator,
             clock_sampling: OnceLock::new(),
+            stack_sample_events: OnceLock::new(),
             memory_recorder_config: OnceLock::new(),
             memory_recorder_end: OnceLock::new(),
             network_recorder_config: OnceLock::new(),
@@ -1735,6 +1740,10 @@ impl SessionRecorder {
             })?;
         }
 
+        for event in self.stack_sample_events.get().into_iter().flatten() {
+            writer.add_stack_sample_event(event.clone())?;
+        }
+
         // Step 3: Generate process and thread records
         // Use the shared UtidGenerator to get consistent utid/upid values that match
         // what was used during streaming.
@@ -2232,6 +2241,7 @@ mod tests {
             utid_generator,
             tpu_metrics_recorder: None,
             clock_sampling: OnceLock::new(),
+            stack_sample_events: OnceLock::new(),
             memory_recorder_config: OnceLock::new(),
             memory_recorder_end: OnceLock::new(),
             network_recorder_config: OnceLock::new(),

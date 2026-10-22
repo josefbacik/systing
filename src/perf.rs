@@ -151,6 +151,135 @@ pub const PERF_COUNT_HW_STALLED_CYCLES_FRONTEND: u64 = 7;
 pub const PERF_COUNT_HW_STALLED_CYCLES_BACKEND: u64 = 8;
 
 pub const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
+
+/// The kernel's generic hardware events (enum perf_hw_id), by the names
+/// `perf list` gives them, aliases included. A PMU driver maps each to a
+/// raw event of the CPU it runs on, or refuses it (ENOENT) when it has no
+/// equivalent — a VM without a virtual PMU refuses them all.
+pub const GENERIC_HARDWARE_EVENTS: &[(&str, u64)] = &[
+    ("cpu-cycles", 0),
+    ("cycles", 0),
+    ("instructions", 1),
+    ("cache-references", 2),
+    ("cache-misses", 3),
+    ("branch-instructions", 4),
+    ("branches", 4),
+    ("branch-misses", 5),
+    ("bus-cycles", 6),
+    ("stalled-cycles-frontend", 7),
+    ("idle-cycles-frontend", 7),
+    ("stalled-cycles-backend", 8),
+    ("idle-cycles-backend", 8),
+    ("ref-cycles", 9),
+];
+
+/// The kernel's software events (enum perf_sw_ids), by their `perf list`
+/// names. Counted by the kernel itself, so they exist on every host.
+/// `dummy` and `bpf-output` are left out: they count nothing.
+pub const GENERIC_SOFTWARE_EVENTS: &[(&str, u64)] = &[
+    ("cpu-clock", 0),
+    ("task-clock", 1),
+    ("page-faults", 2),
+    ("faults", 2),
+    ("context-switches", 3),
+    ("cs", 3),
+    ("cpu-migrations", 4),
+    ("migrations", 4),
+    ("minor-faults", 5),
+    ("major-faults", 6),
+    ("alignment-faults", 7),
+    ("emulation-faults", 8),
+    ("cgroup-switches", 11),
+];
+
+/// `hardware:<name>` or `software:<name>` to the (type, config) pair
+/// perf_event_open takes; None for another prefix or an unknown name.
+pub fn generic_event(spec: &str) -> Option<(u32, u64)> {
+    let (kind, name) = spec.split_once(':')?;
+    let (event_type, table) = match kind {
+        "hardware" => (PERF_TYPE_HARDWARE, GENERIC_HARDWARE_EVENTS),
+        "software" => (PERF_TYPE_SOFTWARE, GENERIC_SOFTWARE_EVENTS),
+        _ => return None,
+    };
+    table
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, config)| (event_type, *config))
+}
+
+/// Whether this process may open `spec` here: a counting event on itself,
+/// user mode only, so it needs no privilege. Ok(false) means the host has no
+/// such event (a VM without a PMU); an error is anything else (no
+/// permission to tell).
+pub fn probe_generic_event(spec: &str) -> Result<bool, Error> {
+    let Some((event_type, config)) = generic_event(spec) else {
+        return Ok(false);
+    };
+    let mut attr: perf_event_attr = unsafe { mem::zeroed() };
+    attr._type = event_type;
+    attr.size = mem::size_of::<perf_event_attr>() as u32;
+    attr.config = config;
+    attr.flags.set_disabled(1);
+    attr.flags.set_exclude_kernel(1);
+    attr.flags.set_exclude_hv(1);
+    match perf_event_open(&attr, 0, -1, -1, 0) {
+        Ok(file) => {
+            unsafe { libc::close(file.into_raw_fd()) };
+            Ok(true)
+        }
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOENT) | Some(libc::EOPNOTSUPP) | Some(libc::ENODEV)
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// What `--list-events` prints: the generic events `hardware:` and
+/// `software:` trace events take, each checked against this host, then the
+/// PMU events sysfs advertises for `--perf-counter`.
+pub fn list_events() -> Result<()> {
+    println!(
+        "Generic events, for --trace-event and the \"event\" field of a trace config.\n\
+         Each is counted per CPU into a counter track; with a period\n\
+         (hardware:<name>:<period>) it also records the running stack every <period> events.\n"
+    );
+    for (kind, table) in [
+        ("hardware", GENERIC_HARDWARE_EVENTS),
+        ("software", GENERIC_SOFTWARE_EVENTS),
+    ] {
+        println!("{kind}:");
+        let mut last_config = None;
+        for (name, config) in table {
+            if last_config == Some(*config) {
+                println!("  {kind}:{name} (alias)");
+                continue;
+            }
+            last_config = Some(*config);
+            let note = match probe_generic_event(&format!("{kind}:{name}")) {
+                Ok(true) => "",
+                Ok(false) => " (not supported on this host)",
+                Err(_) => " (could not check: no permission)",
+            };
+            println!("  {kind}:{name}{note}");
+        }
+        println!();
+    }
+    let mut counters = PerfCounters::default();
+    if counters.discover().is_ok() && !counters.events.is_empty() {
+        println!("PMU events on this host, for --perf-counter:");
+        let mut names: Vec<&String> = counters.events.keys().collect();
+        names.sort();
+        for name in names {
+            println!("  {name}");
+        }
+    }
+    Ok(())
+}
 /// Software page-fault counter: fires once per page fault in the faulting
 /// task's context, on every arch. Opened per CPU with `sample_period = N` it
 /// samples 1:N kernel-side; with `exclude_kernel` it counts user-mode faults
@@ -521,6 +650,20 @@ impl PerfCounters {
             return Some(result.clone());
         }
 
+        // hardware:<name> / software:<name>: the kernel's generic events,
+        // on every possible CPU. No sysfs entry backs them, so they come
+        // after the discovered set and never shadow a PMU's own name.
+        if let Some((event_type, event_config)) = generic_event(name) {
+            let num_cpus = libbpf_rs::num_possible_cpus().ok()? as u32;
+            return Some(vec![PerfHwEvent {
+                name: name.to_string(),
+                event_type,
+                event_config,
+                cpus: (0..num_cpus).collect(),
+                ..Default::default()
+            }]);
+        }
+
         if !name.contains("*") {
             return None;
         }
@@ -542,5 +685,47 @@ impl PerfCounters {
             return Some(result);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generic_event_names_follow_perf_list() {
+        assert_eq!(
+            generic_event("hardware:cache-misses"),
+            Some((PERF_TYPE_HARDWARE, 3))
+        );
+        assert_eq!(
+            generic_event("hardware:cycles"),
+            generic_event("hardware:cpu-cycles")
+        );
+        assert_eq!(
+            generic_event("software:context-switches"),
+            Some((PERF_TYPE_SOFTWARE, 3))
+        );
+        assert_eq!(
+            generic_event("software:faults"),
+            Some((PERF_TYPE_SOFTWARE, PERF_COUNT_SW_PAGE_FAULTS))
+        );
+        assert_eq!(generic_event("software:cache-misses"), None);
+        assert_eq!(generic_event("tracepoint:sched:x"), None);
+        assert_eq!(generic_event("hardware"), None);
+    }
+
+    #[test]
+    fn generic_names_resolve_without_sysfs() {
+        // No discover(): the generic tables alone back the prefixed names.
+        let counters = PerfCounters::default();
+        let events = counters.event("software:task-clock").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            (events[0].event_type, events[0].event_config),
+            (PERF_TYPE_SOFTWARE, 1)
+        );
+        assert!(!events[0].cpus.is_empty());
+        assert!(counters.event("task-clock").is_none());
     }
 }

@@ -20,7 +20,8 @@ use crate::parquet_paths::ParquetPaths;
 use super::config::ValidationConfig;
 use super::queries::{
     CmdlineStats, FieldCheck, OrphanCheck, SchemaResult, StackViolation, TpuMetricCheck,
-    ValidationQueries, STACK_RUNNING, STACK_SLEEP_INTERRUPTIBLE, STACK_SLEEP_UNINTERRUPTIBLE,
+    ValidationQueries, STACK_PERF_EVENT_FIRST, STACK_RUNNING, STACK_SLEEP_INTERRUPTIBLE,
+    STACK_SLEEP_UNINTERRUPTIBLE,
 };
 use super::result::{ValidationError, ValidationResult};
 use super::runner::run_common_validations;
@@ -518,6 +519,11 @@ impl ValidationQueries for ParquetQueries {
                         message: "No sched_slice found for this utid".to_string(),
                     })
                 }
+                // A hardware:/software: event's sample: taken on-CPU in the
+                // event's context, but some fire inside __schedule after the
+                // switch closed the slice (context-switches), so no timing
+                // rule holds for all of them.
+                (perf, _) if perf >= STACK_PERF_EVENT_FIRST => None,
                 // Unknown stack_event_type
                 (unknown, _) => Some(StackViolation {
                     ts: sample.ts,

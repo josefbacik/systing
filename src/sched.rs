@@ -549,6 +549,7 @@ mod tests {
             add_go_label(crate::trace::GoLabelRecord),
             set_sysinfo(crate::trace::SysInfoRecord),
             add_cpu_info(crate::trace::CpuInfoRecord),
+            add_stack_sample_event(crate::trace::StackSampleEventRecord),
             add_tpu_device(crate::trace::TpuDeviceRecord),
             add_tpu_op(crate::trace::TpuOpRecord),
             add_tpu_metric(crate::trace::TpuMetricRecord),

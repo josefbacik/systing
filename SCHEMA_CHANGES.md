@@ -445,6 +445,40 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 32 (systing 1.29.0) — 2026-10-16
+
+The generic trace events take two new kinds, the kernel's generic perf
+events: `hardware:<name>` (cache-misses, instructions, branch-misses, ...)
+and `software:<name>` (context-switches, page-faults, cpu-migrations, ...),
+by the names `perf list` gives them; `systing --list-events` prints them and
+checks each against the host. Such an event is counted per CPU into a counter
+track on every tick of the stack sampler, like `--perf-counter`. Given a
+period (`hardware:cache-misses:100000`) it is also a stack sampler of its
+own: the running stack every <period> events, stored as `stack_sample` rows
+beside the CPU sampler's, under a `stack_event_type` of its own so a CPU flame
+graph (`stack_event_type = 1`) never mixes them in.
+
+### Added tables
+- `stack_sample_event` (`stack_event_type TINYINT`, `name VARCHAR`,
+  `event VARCHAR`, `period BIGINT`): one row per hardware:/software: event
+  with a period. `stack_event_type` is the value its `stack_sample` rows
+  carry (3 and up, in the events' name order), `name` its name in the trace
+  configuration (the spec itself for `--trace-event`), `event` the perf event
+  (`hardware:cache-misses`) — also the prefix of its counter tracks'
+  names, `'<event> CPU <n>'` — and `period` the events one sample stands
+  for. Empty when none was configured; absent from older traces.
+
+### Changed semantics
+- `stack_sample.stack_event_type`: 3 and up are new (see above). 0, 1 and 2
+  are unchanged, and so is every query that filters on them.
+
+### Fixes (no schema effect)
+- With more than one `--perf-counter`, every counter after the first was
+  recorded as a running total instead of the per-tick delta the first one
+  was: the BPF map holding the last value had room for one counter.
+
+---
+
 ## Schema Version 31 (systing 1.28.0) — 2026-10-14
 
 The task-stacks recorder says what each thread was waiting in, beside where

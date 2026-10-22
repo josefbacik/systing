@@ -34,9 +34,9 @@ use crate::trace::{
     MemoryThpRecord, MemoryVfioRecord, MemoryVmstatRecord, NetworkDnsRecord,
     NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord,
     NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord,
-    SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
-    SysInfoRecord, TaskContextRecord, TaskStackEventRecord, ThreadRecord, ThreadStateRecord,
-    TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleEventRecord,
+    StackSampleRecord, SysInfoRecord, TaskContextRecord, TaskStackEventRecord, ThreadRecord,
+    ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -154,6 +154,7 @@ pub struct StreamingParquetWriter {
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
     cpu_infos: Vec<CpuInfoRecord>,
+    stack_sample_events: Vec<StackSampleEventRecord>,
     tpu_devices: Vec<TpuDeviceRecord>,
     tpu_ops: Vec<TpuOpRecord>,
     tpu_metrics: Vec<TpuMetricRecord>,
@@ -209,6 +210,7 @@ pub struct StreamingParquetWriter {
     clock_snapshot_writer: Option<TableWriter>,
     sysinfo_writer: Option<TableWriter>,
     cpu_info_writer: Option<TableWriter>,
+    stack_sample_event_writer: Option<TableWriter>,
     tpu_device_writer: Option<TableWriter>,
     tpu_op_writer: Option<TableWriter>,
     tpu_metric_writer: Option<TableWriter>,
@@ -297,6 +299,7 @@ impl StreamingParquetWriter {
             clock_snapshots: Vec::new(),
             sysinfo: None,
             cpu_infos: Vec::new(),
+            stack_sample_events: Vec::new(),
             tpu_devices: Vec::new(),
             tpu_ops: Vec::new(),
             tpu_metrics: Vec::new(),
@@ -340,6 +343,7 @@ impl StreamingParquetWriter {
             clock_snapshot_writer: None,
             sysinfo_writer: None,
             cpu_info_writer: None,
+            stack_sample_event_writer: None,
             tpu_device_writer: None,
             tpu_op_writer: None,
             tpu_metric_writer: None,
@@ -903,6 +907,26 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    fn flush_stack_sample_events(&mut self) -> Result<()> {
+        if self.stack_sample_events.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::stack_sample_event_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.stack_sample_event_writer,
+            &self.sink,
+            "stack_sample_event",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_stack_sample_event_batch(&self.stack_sample_events, &schema)?;
+        writer.write(&batch)?;
+        self.stack_sample_events.clear();
+        Ok(())
+    }
+
     // Flush cpu_infos buffer
     fn flush_cpu_infos(&mut self) -> Result<()> {
         if self.cpu_infos.is_empty() {
@@ -1394,6 +1418,7 @@ impl StreamingParquetWriter {
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
         close_writer!(self.cpu_info_writer);
+        close_writer!(self.stack_sample_event_writer);
         close_writer!(self.tpu_device_writer);
         close_writer!(self.tpu_op_writer);
         close_writer!(self.tpu_metric_writer);
@@ -1437,6 +1462,7 @@ impl Drop for StreamingParquetWriter {
             || self.clock_snapshot_writer.is_some()
             || self.sysinfo_writer.is_some()
             || self.cpu_info_writer.is_some()
+            || self.stack_sample_event_writer.is_some()
             || self.tpu_device_writer.is_some()
             || self.tpu_op_writer.is_some()
             || self.tpu_metric_writer.is_some()
@@ -1981,6 +2007,15 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_stack_sample_event(&mut self, record: StackSampleEventRecord) -> Result<()> {
+        self.stack_sample_events.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.stack_sample_events, self.batch_size) {
+            self.flush_stack_sample_events()?;
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.flush_processes()?;
         self.flush_threads()?;
@@ -2021,6 +2056,7 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
         self.flush_cpu_infos()?;
+        self.flush_stack_sample_events()?;
         self.flush_tpu_devices()?;
         self.flush_tpu_ops()?;
         self.flush_tpu_metrics()?;
@@ -2791,6 +2827,33 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
             Arc::new(network_packet_sample_rate_builder.finish()),
             Arc::new(task_stacks_remote_reads_builder.finish()),
             Arc::new(go_context_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_stack_sample_event_batch(
+    records: &[StackSampleEventRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut type_builder = Int8Builder::with_capacity(records.len());
+    let mut name_builder = StringBuilder::with_capacity(records.len(), 64);
+    let mut event_builder = StringBuilder::with_capacity(records.len(), 64);
+    let mut period_builder = Int64Builder::with_capacity(records.len());
+
+    for record in records {
+        type_builder.append_value(record.stack_event_type);
+        name_builder.append_value(&record.name);
+        event_builder.append_value(&record.event);
+        period_builder.append_value(record.period);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(type_builder.finish()),
+            Arc::new(name_builder.finish()),
+            Arc::new(event_builder.finish()),
+            Arc::new(period_builder.finish()),
         ],
     )?)
 }
@@ -4231,6 +4294,45 @@ mod tests {
                 && msg.contains("memory_future_leg, memory_future_sample_rate")
                 && msg.contains(&format!("schema {SCHEMA_VERSION}")),
             "the refusal names the table, the unknown columns and this schema: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_stack_sample_event_duckdb_round_trip() {
+        use crate::duckdb::parquet_to_duckdb;
+        use duckdb::Connection;
+
+        let dir = TempDir::new().unwrap();
+        let mut writer = StreamingParquetWriter::new(dir.path()).unwrap();
+        writer
+            .add_stack_sample_event(StackSampleEventRecord {
+                stack_event_type: 3,
+                name: "llc_miss".to_string(),
+                event: "hardware:cache-misses".to_string(),
+                period: 100_000,
+            })
+            .unwrap();
+        writer.finish().unwrap();
+
+        let db_path = dir.path().join("test.duckdb");
+        parquet_to_duckdb(dir.path(), &db_path, "test-trace").unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        let row: (String, i8, String, String, i64) = conn
+            .query_row(
+                "SELECT trace_id, stack_event_type, name, event, period FROM stack_sample_event",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "test-trace".to_string(),
+                3,
+                "llc_miss".to_string(),
+                "hardware:cache-misses".to_string(),
+                100_000
+            )
         );
     }
 

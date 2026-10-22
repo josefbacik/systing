@@ -626,6 +626,14 @@ The currently allowed formats are
 - `kretprobe:function_name`
 - `kretprobe:offset`
 - `tracepoint:subsystem:tracepoint_name`
+- `hardware:event_name` or `hardware:event_name:period` (e.g. `hardware:cache-misses:100000`)
+- `software:event_name` or `software:event_name:period` (e.g. `software:context-switches`)
+
+The `hardware:` and `software:` events are the kernel's generic perf events;
+`systing --list-events` prints the names and checks them against the host. Each
+is counted per CPU into a counter track (like `--perf-counter`); with a period
+it also records the running stack every `period` events, as `stack_sample` rows
+with a `stack_event_type` of their own (see the `stack_sample_event` table).
 
 For all `usdt` and `u*probe` events you *must* specify `--trace-event-pid` to to
 indicate which PID's you wish to record the events for. For example, if you want

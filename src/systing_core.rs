@@ -633,7 +633,12 @@ const CORE_BPF_PROGRAMS: &[&str] = &["systing_perf_event_clock"];
 /// Generic probe handlers for user-specified `--trace-event` / USDT / uprobe /
 /// kprobe. Loaded only when at least one trace event is configured so that
 /// `probe_ringbufs` can be `autocreate=false` otherwise.
-const PROBE_BPF_PROGRAMS: &[&str] = &["systing_usdt", "systing_uprobe", "systing_kprobe"];
+const PROBE_BPF_PROGRAMS: &[&str] = &[
+    "systing_usdt",
+    "systing_uprobe",
+    "systing_kprobe",
+    "systing_perf_event_sample",
+];
 
 /// Upper bound on per-CPU-sharded ring buffers in each ringbuf ARRAY_OF_MAPS
 /// family. Must match NR_RINGBUFS_MAX in src/bpf/systing_system.bpf.c (the
@@ -2734,6 +2739,76 @@ fn is_old_kernel() -> bool {
     }
 }
 
+/// The first `stack_sample.stack_event_type` a hardware:/software: trace
+/// event's samples take; STACK_PERF_EVENT_FIRST in the BPF object.
+pub const STACK_PERF_EVENT_FIRST: i8 = 3;
+
+/// The most counters read on the sampler tick; MAX_PERF_COUNTERS in the BPF
+/// object (the size of last_perf_counter_value).
+const MAX_PERF_COUNTERS: usize = 64;
+
+/// What setup_perf_counter_events opened: every counter's per-CPU events,
+/// kept alive for the capture, and which of them are samplers still to
+/// attach (attach_clock_sampler), by index, with their attach cookie.
+struct PerfCounterFiles {
+    events: Vec<PerfOpenEvents>,
+    samplers: Vec<(usize, u64)>,
+}
+
+/// A hardware:/software: trace event with a period: the counter `event`
+/// opened in period mode, its samples stored under `stack_event_type`.
+struct PerfSampler {
+    /// The event's name in the configuration (its spec for --trace-event).
+    name: String,
+    /// Its entry in the perf counter names: `hardware:cache-misses`.
+    event: String,
+    period: u64,
+    stack_event_type: i8,
+}
+
+/// Adds every hardware:/software: trace event to `perf_counter_names` (each
+/// is a counter) and returns the ones with a period, numbered from
+/// STACK_PERF_EVENT_FIRST in name order so a configuration numbers the same
+/// way every run.
+fn perf_trace_events(
+    recorder: &Arc<SessionRecorder>,
+    perf_counter_names: &mut Vec<String>,
+) -> Result<Vec<PerfSampler>> {
+    let probe_recorder = recorder.probe_recorder.lock().unwrap();
+    let mut events: Vec<(&String, &crate::events::PerfSampleEvent)> = probe_recorder
+        .config_events
+        .iter()
+        .filter_map(|(name, event)| match &event.event {
+            EventProbe::Perf(perf) => Some((name, perf)),
+            _ => None,
+        })
+        .collect();
+    events.sort_by(|a, b| a.0.cmp(b.0));
+    let mut samplers = Vec::new();
+    for (name, perf) in events {
+        let event = perf.spec();
+        if perf_counter_names.contains(&event) {
+            bail!("perf event {event} is configured twice");
+        }
+        perf_counter_names.push(event.clone());
+        if perf.period > 0 {
+            samplers.push(PerfSampler {
+                name: name.clone(),
+                event,
+                period: perf.period,
+                stack_event_type: STACK_PERF_EVENT_FIRST + samplers.len() as i8,
+            });
+        }
+    }
+    if perf_counter_names.len() > MAX_PERF_COUNTERS {
+        bail!(
+            "{} perf counters configured (--perf-counter and hardware:/software: events); at most {MAX_PERF_COUNTERS}",
+            perf_counter_names.len()
+        );
+    }
+    Ok(samplers)
+}
+
 fn setup_perf_counters(
     opts: &Config,
     counters: &mut PerfCounters,
@@ -3627,7 +3702,8 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
             "tcp_poll_exit" => skel.links.tcp_poll_exit.is_none(),
             // Programs that are manually attached (skip auto-attach check)
             // These include: systing_usdt, systing_uprobe, systing_kprobe,
-            // systing_tracepoint, systing_raw_tracepoint, systing_perf_event_clock
+            // systing_tracepoint, systing_raw_tracepoint, systing_perf_event_clock,
+            // systing_perf_event_sample
             _ => continue,
         };
 
@@ -3944,6 +4020,7 @@ fn attach_clock_sampler(
     skel: &mut SystingSystemSkel,
     opts: &Config,
     num_cpus: u32,
+    perf_samplers: &[(&PerfOpenEvents, u64)],
 ) -> Result<(
     Vec<libbpf_rs::Link>,
     ClockSamplingConfig,
@@ -3952,6 +4029,26 @@ fn attach_clock_sampler(
     use crate::perf;
 
     let mut perf_links = Vec::new();
+
+    // The hardware:/software: trace events' samplers ride this last slot
+    // for the same reason as the clock sampler. The cookie is the
+    // stack_event_type their samples are stored under.
+    for (files, cookie) in perf_samplers {
+        for (_, file) in *files {
+            let link = skel
+                .progs
+                .systing_perf_event_sample
+                .attach_perf_event_with_opts(
+                    file.as_raw_fd(),
+                    libbpf_rs::PerfEventOpts {
+                        cookie: *cookie,
+                        ..Default::default()
+                    },
+                )
+                .with_context(|| "Failed to attach a hardware:/software: event sampler")?;
+            perf_links.push(link);
+        }
+    }
 
     // Clamp to avoid divide-by-zero for library callers that bypass the
     // clap range(1..) validator on --sample-freq.
@@ -4146,9 +4243,11 @@ fn setup_perf_counter_events(
     skel: &mut SystingSystemSkel,
     counters: &PerfCounters,
     perf_counter_names: &[String],
+    perf_samplers: &[PerfSampler],
     num_cpus: u32,
-) -> Result<Vec<PerfOpenEvents>> {
+) -> Result<PerfCounterFiles> {
     let mut event_files_vec = Vec::new();
+    let mut sampler_files = Vec::new();
 
     // Determine if we need slots for topdown counters
     let need_slots = perf_counter_names
@@ -4177,15 +4276,36 @@ fn setup_perf_counter_events(
             .with_context(|| "Failed to enable 'slots' perf events")?;
     }
 
-    // Setup counter events and populate perf_counters map
+    // Setup counter events and populate perf_counters map. A counter that
+    // is also a sampler (a hardware:/software: trace event with a period) is
+    // opened in period mode: the one fd per CPU is both read on the clock
+    // tick and the source of systing_perf_event_sample's samples.
     for (index, event_name) in perf_counter_names.iter().enumerate() {
         let mut event_files = PerfOpenEvents::default();
-        let hwevents = counters.event(event_name).unwrap();
+        let hwevents = counters.event(event_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown perf event '{event_name}'; systing --list-events shows the names"
+            )
+        })?;
+        let sampler = perf_samplers.iter().find(|s| s.event == *event_name);
 
         for hwevent in hwevents {
             event_files.add_hw_event(hwevent)?;
         }
-        event_files.open_events(Some(&slots_files), 0)?;
+        event_files
+            .open_events(Some(&slots_files), sampler.map_or(0, |s| s.period))
+            .with_context(|| {
+                if event_name.starts_with("hardware:") {
+                    format!(
+                        "Failed to open perf event '{event_name}': a hardware event needs a PMU                          (bare metal, or a VM that exposes one); systing --list-events shows                          what this host supports"
+                    )
+                } else {
+                    format!("Failed to open perf event '{event_name}'")
+                }
+            })?;
+        if let Some(sampler) = sampler {
+            sampler_files.push((event_files_vec.len(), sampler.stack_event_type as u64));
+        }
 
         let floor = index * num_cpus as usize;
         for (cpu, file) in &event_files {
@@ -4196,7 +4316,13 @@ fn setup_perf_counter_events(
                 .perf_counters
                 .update(&key_val, &fd_val, libbpf_rs::MapFlags::ANY)?;
         }
-        event_files.enable()?;
+        // A sampler's fds become bpf links (attach_clock_sampler), which
+        // enable the event on attach and close the fd on detach: an enable
+        // here would have the file disable a closed fd at drop. The events
+        // are opened counting either way.
+        if sampler.is_none() {
+            event_files.enable()?;
+        }
         event_files_vec.push(event_files);
     }
 
@@ -4205,7 +4331,10 @@ fn setup_perf_counter_events(
         event_files_vec.push(slots_files);
     }
 
-    Ok(event_files_vec)
+    Ok(PerfCounterFiles {
+        events: event_files_vec,
+        samplers: sampler_files,
+    })
 }
 
 /// Memory recorder, fault leg, on arches without the x86-only
@@ -5254,6 +5383,12 @@ fn attach_probes(
     let probe_recorder = recorder.probe_recorder.lock().unwrap();
 
     for event in probe_recorder.config_events.values() {
+        // hardware:/software: events are perf events, not probes: opened
+        // with the perf counters (setup_perf_counter_events) and attached
+        // with the clock sampler (attach_clock_sampler).
+        if event.is_perf() {
+            continue;
+        }
         let mut desc_array = arg_desc_array {
             num_args: event.args.len() as u8,
             pad: [0; 3],
@@ -6026,6 +6161,22 @@ pub fn systing(
             ring_plan,
         )?;
 
+        // hardware:/software: trace events ride the perf-counter path: each
+        // is one more counter read on the sampler tick, and one with a period
+        // is also a stack sampler of its own (systing_perf_event_sample).
+        let perf_samplers = perf_trace_events(&recorder, &mut perf_counter_names)?;
+        let _ = recorder.stack_sample_events.set(
+            perf_samplers
+                .iter()
+                .map(|s| crate::trace::StackSampleEventRecord {
+                    stack_event_type: s.stack_event_type,
+                    name: s.name.clone(),
+                    event: s.event.clone(),
+                    period: s.period as i64,
+                })
+                .collect(),
+        );
+
         for counter in perf_counter_names.iter() {
             recorder
                 .perf_counter_recorder
@@ -6322,8 +6473,13 @@ pub fn systing(
 
         // Set up the perf counter events and populate the perf_counters map
         // before anything that reads it is attached.
-        let _events_files =
-            setup_perf_counter_events(&mut skel, &counters, &perf_counter_names, num_cpus)?;
+        let counter_files = setup_perf_counter_events(
+            &mut skel,
+            &counters,
+            &perf_counter_names,
+            &perf_samplers,
+            num_cpus,
+        )?;
 
         skel.attach().with_context(|| {
             "Failed to attach BPF programs to tracepoints. Check if tracepoints are enabled."
@@ -6395,8 +6551,13 @@ pub fn systing(
         // Every tracepoint, raw_tp, fentry, USDT and uprobe link is in place:
         // start the CPU stack sampler now, so the capture never contains the
         // tracer's own attach phase (see attach_clock_sampler).
+        let sampler_files: Vec<(&PerfOpenEvents, u64)> = counter_files
+            .samplers
+            .iter()
+            .map(|(index, cookie)| (&counter_files.events[*index], *cookie))
+            .collect();
         let (_perf_links, clock_sampling, memory_fault_leg) =
-            attach_clock_sampler(&mut skel, &opts, num_cpus)?;
+            attach_clock_sampler(&mut skel, &opts, num_cpus, &sampler_files)?;
 
         // Record which event/period drives stack sampling so the trace's
         // sysinfo row documents what each stack sample represents. Perf

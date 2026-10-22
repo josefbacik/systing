@@ -182,6 +182,13 @@ enum stack_event_type {
 	STACK_SLEEP_UNINTERRUPTIBLE,
 	STACK_RUNNING,
 	STACK_SLEEP_INTERRUPTIBLE,
+	/*
+	 * This value and up: a running stack taken by a hardware:/software:
+	 * trace event's sampler (systing_perf_event_sample), one value per
+	 * configured event in the order userspace numbered them; the
+	 * stack_sample_event table says which event each value is.
+	 */
+	STACK_PERF_EVENT_FIRST,
 };
 
 /*
@@ -770,11 +777,15 @@ struct {
 	__uint(max_entries, MISSED_EVENT_MAX);
 } missed_events SEC(".maps");
 
+/* read_counters() keeps each counter's last value here, by counter index,
+ * to turn the running count into a per-tick delta. MAX_PERF_COUNTERS is
+ * the most counters a capture may configure; userspace refuses more. */
+#define MAX_PERF_COUNTERS 64
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, u64);
-	__uint(max_entries, 1);
+	__uint(max_entries, MAX_PERF_COUNTERS);
 } last_perf_counter_value SEC(".maps");
 
 /*
@@ -1958,18 +1969,21 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 	/*
 	 * The sampled thread's task_context id. Only running-stack events for
 	 * now (STACK_RUNNING: the CPU sampler's, and the ones the usdt, uprobe,
-	 * kprobe, tracepoint and raw tracepoint handlers emit; in each of them
-	 * the task is current). Sleep stacks are left out on purpose: they are
+	 * kprobe, tracepoint and raw tracepoint handlers emit, and the perf
+	 * event samplers' STACK_PERF_EVENT_FIRST and up; in each of them the
+	 * task is current). Sleep stacks are left out on purpose: they are
 	 * emitted from sched_switch. reserve_stack_event() cleared the record's
 	 * fixed part, this field in it, so every other stack event carries
 	 * 0 = none. The knob is rodata: with it off this arm is pruned at load
 	 * time and the maps it names are not created.
 	 */
-	if (task_context_config.enabled && type == STACK_RUNNING)
+	if (task_context_config.enabled && type != STACK_SLEEP_UNINTERRUPTIBLE &&
+	    type != STACK_SLEEP_INTERRUPTIBLE)
 		event->task_context_id = task_context_read_current(task);
 	/* The same for a Go program's goroutine, the same events, the same
 	 * reasons; pruned at load time without the flag. */
-	if (go_context_config.enabled && type == STACK_RUNNING)
+	if (go_context_config.enabled && type != STACK_SLEEP_UNINTERRUPTIBLE &&
+	    type != STACK_SLEEP_INTERRUPTIBLE)
 		event->go_goid = go_context_read_current(task, &event->go_labels_id);
 
 #ifdef SYSTING_PYSTACKS
@@ -2642,6 +2656,27 @@ int systing_perf_event_clock(void *ctx)
 			}
 		}
 	}
+	return 0;
+}
+
+/*
+ * A hardware:/software: trace event with a period: one perf event per CPU,
+ * opened by userspace in period mode like the clock sampler's and attached in
+ * the same last slot (attach_clock_sampler in systing_core.rs), so the same
+ * stack-skip rule holds — the walk starts from the sample's registers. The
+ * attach cookie is the stack_event_type the samples are stored under
+ * (STACK_PERF_EVENT_FIRST and up), so the record carries nothing new. The
+ * event's count is read with the other counters on the clock tick
+ * (read_counters), not here. Loaded only when a trace event is configured.
+ */
+SEC("perf_event")
+int systing_perf_event_sample(void *ctx)
+{
+	u64 ts = bpf_ktime_get_boot_ns();
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	emit_stack_event_with_ts(ctx, task, bpf_get_attach_cookie(ctx), ts,
+				 PERF_EVENT_SKIP_STACK_DEPTH);
 	return 0;
 }
 
