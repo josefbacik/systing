@@ -93,6 +93,30 @@ pub(crate) fn duckdb_resource_limits(mem_fraction_pct: u64, min_mib: u64) -> (Op
     (mem_limit_mib, threads)
 }
 
+/// The `(memory_limit in MiB, threads)` budget of a bulk import or export.
+fn bulk_io_limits() -> (Option<u64>, u64) {
+    // Leave 25% of the container for everything that is not DuckDB's buffer
+    // pool (our own heap, resident BPF maps, kernel page cache pressure),
+    // clamped to at least 1 GiB so tiny containers still get a working import.
+    duckdb_resource_limits(75, 1024)
+}
+
+/// Open a database file for a bulk import or export.
+fn open_for_bulk_io(db_path: &Path) -> duckdb::Result<Connection> {
+    // Above 64 CPUs DuckDB by default pins worker i to CPU i, so whatever
+    // waits for that worker waits for CPU i, however idle the others are.
+    // The open itself starts the workers, and a later SET pin_threads leaves
+    // them pinned, so the setting goes on the Config.
+    // `threads` goes there too: without it the open starts about one worker
+    // per CPU, which the SET threads in configure_for_bulk_io then stops and
+    // replaces.
+    let (_, threads) = bulk_io_limits();
+    let config = duckdb::Config::default()
+        .threads(threads as i64)?
+        .with("pin_threads", "off")?;
+    Connection::open_with_flags(db_path, config)
+}
+
 /// Configure a DuckDB connection for bulk parquet import/export under a memory
 /// budget.
 ///
@@ -102,10 +126,7 @@ pub(crate) fn duckdb_resource_limits(mem_fraction_pct: u64, min_mib: u64) -> (Op
 /// without reorder buffering, and points `temp_directory` at `spill_dir` so
 /// DuckDB can spill instead of OOMing if it still hits the cap.
 fn configure_for_bulk_io(conn: &Connection, spill_dir: &Path) -> Result<()> {
-    // Leave 25% of the container for everything that is not DuckDB's buffer
-    // pool (our own heap, resident BPF maps, kernel page cache pressure),
-    // clamped to at least 1 GiB so tiny containers still get a working import.
-    let (mem_limit_mib, threads) = duckdb_resource_limits(75, 1024);
+    let (mem_limit_mib, threads) = bulk_io_limits();
 
     let escaped_spill = spill_dir.to_string_lossy().replace('\'', "''");
     let mut pragmas = format!(
@@ -1123,7 +1144,7 @@ pub fn parquet_to_duckdb_with_options(
         })?;
     }
 
-    let mut conn = Connection::open(db_path)
+    let mut conn = open_for_bulk_io(db_path)
         .with_context(|| format!("Failed to create DuckDB database: {}", db_path.display()))?;
 
     let result = import_directory(&mut conn, parquet_dir, db_path, trace_id, options);
@@ -2135,7 +2156,7 @@ fn import_duckdb_traces_inner(conn: &Connection, mappings: &[TraceImportMapping]
 /// ).unwrap();
 /// ```
 pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> Result<()> {
-    let conn = Connection::open(db_path)
+    let conn = open_for_bulk_io(db_path)
         .with_context(|| format!("Failed to open DuckDB database: {}", db_path.display()))?;
 
     // Create output directory if it doesn't exist
@@ -2271,6 +2292,79 @@ mod tests {
             .query_row("SELECT current_setting('temp_directory')", [], |r| r.get(0))
             .unwrap();
         assert_eq!(temp_dir, tmp.path().to_string_lossy());
+    }
+
+    /// The bulk-io open must leave DuckDB's workers unpinned. Reading
+    /// `pin_threads` back is not enough: a late `SET pin_threads` reads back
+    /// the same and leaves the running workers pinned. So each worker's CPU
+    /// mask is compared with the opener's too, which can fail only above 64
+    /// CPUs, where DuckDB pins by default. Threads that the scan misses go
+    /// unchecked.
+    #[test]
+    fn test_open_for_bulk_io_turns_pinning_off() {
+        // A new thread inherits its creator's name, so this name marks the
+        // opener and the workers it starts, and no other test's threads.
+        const NAME: &str = "bulk-io-open";
+        fn field(status: &str, key: &str) -> String {
+            let line = status.lines().find_map(|l| l.strip_prefix(key));
+            line.unwrap().trim().to_string()
+        }
+
+        let opener = std::thread::Builder::new().name(NAME.to_string());
+        let (pin_threads, own, allowed) = opener
+            .spawn(|| {
+                let tmp = TempDir::new().unwrap();
+                let conn = open_for_bulk_io(&tmp.path().join("test.duckdb")).unwrap();
+                let own = fs::read_to_string("/proc/thread-self/status").unwrap();
+                let own = field(&own, "Cpus_allowed_list:");
+                let allowed: Vec<String> = fs::read_dir("/proc/self/task")
+                    .unwrap()
+                    .filter_map(|task| fs::read_to_string(task.unwrap().path().join("status")).ok())
+                    .filter(|status| field(status, "Name:") == NAME)
+                    .map(|status| field(&status, "Cpus_allowed_list:"))
+                    .collect();
+                let pin_threads: String = conn
+                    .query_row(
+                        "SELECT current_setting('pin_threads') AS pin_threads",
+                        [],
+                        |r| r.get("pin_threads"),
+                    )
+                    .unwrap();
+                (pin_threads, own, allowed)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert!(
+            allowed.iter().all(|cpus| *cpus == own),
+            "a DuckDB worker is pinned: the opener may run on CPUs {own}, \
+             the threads named {NAME} may run on {allowed:?}"
+        );
+        assert_eq!(
+            pin_threads.to_lowercase(),
+            "off",
+            "pin_threads after open_for_bulk_io"
+        );
+    }
+
+    /// Can fail only where DuckDB's default thread count differs from
+    /// `bulk_io_limits()`.
+    #[test]
+    fn test_open_for_bulk_io_sets_threads() {
+        let tmp = TempDir::new().unwrap();
+        let conn = open_for_bulk_io(&tmp.path().join("test.duckdb")).unwrap();
+
+        let threads: u64 = conn
+            .query_row("SELECT current_setting('threads') AS threads", [], |r| {
+                r.get("threads")
+            })
+            .unwrap();
+        assert_eq!(
+            threads,
+            bulk_io_limits().1,
+            "threads after open_for_bulk_io"
+        );
     }
 
     /// Regression test for the production failure mode: a large trace's
