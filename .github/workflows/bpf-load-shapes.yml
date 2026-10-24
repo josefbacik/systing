@@ -236,7 +236,7 @@ jobs:
       # up last, so that it is the one on PATH for anything else.
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.27.1"
+          go-version: "1.27.2"
           cache: false
       - run: echo "GO_1_27=$(command -v go)" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
@@ -433,6 +433,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: "true"
+      # The go_context cases and the Go reader's end-to-end check build their
+      # programs here: each Go systing has bindings for, as on the guests.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.2"
+          cache: false
+      - run: echo "GO_1_27=$(command -v go)" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.7"
+          cache: false
+      - run: echo "GO_1_26=$(command -v go)" >> "$GITHUB_ENV"
       - name: Download the pre-built DuckDB library the crate pins (arm64)
         run: |
           LIBDUCKDB_VERSION="$(scripts/libduckdb-version.sh)"
@@ -505,6 +517,48 @@ jobs:
           set -e
           echo "::group::guest output (arm64)"
           cat "$OUT" || cat "$OUT.raw" || true
+          echo "::endgroup::"
+          grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      - name: Go reader end to end on arm64
+        # What only an arm64 program can show: frame-pointer stacks, the stack-check
+        # case, the tick rate, each compared with the program's own pprof port.
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo build --release --no-default-features -p systing-go-profile
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          PATH="$(dirname "$GO_1_26"):$PATH" go-profile/e2e/run.sh
+          PATH="$(dirname "$GO_1_27"):$PATH" go-profile/e2e/run.sh
+      - name: Build the go_context_record test binary
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo test --test go_context_record --no-run --no-default-features --message-format=json > /tmp/build-go-context.json
+          BIN="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "go_context_record") | .executable' /tmp/build-go-context.json | tail -1)"
+          test -x "$BIN"
+          cp "$BIN" gate/go_context_record
+      - name: Run the go_context end-to-end cases as root
+        # g from x28, on real arm64 cores: the one place that read runs.
+        run: |
+          chmod +x gate/go_context_record scripts/ci/vmtest-go-context-e2e.sh
+          OUT="$GITHUB_WORKSPACE/go-context-e2e-arm64.log"
+          set +e
+          sudo -E bash "$GITHUB_WORKSPACE/scripts/ci/vmtest-go-context-e2e.sh" \
+            "$GITHUB_WORKSPACE/gate/go_context_record" "$GITHUB_WORKSPACE/gate" "$OUT" "$GO_1_26" "$GO_1_27"
+          echo "the script exited $? (informational: the file it wrote decides)"
+          set -e
+          echo "::group::go_context output (arm64)"
+          cat "$OUT" || true
           echo "::endgroup::"
           grep -q '^VNG-TEST-EXIT:0$' "$OUT"
       - name: Say which task-stacks contract this runner's kernel was held to

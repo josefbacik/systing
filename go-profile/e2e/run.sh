@@ -8,7 +8,7 @@
 #
 #   go-profile/e2e/run.sh
 #
-# Needs Go 1.26 (the version systing has bindings for), a C compiler (for the
+# Needs Go 1.26 or 1.27 (the versions systing has bindings for), a C compiler (for the
 # system linker) and a build of the tool:
 # `cargo build --release -p systing-go-profile`. TOOL overrides its path.
 # Every build must succeed: a build it cannot make fails the check. Runs as

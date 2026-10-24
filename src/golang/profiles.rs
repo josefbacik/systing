@@ -45,6 +45,15 @@ impl HeapRecord {
     }
 }
 
+/// One heap bucket as read: its allocs and frees of the active cycle, and of
+/// the future ones together.
+struct HeapBucket {
+    pcs: Vec<u64>,
+    size: u64,
+    active: [u64; 2],
+    future: [u64; 2],
+}
+
 /// The heap profile.
 #[derive(Debug, Clone)]
 pub struct HeapProfile {
@@ -76,15 +85,15 @@ impl GoProcess {
     }
 
     /// Walk the bucket list at `head` (`mbuckets`, `bbuckets` or `xbuckets`),
-    /// giving each bucket of type `typ` its stack and the `record_len` bytes
-    /// of record after it.
+    /// giving each bucket of type `typ` its stack, its object size and the
+    /// `record_len` bytes of record after it.
     fn walk_buckets(
         &self,
         head: Global,
         typ: u64,
         record_len: usize,
         stats: &mut ReadStats,
-        mut each: impl FnMut(Vec<u64>, &[u8]),
+        mut each: impl FnMut(Vec<u64>, u64, &[u8]),
     ) -> Result<()> {
         let l = &self.layout;
         let mut b = self.mem.u64_at(self.global(head)?)?;
@@ -127,7 +136,11 @@ impl GoProcess {
                         .map(|c| u64::from_le_bytes(*c))
                         .collect();
                     stats.records += 1;
-                    each(pcs, &body[stack_len..]);
+                    each(
+                        pcs,
+                        u64_in(&header, l.bucket_object_size),
+                        &body[stack_len..],
+                    );
                 }
                 Err(_) => stats.skipped += 1,
             }
@@ -148,58 +161,71 @@ impl GoProcess {
                  reach runtime.MemProfile, or it turned sampling off)"
             );
         }
-        // allocs, frees, alloc_bytes, free_bytes of one cycle.
+        // allocs, frees of one cycle.
         let cycle = |rec: &[u8], at: usize| {
             [
                 u64_in(rec, at + l.cycle_allocs),
                 u64_in(rec, at + l.cycle_frees),
-                u64_in(rec, at + l.cycle_alloc_bytes),
-                u64_in(rec, at + l.cycle_free_bytes),
             ]
         };
-        let mut recs: Vec<(Vec<u64>, [u64; 4], [u64; 4])> = Vec::new();
+        let mut recs = Vec::new();
         self.walk_buckets(
             Global::MBuckets,
             l.mem_profile,
             l.mem_record_size,
             stats,
-            |pcs, rec| {
+            |pcs, size, rec| {
                 let active = cycle(rec, l.mem_record_active);
-                let mut future = [0u64; 4];
+                let mut future = [0u64; 2];
                 for i in 0..l.mem_record_future_cycles {
                     let c = cycle(rec, l.mem_record_future + i * l.cycle_size);
                     for (sum, v) in future.iter_mut().zip(c) {
                         *sum = sum.wrapping_add(v);
                     }
                 }
-                recs.push((pcs, active, future));
+                recs.push(HeapBucket {
+                    pcs,
+                    size,
+                    active,
+                    future,
+                });
             },
         )?;
         // As memProfileInternal: with no GC yet nothing is in the active
         // cycle, and every cycle is summed instead.
-        let none_active = recs.iter().all(|(_, a, _)| a[0] == 0 && a[1] == 0);
+        let none_active = recs
+            .iter()
+            .all(|b: &HeapBucket| b.active[0] == 0 && b.active[1] == 0);
         let mut records = Vec::with_capacity(recs.len());
-        for (pcs, active, future) in recs {
+        for HeapBucket {
+            pcs,
+            size,
+            active,
+            future,
+        } in recs
+        {
             let mut c = active;
             if none_active {
                 for (sum, v) in c.iter_mut().zip(future) {
                     *sum = sum.wrapping_add(v);
                 }
             }
-            let [allocs, frees, alloc_bytes, free_bytes] = c;
+            let [allocs, frees] = c;
             if allocs == 0 && frees == 0 {
                 continue;
             }
-            if frees > allocs || free_bytes > alloc_bytes {
+            // A bucket holds one object size, so its bytes are its objects
+            // times that (Go 1.27 keeps no byte counts of its own).
+            let Some(alloc_bytes) = allocs.checked_mul(size).filter(|_| frees <= allocs) else {
                 stats.skipped += 1;
                 continue;
-            }
+            };
             records.push(HeapRecord {
                 pcs: self.hide_runtime(&pcs),
                 alloc_objects: allocs,
                 alloc_bytes,
                 live_objects: allocs - frees,
-                live_bytes: alloc_bytes - free_bytes,
+                live_bytes: (allocs - frees) * size,
             });
         }
         self.account(stats, before, started.elapsed());
@@ -219,12 +245,12 @@ impl GoProcess {
             (Global::BBuckets, l.block_profile)
         };
         let mut records = Vec::new();
-        self.walk_buckets(head, typ, l.block_record_size, stats, |pcs, rec| {
+        self.walk_buckets(head, typ, l.block_record_size, stats, |pcs, _, rec| {
             let count = f64::from_bits(u64_in(rec, l.block_record_count));
             let cycles = u64_in(rec, l.block_record_cycles) as i64;
             records.push(ContentionRecord {
                 // A stack the runtime stored already expanded starts with
-                // logicalStackSentinel (^0).
+                // logicalStackSentinel (^0), up to Go 1.26.
                 pcs: pcs.into_iter().filter(|&pc| pc != u64::MAX).collect(),
                 // As blockProfileInternal: a count that rounds to 0 is 1.
                 contentions: (count as i64).max(1),
@@ -283,36 +309,41 @@ pub fn scale_heap_sample(count: u64, size: u64, rate: i64) -> (u64, u64) {
     )
 }
 
-/// The TSC and CLOCK_MONOTONIC (the runtime's cputicks and nanotime) now.
+/// The runtime's cputicks and nanotime now.
 fn tsc_and_monotonic() -> (i64, i64) {
+    (cputicks() as i64, monotonic_ns())
+}
+
+/// CLOCK_MONOTONIC, the runtime's nanotime.
+fn monotonic_ns() -> i64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: a valid timespec to fill.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    (rdtsc() as i64, ts.tv_sec * 1_000_000_000 + ts.tv_nsec)
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
 }
 
-/// TSC ticks per second, measured over a short wait.
+/// CPU ticks per second, measured over a short wait.
 fn measure_tsc() -> f64 {
     let t0 = Instant::now();
-    let c0 = rdtsc();
+    let c0 = cputicks();
     std::thread::sleep(Duration::from_millis(50));
-    let c1 = rdtsc();
+    let c1 = cputicks();
     c1.wrapping_sub(c0) as f64 / t0.elapsed().as_secs_f64()
 }
 
 #[cfg(target_arch = "x86_64")]
-fn rdtsc() -> u64 {
+fn cputicks() -> u64 {
     // SAFETY: rdtsc has no preconditions on x86-64.
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
-/// Programs other than x86-64 ones are refused when they are opened.
+/// On arm64 the runtime's cputicks is its nanotime.
 #[cfg(not(target_arch = "x86_64"))]
-fn rdtsc() -> u64 {
-    0
+fn cputicks() -> u64 {
+    monotonic_ns() as u64
 }
 
 #[cfg(test)]
