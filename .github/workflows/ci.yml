@@ -15,7 +15,10 @@ permissions:
 jobs:
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: the heap tests need Ubuntu 24.04's Python 3.12, as the
+    # runner's python3 and as libpython3.12t64. Ubuntu 26.04 has neither, and
+    # apt-get install below fails there before anything is built.
+    runs-on: ubuntu-24.04
     steps:
       - name: Install system dependencies
         run: |
