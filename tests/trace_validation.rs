@@ -5258,6 +5258,114 @@ fn test_e2e_only_cpu_stacks_emits_samples() {
     }
 }
 
+/// A thread that waits for a CPU has not run, so its stack has not moved: its
+/// snapshots extend one event as a sleeping thread's do, and read none of its
+/// memory. The thread is kept waiting by a real-time spinner on its one CPU,
+/// which leaves it the few tens of milliseconds a second that the kernel holds
+/// back for other tasks, so it does run now and then: few events, not one.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_task_stacks_extends_a_thread_that_waits_for_a_cpu() {
+    /// A spinner pinned to one CPU, stopped when the test ends, by a failed
+    /// assert too: left behind, a real-time one would keep that CPU for good.
+    struct Spinner(std::process::Child);
+
+    impl Spinner {
+        fn on(cpu: usize) -> Self {
+            let child = std::process::Command::new("sh")
+                .args(["-c", "while :; do :; done"])
+                .spawn()
+                .expect("Failed to spawn a spinner");
+            let spinner = Spinner(child);
+            // SAFETY: the set is plain data, and the call only reads it.
+            let pinned = unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(cpu, &mut set);
+                libc::sched_setaffinity(spinner.pid(), std::mem::size_of_val(&set), &set)
+            };
+            assert_eq!(pinned, 0, "Failed to pin a spinner to CPU {cpu}");
+            spinner
+        }
+
+        fn pid(&self) -> i32 {
+            self.0.id() as i32
+        }
+    }
+
+    impl Drop for Spinner {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // SAFETY: the set is plain data, which the call fills in.
+    let allowed = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        let got = libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set);
+        assert_eq!(got, 0, "Failed to read this process's CPUs");
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+            .collect::<Vec<_>>()
+    };
+    let Some(&cpu) = allowed.last().filter(|_| allowed.len() > 1) else {
+        eprintln!("skipping: one CPU, which the spinner would take from the recorder too");
+        return;
+    };
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let waiter = Spinner::on(cpu);
+    let hog = Spinner::on(cpu);
+    let param = libc::sched_param { sched_priority: 1 };
+    // SAFETY: `param` outlives the call, which only reads it.
+    let raised = unsafe { libc::sched_setscheduler(hog.pid(), libc::SCHED_FIFO, &param) };
+    if raised != 0 {
+        eprintln!(
+            "skipping: cannot make a spinner real-time ({})",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let config = Config {
+        duration: 2,
+        pid: vec![waiter.pid() as u32],
+        output_dir: dir.path().to_path_buf(),
+        no_sched: true,
+        no_irq: true,
+        no_cpu_stack_traces: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        collect_pystacks: false,
+        task_stacks: true,
+        task_stacks_interval_ms: 100,
+        parquet_only: true,
+        ..Config::default()
+    };
+    let result = systing(config, None);
+    drop(hog);
+    drop(waiter);
+    result.expect("systing recording failed");
+
+    let events_path = dir.path().join("task_stack_event.parquet");
+    // 2 s at 100 ms is 20 iterations, and a thread that was walked at each of
+    // them would have 20 events.
+    let events = parquet_row_count(&events_path);
+    assert!(
+        (1..15).contains(&events),
+        "expected the waiting thread's iterations to share events, got {events} events for 20 iterations"
+    );
+    assert!(
+        parquet_int_column_contains(&events_path, "end_iteration", 20),
+        "no event reaches iteration 20: too few snapshots for the count to say anything"
+    );
+    assert!(
+        parquet_column_contains(&events_path, "state", "R"),
+        "the waiting thread was never recorded in state R"
+    );
+}
+
 /// The task-stacks recorder end to end: a task-iterator-only recording
 /// targeted at a child process must land the child's thread in the
 /// task_stack_event table, its iterations spanned by few events because it

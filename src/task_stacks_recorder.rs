@@ -12,11 +12,11 @@
 //! not. Either walk records the same threads, but for a process whose every
 //! thread has exited and which waits to be reaped: the kernel's listing of a
 //! `--cgroup` target leaves it out, and the walk over every thread meets it.
-//! A thread that has used no CPU time and sits in the same non-runnable state
-//! as at its last record cannot have changed its stack: for it the program
-//! skips the walk and writes a bare header flagged unchanged. The stacks are
-//! symbolized with the stack recorder's at the end of the capture. In
-//! Python-only mode a thread without Python frames is left out.
+//! A thread that has used no CPU time and is in the same state as at its last
+//! record cannot have changed its stack: for it the program skips the walk and
+//! writes a bare header flagged unchanged. The stacks are symbolized with the
+//! stack recorder's at the end of the capture. In Python-only mode a thread
+//! without Python frames is left out.
 //!
 //! A thread's records become events. A full record opens one, from the start
 //! of its iteration; an unchanged record extends the thread's open event by
@@ -1934,8 +1934,8 @@ impl TaskStacksThread {
                     // when the iteration saw nothing. One that failed records
                     // nothing, not "nothing seen": BPF has moved the baseline
                     // of every thread it wrote a record for, so a thread that
-                    // stays blocked comes back as unchanged, and that has to
-                    // find its event still open. What this cannot mend: a
+                    // stays blocked, or waits on for a CPU, comes back as
+                    // unchanged, and that has to find its event still open. What this cannot mend: a
                     // thread that moved to another stack within the failed
                     // iteration comes back as unchanged too, and its event
                     // runs on over the stack that was lost, until the thread

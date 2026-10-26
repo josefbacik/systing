@@ -275,8 +275,9 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
 - With `-d` the recorder takes ceil(duration / interval) snapshots, numbered
   from 1 (10 s at 100 ms: iterations 1-100).
 - A thread that has not run since its last snapshot and is still in the same
-  non-runnable state cannot have changed its stack: it is not walked again and
-  its row is extended instead, so a thread blocked for a minute is one row.
+  state cannot have changed its stack: it is not walked again and its row is
+  extended instead, so a thread blocked for a minute is one row. That goes for
+  a thread that waits for a CPU as well as for a blocked one.
 - A capture with targets walks their threads alone, not every thread on the
   host, where it can. With `--pid` (or a traced command) each snapshot walks
   each target process with the task iterator scoped to it, the processes the

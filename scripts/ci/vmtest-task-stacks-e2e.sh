@@ -1,7 +1,8 @@
 #!/bin/bash
 # Guest side of the task-stacks end-to-end step (.github/workflows/bpf-load-shapes.yml):
-# run the four `test_e2e_task_stacks_scoped_walk*` cases of the pre-built
-# `trace_validation` test binary as root on the guest kernel, and decide by what the
+# run the four `test_e2e_task_stacks_scoped_walk*` cases and the case of a thread that
+# waits for a CPU, of the pre-built `trace_validation` test binary, as root on the
+# guest kernel, and decide by what the
 # cases PRINT, not by the exit code alone.
 #
 # Why the exit code is not enough: each case returns early, and passes, where it
@@ -53,7 +54,8 @@ export LD_LIBRARY_PATH="$LIBDUCKDB_DIR"
     else
         echo "=== cgroup2: $(grep ' cgroup2 ' /proc/mounts | head -n 1)"
     fi
-    "$BIN" --ignored --test-threads=1 --nocapture test_e2e_task_stacks_scoped_walk
+    "$BIN" --ignored --test-threads=1 --nocapture test_e2e_task_stacks_scoped_walk \
+        test_e2e_task_stacks_extends_a_thread_that_waits_for_a_cpu
     echo "TEST-BINARY-EXIT:$?"
 } > "$RAW" 2>&1
 

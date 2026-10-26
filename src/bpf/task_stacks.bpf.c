@@ -8,8 +8,8 @@
  * variable-length record per targeted thread: struct task_stacks_event, then
  * kernel_stack_len kernel frames, user_stack_len user frames (u64 each, leaf
  * first) and py_len bytes of struct pystacks_message. A thread that has not run
- * since its last record, and is in the same non-runnable state as then, gets
- * the header alone, flagged TASK_STACKS_UNCHANGED. The header also carries the
+ * since its last record, and is in the same state as then, gets the header
+ * alone, flagged TASK_STACKS_UNCHANGED. The header also carries the
  * thread's task_context id (--include-task-context), the system call it is in
  * and whether it is blocked on I/O, each read for a full record only: a thread
  * that has not run cannot have changed any of them.
@@ -91,7 +91,7 @@ struct task_status {
 	u64 stime;
 	u64 runtime;	/* se.sum_exec_runtime: ns on a CPU, exact */
 	u32 state;
-	u32 pad;
+	u32 on_cpu;	/* read while the thread was on a CPU */
 };
 
 struct {
@@ -168,23 +168,23 @@ struct {
 	__type(value, struct task_stacks_walk_stats);
 } task_stacks_walk_stats SEC(".maps");
 
-static __always_inline void read_status(struct task_struct *task,
+static __always_inline void read_status(struct task_struct *task, bool on_cpu,
 					struct task_status *now)
 {
 	now->utime = BPF_CORE_READ(task, utime);
 	now->stime = BPF_CORE_READ(task, stime);
 	now->runtime = BPF_CORE_READ(task, se.sum_exec_runtime);
 	now->state = get_task_state(task);
-	now->pad = 0;
+	now->on_cpu = on_cpu;
 }
 
 /*
  * Fill the event's state and its CPU-time deltas against the thread's last
  * full record (zero the first time a thread is seen), and return whether the
- * thread is unchanged since then: it has not been on a CPU, and it is, as it
- * was, in one and the same state other than runnable. A thread that is not
- * runnable changes its stacks only by running; so its last record, stacks
- * included, still describes it, and the walk can be skipped.
+ * thread is unchanged since then: it has not been on a CPU, and it is in the
+ * state it was in. A thread changes its stacks only by running, whether it is
+ * blocked or waits for a CPU; so its last record, stacks included, still
+ * describes it, and the walk can be skipped.
  *
  * "Has not been on a CPU" is se.sum_exec_runtime standing still. utime and
  * stime are what the record reports, but they advance by scheduler ticks: a
@@ -197,6 +197,9 @@ static __always_inline void read_status(struct task_struct *task,
  * asleep with the runtime of before it ran. So a thread that is on a CPU is
  * never unchanged, whatever its state says; on_cpu is cleared after the
  * switch-out's update, which is why the caller reads it before the status.
+ * Nor is a thread whose last record was read on a CPU: that is a best effort,
+ * with no kernel frames and no system call, and a thread caught between the
+ * update and the clearing has the counters it will go on having.
  * The two reads are helper calls, which the compiler keeps in order, and
  * x86-64 keeps loads in order; arm64 may not, but the runtime load would have
  * to pass the whole switch-out, a microsecond, to see the old value.
@@ -206,7 +209,9 @@ static __always_inline void read_status(struct task_struct *task,
  * baseline's too. A thread's own never go back, but nothing removes a dead
  * thread's baseline, and a new thread that is handed its tid starts from zero
  * under it: it would read unchanged until it had run for longer than the dead
- * one. As it is, it gets a full record, with one clamped delta.
+ * one. As it is, it gets a full record, with one clamped delta. The one exception
+ * takes a wrap of pid_max within a capture: a baseline read before its thread
+ * first ran, and a new thread on that tid that has not run yet either.
  */
 static bool status_delta(u32 tid, const struct task_status *now, bool on_cpu,
 			 struct task_stacks_event *e)
@@ -225,10 +230,9 @@ static bool status_delta(u32 tid, const struct task_status *now, bool on_cpu,
 		e->stime_delta = now->stime - prev->stime;
 	if (now->runtime > prev->runtime)
 		e->runtime_delta = now->runtime - prev->runtime;
-	/* TASK_RUNNING is 0: on a CPU, or waiting for one. */
-	return !on_cpu && now->runtime == prev->runtime &&
+	return !on_cpu && !prev->on_cpu && now->runtime == prev->runtime &&
 	       now->utime == prev->utime && now->stime == prev->stime &&
-	       now->state && now->state == prev->state;
+	       now->state == prev->state;
 }
 
 /*
@@ -565,7 +569,7 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	 * kernel has no on_cpu, nor a CPU for the thread to be on but ours. */
 	on_cpu = bpf_core_field_exists(task->on_cpu) ?
 			 BPF_CORE_READ(task, on_cpu) : 0;
-	read_status(task, &now);
+	read_status(task, on_cpu, &now);
 	if (status_delta(tid, &now, on_cpu, e)) {
 		/* The header alone: userspace extends the thread's last record
 		 * to this iteration. A thread it hears nothing of has gone. */
