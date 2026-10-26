@@ -8,9 +8,9 @@ through `runtime/pprof`, which needs code in the program and usually a
 from outside: no port, no signal, no code of ours in the program, and the
 program is not stopped.
 
-**Status:** experimental. x86-64 only. The profile readers read Go 1.26, and
-the goroutine reader of `--include-go-context` Go 1.26 and 1.27; other
-versions are refused until they have bindings (below). The reading is `systing::golang`
+**Status:** experimental. x86-64 and arm64, a program of the machine's own
+architecture. Go 1.26 and 1.27; other versions are refused until they have
+bindings (below). The reading is `systing::golang`
 (`src/golang/`); two commands use it:
 
 - `systing-heap --pid PID --snoop` on a Go program: its heap profile, into the
@@ -62,12 +62,13 @@ It is built as `--include-task-context` is (`src/golang/context/`,
 `src/golang/bpf/go_context.bpf.h`). User space reads each Go program's
 executable once, in bounded reads, for where the runtime keeps the running
 goroutine (`g`, at a fixed distance from the thread pointer that the
-program's own code loads it from), and writes that, with the layout of its Go
-version, into a map the sampler looks up. It does so only for a process whose
+program's own code loads it from; on arm64 in register x28, which the sampler
+reads), and writes that, with the layout of its Go version, into a map the
+sampler looks up. It does so only for a process whose
 executable is mapped in its own memory: a process forked from a Go program
 that never execs keeps the program's `exe` link, but not its memory (gVisor's
-systrap stubs hold their sandboxed guest's). A position-independent program
-is refused: it does not load `g` from a fixed offset.
+systrap stubs hold their sandboxed guest's). On x86-64 a position-independent
+program is refused: it does not load `g` from a fixed offset.
 
 A sample then reads `g`, its m (`g.m`) and the m's current goroutine
 (`m.curg`): a thread on its system stack (a cgo call, the garbage collector's
@@ -112,7 +113,8 @@ twice per request.
 `go-profile/e2e/run.sh` runs this comparison on a small workload linked by
 Go's own linker and by the system linker (as distributions build Go
 programs), each as built and stripped, and fails on any difference beyond
-those (it needs Go 1.26, a C compiler and a build of the tool).
+those (it needs Go 1.26 or 1.27, a C compiler and a build of the tool). CI
+runs it with both on x86-64 and on arm64.
 
 ## How it works
 
@@ -120,9 +122,9 @@ those (it needs Go 1.26, a C compiler and a build of the tool).
 
 | File | What it does |
 |---|---|
-| `discovery.rs` | Opens a program: its Go version (`.go.buildinfo`), where the runtime's globals are, and how far it was loaded from its link addresses. Globals come from `.symtab`; a stripped binary has none, but its `.gopclntab` names every function, and each global is the first one a known runtime function loads (`runtime.memProfileInternal` loads `runtime.mbuckets`, and so on), read from the file's code. |
+| `discovery.rs` | Opens a program: its Go version (`.go.buildinfo`), where the runtime's globals are, and how far it was loaded from its link addresses. Globals come from `.symtab`; a stripped binary has none, but its `.gopclntab` names every function, and each global is the first one a known runtime function loads (`runtime.memProfileInternal` loads `runtime.mbuckets`, and so on), read from the file's code: a RIP-relative load on x86-64, an `adrp` pair on arm64. |
 | `offsets.rs`, `bindings/` | The runtime's struct layouts per Go version, generated (below). |
-| `profiles.rs` | The heap, block and mutex bucket lists, turned into what pprof writes: the heap as of the last finished GC cycle and scaled as Go scales it, delays from CPU ticks to nanoseconds. |
+| `profiles.rs` | The heap, block and mutex bucket lists, turned into what pprof writes: the heap as of the last finished GC cycle and scaled as Go scales it (a bucket's bytes are its objects times its object size), delays from CPU ticks to nanoseconds. |
 | `goroutines.rs` | `runtime.allgs`: each goroutine's state, wait reason and since when, and its stack by frame pointers from where it stopped. |
 | `flight.rs` | The flight recorder's finished generations, copied batch by batch, again if the recorder swapped its ring meanwhile. |
 | `symbols.rs` | Names from the program's own function table, which every Go binary keeps. |
@@ -143,11 +145,13 @@ goroutine state name and wait reason the readers use, into
 `src/golang/bindings/v1_<minor>.rs`:
 
 ```
-python3 scripts/generate_go_bindings.py go1.27.1     # fetches that toolchain
+python3 scripts/generate_go_bindings.py go1.27.2     # fetches that toolchain
 python3 scripts/generate_go_bindings.py --go /path/to/go
 ```
 
-Each reader has a table of its own in that file (`TABLES` in the script),
+The script reads the program built for amd64 and for arm64, and refuses to
+write a file if they disagree: one file serves both. Each reader has a table
+of its own in that file (`TABLES` in the script),
 written only when everything it names is in that runtime. So a struct that
 changed shape (a field gone, not moved) leaves out only the table of the
 reader that reads it, until its code follows, and the other readers can take
@@ -167,10 +171,12 @@ version's numbers, and so are release candidates and experiment builds
 - On a Go program or profile, `systing-heap` has no overall limit on memory
   or time. Where that input isn't trusted, run it under a cgroup memory limit
   and `timeout`.
-- x86-64 only: stripped binaries are read by instruction encoding, and the
-  bindings are for linux/amd64.
-- `--include-go-context` gives no goroutine for a position-independent Go
-  program (`-buildmode=pie`, the default of some distributions).
+- x86-64 and arm64 only: stripped binaries are read by instruction encoding,
+  and the bindings are for linux/amd64 and linux/arm64.
+- On x86-64, `--include-go-context` gives no goroutine for a
+  position-independent Go program (`-buildmode=pie`, the default of some
+  distributions). On arm64 it gives none for a sample in C code that has taken
+  x28 for itself.
 - Function names only: no line numbers, and inlined calls are not expanded
   (the function table has both; they are not decoded yet).
 - `systing-go-profile` reads no pprof labels (`--include-go-context` does,

@@ -97,7 +97,7 @@ enum go_context_reason {
 
 /* One process's recipe, as user space found it (src/golang/context/recipe.rs). */
 struct go_context_recipe {
-	s64 g_tls_offset; /* &g's thread-local word - thread pointer */
+	s64 g_tls_offset; /* &g's thread-local word - thread pointer; not on arm64 */
 	u64 goid; /* offsets in runtime.g */
 	u64 labels;
 	u64 g_m;
@@ -446,7 +446,7 @@ out:
 static __noinline u64 go_context_read_current(struct task_struct *task, u64 *labels_id)
 {
 	const struct go_context_recipe *recipe;
-	u64 tp, g = 0, m = 0, m2 = 0, curg = 0, goid = 0, labels = 0;
+	u64 g = 0, m = 0, m2 = 0, curg = 0, goid = 0, labels = 0;
 	u32 tgid = task->tgid;
 	u32 tid = task->pid;
 
@@ -455,7 +455,7 @@ static __noinline u64 go_context_read_current(struct task_struct *task, u64 *lab
 		go_context_count(GO_CONTEXT_R_RESTRICTED);
 		return 0;
 	}
-#if !defined(__x86_64__)
+#if !defined(__x86_64__) && !defined(__aarch64__)
 	return 0;
 #endif
 	recipe = bpf_map_lookup_elem(&go_context_recipes, &tgid);
@@ -468,15 +468,25 @@ static __noinline u64 go_context_read_current(struct task_struct *task, u64 *lab
 		return 0;
 	}
 
-	tp = task_context_thread_pointer(task);
-	if (!task_context_user_range_ok(tp, 0)) {
-		go_context_count(GO_CONTEXT_R_TP_IMPLAUSIBLE);
-		return 0;
+#if defined(__aarch64__)
+	/* Go keeps g in x28, and in thread-local storage only under cgo. A cgo
+	 * call leaves g0 there, unless the C code takes the register for itself:
+	 * the checks below turn that away, and the sample has no goroutine. */
+	g = ((const struct user_pt_regs *)bpf_task_pt_regs(task))->regs[28];
+#else
+	{
+		u64 tp = task_context_thread_pointer(task);
+
+		if (!task_context_user_range_ok(tp, 0)) {
+			go_context_count(GO_CONTEXT_R_TP_IMPLAUSIBLE);
+			return 0;
+		}
+		if (go_context_word(&g, tp + (u64)recipe->g_tls_offset)) {
+			go_context_count(GO_CONTEXT_R_G_READ_FAILED);
+			return 0;
+		}
 	}
-	if (go_context_word(&g, tp + (u64)recipe->g_tls_offset)) {
-		go_context_count(GO_CONTEXT_R_G_READ_FAILED);
-		return 0;
-	}
+#endif
 	if (!task_context_user_range_ok(g, 0)) {
 		go_context_count(g ? GO_CONTEXT_R_TP_IMPLAUSIBLE : GO_CONTEXT_R_SYSTEM_STACK);
 		return 0;

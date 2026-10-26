@@ -180,6 +180,14 @@ pub(crate) fn u64_in(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
+/// What a program must be built for to be read: this machine's architecture,
+/// x86-64 or arm64.
+const NATIVE_ARCHITECTURE: object::Architecture = if cfg!(target_arch = "aarch64") {
+    object::Architecture::Aarch64
+} else {
+    object::Architecture::X86_64
+};
+
 /// A running Go program, opened for reading.
 pub struct GoProcess {
     pub pid: u32,
@@ -314,8 +322,8 @@ impl GoProcess {
             })?;
         let cache = ReadCache::new(&file);
         let obj = object::File::parse(&cache).context("parsing the program's ELF")?;
-        if obj.architecture() != object::Architecture::X86_64 {
-            bail!("only x86-64 Go programs are supported");
+        if obj.architecture() != NATIVE_ARCHITECTURE {
+            bail!("only Go programs of this machine's architecture ({NATIVE_ARCHITECTURE:?}) are supported");
         }
         let version = build_version(&obj).context("finding the Go version in .go.buildinfo")?;
         let layout = match version_numbers(&version).and_then(|(a, b)| offsets::for_version(a, b)) {
@@ -455,7 +463,11 @@ fn globals_by_code<'a, R: object::ReadRef<'a>>(
             (true, Some((s, e))) => a >= s && a < e,
             _ => data.iter().any(|&(s, e)| a >= s && a < e),
         };
-        if let Some(target) = first_rip_relative(&body, entry, rule.lea, allowed) {
+        let target = match obj.architecture() {
+            object::Architecture::Aarch64 => first_adrp_reference(&body, entry, rule.lea, allowed),
+            _ => first_rip_relative(&body, entry, rule.lea, allowed),
+        };
+        if let Some(target) = target {
             let base = target.wrapping_sub((rule.field)(layout) as u64);
             globals.insert(rule.global, base.wrapping_add(bias));
         }
@@ -578,9 +590,131 @@ fn first_rip_relative(
     })
 }
 
+/// The address the first 8-byte load in `code` reads, among those `allowed`
+/// accepts, or with `lea` the first address taken instead. arm64 reaches a
+/// global with `adrp xN, page` and, right after it, `ldr xM, [xN, #low]`, or
+/// `add xM, xN, #low` to have its address: a load if an 8-byte load through
+/// xM follows (an atomic load has no other form), else an address taken, as
+/// for a lock passed to `lock`.
+fn first_adrp_reference(
+    code: &[u8],
+    entry: u64,
+    lea: bool,
+    allowed: impl Fn(u64) -> bool,
+) -> Option<u64> {
+    let words: Vec<u32> = code
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    // An 8-byte load from register `base` itself: ldar, ldr, ldp.
+    let loads_from = |word: u32, base: u32| {
+        (word >> 5) & 31 == base
+            && (word & 0xffff_fc00 == 0xc8df_fc00
+                || word & 0xffff_fc00 == 0xf940_0000
+                || word & 0xffff_8000 == 0xa940_0000)
+    };
+    words.windows(2).enumerate().find_map(|(i, w)| {
+        let (adrp, next) = (w[0], w[1]);
+        if adrp & 0x9f00_0000 != 0x9000_0000 || (next >> 5) & 31 != adrp & 31 {
+            return None;
+        }
+        let low = u64::from((next >> 10) & 0xfff);
+        let low = match next & 0xffc0_0000 {
+            0x9100_0000 => {
+                let then = words.get(i + 2).copied().unwrap_or(0);
+                if loads_from(then, next & 31) == lea {
+                    return None;
+                }
+                low
+            }
+            0xf940_0000 if !lea => low * 8,
+            _ => return None,
+        };
+        // A signed count of pages: immhi in bits 5-23, immlo in bits 29-30.
+        let pages = ((adrp >> 5) & 0x7_ffff) << 2 | (adrp >> 29) & 3;
+        let pages = i64::from((pages << 11) as i32 >> 11);
+        let at = entry.wrapping_add(i as u64 * 4);
+        let target = (at & !0xfff).wrapping_add((pages << 12) as u64) + low;
+        allowed(target).then_some(target)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_the_first_adrp_reference() {
+        let code =
+            |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let find = |words: &[u32], lea| first_adrp_reference(&code(words), 0x1000, lea, |_| true);
+        // At 0x1000, adrp x0, +2 pages.
+        let adrp = 0xd000_0000;
+        // ldr x1, [x0, #0x18]: a load.
+        assert_eq!(find(&[adrp, 0xf940_0c01], false), Some(0x3018));
+        assert_eq!(find(&[adrp, 0xf940_0c01], true), None);
+        // add x1, x0, #0x18, then ldar x2, [x1]: a load.
+        let add = 0x9100_6001;
+        assert_eq!(find(&[adrp, add, 0xc8df_fc22], false), Some(0x3018));
+        // The same then ldp x2, x3, [x1], and ldr x2, [x1].
+        assert_eq!(find(&[adrp, add, 0xa940_0c22], false), Some(0x3018));
+        assert_eq!(find(&[adrp, add, 0xf940_0022], false), Some(0x3018));
+        // ldar w2, [x1] is 4 bytes, and a call takes the address.
+        assert_eq!(find(&[adrp, add, 0x88df_fc22], false), None);
+        assert_eq!(find(&[adrp, add, 0x9400_0010], false), None);
+        assert_eq!(find(&[adrp, add, 0x9400_0010], true), Some(0x3018));
+        // A load through another register is not this pair's.
+        assert_eq!(find(&[adrp, 0xf940_0c21], false), None);
+        // A refused address is passed over.
+        let refused =
+            first_adrp_reference(&code(&[adrp, 0xf940_0c01]), 0x1000, false, |a| a != 0x3018);
+        assert_eq!(refused, None);
+    }
+
+    /// Every global the stripped-binary rules find must be where the symbol
+    /// table says, in a program Go builds for each architecture: the code is
+    /// only read, so no such machine is needed. Needs a Go with bindings;
+    /// without one it says so and passes.
+    #[test]
+    fn the_code_rules_agree_with_the_symbols() {
+        let workload = concat!(env!("CARGO_MANIFEST_DIR"), "/go-profile/e2e/workload");
+        for arch in ["amd64", "arm64"] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("workload");
+            let built = std::process::Command::new("go")
+                .args(["build", "-o"])
+                .arg(&bin)
+                .arg(".")
+                .current_dir(workload)
+                .env("GOOS", "linux")
+                .env("GOARCH", arch)
+                .env("CGO_ENABLED", "0")
+                .status();
+            if !built.is_ok_and(|s| s.success()) {
+                eprintln!("no Go that builds the workload: skipped");
+                return;
+            }
+            let file = File::open(&bin).unwrap();
+            let cache = ReadCache::new(&file);
+            let obj = object::File::parse(&cache).unwrap();
+            let version = build_version(&obj).unwrap();
+            let layout = version_numbers(&version)
+                .and_then(|(major, minor)| offsets::for_version(major, minor));
+            let Some(layout) = layout else {
+                eprintln!("no bindings for {version}: skipped");
+                return;
+            };
+            let elf = ElfPclntab::from_path(bin.to_str().unwrap())
+                .unwrap()
+                .unwrap();
+            let by_code = globals_by_code(&obj, &file, &elf.table, &layout, 0);
+            let by_symbols = globals_by_symbols(&cache, 0);
+            assert_eq!(by_symbols.len(), RULES.len(), "{arch}: {by_symbols:?}");
+            assert_eq!(by_code, by_symbols, "{arch} {version}");
+        }
+    }
 
     #[test]
     fn finds_the_first_rip_relative_load() {

@@ -12,6 +12,10 @@
 //! program: it loads the displacement into a register first (from the GOT, or
 //! as an immediate), so what has this form in it is C code.
 //!
+//! On arm64 there is nothing to find: Go keeps `g` in register x28 and writes
+//! it to thread-local storage only under cgo, so the sampler reads the
+//! register, wherever the program was loaded.
+//!
 //! Every executable of the host may be looked at, and a file states its own
 //! sizes, so what one can make this read is bounded. It is read as
 //! `task_context::discovery::elf_facts` reads one: the file header, a section
@@ -27,7 +31,7 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{bail, Context, Result};
-use object::elf::{FileHeader64, EM_X86_64, ET_EXEC, PN_XNUM, SHN_XINDEX, SHT_NOBITS};
+use object::elf::{FileHeader64, EM_AARCH64, EM_X86_64, ET_EXEC, PN_XNUM, SHN_XINDEX, SHT_NOBITS};
 use object::read::elf::{FileHeader, SectionHeader};
 use object::read::{ReadCache, ReadRef};
 use object::Endianness;
@@ -51,12 +55,18 @@ const MAX_TEXT_SCAN: u64 = 64 << 20;
 const SCAN_CHUNK: u64 = 1 << 20;
 /// `mov r14, fs:[disp32]`, before its displacement.
 const G_LOAD: [u8; 5] = [0x64, 0x4c, 0x8b, 0x34, 0x25];
+/// What a program must be built for: this machine.
+const NATIVE_MACHINE: u16 = if cfg!(target_arch = "aarch64") {
+    EM_AARCH64
+} else {
+    EM_X86_64
+};
 
 /// The recipe of one executable: the BPF map's value, as it is laid out
 /// there (`struct go_context_recipe` in `bpf/go_context.bpf.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recipe {
-    /// `&g's thread-local word - the thread pointer`.
+    /// `&g's thread-local word - the thread pointer`; unused on arm64.
     pub g_tls_offset: i64,
     /// Offsets in `runtime.g`, `runtime.m` and the label types.
     pub goid: u64,
@@ -157,8 +167,8 @@ fn read_recipe(file: &File) -> Result<Option<Recipe>> {
     if sections.section_by_name(endian, b".gopclntab").is_none() {
         return Ok(None);
     }
-    if header.e_machine(endian) != EM_X86_64 {
-        bail!("only x86-64 Go programs are supported");
+    if header.e_machine(endian) != NATIVE_MACHINE {
+        bail!("only Go programs of this machine's architecture are supported");
     }
     // Where a section's bytes are in the file, and how many it states.
     let range = |name: &str| -> Result<(u64, u64)> {
@@ -181,14 +191,18 @@ fn read_recipe(file: &File) -> Result<Option<Recipe>> {
     else {
         bail!("built with {version}: no bindings for its runtime's layout");
     };
-    if header.e_type(endian) != ET_EXEC {
-        bail!("a position-independent program: g is not loaded from a fixed offset");
-    }
-    let (text_offset, text_size) = range(".text")?;
-    let g_tls_offset = g_tls_offset(
-        |at, buf| file.read_exact_at(buf, text_offset + at),
-        text_size,
-    )?;
+    let g_tls_offset = if NATIVE_MACHINE == EM_AARCH64 {
+        0
+    } else {
+        if header.e_type(endian) != ET_EXEC {
+            bail!("a position-independent program: g is not loaded from a fixed offset");
+        }
+        let (text_offset, text_size) = range(".text")?;
+        g_tls_offset(
+            |at, buf| file.read_exact_at(buf, text_offset + at),
+            text_size,
+        )?
+    };
     Ok(Some(Recipe {
         g_tls_offset,
         goid: layout.g_goid as u64,

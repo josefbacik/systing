@@ -15,7 +15,10 @@ permissions:
 jobs:
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: the heap tests need Ubuntu 24.04's Python 3.12, as the
+    # runner's python3 and as libpython3.12t64. Ubuntu 26.04 has neither, and
+    # apt-get install below fails there before anything is built.
+    runs-on: ubuntu-24.04
     steps:
       - name: Install system dependencies
         run: |
@@ -25,9 +28,15 @@ jobs:
       # and the test that an older one is refused needs the runner's own: the
       # 3.14 is installed beside it, as python3.14, and python3 stays what it
       # was. Both are printed, so the log says what a green run ran.
-      # The Go version systing has bindings for: the gopclntab crate's test
+      # The Go versions systing has bindings for: the gopclntab crate's test
       # builds Go programs with both linkers, and the Go reader's end-to-end
       # check below runs them. Without a Go, both would only say they skip.
+      # The second one set up stays on PATH for anything else.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.2"
+          cache: false
+      - run: echo "GO_1_27=$(command -v go)" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.7"
@@ -83,9 +92,11 @@ jobs:
           SYSTING_BPF_CLANG: "clang-21"
         run: |
           go version
+          "$GO_1_27" version
           cargo build --release --no-default-features -p systing-go-profile
           sudo sysctl -w kernel.yama.ptrace_scope=0
           go-profile/e2e/run.sh
+          PATH="$(dirname "$GO_1_27"):$PATH" go-profile/e2e/run.sh
 
   fmt:
     name: Rustfmt

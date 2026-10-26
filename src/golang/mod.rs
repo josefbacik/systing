@@ -25,8 +25,9 @@
 //! can change under the read: records that cannot be right are skipped and
 //! counted, never trusted.
 //!
-//! x86-64 only: the stripped-binary rules find globals by instruction
-//! encoding, and the bindings are generated for linux/amd64.
+//! x86-64 and arm64, a program of this machine's own architecture: the
+//! stripped-binary rules find globals by instruction encoding, and the
+//! bindings are generated for linux/amd64 and linux/arm64.
 
 pub mod bindings;
 pub mod context;

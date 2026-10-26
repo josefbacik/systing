@@ -3,7 +3,7 @@
 //!
 //! A goroutine that is not running keeps where it stopped in its `g`
 //! (`sched`, or `syscallpc`/`syscallbp` in a system call), and its stack is
-//! walked from there by frame pointers, which Go keeps on x86-64. A running
+//! walked from there by frame pointers, which Go keeps on x86-64 and arm64. A running
 //! goroutine's registers are on a CPU, not in memory: it has no stack here.
 
 use std::time::Instant;
@@ -99,7 +99,8 @@ impl GoProcess {
                     let (mut pcs, whole) =
                         self.walk_stack(pc, word(l.g_sched_bp), word(l.g_stack_hi));
                     if status != l.g_waiting {
-                        if let Some(caller) = self.caller_at_stack_check(pc, word(l.g_sched_sp)) {
+                        let (sp, lr) = (word(l.g_sched_sp), word(l.g_sched_lr));
+                        if let Some(caller) = self.caller_at_stack_check(pc, sp, lr) {
                             pcs.insert(1, caller);
                         }
                     }
@@ -162,22 +163,33 @@ impl GoProcess {
     /// A goroutine preempted at a function's stack check was stopped before
     /// that function pushed its frame pointer: `sched.bp` is still its
     /// caller's, so the walk from it passes the caller over. `morestack` saved
-    /// the function's SP, where the return address into the caller lies. The
-    /// case is known by the instruction before `pc`: the call to morestack.
-    fn caller_at_stack_check(&self, pc: u64, sp: u64) -> Option<u64> {
-        let call = self.mem.bytes(pc.checked_sub(5)?, 5).ok()?;
-        if call[0] != 0xe8 {
-            return None;
-        }
-        let rel = i64::from(i32::from_le_bytes(call[1..5].try_into().unwrap()));
-        let target = (pc as i64).wrapping_add(rel) as u64;
+    /// the return address into the caller: at the function's SP on x86-64, in
+    /// `sched.lr` on arm64. The case is known by the instruction before `pc`:
+    /// the call to morestack.
+    fn caller_at_stack_check(&self, pc: u64, sp: u64, lr: u64) -> Option<u64> {
+        let arm64 = cfg!(target_arch = "aarch64");
+        let target = if arm64 {
+            let call = self.mem.bytes(pc.checked_sub(4)?, 4).ok()?;
+            bl_target(u32::from_le_bytes(call.try_into().unwrap()), pc - 4)?
+        } else {
+            let call = self.mem.bytes(pc.checked_sub(5)?, 5).ok()?;
+            if call[0] != 0xe8 {
+                return None;
+            }
+            let rel = i64::from(i32::from_le_bytes(call[1..5].try_into().unwrap()));
+            (pc as i64).wrapping_add(rel) as u64
+        };
         if !self
             .function(target, false)?
             .starts_with("runtime.morestack")
         {
             return None;
         }
-        self.mem.u64_at(sp).ok()
+        if arm64 {
+            Some(lr)
+        } else {
+            self.mem.u64_at(sp).ok()
+        }
     }
 
     /// A stopped goroutine's stack by frame pointers: `pc` where it will go
@@ -237,9 +249,27 @@ fn is_system_goroutine(start: &str) -> bool {
         )
 }
 
+/// Where the arm64 instruction `word` at `at` calls, if it is a `bl`.
+fn bl_target(word: u32, at: u64) -> Option<u64> {
+    if word >> 26 != 0b100101 {
+        return None;
+    }
+    // A signed count of instructions, in the low 26 bits.
+    let offset = i64::from((word << 6) as i32 >> 6) * 4;
+    Some(at.wrapping_add(offset as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arm64_calls() {
+        assert_eq!(bl_target(0x9400_0010, 0x1000), Some(0x1040));
+        assert_eq!(bl_target(0x97ff_fff0, 0x1000), Some(0xfc0));
+        // `b`, not `bl`.
+        assert_eq!(bl_target(0x1400_0010, 0x1000), None);
+    }
 
     #[test]
     fn system_goroutines_as_the_runtime_says() {
