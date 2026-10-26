@@ -82,8 +82,9 @@ const volatile struct {
  * evicted from it starts over with a full record and zero deltas. An iteration
  * touches every targeted thread once, in pid order, which is an LRU's worst
  * case: with more targeted threads than entries nearly every lookup misses,
- * so every thread is walked every time and every delta is zero. 65,536 is the
- * most threads a capture can target and keep the skip and the deltas.
+ * so every thread is walked every time and every delta is zero. So userspace
+ * sizes it to the host's threads before the load (task_status_entries() in
+ * task_stacks_recorder.rs); what is declared here is the least it gets.
  */
 struct task_status {
 	u64 utime;

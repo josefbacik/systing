@@ -568,6 +568,45 @@ fn choose_walk(filter: &TargetFilter, facts: &WalkFacts) -> (TaskWalk, Option<&'
     (TaskWalk::ByCgroup, None)
 }
 
+/// The largest `task_status` a capture loads: it is keyed by tid, and this is
+/// the most tids a 64-bit kernel hands out (PID_MAX_LIMIT).
+const TASK_STATUS_MAX_ENTRIES: u64 = 4 * 1024 * 1024;
+
+/// Entries of `task_status` to leave for each possible CPU. An LRU map keeps
+/// free entries on per-CPU lists, up to 128 each, and evicts live entries
+/// before it takes those back, so a table with room to spare in all can still
+/// evict from any CPU the walk has run on.
+const TASK_STATUS_ENTRIES_PER_CPU: u64 = 256;
+
+/// The threads on the host from the text of /proc/loadavg, whose fourth field
+/// is `runnable/total`.
+fn threads_in_loadavg(loadavg: &str) -> Option<u64> {
+    loadavg
+        .split_whitespace()
+        .nth(3)?
+        .split_once('/')?
+        .1
+        .parse()
+        .ok()
+}
+
+/// How many entries `task_status` gets for a capture on a host with `threads`
+/// threads at its start (`None`: not known) and `cpus` possible CPUs, where
+/// the object declares `declared` entries.
+///
+/// A thread missing from the table is walked again at every snapshot and its
+/// CPU-time deltas read zero, so the table has to hold every thread a capture
+/// walks. Twice the threads, to leave room for the ones that start during the
+/// capture: past that the table evicts, which costs a walk and never a thread.
+fn task_status_entries(threads: Option<u64>, cpus: u64, declared: u32) -> u32 {
+    let wanted = threads
+        .unwrap_or(0)
+        .saturating_mul(2)
+        .max(u64::from(declared))
+        .saturating_add(cpus.saturating_mul(TASK_STATUS_ENTRIES_PER_CPU));
+    wanted.min(TASK_STATUS_MAX_ENTRIES) as u32
+}
+
 /// The first patch release of each stable line that carries the fix making a
 /// `bpf_find_vma` lookup on another task's address space safe (CVE-2026-93137).
 /// A line that is not listed has no fixed release this table knows of.
@@ -1224,9 +1263,9 @@ impl TaskStacksIter {
         Ok(())
     }
 
-    /// Open, configure, load and attach the object; with `member_dirs`, the
-    /// cgroup-members program too, a link of it on each directory and the
-    /// cgroups below it.
+    /// [`Self::load_sized_object`], with `task_status` sized to the host, or
+    /// at its declared size where the memory for that is not to be had: a
+    /// smaller table costs walks, and no table costs the capture.
     fn load_object(
         filter: &TargetFilter,
         maps: &TargetFilterMaps<'_>,
@@ -1235,6 +1274,48 @@ impl TaskStacksIter {
         mode: TaskStackFrames,
         member_dirs: &[BorrowedFd<'_>],
         remote: bool,
+    ) -> Result<LoadedObject> {
+        let load = |sized| {
+            Self::load_sized_object(
+                filter,
+                maps,
+                pystacks_maps,
+                task_context,
+                mode,
+                member_dirs,
+                remote,
+                sized,
+            )
+        };
+        load(true).or_else(|e| {
+            let out_of_memory = e
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<libbpf_rs::Error>())
+                .any(|e| e.kind() == libbpf_rs::ErrorKind::OutOfMemory);
+            if !out_of_memory {
+                return Err(e);
+            }
+            eprintln!(
+                "task-stacks: no memory for a status table of this host's threads, \
+                 loading the declared size: {e:#}"
+            );
+            load(false)
+        })
+    }
+
+    /// Open, configure, load and attach the object; with `member_dirs`, the
+    /// cgroup-members program too, a link of it on each directory and the
+    /// cgroups below it. With `sized`, `task_status` is sized to the host.
+    #[allow(clippy::too_many_arguments)]
+    fn load_sized_object(
+        filter: &TargetFilter,
+        maps: &TargetFilterMaps<'_>,
+        pystacks_maps: &SharedPystacksMaps<'_>,
+        task_context: Option<(&SharedTaskContextMaps<'_>, TaskContextMode)>,
+        mode: TaskStackFrames,
+        member_dirs: &[BorrowedFd<'_>],
+        remote: bool,
+        sized: bool,
     ) -> Result<LoadedObject> {
         let mut storage = MaybeUninit::uninit();
         let mut open_skel = skel::TaskStacksSkelBuilder::default()
@@ -1248,6 +1329,18 @@ impl TaskStacksIter {
             task_context.map(|(_, task_context_mode)| task_context_mode),
             remote,
         )?;
+
+        if sized {
+            let threads = std::fs::read_to_string("/proc/loadavg")
+                .ok()
+                .and_then(|loadavg| threads_in_loadavg(&loadavg));
+            let cpus = libbpf_rs::num_possible_cpus().map_or(1, |cpus| cpus as u64);
+            let task_status = &mut open_skel.maps.task_status;
+            let entries = task_status_entries(threads, cpus, task_status.max_entries());
+            task_status
+                .set_max_entries(entries)
+                .context("Failed to size the task-stacks status table")?;
+        }
 
         let m = &mut open_skel.maps;
         maps.reuse_in(
@@ -1318,7 +1411,8 @@ impl TaskStacksIter {
     ///
     /// The main object's maps are not reused here: the object's own are
     /// created as declared. A capture's reused maps can differ from those in
-    /// size (the main object resizes some of its maps before it loads); the
+    /// size (the main object resizes some of its maps before it loads), and
+    /// so can its `task_status`; the
     /// probe rests on the verdict not turning on a map's size, since the
     /// programs reach those maps only through lookups and the ring's
     /// reserve. What the probe leaves unread is what needs a target: the
@@ -2871,6 +2965,34 @@ mod tests {
     #[test]
     fn record_header_has_no_padding() {
         assert_eq!(std::mem::size_of::<task_stacks_event>(), 88);
+    }
+
+    #[test]
+    fn threads_are_read_from_loadavg() {
+        assert_eq!(threads_in_loadavg("0.00 0.02 0.00 1/118 1973\n"), Some(118));
+        assert_eq!(threads_in_loadavg(""), None);
+        assert_eq!(threads_in_loadavg("0.00 0.02 0.00 118 1973\n"), None);
+        assert_eq!(threads_in_loadavg("0.00 0.02 0.00 1/x 1973\n"), None);
+    }
+
+    #[test]
+    fn task_status_holds_every_thread_and_room_for_as_many_more() {
+        const DECLARED: u32 = 65_536;
+        // An ordinary host: what the object declares, and the free entries
+        // that its CPUs can keep to themselves.
+        assert_eq!(task_status_entries(Some(500), 4, DECLARED), 66_560);
+        // Not known: the same.
+        assert_eq!(task_status_entries(None, 4, DECLARED), 66_560);
+        // Past that it grows with the threads...
+        assert_eq!(task_status_entries(Some(150_000), 4, DECLARED), 301_024);
+        // ... and the CPUs' share comes on top wherever the table stands: on
+        // a large host it matters from well under the declared size.
+        assert_eq!(task_status_entries(Some(30_000), 192, DECLARED), 114_688);
+        // Never past the tids there are, however odd the reading.
+        assert_eq!(
+            task_status_entries(Some(u64::MAX), 192, DECLARED),
+            4 * 1024 * 1024
+        );
     }
 
     #[test]

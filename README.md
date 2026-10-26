@@ -377,9 +377,11 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
 What to keep in mind: a row's `ts` is the start of its iteration's walk, which
 reaches a given thread up to one walk later. A blocked thread's stack is exact;
 a running thread's is read while it runs and is a best effort. The
-unchanged-thread skip and the CPU-time deltas hold for up to 65,536 targeted
-threads. `--collect-build-id` does not apply to these stacks. The recorder keeps
-its events until the capture ends, so it cannot be used with `--continuous`.
+unchanged-thread skip and the CPU-time deltas hold for twice the threads the
+host had when the capture started, and at least 65,536; a thread past that is
+still recorded, and walked again at every snapshot. `--collect-build-id` does
+not apply to these stacks. The recorder keeps its events until the capture ends,
+so it cannot be used with `--continuous`.
 
 ### Task Context
 
