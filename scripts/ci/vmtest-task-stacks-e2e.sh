@@ -1,9 +1,9 @@
 #!/bin/bash
 # Guest side of the task-stacks end-to-end step (.github/workflows/bpf-load-shapes.yml):
 # run the four `test_e2e_task_stacks_scoped_walk*` cases, the case of a thread that
-# waits for a CPU and the case of a target that holds its memory-map lock, of the
-# pre-built `trace_validation` test binary, as root on the guest kernel, and decide by
-# what the
+# waits for a CPU, the case of a target that holds its memory-map lock and the case of
+# frame pointers off the stack, of the pre-built `trace_validation` test binary, as root
+# on the guest kernel, and decide by what the
 # cases PRINT, not by the exit code alone.
 #
 # Why the exit code is not enough: each case returns early, and passes, where it
@@ -57,7 +57,8 @@ export LD_LIBRARY_PATH="$LIBDUCKDB_DIR"
     fi
     "$BIN" --ignored --test-threads=1 --nocapture test_e2e_task_stacks_scoped_walk \
         test_e2e_task_stacks_extends_a_thread_that_waits_for_a_cpu \
-        test_e2e_task_stacks_goes_on_past_a_busy_lock
+        test_e2e_task_stacks_goes_on_past_a_busy_lock \
+        test_e2e_task_stacks_keeps_to_the_threads_stack
     echo "TEST-BINARY-EXIT:$?"
 } > "$RAW" 2>&1
 
@@ -141,6 +142,7 @@ fi
     need '[--pid, forks past the cap] scoped: '
     need '[waits for a CPU] '
     need '[busy lock] '
+    need '[off the stack] '
     echo "VNG-TEST-EXIT:$rc"
 } > "$OUT" 2>&1
 sync

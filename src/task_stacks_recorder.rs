@@ -1707,6 +1707,8 @@ pub struct WalkStats {
     pub group_threads: u64,
     /// The full records cut short at a busy lock.
     pub cut: u64,
+    /// The user stacks stopped at a frame pointer off the thread's stack.
+    pub off_stack: u64,
 }
 
 const _: () = assert!(
@@ -1717,9 +1719,9 @@ const _: () = assert!(
 /// there is something to say: the snapshots of a scoped capture that took the
 /// full walk, the walks of a process read again and those of them short the
 /// second time too, the records that did not fit the kernel's buffer and
-/// were unwound again at the next read, and the records cut short at a busy
-/// lock. New parts go last: what reads the line finds the earlier ones where
-/// they were.
+/// were unwound again at the next read, the records cut short at a busy lock,
+/// and the user stacks stopped at a frame pointer off the thread's stack. New
+/// parts go last: what reads the line finds the earlier ones where they were.
 fn closing_asides(full_walks: u64, reread: u64, still_short: u64, stats: &WalkStats) -> String {
     let mut asides = String::new();
     match full_walks {
@@ -1745,6 +1747,12 @@ fn closing_asides(full_walks: u64, reread: u64, still_short: u64, stats: &WalkSt
         0 => {}
         n => asides.push_str(&format!(
             "; {n} records were cut short at a busy memory-map lock"
+        )),
+    }
+    match stats.off_stack {
+        0 => {}
+        n => asides.push_str(&format!(
+            "; {n} user stacks stopped at a frame pointer off the thread's stack"
         )),
     }
     asides
@@ -2891,6 +2899,7 @@ mod tests {
                 &WalkStats {
                     unsent: 3,
                     cut: 7,
+                    off_stack: 9,
                     ..WalkStats::default()
                 }
             ),
@@ -2898,7 +2907,8 @@ mod tests {
              ; 5 walks of a process came up short and were read again, \
              1 of them short the second time too\
              ; 3 records did not fit the kernel's buffer and were unwound again\
-             ; 7 records were cut short at a busy memory-map lock"
+             ; 7 records were cut short at a busy memory-map lock\
+             ; 9 user stacks stopped at a frame pointer off the thread's stack"
         );
     }
 

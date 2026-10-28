@@ -53,7 +53,8 @@
  *
  * A look is no guarantee: the lock can be taken between it and the read, a
  * reader holds it with none of these bits set, and a read that finds it free
- * can go on to hold it for as long as a page takes to arrive.
+ * can go on to hold it for as long as a page takes to arrive, which is why the
+ * unwinder keeps to the stack.
  *
  * mm is the thread's address space as this record found it, unpinned. It is
  * only ever a number to read a word at, with a read that cannot fault, and
@@ -63,7 +64,7 @@
 struct task_stacks_look {
 	u64 mm;
 	u32 cut;	/* a look found the lock busy: read no more of this record */
-	u32 pad;
+	u32 off_stack;	/* the user stack stopped at a frame off the thread's stack */
 };
 
 struct {
@@ -270,6 +271,7 @@ struct task_stacks_walk_stats {
 	u64 unsent;
 	u64 group_threads;
 	u64 cut;	/* full records cut short at a busy lock */
+	u64 off_stack;	/* user stacks stopped at a frame off the thread's stack */
 };
 
 struct {
@@ -497,6 +499,43 @@ static __always_inline u32 bounded(u32 n, u32 max)
 }
 
 /*
+ * The most a stack can reach above a thread's stack pointer and still be told
+ * by what lies above it (8 MiB, the usual limit of a stack), and what is allowed
+ * to a stack nothing tells the end of.
+ */
+#define TASK_STACKS_TOP_WINDOW (8ULL << 20)
+#define TASK_STACKS_UNKNOWN_TOP (1ULL << 20)
+
+/*
+ * An address no frame of `task`'s user stack reaches, for the unwinder.
+ *
+ * A C library puts a thread's descriptor, which is what its thread pointer
+ * points at, at the top of the mapping of the thread's stack, so that is the
+ * top of a thread's stack where the pointer lies a stack's reach above sp.
+ * Where it lies there and is something else, as on a stack the thread was
+ * handed or under Go without cgo, nothing is cut: the limit is only further up.
+ * A main thread's descriptor is elsewhere, and its stack ends where exec left
+ * it. What is left has only so much above sp: goroutines and fibers, stacks
+ * past the window. Honest frames that lie on another stack from sp's are lost
+ * to this: the frames of the goroutine beneath cgo or systemstack, and those
+ * beneath a signal handler on an alternate stack.
+ */
+static __always_inline u64 task_stacks_user_top(struct task_struct *task, u64 sp)
+{
+	u64 tp = task_context_thread_pointer(task);
+	u64 start;
+
+	if (tp > sp && tp - sp <= TASK_STACKS_TOP_WINDOW)
+		return tp;
+	if (task->pid == task->tgid) {
+		start = BPF_CORE_READ(task, mm, start_stack);
+		if (start > sp && start - sp <= TASK_STACKS_TOP_WINDOW)
+			return start;
+	}
+	return sp + TASK_STACKS_UNKNOWN_TOP;
+}
+
+/*
  * Thread `tid`'s user stack into the scratch, by frame pointers (see
  * task_stack_unwinder.bpf.h: bpf_get_task_stack() reads a user stack only for
  * the current task). Returns the number of frames.
@@ -517,8 +556,16 @@ __noinline int task_stacks_read_user(pid_t tid)
 	if (get_task(tid, &task))
 		return 0;
 	if (task_stacks_config.remote_user_reads) {
+		struct pt_regs *regs = (struct pt_regs *)bpf_task_pt_regs(task);
+		struct task_stacks_look *look = get_look();
+		bool refused = false;
+
 		n = unwind_user_stack_task(task, s->user_stack,
-					   TASK_STACKS_MAX_DEPTH);
+					   TASK_STACKS_MAX_DEPTH,
+					   task_stacks_user_top(task, PT_REGS_SP(regs)),
+					   &refused);
+		if (look)
+			look->off_stack = refused;
 	} else {
 		/* Where the thread was interrupted, from its saved registers.
 		 * Nothing of the task's own memory is read, and on arm64 the
@@ -691,6 +738,7 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	look->mm = task_stacks_config.remote_user_reads ?
 			   (u64)BPF_CORE_READ(task, mm) : 0;
 	look->cut = 0;
+	look->off_stack = 0;
 
 	/* Before the status, not after: see status_delta(). A uniprocessor
 	 * kernel has no on_cpu, nor a CPU for the thread to be on but ours. */
@@ -772,6 +820,8 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 		bpf_map_update_elem(&task_status, &tid, &now, BPF_ANY);
 		if (stats && now.cut)
 			__sync_fetch_and_add(&stats->cut, 1);
+		if (stats && look->off_stack)
+			__sync_fetch_and_add(&stats->off_stack, 1);
 	} else if (stats) {
 		__sync_fetch_and_add(&stats->unsent, 1);
 	}

@@ -5608,6 +5608,143 @@ fn test_e2e_task_stacks_goes_on_past_a_busy_lock() {
     eprintln!("[busy lock] {cut} records cut, {last} of 50 snapshots, {rewalked} walked again");
 }
 
+/// Frame pointers that leave the thread's stack are not followed, so the page
+/// they point at is not touched: a page of a mapping just above the thread's
+/// stack, and one further up, stay out of the address space, which mincore()
+/// would show had the walk read them. A chain of 100 frames on the stack is
+/// followed to its end. Each thread here sets its frame pointer by hand and
+/// waits in a system call with it until the test is done.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_task_stacks_keeps_to_the_threads_stack() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const PAGE: usize = 4096;
+    const MAPPING: usize = 32 << 20;
+    const CHAIN: usize = 100;
+    /// Where the chain's return addresses start: nothing maps it, so each is
+    /// a frame of its own, symbolized or not.
+    const NOT_CODE: u64 = 0x1000;
+
+    /// Wait in the kernel, with `frame_pointer` in the register, for `word` to
+    /// stop being 0.
+    fn wait_with_frame_pointer(word: &AtomicU32, frame_pointer: u64) {
+        // SAFETY: the frame pointer is saved and restored around the system
+        // call, nothing in between uses the stack, and the call only reads
+        // `word`, which outlives it.
+        unsafe {
+            std::arch::asm!(
+                "push rbp",
+                "mov rbp, {frame_pointer}",
+                "2:",
+                "mov rax, {futex}",
+                "syscall",
+                "cmp dword ptr [rdi], 0",
+                "je 2b",
+                "pop rbp",
+                frame_pointer = in(reg) frame_pointer,
+                futex = const libc::SYS_futex,
+                in("rdi") word.as_ptr(),
+                in("rsi") libc::FUTEX_WAIT,
+                in("rdx") 0,
+                in("r10") 0,
+                out("rax") _,
+                out("rcx") _,
+                out("r11") _,
+            );
+        }
+    }
+
+    // SAFETY: a new mapping that nothing else uses. It comes before the
+    // threads' stacks, which are mapped below it, the first of them right
+    // below it where the address space has no hole to take it.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            MAPPING,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED, "Failed to map");
+    let base = mapping as u64;
+    let targets = [base, base + (MAPPING as u64) / 2];
+
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    DONE.store(0, Ordering::SeqCst);
+    let mut threads: Vec<_> = targets
+        .iter()
+        .map(|&target| std::thread::spawn(move || wait_with_frame_pointer(&DONE, target)))
+        .collect();
+    threads.push(std::thread::spawn(|| {
+        let mut frames = [[0u64; 2]; CHAIN];
+        let at = frames.as_ptr() as u64;
+        for (i, frame) in frames.iter_mut().enumerate() {
+            let next = at + 16 * (i as u64 + 1);
+            *frame = [if i + 1 < CHAIN { next } else { 0 }, NOT_CODE + i as u64];
+        }
+        wait_with_frame_pointer(&DONE, std::hint::black_box(at));
+        std::hint::black_box(&frames);
+    }));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let pid = std::process::id().to_string();
+    let capture = std::panic::catch_unwind(|| task_stacks_capture(&["--pid", &pid], 100, 1, false));
+    DONE.store(1, Ordering::SeqCst);
+    // SAFETY: a wake on a word of this process's.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            DONE.as_ptr(),
+            libc::FUTEX_WAKE,
+            threads.len(),
+        );
+    }
+    for thread in threads {
+        thread.join().expect("A thread panicked");
+    }
+    let (stderr, dir) = capture.expect("The capture failed");
+
+    for target in targets {
+        let mut resident = 0u8;
+        // SAFETY: one page of the mapping above, and one byte to say of it.
+        let got =
+            unsafe { libc::mincore(target as usize as *mut libc::c_void, PAGE, &mut resident) };
+        assert_eq!(got, 0, "mincore failed");
+        assert_eq!(
+            resident & 1,
+            0,
+            "the walk read {target:#x}, off the thread's stack"
+        );
+    }
+    let off_stack = task_stacks_off_stack_count(&stderr);
+    assert!(
+        off_stack >= 2,
+        "too few stacks stopped off their thread's stack:\n{stderr}"
+    );
+
+    let deepest: i64 = duckdb::Connection::open_in_memory()
+        .expect("Failed to open DuckDB")
+        .query_row(
+            &format!(
+                "SELECT max(len(list_filter(frame_names, f -> NOT contains(f, '[kernel]')))) \
+                 FROM read_parquet('{}')",
+                dir.path().join("stack.parquet").display()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to read the stacks");
+    assert!(
+        deepest > CHAIN as i64,
+        "the deepest user stack has {deepest} frames, of the {CHAIN} on the thread's stack"
+    );
+    eprintln!("[off the stack] {off_stack} stopped, both pages untouched, deepest {deepest}");
+}
+
 /// The task-stacks recorder end to end: a task-iterator-only recording
 /// targeted at a child process must land the child's thread in the
 /// task_stack_event table, its iterations spanned by few events because it
@@ -5863,6 +6000,15 @@ fn task_stacks_closing_count(stderr: &str, marker: &str) -> u64 {
 /// The records a capture cut short at a busy lock.
 fn task_stacks_cut_count(stderr: &str) -> u64 {
     task_stacks_closing_count(stderr, " records were cut short at a busy memory-map lock")
+}
+
+/// The user stacks a capture stopped at a frame pointer off the thread's stack.
+#[cfg(target_arch = "x86_64")]
+fn task_stacks_off_stack_count(stderr: &str) -> u64 {
+    task_stacks_closing_count(
+        stderr,
+        " user stacks stopped at a frame pointer off the thread's stack",
+    )
 }
 
 /// What a recording says of its own coverage, over every thread in it. Counted
