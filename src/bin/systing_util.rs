@@ -34,8 +34,8 @@ use std::sync::LazyLock;
 use std::thread;
 use std::time::Instant;
 use systing::duckdb::{
-    create_schema, get_trace_info, import_column_list, import_duckdb_traces, ImportOptions,
-    ImportReport, TraceImportMapping, SCHEMA_VERSION,
+    create_schema, get_trace_info, import_column_list, import_duckdb_traces,
+    import_table_from_parquet, ImportOptions, ImportReport, TraceImportMapping, SCHEMA_VERSION,
 };
 use systing::ParquetPaths;
 
@@ -3538,10 +3538,6 @@ fn run_convert(
             }
         }
 
-        let order = systing::duckdb::import_order_by(table_name)
-            .map(|o| format!(" ORDER BY {o}"))
-            .unwrap_or_default();
-
         // Import files that already have trace_id. BY NAME so parquet files
         // written by older systing versions (with fewer columns) import
         // cleanly - missing columns become NULL; a column this systing does
@@ -3577,7 +3573,6 @@ fn run_convert(
         // Import files that need trace_id injection (one at a time to add trace_id)
         for (trace_id, path) in needs_injection {
             let escaped_path = path.replace('\'', "''");
-            let escaped_trace_id = trace_id.replace('\'', "''");
             let source_sql = format!("read_parquet('{escaped_path}')");
             let Some(columns) = import_column_list(
                 &conn,
@@ -3589,9 +3584,8 @@ fn run_convert(
             else {
                 continue;
             };
-            conn.execute_batch(&format!(
-                "INSERT INTO {table_name} BY NAME SELECT '{escaped_trace_id}' as trace_id, {columns} FROM {source_sql}{order}"
-            ))?;
+            import_table_from_parquet(&conn, table_name, trace_id, &columns, &source_sql)
+                .with_context(|| format!("Failed to import table '{table_name}' from '{path}'"))?;
         }
 
         if verbose {
