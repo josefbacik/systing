@@ -5373,6 +5373,55 @@ fn test_e2e_task_stacks_extends_a_thread_that_waits_for_a_cpu() {
     eprintln!("[waits for a CPU] {events} events for 20 iterations");
 }
 
+/// Wait in the kernel, with `frame_pointer` in the register, for `word` to stop
+/// being 0. A thread's frame pointer is what the walk reads a stack from, so
+/// this is how a test says what the walk finds there, in a test binary built
+/// without frame pointers. A private futex: a shared one can look its word up
+/// under the process's memory-map lock, and a thread here waits while that is
+/// held.
+#[cfg(target_arch = "x86_64")]
+fn wait_with_frame_pointer(word: &std::sync::atomic::AtomicU32, frame_pointer: u64) {
+    // SAFETY: the frame pointer is saved and restored around the system call,
+    // nothing in between uses the stack, and the call only reads `word`, which
+    // outlives it.
+    unsafe {
+        std::arch::asm!(
+            "push rbp",
+            "mov rbp, {frame_pointer}",
+            "2:",
+            "mov rax, {futex}",
+            "syscall",
+            "cmp dword ptr [rdi], 0",
+            "je 2b",
+            "pop rbp",
+            frame_pointer = in(reg) frame_pointer,
+            futex = const libc::SYS_futex,
+            in("rdi") word.as_ptr(),
+            in("rsi") libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+            in("rdx") 0,
+            in("r10") 0,
+            out("rax") _,
+            out("rcx") _,
+            out("r11") _,
+        );
+    }
+}
+
+/// Let what waits on `word` go.
+#[cfg(target_arch = "x86_64")]
+fn wake_waiters(word: &std::sync::atomic::AtomicU32) {
+    word.store(1, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: a wake on a word of this process's, which only wakes.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr(),
+            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+            i32::MAX,
+        )
+    };
+}
+
 /// The body of the process `test_e2e_task_stacks_goes_on_past_a_busy_lock`
 /// forks: it holds its own memory-map lock for writing for `hold`, with no
 /// privilege or kernel option, and never returns. mprotect() holds the lock
@@ -5381,13 +5430,19 @@ fn test_e2e_task_stacks_extends_a_thread_that_waits_for_a_cpu() {
 /// a call of a fraction of a second lasts for as long as that thread spins.
 ///
 /// One byte on `ready` says it is set up; one byte from `go` starts it. One
-/// thread sleeps across the hold and wakes once in the middle of it.
+/// thread sleeps across the hold and wakes once in the middle of it, with a
+/// frame on its stack for the walk to read: a record is cut only by a read that
+/// was going to be made, and without one nothing would say the thread's stack
+/// was not whole.
+#[cfg(target_arch = "x86_64")]
 fn hold_own_memory_map_lock(mut ready: std::fs::File, mut go: std::fs::File, cpu: usize) {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     const SPAN: usize = 16 << 30;
-    const LEAD: Duration = Duration::from_millis(300);
+    // Off the beat of the 100 ms snapshots, so that the hold starts between
+    // two walks and not on one: see the attempts in the test.
+    const LEAD: Duration = Duration::from_millis(350);
     const HOLD: Duration = Duration::from_secs(2);
 
     fn pin(cpu: usize) {
@@ -5434,23 +5489,46 @@ fn hold_own_memory_map_lock(mut ready: std::fs::File, mut go: std::fs::File, cpu
         // SAFETY: the mapping above, which nothing else uses.
         unsafe { libc::mprotect(span as *mut libc::c_void, SPAN, libc::PROT_READ) };
     });
+    static MIDDLE: AtomicU32 = AtomicU32::new(0);
+    static NEVER: AtomicU32 = AtomicU32::new(0);
     std::thread::spawn(|| {
-        while !HOLDING.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(1));
+        // The last frame of a chain: no next one, and a return address.
+        let frame = [0u64, 0x1000];
+        let at = std::hint::black_box(frame.as_ptr() as u64);
+        // One call site: a page of code not yet run would have to be faulted
+        // in, in the middle of the hold.
+        for word in [&MIDDLE, &NEVER] {
+            wait_with_frame_pointer(word, at);
         }
-        std::thread::sleep(HOLD / 2);
-        std::thread::sleep(Duration::from_secs(1000));
+        std::hint::black_box(&frame);
     });
 
-    ready.write_all(b"y").expect("Failed to say it is ready");
-    go.read_exact(&mut [0]).expect("Failed to hear the go");
-    std::thread::sleep(LEAD);
+    fn spin_for(time: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < time {
+            std::hint::spin_loop();
+        }
+    }
+
+    // Once for nothing, before the hold, and then for real. A forked child
+    // starts with no code mapped, so what spins would fault at the lock on its
+    // first time through, and leave the holder the CPU to finish in a moment.
+    static REHEARSAL: AtomicU32 = AtomicU32::new(0);
     pin(cpu);
-    HOLDING.store(true, Ordering::Release);
-    std::thread::sleep(Duration::from_millis(3));
-    let start = Instant::now();
-    while start.elapsed() < HOLD {
-        std::hint::spin_loop();
+    for (rehearsal, word, half) in [
+        (true, &REHEARSAL, Duration::from_millis(1)),
+        (false, &MIDDLE, HOLD / 2),
+    ] {
+        if !rehearsal {
+            ready.write_all(b"y").expect("Failed to say it is ready");
+            go.read_exact(&mut [0]).expect("Failed to hear the go");
+            std::thread::sleep(LEAD);
+            HOLDING.store(true, Ordering::Release);
+        }
+        std::thread::sleep(Duration::from_millis(3));
+        spin_for(half);
+        wake_waiters(word);
+        spin_for(half);
     }
     std::thread::sleep(Duration::from_secs(1000));
 }
@@ -5463,6 +5541,7 @@ fn hold_own_memory_map_lock(mut ready: std::fs::File, mut go: std::fs::File, cpu
 /// kernel on which the look read every lock as busy would cut every stack.
 /// A thread that sleeps through the end of the hold, its one record since the
 /// start having been cut, is walked again with no CPU time to its name.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_task_stacks_goes_on_past_a_busy_lock() {
@@ -5557,6 +5636,34 @@ fn test_e2e_task_stacks_goes_on_past_a_busy_lock() {
             .expect("Failed to read the events")
     }
 
+    fn event_rows(out_dir: &TempDir) -> String {
+        let events = out_dir.path().join("task_stack_event.parquet");
+        let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+        let mut rows = conn
+            .prepare(&format!(
+                "SELECT utid, start_iteration, end_iteration, state, runtime_delta_ns \
+                 FROM read_parquet('{}') ORDER BY utid, start_iteration",
+                events.display()
+            ))
+            .expect("Failed to read the events");
+        rows.query_map([], |row| {
+            Ok(format!(
+                "{:?}",
+                (
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                )
+            ))
+        })
+        .expect("Failed to read the events")
+        .map(|row| row.expect("Failed to read an event"))
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
     let Some(cpu) = spare_cpu() else {
         eprintln!("skipping: one CPU, which the holder takes up, and the recorder needs one");
         return;
@@ -5565,47 +5672,59 @@ fn test_e2e_task_stacks_goes_on_past_a_busy_lock() {
         eprintln!("skipping: a PREEMPT_RT kernel has no lock word to look at");
         return;
     }
-    let (mut ready_rx, ready_tx) = pipe();
-    let (go_rx, mut go_tx) = pipe();
-    // SAFETY: the child calls nothing that a fork from a process with other
-    // threads leaves unusable: it runs on the allocator, which glibc mends at a
-    // fork, and it ends here, whatever happens, not in the test harness.
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "Failed to fork");
-    if pid == 0 {
-        let _ = std::panic::catch_unwind(|| hold_own_memory_map_lock(ready_tx, go_rx, cpu));
-        unsafe { libc::_exit(1) };
-    }
-    let _holder = Holder(pid);
-    drop(ready_tx);
-    drop(go_rx);
-    ready_rx
-        .read_exact(&mut [0])
-        .expect("The holder died setting up");
+    // A look is no guarantee: a hold that starts between a look and its read
+    // does stall the walk, for that one hold, and a hold that starts on a walk
+    // can do that. So a capture may lose that race, and all of them not: the
+    // walk that waits at every lock is the one that loses every time.
+    let mut last = 0;
+    for attempt in 1..=3 {
+        let (mut ready_rx, ready_tx) = pipe();
+        let (go_rx, mut go_tx) = pipe();
+        // SAFETY: the child calls nothing that a fork from a process with other
+        // threads leaves unusable: it runs on the allocator, which glibc mends at a
+        // fork, and it ends here, whatever happens, not in the test harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "Failed to fork");
+        if pid == 0 {
+            let _ = std::panic::catch_unwind(|| hold_own_memory_map_lock(ready_tx, go_rx, cpu));
+            unsafe { libc::_exit(1) };
+        }
+        let _holder = Holder(pid);
+        drop(ready_tx);
+        drop(go_rx);
+        ready_rx
+            .read_exact(&mut [0])
+            .expect("The holder died setting up");
 
-    let (stderr, dir) = capture(pid, 2, || {});
-    if task_stacks_remote_reads(&dir).as_deref() != Some("on") {
-        eprintln!("skipping: this capture does not read other tasks' memory");
+        let (stderr, dir) = capture(pid, 2, || {});
+        if task_stacks_remote_reads(&dir).as_deref() != Some("on") {
+            eprintln!("skipping: this capture does not read other tasks' memory");
+            return;
+        }
+        let quiet = task_stacks_cut_count(&stderr);
+        assert_eq!(quiet, 0, "records cut with the lock left alone:\n{stderr}");
+
+        let (stderr, dir) = capture(pid, 5, || {
+            go_tx.write_all(b"g").expect("Failed to start the hold");
+        });
+        let cut = task_stacks_cut_count(&stderr);
+        let rewalked;
+        (last, rewalked) = walks(&dir);
+        if last < 45 {
+            eprintln!("[busy lock] attempt {attempt}: stalled, snapshot {last} of 50");
+            continue;
+        }
+        assert!(cut > 0, "no record was cut short:\n{stderr}");
+        assert!(
+            rewalked > 0,
+            "no thread was walked again once the lock was free; the events, as \
+             (utid, first, last, state, ns on a CPU):\n{}",
+            event_rows(&dir)
+        );
+        eprintln!("[busy lock] {cut} records cut, {last} of 50 snapshots, {rewalked} walked again");
         return;
     }
-    let quiet = task_stacks_cut_count(&stderr);
-    assert_eq!(quiet, 0, "records cut with the lock left alone:\n{stderr}");
-
-    let (stderr, dir) = capture(pid, 5, || {
-        go_tx.write_all(b"g").expect("Failed to start the hold");
-    });
-    let cut = task_stacks_cut_count(&stderr);
-    let (last, rewalked) = walks(&dir);
-    assert!(
-        last >= 45,
-        "the capture reached snapshot {last} of 50: the walk waited at the lock"
-    );
-    assert!(cut > 0, "no record was cut short:\n{stderr}");
-    assert!(
-        rewalked > 0,
-        "no thread was walked again once the lock was free"
-    );
-    eprintln!("[busy lock] {cut} records cut, {last} of 50 snapshots, {rewalked} walked again");
+    panic!("the capture reached snapshot {last} of 50, each time: the walk waited at the lock");
 }
 
 /// Frame pointers that leave the thread's stack are not followed, so the page
@@ -5626,35 +5745,6 @@ fn test_e2e_task_stacks_keeps_to_the_threads_stack() {
     /// Where the chain's return addresses start: nothing maps it, so each is
     /// a frame of its own, symbolized or not.
     const NOT_CODE: u64 = 0x1000;
-
-    /// Wait in the kernel, with `frame_pointer` in the register, for `word` to
-    /// stop being 0.
-    fn wait_with_frame_pointer(word: &AtomicU32, frame_pointer: u64) {
-        // SAFETY: the frame pointer is saved and restored around the system
-        // call, nothing in between uses the stack, and the call only reads
-        // `word`, which outlives it.
-        unsafe {
-            std::arch::asm!(
-                "push rbp",
-                "mov rbp, {frame_pointer}",
-                "2:",
-                "mov rax, {futex}",
-                "syscall",
-                "cmp dword ptr [rdi], 0",
-                "je 2b",
-                "pop rbp",
-                frame_pointer = in(reg) frame_pointer,
-                futex = const libc::SYS_futex,
-                in("rdi") word.as_ptr(),
-                in("rsi") libc::FUTEX_WAIT,
-                in("rdx") 0,
-                in("r10") 0,
-                out("rax") _,
-                out("rcx") _,
-                out("r11") _,
-            );
-        }
-    }
 
     // SAFETY: a new mapping that nothing else uses. It comes before the
     // threads' stacks, which are mapped below it, the first of them right
@@ -5693,16 +5783,7 @@ fn test_e2e_task_stacks_keeps_to_the_threads_stack() {
 
     let pid = std::process::id().to_string();
     let capture = std::panic::catch_unwind(|| task_stacks_capture(&["--pid", &pid], 100, 1, false));
-    DONE.store(1, Ordering::SeqCst);
-    // SAFETY: a wake on a word of this process's.
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            DONE.as_ptr(),
-            libc::FUTEX_WAKE,
-            threads.len(),
-        );
-    }
+    wake_waiters(&DONE);
     for thread in threads {
         thread.join().expect("A thread panicked");
     }
@@ -5998,6 +6079,7 @@ fn task_stacks_closing_count(stderr: &str, marker: &str) -> u64 {
 }
 
 /// The records a capture cut short at a busy lock.
+#[cfg(target_arch = "x86_64")]
 fn task_stacks_cut_count(stderr: &str) -> u64 {
     task_stacks_closing_count(stderr, " records were cut short at a busy memory-map lock")
 }
