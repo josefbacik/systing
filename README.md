@@ -278,6 +278,14 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   state cannot have changed its stack: it is not walked again and its row is
   extended instead, so a thread blocked for a minute is one row. That goes for
   a thread that waits for a CPU as well as for a blocked one.
+- A read of a thread's memory takes its process's memory-map lock, and that is
+  never waited for: while the lock is held for writing or has a queue, a thread
+  whose record is due gets a stack cut short at that point, with its kernel
+  frames whole, and no Python frames or task context from there on. A thread
+  that sleeps through it is walked again once the lock is free, which opens a
+  row with no CPU time. In Python-only mode a thread whose Python walk is
+  refused outright has no row while that lasts. The capture's closing line
+  counts the records cut, and only that line says so: no row does.
 - A capture with targets walks their threads alone, not every thread on the
   host, where it can. With `--pid` (or a traced command) each snapshot walks
   each target process with the task iterator scoped to it, the processes the

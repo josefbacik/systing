@@ -14,9 +14,11 @@
 //! `--cgroup` target leaves it out, and the walk over every thread meets it.
 //! A thread that has used no CPU time and is in the same state as at its last
 //! record cannot have changed its stack: for it the program skips the walk and
-//! writes a bare header flagged unchanged. The stacks are symbolized with the
-//! stack recorder's at the end of the capture. In Python-only mode a thread
-//! without Python frames is left out.
+//! writes a bare header flagged unchanged. A read of a thread's memory that
+//! would wait at its process's busy memory-map lock is not made: the record is
+//! cut short, says so, and the thread is walked again once the lock is free.
+//! The stacks are symbolized with the stack recorder's at the end of the
+//! capture. In Python-only mode a thread without Python frames is left out.
 //!
 //! A thread's records become events. A full record opens one, from the start
 //! of its iteration; an unchanged record extends the thread's open event by
@@ -253,6 +255,10 @@ const FLAG_UNCHANGED: u32 = 1;
 /// `task_stacks_event.flags`: the thread is blocked on I/O
 /// (TASK_STACKS_IN_IOWAIT).
 const FLAG_IN_IOWAIT: u32 = 2;
+/// `task_stacks_event.flags`: the lock of the thread's address space was busy,
+/// so the record reads none of its memory from there on, if it is a full one,
+/// and the record before it did not if it is unchanged (TASK_STACKS_USER_CUT).
+const FLAG_USER_CUT: u32 = 4;
 
 /// What a walk found of the GIL, as pystacks' message has it
 /// (`PYSTACKS_GIL_STATE_*`, pystacks.bpf.h): free, held by the walked thread,
@@ -311,6 +317,10 @@ pub struct TaskSample {
     pub syscall_nr: Option<i32>,
     /// The thread was blocked on I/O; never set in an unchanged record.
     pub in_iowait: bool,
+    /// The lock of the thread's address space was busy, so a full record has
+    /// not read all it could of the thread's memory, and an unchanged one
+    /// extends a record that did not.
+    pub user_cut: bool,
     /// The thread's task_context id (`--include-task-context`); `None` for
     /// none, and always for an unchanged record, which reads none.
     pub task_context_id: Option<u64>,
@@ -436,6 +446,7 @@ fn parse_records(buf: &[u8]) -> Result<Vec<TaskSample>> {
             state: e.state,
             syscall_nr: (e.syscall_nr >= 0).then_some(e.syscall_nr),
             in_iowait: e.flags & FLAG_IN_IOWAIT != 0,
+            user_cut: e.flags & FLAG_USER_CUT != 0,
             task_context_id: convert_task_context_id(e.task_context_id),
             kernel_stack,
             user_stack,
@@ -1694,6 +1705,8 @@ pub struct WalkStats {
     pub unsent: u64,
     /// The thread count of the thread group the walk last entered.
     pub group_threads: u64,
+    /// The full records cut short at a busy lock.
+    pub cut: u64,
 }
 
 const _: () = assert!(
@@ -1703,10 +1716,11 @@ const _: () = assert!(
 /// What the capture's closing line adds to its counts, each part only when
 /// there is something to say: the snapshots of a scoped capture that took the
 /// full walk, the walks of a process read again and those of them short the
-/// second time too, and the records that did not fit the kernel's buffer and
-/// were unwound again at the next read. New parts go last: what reads the
-/// line finds the earlier ones where they were.
-fn closing_asides(full_walks: u64, reread: u64, still_short: u64, unsent: u64) -> String {
+/// second time too, the records that did not fit the kernel's buffer and
+/// were unwound again at the next read, and the records cut short at a busy
+/// lock. New parts go last: what reads the line finds the earlier ones where
+/// they were.
+fn closing_asides(full_walks: u64, reread: u64, still_short: u64, stats: &WalkStats) -> String {
     let mut asides = String::new();
     match full_walks {
         0 => {}
@@ -1721,10 +1735,16 @@ fn closing_asides(full_walks: u64, reread: u64, still_short: u64, unsent: u64) -
              {still_short} of them short the second time too"
         )),
     }
-    match unsent {
+    match stats.unsent {
         0 => {}
         n => asides.push_str(&format!(
             "; {n} records did not fit the kernel's buffer and were unwound again"
+        )),
+    }
+    match stats.cut {
+        0 => {}
+        n => asides.push_str(&format!(
+            "; {n} records were cut short at a busy memory-map lock"
         )),
     }
     asides
@@ -1881,6 +1901,9 @@ impl TaskStacksThread {
                     // remembers, see ThreadNames::read.)
                     let mut seen: HashMap<u32, HashSet<i32>> = HashMap::new();
                     let mut renamers: HashMap<u32, HashSet<i32>> = HashMap::new();
+                    // Those read /proc/pid/mem, which waits at the lock that
+                    // cut these processes' records short.
+                    let mut locked: HashSet<u32> = HashSet::new();
                     let entries: Option<Vec<_>> = match iter.snapshot() {
                         Ok(samples) => Some(
                             samples
@@ -1890,6 +1913,9 @@ impl TaskStacksThread {
                                         seen.entry(tgid(&sample.task))
                                             .or_default()
                                             .insert(tid(&sample.task) as i32);
+                                        if sample.user_cut {
+                                            locked.insert(tgid(&sample.task));
+                                        }
                                     }
                                     if sample.unchanged {
                                         return Some(SnapshotEntry::Unchanged {
@@ -1940,6 +1966,7 @@ impl TaskStacksThread {
                     // iteration comes back as unchanged too, and its event
                     // runs on over the stack that was lost, until the thread
                     // next changes.
+                    renamers.retain(|tgid, _| !locked.contains(tgid));
                     for (tgid, changed) in renamers {
                         let names = thread_names.read(tgid, &changed, &seen[&tgid]);
                         if !names.is_empty() {
@@ -1983,7 +2010,7 @@ impl TaskStacksThread {
                             iter.full_walk_snapshots(),
                             iter.reread_processes(),
                             iter.still_short_processes(),
-                            stats.unsent
+                            &stats
                         )
                     );
                 }
@@ -2847,17 +2874,31 @@ mod tests {
 
     #[test]
     fn the_closing_line_adds_only_what_there_is_to_say() {
-        assert_eq!(closing_asides(0, 0, 0, 0), "");
+        let unsent = WalkStats {
+            unsent: 3,
+            ..WalkStats::default()
+        };
+        assert_eq!(closing_asides(0, 0, 0, &WalkStats::default()), "");
         assert_eq!(
-            closing_asides(0, 0, 0, 3),
+            closing_asides(0, 0, 0, &unsent),
             "; 3 records did not fit the kernel's buffer and were unwound again"
         );
         assert_eq!(
-            closing_asides(2, 5, 1, 3),
+            closing_asides(
+                2,
+                5,
+                1,
+                &WalkStats {
+                    unsent: 3,
+                    cut: 7,
+                    ..WalkStats::default()
+                }
+            ),
             "; 2 snapshots walked every thread on the host instead\
              ; 5 walks of a process came up short and were read again, \
              1 of them short the second time too\
-             ; 3 records did not fit the kernel's buffer and were unwound again"
+             ; 3 records did not fit the kernel's buffer and were unwound again\
+             ; 7 records were cut short at a busy memory-map lock"
         );
     }
 
@@ -3032,6 +3073,24 @@ mod tests {
 
         assert_eq!(tid(&samples[2].task), 102);
         assert!(samples[2].unchanged);
+    }
+
+    #[test]
+    fn parse_records_reads_the_mark_of_a_busy_lock() {
+        let t = task(100, 100, "main");
+        let mut bytes = record_bytes_in_syscall(&t, 0, -1);
+        bytes.extend(record_bytes_in_syscall(&t, FLAG_USER_CUT, -1));
+        bytes.extend(record_bytes_in_syscall(
+            &t,
+            FLAG_UNCHANGED | FLAG_USER_CUT,
+            -1,
+        ));
+        let marks: Vec<_> = parse_records(&bytes)
+            .unwrap()
+            .iter()
+            .map(|s| (s.user_cut, s.unchanged))
+            .collect();
+        assert_eq!(marks, [(false, false), (true, false), (true, true)]);
     }
 
     /// A record of a thread in system call `syscall_nr` (-1: in none): the
