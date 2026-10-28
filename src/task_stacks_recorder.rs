@@ -12,11 +12,13 @@
 //! not. Either walk records the same threads, but for a process whose every
 //! thread has exited and which waits to be reaped: the kernel's listing of a
 //! `--cgroup` target leaves it out, and the walk over every thread meets it.
-//! A thread that has used no CPU time and sits in the same non-runnable state
-//! as at its last record cannot have changed its stack: for it the program
-//! skips the walk and writes a bare header flagged unchanged. The stacks are
-//! symbolized with the stack recorder's at the end of the capture. In
-//! Python-only mode a thread without Python frames is left out.
+//! A thread that has used no CPU time and is in the same state as at its last
+//! record cannot have changed its stack: for it the program skips the walk and
+//! writes a bare header flagged unchanged. A read of a thread's memory that
+//! would wait at its process's busy memory-map lock is not made: the record is
+//! cut short, says so, and the thread is walked again once the lock is free.
+//! The stacks are symbolized with the stack recorder's at the end of the
+//! capture. In Python-only mode a thread without Python frames is left out.
 //!
 //! A thread's records become events. A full record opens one, from the start
 //! of its iteration; an unchanged record extends the thread's open event by
@@ -253,6 +255,10 @@ const FLAG_UNCHANGED: u32 = 1;
 /// `task_stacks_event.flags`: the thread is blocked on I/O
 /// (TASK_STACKS_IN_IOWAIT).
 const FLAG_IN_IOWAIT: u32 = 2;
+/// `task_stacks_event.flags`: the lock of the thread's address space was busy,
+/// so the record reads none of its memory from there on, if it is a full one,
+/// and the record before it did not if it is unchanged (TASK_STACKS_USER_CUT).
+const FLAG_USER_CUT: u32 = 4;
 
 /// What a walk found of the GIL, as pystacks' message has it
 /// (`PYSTACKS_GIL_STATE_*`, pystacks.bpf.h): free, held by the walked thread,
@@ -311,6 +317,10 @@ pub struct TaskSample {
     pub syscall_nr: Option<i32>,
     /// The thread was blocked on I/O; never set in an unchanged record.
     pub in_iowait: bool,
+    /// The lock of the thread's address space was busy, so a full record has
+    /// not read all it could of the thread's memory, and an unchanged one
+    /// extends a record that did not.
+    pub user_cut: bool,
     /// The thread's task_context id (`--include-task-context`); `None` for
     /// none, and always for an unchanged record, which reads none.
     pub task_context_id: Option<u64>,
@@ -436,6 +446,7 @@ fn parse_records(buf: &[u8]) -> Result<Vec<TaskSample>> {
             state: e.state,
             syscall_nr: (e.syscall_nr >= 0).then_some(e.syscall_nr),
             in_iowait: e.flags & FLAG_IN_IOWAIT != 0,
+            user_cut: e.flags & FLAG_USER_CUT != 0,
             task_context_id: convert_task_context_id(e.task_context_id),
             kernel_stack,
             user_stack,
@@ -566,6 +577,45 @@ fn choose_walk(filter: &TargetFilter, facts: &WalkFacts) -> (TaskWalk, Option<&'
         );
     }
     (TaskWalk::ByCgroup, None)
+}
+
+/// The largest `task_status` a capture loads: it is keyed by tid, and this is
+/// the most tids a 64-bit kernel hands out (PID_MAX_LIMIT).
+const TASK_STATUS_MAX_ENTRIES: u64 = 4 * 1024 * 1024;
+
+/// Entries of `task_status` to leave for each possible CPU. An LRU map keeps
+/// free entries on per-CPU lists, up to 128 each, and evicts live entries
+/// before it takes those back, so a table with room to spare in all can still
+/// evict from any CPU the walk has run on.
+const TASK_STATUS_ENTRIES_PER_CPU: u64 = 256;
+
+/// The threads on the host from the text of /proc/loadavg, whose fourth field
+/// is `runnable/total`.
+fn threads_in_loadavg(loadavg: &str) -> Option<u64> {
+    loadavg
+        .split_whitespace()
+        .nth(3)?
+        .split_once('/')?
+        .1
+        .parse()
+        .ok()
+}
+
+/// How many entries `task_status` gets for a capture on a host with `threads`
+/// threads at its start (`None`: not known) and `cpus` possible CPUs, where
+/// the object declares `declared` entries.
+///
+/// A thread missing from the table is walked again at every snapshot and its
+/// CPU-time deltas read zero, so the table has to hold every thread a capture
+/// walks. Twice the threads, to leave room for the ones that start during the
+/// capture: past that the table evicts, which costs a walk and never a thread.
+fn task_status_entries(threads: Option<u64>, cpus: u64, declared: u32) -> u32 {
+    let wanted = threads
+        .unwrap_or(0)
+        .saturating_mul(2)
+        .max(u64::from(declared))
+        .saturating_add(cpus.saturating_mul(TASK_STATUS_ENTRIES_PER_CPU));
+    wanted.min(TASK_STATUS_MAX_ENTRIES) as u32
 }
 
 /// The first patch release of each stable line that carries the fix making a
@@ -1224,9 +1274,9 @@ impl TaskStacksIter {
         Ok(())
     }
 
-    /// Open, configure, load and attach the object; with `member_dirs`, the
-    /// cgroup-members program too, a link of it on each directory and the
-    /// cgroups below it.
+    /// [`Self::load_sized_object`], with `task_status` sized to the host, or
+    /// at its declared size where the memory for that is not to be had: a
+    /// smaller table costs walks, and no table costs the capture.
     fn load_object(
         filter: &TargetFilter,
         maps: &TargetFilterMaps<'_>,
@@ -1235,6 +1285,48 @@ impl TaskStacksIter {
         mode: TaskStackFrames,
         member_dirs: &[BorrowedFd<'_>],
         remote: bool,
+    ) -> Result<LoadedObject> {
+        let load = |sized| {
+            Self::load_sized_object(
+                filter,
+                maps,
+                pystacks_maps,
+                task_context,
+                mode,
+                member_dirs,
+                remote,
+                sized,
+            )
+        };
+        load(true).or_else(|e| {
+            let out_of_memory = e
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<libbpf_rs::Error>())
+                .any(|e| e.kind() == libbpf_rs::ErrorKind::OutOfMemory);
+            if !out_of_memory {
+                return Err(e);
+            }
+            eprintln!(
+                "task-stacks: no memory for a status table of this host's threads, \
+                 loading the declared size: {e:#}"
+            );
+            load(false)
+        })
+    }
+
+    /// Open, configure, load and attach the object; with `member_dirs`, the
+    /// cgroup-members program too, a link of it on each directory and the
+    /// cgroups below it. With `sized`, `task_status` is sized to the host.
+    #[allow(clippy::too_many_arguments)]
+    fn load_sized_object(
+        filter: &TargetFilter,
+        maps: &TargetFilterMaps<'_>,
+        pystacks_maps: &SharedPystacksMaps<'_>,
+        task_context: Option<(&SharedTaskContextMaps<'_>, TaskContextMode)>,
+        mode: TaskStackFrames,
+        member_dirs: &[BorrowedFd<'_>],
+        remote: bool,
+        sized: bool,
     ) -> Result<LoadedObject> {
         let mut storage = MaybeUninit::uninit();
         let mut open_skel = skel::TaskStacksSkelBuilder::default()
@@ -1248,6 +1340,18 @@ impl TaskStacksIter {
             task_context.map(|(_, task_context_mode)| task_context_mode),
             remote,
         )?;
+
+        if sized {
+            let threads = std::fs::read_to_string("/proc/loadavg")
+                .ok()
+                .and_then(|loadavg| threads_in_loadavg(&loadavg));
+            let cpus = libbpf_rs::num_possible_cpus().map_or(1, |cpus| cpus as u64);
+            let task_status = &mut open_skel.maps.task_status;
+            let entries = task_status_entries(threads, cpus, task_status.max_entries());
+            task_status
+                .set_max_entries(entries)
+                .context("Failed to size the task-stacks status table")?;
+        }
 
         let m = &mut open_skel.maps;
         maps.reuse_in(
@@ -1318,7 +1422,8 @@ impl TaskStacksIter {
     ///
     /// The main object's maps are not reused here: the object's own are
     /// created as declared. A capture's reused maps can differ from those in
-    /// size (the main object resizes some of its maps before it loads); the
+    /// size (the main object resizes some of its maps before it loads), and
+    /// so can its `task_status`; the
     /// probe rests on the verdict not turning on a map's size, since the
     /// programs reach those maps only through lookups and the ring's
     /// reserve. What the probe leaves unread is what needs a target: the
@@ -1600,6 +1705,10 @@ pub struct WalkStats {
     pub unsent: u64,
     /// The thread count of the thread group the walk last entered.
     pub group_threads: u64,
+    /// The full records cut short at a busy lock.
+    pub cut: u64,
+    /// The user stacks stopped at a frame pointer off the thread's stack.
+    pub off_stack: u64,
 }
 
 const _: () = assert!(
@@ -1609,10 +1718,11 @@ const _: () = assert!(
 /// What the capture's closing line adds to its counts, each part only when
 /// there is something to say: the snapshots of a scoped capture that took the
 /// full walk, the walks of a process read again and those of them short the
-/// second time too, and the records that did not fit the kernel's buffer and
-/// were unwound again at the next read. New parts go last: what reads the
-/// line finds the earlier ones where they were.
-fn closing_asides(full_walks: u64, reread: u64, still_short: u64, unsent: u64) -> String {
+/// second time too, the records that did not fit the kernel's buffer and
+/// were unwound again at the next read, the records cut short at a busy lock,
+/// and the user stacks stopped at a frame pointer off the thread's stack. New
+/// parts go last: what reads the line finds the earlier ones where they were.
+fn closing_asides(full_walks: u64, reread: u64, still_short: u64, stats: &WalkStats) -> String {
     let mut asides = String::new();
     match full_walks {
         0 => {}
@@ -1627,10 +1737,22 @@ fn closing_asides(full_walks: u64, reread: u64, still_short: u64, unsent: u64) -
              {still_short} of them short the second time too"
         )),
     }
-    match unsent {
+    match stats.unsent {
         0 => {}
         n => asides.push_str(&format!(
             "; {n} records did not fit the kernel's buffer and were unwound again"
+        )),
+    }
+    match stats.cut {
+        0 => {}
+        n => asides.push_str(&format!(
+            "; {n} records were cut short at a busy memory-map lock"
+        )),
+    }
+    match stats.off_stack {
+        0 => {}
+        n => asides.push_str(&format!(
+            "; {n} user stacks stopped at a frame pointer off the thread's stack"
         )),
     }
     asides
@@ -1787,6 +1909,9 @@ impl TaskStacksThread {
                     // remembers, see ThreadNames::read.)
                     let mut seen: HashMap<u32, HashSet<i32>> = HashMap::new();
                     let mut renamers: HashMap<u32, HashSet<i32>> = HashMap::new();
+                    // Those read /proc/pid/mem, which waits at the lock that
+                    // cut these processes' records short.
+                    let mut locked: HashSet<u32> = HashSet::new();
                     let entries: Option<Vec<_>> = match iter.snapshot() {
                         Ok(samples) => Some(
                             samples
@@ -1796,6 +1921,9 @@ impl TaskStacksThread {
                                         seen.entry(tgid(&sample.task))
                                             .or_default()
                                             .insert(tid(&sample.task) as i32);
+                                        if sample.user_cut {
+                                            locked.insert(tgid(&sample.task));
+                                        }
                                     }
                                     if sample.unchanged {
                                         return Some(SnapshotEntry::Unchanged {
@@ -1840,12 +1968,13 @@ impl TaskStacksThread {
                     // when the iteration saw nothing. One that failed records
                     // nothing, not "nothing seen": BPF has moved the baseline
                     // of every thread it wrote a record for, so a thread that
-                    // stays blocked comes back as unchanged, and that has to
-                    // find its event still open. What this cannot mend: a
+                    // stays blocked, or waits on for a CPU, comes back as
+                    // unchanged, and that has to find its event still open. What this cannot mend: a
                     // thread that moved to another stack within the failed
                     // iteration comes back as unchanged too, and its event
                     // runs on over the stack that was lost, until the thread
                     // next changes.
+                    renamers.retain(|tgid, _| !locked.contains(tgid));
                     for (tgid, changed) in renamers {
                         let names = thread_names.read(tgid, &changed, &seen[&tgid]);
                         if !names.is_empty() {
@@ -1889,7 +2018,7 @@ impl TaskStacksThread {
                             iter.full_walk_snapshots(),
                             iter.reread_processes(),
                             iter.still_short_processes(),
-                            stats.unsent
+                            &stats
                         )
                     );
                 }
@@ -2753,17 +2882,33 @@ mod tests {
 
     #[test]
     fn the_closing_line_adds_only_what_there_is_to_say() {
-        assert_eq!(closing_asides(0, 0, 0, 0), "");
+        let unsent = WalkStats {
+            unsent: 3,
+            ..WalkStats::default()
+        };
+        assert_eq!(closing_asides(0, 0, 0, &WalkStats::default()), "");
         assert_eq!(
-            closing_asides(0, 0, 0, 3),
+            closing_asides(0, 0, 0, &unsent),
             "; 3 records did not fit the kernel's buffer and were unwound again"
         );
         assert_eq!(
-            closing_asides(2, 5, 1, 3),
+            closing_asides(
+                2,
+                5,
+                1,
+                &WalkStats {
+                    unsent: 3,
+                    cut: 7,
+                    off_stack: 9,
+                    ..WalkStats::default()
+                }
+            ),
             "; 2 snapshots walked every thread on the host instead\
              ; 5 walks of a process came up short and were read again, \
              1 of them short the second time too\
-             ; 3 records did not fit the kernel's buffer and were unwound again"
+             ; 3 records did not fit the kernel's buffer and were unwound again\
+             ; 7 records were cut short at a busy memory-map lock\
+             ; 9 user stacks stopped at a frame pointer off the thread's stack"
         );
     }
 
@@ -2874,6 +3019,34 @@ mod tests {
     }
 
     #[test]
+    fn threads_are_read_from_loadavg() {
+        assert_eq!(threads_in_loadavg("0.00 0.02 0.00 1/118 1973\n"), Some(118));
+        assert_eq!(threads_in_loadavg(""), None);
+        assert_eq!(threads_in_loadavg("0.00 0.02 0.00 118 1973\n"), None);
+        assert_eq!(threads_in_loadavg("0.00 0.02 0.00 1/x 1973\n"), None);
+    }
+
+    #[test]
+    fn task_status_holds_every_thread_and_room_for_as_many_more() {
+        const DECLARED: u32 = 65_536;
+        // An ordinary host: what the object declares, and the free entries
+        // that its CPUs can keep to themselves.
+        assert_eq!(task_status_entries(Some(500), 4, DECLARED), 66_560);
+        // Not known: the same.
+        assert_eq!(task_status_entries(None, 4, DECLARED), 66_560);
+        // Past that it grows with the threads...
+        assert_eq!(task_status_entries(Some(150_000), 4, DECLARED), 301_024);
+        // ... and the CPUs' share comes on top wherever the table stands: on
+        // a large host it matters from well under the declared size.
+        assert_eq!(task_status_entries(Some(30_000), 192, DECLARED), 114_688);
+        // Never past the tids there are, however odd the reading.
+        assert_eq!(
+            task_status_entries(Some(u64::MAX), 192, DECLARED),
+            4 * 1024 * 1024
+        );
+    }
+
+    #[test]
     fn parse_records_reads_frames_python_bytes_and_the_unchanged_flag() {
         let main = task(100, 100, "main");
         let worker = task(100, 101, "worker-1");
@@ -2910,6 +3083,24 @@ mod tests {
 
         assert_eq!(tid(&samples[2].task), 102);
         assert!(samples[2].unchanged);
+    }
+
+    #[test]
+    fn parse_records_reads_the_mark_of_a_busy_lock() {
+        let t = task(100, 100, "main");
+        let mut bytes = record_bytes_in_syscall(&t, 0, -1);
+        bytes.extend(record_bytes_in_syscall(&t, FLAG_USER_CUT, -1));
+        bytes.extend(record_bytes_in_syscall(
+            &t,
+            FLAG_UNCHANGED | FLAG_USER_CUT,
+            -1,
+        ));
+        let marks: Vec<_> = parse_records(&bytes)
+            .unwrap()
+            .iter()
+            .map(|s| (s.user_cut, s.unchanged))
+            .collect();
+        assert_eq!(marks, [(false, false), (true, false), (true, true)]);
     }
 
     /// A record of a thread in system call `syscall_nr` (-1: in none): the

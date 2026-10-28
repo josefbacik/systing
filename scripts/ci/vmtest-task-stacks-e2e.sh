@@ -1,7 +1,9 @@
 #!/bin/bash
 # Guest side of the task-stacks end-to-end step (.github/workflows/bpf-load-shapes.yml):
-# run the four `test_e2e_task_stacks_scoped_walk*` cases of the pre-built
-# `trace_validation` test binary as root on the guest kernel, and decide by what the
+# run the four `test_e2e_task_stacks_scoped_walk*` cases, the case of a thread that
+# waits for a CPU, the case of a target that holds its memory-map lock and the case of
+# frame pointers off the stack, of the pre-built `trace_validation` test binary, as root
+# on the guest kernel, and decide by what the
 # cases PRINT, not by the exit code alone.
 #
 # Why the exit code is not enough: each case returns early, and passes, where it
@@ -12,7 +14,7 @@
 # ways (a line that says it is skipping, `took the full walk`, `took the walk over
 # every thread`) and any of the three fails the step: that is what shows the walks
 # were scoped. A line only a run of each case prints is required of every case: that
-# is what shows all four ran.
+# is what shows they all ran.
 #
 # One early return is the kernel's and not the guest's: the walk scoped to `--cgroup`
 # targets lists their processes with the css_task iterator, which a kernel before 6.7
@@ -53,7 +55,10 @@ export LD_LIBRARY_PATH="$LIBDUCKDB_DIR"
     else
         echo "=== cgroup2: $(grep ' cgroup2 ' /proc/mounts | head -n 1)"
     fi
-    "$BIN" --ignored --test-threads=1 --nocapture test_e2e_task_stacks_scoped_walk
+    "$BIN" --ignored --test-threads=1 --nocapture test_e2e_task_stacks_scoped_walk \
+        test_e2e_task_stacks_extends_a_thread_that_waits_for_a_cpu \
+        test_e2e_task_stacks_goes_on_past_a_busy_lock \
+        test_e2e_task_stacks_keeps_to_the_threads_stack
     echo "TEST-BINARY-EXIT:$?"
 } > "$RAW" 2>&1
 
@@ -109,7 +114,7 @@ fi
     fi
     # The three wordings of an early return (the first is the bare word: the cases
     # write both `skipping: ...` and `skipping the --cgroup half: ...`), and one line
-    # or more of each case, so that all four ran. No line anchors: with one test
+    # or more of each case, so that they all ran. No line anchors: with one test
     # thread the test runner prints `test <name> ... ` without a newline before a
     # case runs, so a case's first line follows it.
     if [ "$cgroup_walk" = scoped ]; then
@@ -135,6 +140,9 @@ fi
     need 'most walks cut, as it comes] visited '
     need 'most walks whole, as it comes] visited '
     need '[--pid, forks past the cap] scoped: '
+    need '[waits for a CPU] '
+    need '[busy lock] '
+    need '[off the stack] '
     echo "VNG-TEST-EXIT:$rc"
 } > "$OUT" 2>&1
 sync

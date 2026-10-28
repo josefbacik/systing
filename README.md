@@ -275,8 +275,24 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
 - With `-d` the recorder takes ceil(duration / interval) snapshots, numbered
   from 1 (10 s at 100 ms: iterations 1-100).
 - A thread that has not run since its last snapshot and is still in the same
-  non-runnable state cannot have changed its stack: it is not walked again and
-  its row is extended instead, so a thread blocked for a minute is one row.
+  state cannot have changed its stack: it is not walked again and its row is
+  extended instead, so a thread blocked for a minute is one row. That goes for
+  a thread that waits for a CPU as well as for a blocked one.
+- A read of a thread's memory takes its process's memory-map lock, and that is
+  never waited for: while the lock is held for writing or has a queue, a thread
+  whose record is due gets a stack cut short at that point, with its kernel
+  frames whole, and no Python frames or task context from there on. A thread
+  that sleeps through it is walked again once the lock is free, which opens a
+  row with no CPU time. In Python-only mode a thread whose Python walk is
+  refused outright has no row while that lasts. The capture's closing line
+  counts the records cut, and only that line says so: no row does.
+- A user stack is followed only while its frame pointers stay on the thread's
+  stack: rising, aligned, and below the top of that stack, or within 1 MiB of
+  the stack pointer where the top is not known. So the frames beneath a switch
+  to another stack are not in it: a goroutine's beneath cgo or `systemstack`, or
+  those beneath a signal handler on an alternate stack. The closing line counts
+  the stacks that stopped this way, which includes every thread caught in code
+  built without frame pointers whose register holds something else.
 - A capture with targets walks their threads alone, not every thread on the
   host, where it can. With `--pid` (or a traced command) each snapshot walks
   each target process with the task iterator scoped to it, the processes the
@@ -377,9 +393,11 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
 What to keep in mind: a row's `ts` is the start of its iteration's walk, which
 reaches a given thread up to one walk later. A blocked thread's stack is exact;
 a running thread's is read while it runs and is a best effort. The
-unchanged-thread skip and the CPU-time deltas hold for up to 65,536 targeted
-threads. `--collect-build-id` does not apply to these stacks. The recorder keeps
-its events until the capture ends, so it cannot be used with `--continuous`.
+unchanged-thread skip and the CPU-time deltas hold for twice the threads the
+host had when the capture started, and at least 65,536; a thread past that is
+still recorded, and walked again at every snapshot. `--collect-build-id` does
+not apply to these stacks. The recorder keeps its events until the capture ends,
+so it cannot be used with `--continuous`.
 
 ### Task Context
 

@@ -8,8 +8,8 @@
  * variable-length record per targeted thread: struct task_stacks_event, then
  * kernel_stack_len kernel frames, user_stack_len user frames (u64 each, leaf
  * first) and py_len bytes of struct pystacks_message. A thread that has not run
- * since its last record, and is in the same non-runnable state as then, gets
- * the header alone, flagged TASK_STACKS_UNCHANGED. The header also carries the
+ * since its last record, and is in the same state as then, gets the header
+ * alone, flagged TASK_STACKS_UNCHANGED. The header also carries the
  * thread's task_context id (--include-task-context), the system call it is in
  * and whether it is blocked on I/O, each read for a full record only: a thread
  * that has not run cannot have changed any of them.
@@ -33,6 +33,115 @@
 
 #ifndef STROBELIGHT_SLEEPABLE_BPF
 #error "task_stacks.bpf.c must be compiled with -DSTROBELIGHT_SLEEPABLE_BPF (see build_task_stacks_bpf in build.rs)"
+#endif
+
+/*
+ * Never wait at another program's memory-map lock that is already busy. Every
+ * read of another task's memory takes that task's mmap_lock for reading, and
+ * waits for it; there is no form of the read that gives up instead. While it
+ * waits, the walk of every other thread waits behind it, and so does whatever
+ * waits for this program's tasks-trace RCU read section to end, on any tool's
+ * behalf. So each read looks at the lock first, and when a writer holds it or
+ * anyone queues for it the read is refused, and so is every read left in that
+ * thread's record: a short stack now, and the whole one once the lock is free
+ * (see status_delta()). The kernel frames, read without the lock, show who
+ * holds it and who waits.
+ *
+ * All four sites of the read in this object go through the look: the #define
+ * below reaches the unwinder, pystacks' two read helpers and the task-context
+ * reader, none of which is changed for it, so it has to come ahead of them.
+ *
+ * A look is no guarantee: the lock can be taken between it and the read, a
+ * reader holds it with none of these bits set, and a read that finds it free
+ * can go on to hold it for as long as a page takes to arrive, which is why the
+ * unwinder keeps to the stack.
+ *
+ * mm is the thread's address space as this record found it, unpinned. It is
+ * only ever a number to read a word at, with a read that cannot fault, and
+ * what is read only decides whether to call the helper, which pins the
+ * address space itself. 0: no address space, or nothing to read in it.
+ */
+struct task_stacks_look {
+	u64 mm;
+	u32 cut;	/* a look found the lock busy: read no more of this record */
+	u32 off_stack;	/* the user stack stopped at a frame off the thread's stack */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct task_stacks_look);
+} task_stacks_look SEC(".maps");
+
+/* What makes __down_read_trylock() fail, RWSEM_READ_FAILED_MASK in
+ * kernel/locking/rwsem.c: the writer, waiters and handoff bits and the top
+ * bit, set when too many readers have the lock. */
+#define TASK_STACKS_RWSEM_BUSY \
+	((1ULL << 0) | (1ULL << 1) | (1ULL << 2) | (1ULL << 63))
+
+static __always_inline struct task_stacks_look *get_look(void)
+{
+	u32 key = 0;
+
+	return bpf_map_lookup_elem(&task_stacks_look, &key);
+}
+
+/*
+ * Whether this record may read no more of its thread's memory. Global, so the
+ * verifier walks it once however many reads it guards (see "How this file
+ * keeps the verifier's work down" below). A kernel with no such word, as under
+ * PREEMPT_RT, has no way to look: the read goes on as it would have.
+ */
+__noinline int task_stacks_lock_busy(void)
+{
+	struct task_stacks_look *look = get_look();
+	struct mm_struct *mm;
+	u64 count;
+
+	if (!look || !look->mm)
+		return 0;
+	if (look->cut)
+		return 1;
+	mm = (struct mm_struct *)look->mm;
+	if (!bpf_core_field_exists(mm->mmap_lock.count) ||
+	    bpf_core_read(&count, sizeof(count), &mm->mmap_lock.count.counter) ||
+	    !(count & TASK_STACKS_RWSEM_BUSY))
+		return 0;
+	look->cut = 1;
+	return 1;
+}
+
+/* bpf_copy_from_user_task(), but for a busy lock: fails as the helper fails,
+ * with the destination zeroed (a read of NULL does that), so that what counts
+ * a failed read counts this one too. */
+static __always_inline long copy_unless_busy(void *dst, u32 size,
+					     const void *ptr,
+					     struct task_struct *task, u64 flags)
+{
+	if (task_stacks_lock_busy()) {
+		bpf_probe_read_kernel(dst, size, NULL);
+		return -16; /* -EBUSY */
+	}
+	return bpf_copy_from_user_task(dst, size, ptr, task, flags);
+}
+
+#define bpf_copy_from_user_task copy_unless_busy
+
+#ifdef __aarch64__
+/* The unwinder's lookup on arm64 comes before its read of a frame, and gives
+ * up by itself at a busy lock, with nothing to say so: look first, so that the
+ * record is cut like any other. */
+static __always_inline long find_vma_unless_busy(struct task_struct *task,
+						 u64 addr, void *callback,
+						 void *ctx, u64 flags)
+{
+	if (task_stacks_lock_busy())
+		return -16; /* -EBUSY */
+	return bpf_find_vma(task, addr, callback, ctx, flags);
+}
+
+#define bpf_find_vma find_vma_unless_busy
 #endif
 
 /*
@@ -82,15 +191,17 @@ const volatile struct {
  * evicted from it starts over with a full record and zero deltas. An iteration
  * touches every targeted thread once, in pid order, which is an LRU's worst
  * case: with more targeted threads than entries nearly every lookup misses,
- * so every thread is walked every time and every delta is zero. 65,536 is the
- * most threads a capture can target and keep the skip and the deltas.
+ * so every thread is walked every time and every delta is zero. So userspace
+ * sizes it to the host's threads before the load (task_status_entries() in
+ * task_stacks_recorder.rs); what is declared here is the least it gets.
  */
 struct task_status {
 	u64 utime;
 	u64 stime;
 	u64 runtime;	/* se.sum_exec_runtime: ns on a CPU, exact */
 	u32 state;
-	u32 pad;
+	u16 on_cpu;	/* read while the thread was on a CPU */
+	u16 cut;	/* its record was cut short at a busy lock */
 };
 
 struct {
@@ -103,6 +214,7 @@ struct {
 /* task_stacks_event.flags */
 #define TASK_STACKS_UNCHANGED 1	/* the thread's last record still stands */
 #define TASK_STACKS_IN_IOWAIT 2	/* blocked on I/O (task_struct.in_iowait) */
+#define TASK_STACKS_USER_CUT 4	/* its lock was busy: see task_stacks_look */
 
 struct task_stacks_event {
 	struct task_info task;
@@ -158,6 +270,8 @@ struct task_stacks_walk_stats {
 	u64 targeted;
 	u64 unsent;
 	u64 group_threads;
+	u64 cut;	/* full records cut short at a busy lock */
+	u64 off_stack;	/* user stacks stopped at a frame off the thread's stack */
 };
 
 struct {
@@ -167,23 +281,24 @@ struct {
 	__type(value, struct task_stacks_walk_stats);
 } task_stacks_walk_stats SEC(".maps");
 
-static __always_inline void read_status(struct task_struct *task,
+static __always_inline void read_status(struct task_struct *task, bool on_cpu,
 					struct task_status *now)
 {
 	now->utime = BPF_CORE_READ(task, utime);
 	now->stime = BPF_CORE_READ(task, stime);
 	now->runtime = BPF_CORE_READ(task, se.sum_exec_runtime);
 	now->state = get_task_state(task);
-	now->pad = 0;
+	now->on_cpu = on_cpu;
+	now->cut = 0;
 }
 
 /*
  * Fill the event's state and its CPU-time deltas against the thread's last
  * full record (zero the first time a thread is seen), and return whether the
- * thread is unchanged since then: it has not been on a CPU, and it is, as it
- * was, in one and the same state other than runnable. A thread that is not
- * runnable changes its stacks only by running; so its last record, stacks
- * included, still describes it, and the walk can be skipped.
+ * thread is unchanged since then: it has not been on a CPU, and it is in the
+ * state it was in. A thread changes its stacks only by running, whether it is
+ * blocked or waits for a CPU; so its last record, stacks included, still
+ * describes it, and the walk can be skipped.
  *
  * "Has not been on a CPU" is se.sum_exec_runtime standing still. utime and
  * stime are what the record reports, but they advance by scheduler ticks: a
@@ -196,6 +311,9 @@ static __always_inline void read_status(struct task_struct *task,
  * asleep with the runtime of before it ran. So a thread that is on a CPU is
  * never unchanged, whatever its state says; on_cpu is cleared after the
  * switch-out's update, which is why the caller reads it before the status.
+ * Nor is a thread whose last record was read on a CPU: that is a best effort,
+ * with no kernel frames and no system call, and a thread caught between the
+ * update and the clearing has the counters it will go on having.
  * The two reads are helper calls, which the compiler keeps in order, and
  * x86-64 keeps loads in order; arm64 may not, but the runtime load would have
  * to pass the whole switch-out, a microsecond, to see the old value.
@@ -205,7 +323,15 @@ static __always_inline void read_status(struct task_struct *task,
  * baseline's too. A thread's own never go back, but nothing removes a dead
  * thread's baseline, and a new thread that is handed its tid starts from zero
  * under it: it would read unchanged until it had run for longer than the dead
- * one. As it is, it gets a full record, with one clamped delta.
+ * one. As it is, it gets a full record, with one clamped delta. The one exception
+ * takes a wrap of pid_max within a capture: a baseline read before its thread
+ * first ran, and a new thread on that tid that has not run yet either.
+ *
+ * What a thread's last record says of its stacks does not stand if a busy lock
+ * cut it short. Such a thread is walked again once the lock is free; as long
+ * as it is busy the thread is unchanged like any other, so that one long hold
+ * is one short event and no reads. The record that comes after has the event's
+ * whole stack and deltas of zero, the time before it being in the short one.
  */
 static bool status_delta(u32 tid, const struct task_status *now, bool on_cpu,
 			 struct task_stacks_event *e)
@@ -224,10 +350,10 @@ static bool status_delta(u32 tid, const struct task_status *now, bool on_cpu,
 		e->stime_delta = now->stime - prev->stime;
 	if (now->runtime > prev->runtime)
 		e->runtime_delta = now->runtime - prev->runtime;
-	/* TASK_RUNNING is 0: on a CPU, or waiting for one. */
-	return !on_cpu && now->runtime == prev->runtime &&
+	return !on_cpu && !prev->on_cpu && now->runtime == prev->runtime &&
 	       now->utime == prev->utime && now->stime == prev->stime &&
-	       now->state && now->state == prev->state;
+	       now->state == prev->state &&
+	       (!prev->cut || task_stacks_lock_busy());
 }
 
 /*
@@ -373,6 +499,43 @@ static __always_inline u32 bounded(u32 n, u32 max)
 }
 
 /*
+ * The most a stack can reach above a thread's stack pointer and still be told
+ * by what lies above it (8 MiB, the usual limit of a stack), and what is allowed
+ * to a stack nothing tells the end of.
+ */
+#define TASK_STACKS_TOP_WINDOW (8ULL << 20)
+#define TASK_STACKS_UNKNOWN_TOP (1ULL << 20)
+
+/*
+ * An address no frame of `task`'s user stack reaches, for the unwinder.
+ *
+ * A C library puts a thread's descriptor, which is what its thread pointer
+ * points at, at the top of the mapping of the thread's stack, so that is the
+ * top of a thread's stack where the pointer lies a stack's reach above sp.
+ * Where it lies there and is something else, as on a stack the thread was
+ * handed or under Go without cgo, nothing is cut: the limit is only further up.
+ * A main thread's descriptor is elsewhere, and its stack ends where exec left
+ * it. What is left has only so much above sp: goroutines and fibers, stacks
+ * past the window. Honest frames that lie on another stack from sp's are lost
+ * to this: the frames of the goroutine beneath cgo or systemstack, and those
+ * beneath a signal handler on an alternate stack.
+ */
+static __always_inline u64 task_stacks_user_top(struct task_struct *task, u64 sp)
+{
+	u64 tp = task_context_thread_pointer(task);
+	u64 start;
+
+	if (tp > sp && tp - sp <= TASK_STACKS_TOP_WINDOW)
+		return tp;
+	if (task->pid == task->tgid) {
+		start = BPF_CORE_READ(task, mm, start_stack);
+		if (start > sp && start - sp <= TASK_STACKS_TOP_WINDOW)
+			return start;
+	}
+	return sp + TASK_STACKS_UNKNOWN_TOP;
+}
+
+/*
  * Thread `tid`'s user stack into the scratch, by frame pointers (see
  * task_stack_unwinder.bpf.h: bpf_get_task_stack() reads a user stack only for
  * the current task). Returns the number of frames.
@@ -393,8 +556,16 @@ __noinline int task_stacks_read_user(pid_t tid)
 	if (get_task(tid, &task))
 		return 0;
 	if (task_stacks_config.remote_user_reads) {
+		struct pt_regs *regs = (struct pt_regs *)bpf_task_pt_regs(task);
+		struct task_stacks_look *look = get_look();
+		bool refused = false;
+
 		n = unwind_user_stack_task(task, s->user_stack,
-					   TASK_STACKS_MAX_DEPTH);
+					   TASK_STACKS_MAX_DEPTH,
+					   task_stacks_user_top(task, PT_REGS_SP(regs)),
+					   &refused);
+		if (look)
+			look->off_stack = refused;
 	} else {
 		/* Where the thread was interrupted, from its saved registers.
 		 * Nothing of the task's own memory is read, and on arm64 the
@@ -515,6 +686,7 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	struct task_struct *task = ctx->task;
 	struct task_stacks_walk_stats *stats;
 	struct task_stacks_scratch *s;
+	struct task_stacks_look *look;
 	struct pystacks_message *py;
 	struct task_stacks_event *e;
 	u32 klen = 0, ulen = 0, py_len = 0;
@@ -560,15 +732,25 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	e->syscall_nr = TASK_STACKS_NO_SYSCALL;
 	e->task_context_id = 0;
 
+	look = get_look();
+	if (!look)
+		return 0;
+	look->mm = task_stacks_config.remote_user_reads ?
+			   (u64)BPF_CORE_READ(task, mm) : 0;
+	look->cut = 0;
+	look->off_stack = 0;
+
 	/* Before the status, not after: see status_delta(). A uniprocessor
 	 * kernel has no on_cpu, nor a CPU for the thread to be on but ours. */
 	on_cpu = bpf_core_field_exists(task->on_cpu) ?
 			 BPF_CORE_READ(task, on_cpu) : 0;
-	read_status(task, &now);
+	read_status(task, on_cpu, &now);
 	if (status_delta(tid, &now, on_cpu, e)) {
 		/* The header alone: userspace extends the thread's last record
 		 * to this iteration. A thread it hears nothing of has gone. */
 		e->flags = TASK_STACKS_UNCHANGED;
+		if (look->cut)
+			e->flags |= TASK_STACKS_USER_CUT;
 		e->kernel_stack_len = 0;
 		e->user_stack_len = 0;
 		e->py_len = 0;
@@ -601,6 +783,10 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	if (task_context_config.enabled &&
 	    task_stacks_config.remote_user_reads)
 		e->task_context_id = task_stacks_read_context(tid);
+	if (look->cut) {
+		e->flags |= TASK_STACKS_USER_CUT;
+		now.cut = 1;
+	}
 
 	klen = bounded(klen, TASK_STACKS_MAX_DEPTH);
 	ulen = bounded(ulen, TASK_STACKS_MAX_DEPTH);
@@ -630,10 +816,15 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	 * the first run moved the baseline, the second would find the thread
 	 * unchanged and its new stacks would never be sent.
 	 */
-	if (!err)
+	if (!err) {
 		bpf_map_update_elem(&task_status, &tid, &now, BPF_ANY);
-	else if (stats)
+		if (stats && now.cut)
+			__sync_fetch_and_add(&stats->cut, 1);
+		if (stats && look->off_stack)
+			__sync_fetch_and_add(&stats->off_stack, 1);
+	} else if (stats) {
 		__sync_fetch_and_add(&stats->unsent, 1);
+	}
 	return 0;
 }
 

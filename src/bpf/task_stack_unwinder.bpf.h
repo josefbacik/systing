@@ -1,8 +1,9 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 //
 // Vendored from facebookincubator/strobelight-libs
-// (strobelight/bpf_lib/common/task_stack_unwinder.bpf.h); only the vmlinux.h
-// include path differs.
+// (strobelight/bpf_lib/common/task_stack_unwinder.bpf.h). What differs: the
+// vmlinux.h include path, and the limits on the frames it follows, which take
+// the arguments `stack_top` and `refused`.
 
 #ifndef __BPF_LIB_TASK_STACK_UNWINDER_H__
 #define __BPF_LIB_TASK_STACK_UNWINDER_H__
@@ -65,10 +66,21 @@ static long vma_is_safe_callback(
 // (VM_IO|VM_PFNMAP) such as NVIDIA driver memory. See S612453.
 // VMA lookups are cached to avoid redundant bpf_find_vma() calls when
 // consecutive frame pointers fall within the same memory region.
+//
+// A frame pointer is whatever the thread left in that register, which is an
+// address on its stack only in code built to keep it so. A read at any other
+// address can fault a page in from a file while it holds the task's mmap_lock,
+// or, at an address no mapping covers, take that lock for writing. So a frame
+// is read only if it is aligned, at or above the stack pointer, above the frame
+// before it, and all below `stack_top`, which limits the whole walk and not each
+// step of it. *refused is set when a frame pointer fails that. The kernel's user
+// unwinder (kernel/unwind/user.c) and abseil's x86 stack walker ask much the same.
 static __always_inline size_t unwind_user_stack_task(
     struct task_struct* task,
     uint64_t* stack_buf,
-    size_t max_frames) {
+    size_t max_frames,
+    uint64_t stack_top,
+    bool* refused) {
   struct pt_regs* regs = (struct pt_regs*)bpf_task_pt_regs(task);
   struct task_stack_frame frame;
   int err;
@@ -80,6 +92,7 @@ static __always_inline size_t unwind_user_stack_task(
 
   uint64_t ip = PT_REGS_IP(regs);
   uint64_t fp = PT_REGS_FP(regs);
+  uint64_t lowest = PT_REGS_SP(regs);
 
   if (idx < max_frames) {
     stack_buf[idx++] = ip;
@@ -88,6 +101,14 @@ static __always_inline size_t unwind_user_stack_task(
   void* next_frame = (void*)fp;
 
   while (next_frame != NULL && idx < max_frames) {
+    uint64_t at = (uint64_t)next_frame;
+
+    if ((at & 7) != 0 || at < lowest || at >= stack_top ||
+        stack_top - at < sizeof(frame)) {
+      *refused = true;
+      break;
+    }
+
 #ifdef __aarch64__
     // Check if address falls within current checked VMA range
     if ((unsigned long)next_frame < vma_result.vm_start ||
@@ -111,6 +132,7 @@ static __always_inline size_t unwind_user_stack_task(
     }
 
     stack_buf[idx++] = frame.return_address;
+    lowest = at + 1;
     next_frame = frame.next_frame;
   }
 
