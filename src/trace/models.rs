@@ -686,6 +686,20 @@ pub struct SysInfoRecord {
     /// marker. `None` when the task-stacks recorder was not asked for, and in
     /// traces from before schema 29, where it means unknown and never `on`.
     pub task_stacks_remote_reads: Option<String>,
+    /// The full records the task-stacks recorder kept, one `task_stack_event`
+    /// row each: what the next two are a share of. `None`, as they are, when
+    /// no iterator ran, and in traces from before schema 33.
+    pub task_stacks_full_records: Option<i64>,
+    /// Those of them cut short because the lock of the thread's address space
+    /// was busy: their user frames, Python frames and task context stop
+    /// there. No row says which. `None` where no look can be made. A
+    /// Python-only capture has no row for a walk refused from the start, and
+    /// counts it here all the same, so there this can pass the total.
+    pub task_stacks_cut_records: Option<i64>,
+    /// Those of them whose user stack stopped at a frame pointer off the
+    /// thread's stack. No row says which. `None` where no frame pointer is
+    /// followed.
+    pub task_stacks_off_stack_records: Option<i64>,
     /// How `--include-go-context` ran: `on`, or `restricted` (the kernel's
     /// confidentiality mode: nothing was read). `None` when the flag was not
     /// given, and in traces from before schema 30. With it NULL, a NULL

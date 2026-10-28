@@ -2773,6 +2773,9 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     let mut network_tw_leg_builder = StringBuilder::with_capacity(1, 16);
     let mut network_packet_sample_rate_builder = Int64Builder::with_capacity(1);
     let mut task_stacks_remote_reads_builder = StringBuilder::with_capacity(1, 24);
+    let mut task_stacks_full_records_builder = Int64Builder::with_capacity(1);
+    let mut task_stacks_cut_records_builder = Int64Builder::with_capacity(1);
+    let mut task_stacks_off_stack_records_builder = Int64Builder::with_capacity(1);
     let mut go_context_builder = StringBuilder::with_capacity(1, 16);
 
     sysname_builder.append_value(&record.sysname);
@@ -2798,6 +2801,9 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     network_tw_leg_builder.append_option(record.network_tw_leg.as_deref());
     network_packet_sample_rate_builder.append_option(record.network_packet_sample_rate);
     task_stacks_remote_reads_builder.append_option(record.task_stacks_remote_reads.as_deref());
+    task_stacks_full_records_builder.append_option(record.task_stacks_full_records);
+    task_stacks_cut_records_builder.append_option(record.task_stacks_cut_records);
+    task_stacks_off_stack_records_builder.append_option(record.task_stacks_off_stack_records);
     go_context_builder.append_option(record.go_context.as_deref());
 
     Ok(RecordBatch::try_new(
@@ -2826,6 +2832,9 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
             Arc::new(network_tw_leg_builder.finish()),
             Arc::new(network_packet_sample_rate_builder.finish()),
             Arc::new(task_stacks_remote_reads_builder.finish()),
+            Arc::new(task_stacks_full_records_builder.finish()),
+            Arc::new(task_stacks_cut_records_builder.finish()),
+            Arc::new(task_stacks_off_stack_records_builder.finish()),
             Arc::new(go_context_builder.finish()),
         ],
     )?)
@@ -4033,6 +4042,9 @@ mod tests {
                 network_tw_leg: Some("kprobe:notramp".to_string()),
                 network_packet_sample_rate: Some(8),
                 task_stacks_remote_reads: Some("off:kernel-release".to_string()),
+                task_stacks_full_records: Some(4000),
+                task_stacks_cut_records: Some(0),
+                task_stacks_off_stack_records: None,
                 go_context: Some("on".to_string()),
             })
             .unwrap();
@@ -4064,6 +4076,9 @@ mod tests {
             Option<String>,
             Option<i64>,
             Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
         );
 
         let conn = Connection::open(&db_path).unwrap();
@@ -4074,7 +4089,9 @@ mod tests {
                  memory_map_sample_rate, memory_alloc_sample_rate, memory_vfio_leg, \
                  memory_thp_leg, memory_thp_sample_rate, memory_iommu_overflow, \
                  memory_anon_huge_walk, memory_syscall_leg, network_tw_leg, \
-                 network_packet_sample_rate, task_stacks_remote_reads FROM sysinfo",
+                 network_packet_sample_rate, task_stacks_remote_reads, \
+                 task_stacks_full_records, task_stacks_cut_records, \
+                 task_stacks_off_stack_records FROM sysinfo",
                 [],
                 |row| {
                     Ok((
@@ -4099,6 +4116,9 @@ mod tests {
                         row.get(18)?,
                         row.get(19)?,
                         row.get(20)?,
+                        row.get(21)?,
+                        row.get(22)?,
+                        row.get(23)?,
                     ))
                 },
             )
@@ -4131,6 +4151,9 @@ mod tests {
         assert_eq!(row.18, Some("kprobe:notramp".to_string()));
         assert_eq!(row.19, Some(8));
         assert_eq!(row.20, Some("off:kernel-release".to_string()));
+        assert_eq!(row.21, Some(4000));
+        assert_eq!(row.22, Some(0));
+        assert_eq!(row.23, None);
     }
 
     /// A sysinfo.parquet written before the memory columns existed (systing

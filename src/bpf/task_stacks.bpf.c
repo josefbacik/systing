@@ -215,6 +215,7 @@ struct {
 #define TASK_STACKS_UNCHANGED 1	/* the thread's last record still stands */
 #define TASK_STACKS_IN_IOWAIT 2	/* blocked on I/O (task_struct.in_iowait) */
 #define TASK_STACKS_USER_CUT 4	/* its lock was busy: see task_stacks_look */
+#define TASK_STACKS_USER_OFF_STACK 8	/* a frame pointer left the thread's stack */
 
 struct task_stacks_event {
 	struct task_info task;
@@ -270,8 +271,6 @@ struct task_stacks_walk_stats {
 	u64 targeted;
 	u64 unsent;
 	u64 group_threads;
-	u64 cut;	/* full records cut short at a busy lock */
-	u64 off_stack;	/* user stacks stopped at a frame off the thread's stack */
 };
 
 struct {
@@ -787,6 +786,8 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 		e->flags |= TASK_STACKS_USER_CUT;
 		now.cut = 1;
 	}
+	if (look->off_stack)
+		e->flags |= TASK_STACKS_USER_OFF_STACK;
 
 	klen = bounded(klen, TASK_STACKS_MAX_DEPTH);
 	ulen = bounded(ulen, TASK_STACKS_MAX_DEPTH);
@@ -816,15 +817,10 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 	 * the first run moved the baseline, the second would find the thread
 	 * unchanged and its new stacks would never be sent.
 	 */
-	if (!err) {
+	if (!err)
 		bpf_map_update_elem(&task_status, &tid, &now, BPF_ANY);
-		if (stats && now.cut)
-			__sync_fetch_and_add(&stats->cut, 1);
-		if (stats && look->off_stack)
-			__sync_fetch_and_add(&stats->off_stack, 1);
-	} else if (stats) {
+	else if (stats)
 		__sync_fetch_and_add(&stats->unsent, 1);
-	}
 	return 0;
 }
 

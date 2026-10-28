@@ -321,6 +321,19 @@ pub struct TraceSystemInfo {
     /// from before schema 29, where it means unknown and never "on".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_stacks_remote_reads: Option<String>,
+    /// The full records the task-stacks recorder kept (from schema 33), one
+    /// `task_stack_event` row each, what the next two are a share of; `None`,
+    /// as they are, when no iterator ran, or for older traces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_stacks_full_records: Option<i64>,
+    /// Those of them cut short at a busy memory-map lock. No row says which.
+    /// `None` means unknown and never 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_stacks_cut_records: Option<i64>,
+    /// Those of them whose user stack stopped at a frame pointer off the
+    /// thread's stack. No row says which. `None` means unknown and never 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_stacks_off_stack_records: Option<i64>,
     /// How `--include-go-context` ran (from schema 30): "on", or
     /// "restricted" (the kernel's confidentiality mode: nothing was read);
     /// `None` without the flag.
@@ -987,7 +1000,7 @@ impl AnalyzeDb {
             }
         };
         let sql = format!(
-            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
             col("trace_id"),
             col("release"),
             col("machine"),
@@ -1011,6 +1024,9 @@ impl AnalyzeDb {
             col("network_packet_sample_rate"),
             col("task_stacks_remote_reads"),
             col("go_context"),
+            col("task_stacks_full_records"),
+            col("task_stacks_cut_records"),
+            col("task_stacks_off_stack_records"),
         );
 
         let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -1041,6 +1057,9 @@ impl AnalyzeDb {
                 network_packet_sample_rate: row.get(20)?,
                 task_stacks_remote_reads: row.get(21)?,
                 go_context: row.get(22)?,
+                task_stacks_full_records: row.get(23)?,
+                task_stacks_cut_records: row.get(24)?,
+                task_stacks_off_stack_records: row.get(25)?,
             })
         }) else {
             return Vec::new();
@@ -1543,11 +1562,13 @@ mod tests {
                  memory_alloc_sample_rate, memory_vfio_leg, memory_thp_leg, \
                  memory_thp_sample_rate, memory_iommu_overflow, \
                  memory_anon_huge_walk, memory_syscall_leg, network_tw_leg, \
-                 network_packet_sample_rate, task_stacks_remote_reads, go_context) \
+                 network_packet_sample_rate, task_stacks_remote_reads, go_context, \
+                 task_stacks_full_records, task_stacks_cut_records, \
+                 task_stacks_off_stack_records) \
                  VALUES ('t1', 'Linux', '6.12.0', '#1 SMP', 'x86_64', \
                  NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge', 'cpu-clock', 1000000, \
                  'tracepoint', 97, 1, NULL, 'on', NULL, NULL, 0, NULL, 'fentry', \
-                 'kprobe:nobtf', 8, 'off:kernel-release', 'on')",
+                 'kprobe:nobtf', 8, 'off:kernel-release', 'on', 4000, 0, NULL)",
             )
             .unwrap();
         }
@@ -1593,6 +1614,13 @@ mod tests {
             Some("off:kernel-release")
         );
         assert_eq!(sys.go_context.as_deref(), Some("on"));
+        assert_eq!(sys.task_stacks_full_records, Some(4000));
+        assert_eq!(
+            sys.task_stacks_cut_records,
+            Some(0),
+            "0 = counted, and none were cut"
+        );
+        assert_eq!(sys.task_stacks_off_stack_records, None);
     }
 
     #[test]
@@ -1625,6 +1653,9 @@ mod tests {
                  ALTER TABLE sysinfo DROP COLUMN network_packet_sample_rate; \
                  ALTER TABLE sysinfo DROP COLUMN task_stacks_remote_reads; \
                  ALTER TABLE sysinfo DROP COLUMN go_context; \
+                 ALTER TABLE sysinfo DROP COLUMN task_stacks_full_records; \
+                 ALTER TABLE sysinfo DROP COLUMN task_stacks_cut_records; \
+                 ALTER TABLE sysinfo DROP COLUMN task_stacks_off_stack_records; \
                  INSERT INTO sysinfo (trace_id, sysname, release, version, machine) \
                  VALUES ('t1', 'Linux', '5.10.0', '#1 SMP', 'aarch64')",
             )
@@ -1659,6 +1690,12 @@ mod tests {
             "a database from before the column reads unknown, never \"on\""
         );
         assert_eq!(sys.go_context, None);
+        assert_eq!(sys.task_stacks_full_records, None);
+        assert_eq!(
+            sys.task_stacks_cut_records, None,
+            "a database from before the column reads unknown, never 0"
+        );
+        assert_eq!(sys.task_stacks_off_stack_records, None);
     }
 
     #[test]

@@ -280,6 +280,9 @@ pub fn sysinfo_schema() -> Arc<Schema> {
         Field::new("network_tw_leg", DataType::Utf8, true),
         Field::new("network_packet_sample_rate", DataType::Int64, true),
         Field::new("task_stacks_remote_reads", DataType::Utf8, true),
+        Field::new("task_stacks_full_records", DataType::Int64, true),
+        Field::new("task_stacks_cut_records", DataType::Int64, true),
+        Field::new("task_stacks_off_stack_records", DataType::Int64, true),
         Field::new("go_context", DataType::Utf8, true),
     ]))
 }

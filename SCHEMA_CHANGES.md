@@ -445,6 +445,35 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 33 (systing 1.30.0) — 2026-10-28
+
+The task-stacks recorder's walks leave counts in the trace. A record cut short
+at a busy memory-map lock and a user stack stopped at a frame pointer off the
+thread's stack read like any other short stack, and until now only the
+capture's closing line, which goes to stderr, said how many there were.
+
+### Added columns
+- `sysinfo.task_stacks_full_records` (BIGINT): the full records the recorder
+  kept, one `task_stack_event` row each. A record that made no row is not in
+  it: a thread a Python-only capture leaves out, or a snapshot that failed.
+- `sysinfo.task_stacks_cut_records` (BIGINT): the records cut short at a busy
+  lock. User frames, Python frames and `task_context_id` stop at that point. A
+  Python-only capture has no row for a walk refused from the start and counts
+  it here all the same, so there this can pass the total.
+- `sysinfo.task_stacks_off_stack_records` (BIGINT): those of them whose user
+  stack stopped at a frame pointer off the thread's stack.
+
+All three are NULL when no iterator ran, and in traces from before this
+schema. NULL means unknown and never 0: `cut` is NULL too where no look can
+be made (`task_stacks_remote_reads` off, a PREEMPT_RT kernel) and `off_stack`
+where no frame pointer is followed (remote reads off, Python frames alone).
+
+```sql
+SELECT trace_id, task_stacks_cut_records * 1.0 / task_stacks_full_records AS cut_share,
+       task_stacks_off_stack_records * 1.0 / task_stacks_full_records AS off_stack_share
+FROM sysinfo WHERE task_stacks_full_records > 0;
+```
+
 ## Schema Version 32 (systing 1.29.0) — 2026-10-16
 
 The generic trace events take two new kinds, the kernel's generic perf
