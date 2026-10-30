@@ -90,8 +90,8 @@ struct {
 #define PYSYM_GATE_MAP_SIZE 65536
 #define PYSYM_CACHE_SLOTS 1024
 /* Minimum interval between re-emissions of the same un-interned symbol from
- * one CPU. Bounds duplicate ringbuf traffic during warm-up while still
- * guaranteeing eventual interning if a record is dropped. */
+ * one CPU (in the sleepable build, the window in which a repeat is skipped).
+ * Bounds duplicate ringbuf traffic; a dropped record can still be sent later. */
 #define PYSYM_REEMIT_NS (1ULL * 1000 * 1000 * 1000)
 
 /*
@@ -109,12 +109,12 @@ struct {
 } pystacks_symbols SEC(".maps");
 
 /*
- * Carries pystacks_symbol_record from probe context to userspace. A single
- * (un-sharded) ringbuf is fine here: emission is rate-limited to at most one
- * record per CPU per un-interned symbol per PYSYM_REEMIT_NS, so the reserve
- * spinlock's duty cycle is far too low to push waiters into the paravirt
- * halt path even on very wide machines. ~470-byte records; 4MiB buffers ~8k
- * in-flight symbols, and drops are recovered via PYSYM_REEMIT_NS.
+ * Carries pystacks_symbol_record to userspace. A single (un-sharded) ringbuf
+ * is fine here: a probe emits at most one record per CPU per cache slot per
+ * PYSYM_REEMIT_NS, so the reserve spinlock's duty cycle is far too low to push
+ * waiters into the paravirt halt path even on very wide machines, and the
+ * sleepable build's copy has one writer, the thread that reads the iterator.
+ * ~470-byte records; 4MiB buffers ~8k in-flight symbols.
  * Shrunk to one page at open time when pystacks is disabled.
  */
 struct {
@@ -137,6 +137,8 @@ struct {
  * frame (e.g. module-level import code seen exactly once) that loses the
  * slot race on every CPU that saw it, or whose record is dropped by a full
  * ringbuf, stays unresolved — an accepted trade for the hard cap.
+ * In the sleepable build a slot holds a claim per symbol and second instead,
+ * on a ringbuf of its own, under PYSYM_ITER_BUDGET: see emit_symbol_record().
  */
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -144,6 +146,27 @@ struct {
   __type(key, u32);
   __type(value, uint64_t);
 } pystacks_emitted_cache SEC(".maps");
+
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+/* The task iterator's cap on symbol records per PYSYM_REEMIT_NS, over all CPUs
+ * (one thread reads the iterator). Its ringbuf is not the probes', so this
+ * bounds how fast userspace must take in new symbols, not a lock's load. */
+#define PYSYM_ITER_BUDGET (16 * PYSYM_CACHE_SLOTS)
+
+struct pystacks_iter_budget {
+  uint64_t window; /* the PYSYM_REEMIT_NS window that sent counts in */
+  uint64_t sent; /* records sent in that window */
+  uint64_t over; /* records not sent: over the cap */
+  uint64_t no_room; /* records not sent: the ringbuf was full */
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct pystacks_iter_budget);
+} pystacks_iter_budget SEC(".maps");
+#endif
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -267,9 +290,9 @@ static symbol_id_t hash_symbol(const struct pystacks_symbol* const sym) {
 
 /*
  * Send {id, symbol, line table} to userspace for interning, rate-limited by
- * the per-CPU emitted cache. The cache slot is claimed *before* the reserve
- * so that a full ringbuf backs us off for PYSYM_REEMIT_NS instead of
- * hammering the shared reserve spinlock on every frame.
+ * the per-CPU emitted cache. The slot is claimed *before* the reserve and,
+ * outside the sleepable build, kept on failure, so a full ringbuf backs us off
+ * for PYSYM_REEMIT_NS instead of hammering the shared reserve spinlock.
  */
 static __noinline void emit_symbol_record(
     symbol_id_t id,
@@ -284,16 +307,46 @@ static __noinline void emit_symbol_record(
    * shrunk (pystacks disabled), where this path should be dead code anyway. */
   if (!last_emit)
     return;
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+  /* The task iterator sees a blocked thread's frame once, so skip only a repeat
+   * of this symbol in the same PYSYM_REEMIT_NS window; one that userspace did
+   * not intern can be sent again. Tries over PYSYM_ITER_BUDGET are counted. */
+  struct pystacks_iter_budget* budget =
+      bpf_map_lookup_elem(&pystacks_iter_budget, &zero);
+  uint64_t window = now / PYSYM_REEMIT_NS;
+  uint64_t claim = id ^ window;
+  if (!budget || *last_emit == claim)
+    return;
+  *last_emit = claim;
+  if (budget->window != window) {
+    budget->window = window;
+    budget->sent = 0;
+  }
+  if (budget->sent >= PYSYM_ITER_BUDGET) {
+    budget->over++;
+    return;
+  }
+  budget->sent++;
+#else
   if (now - *last_emit < PYSYM_REEMIT_NS)
     return;
   *last_emit = now;
+#endif
 
   /* In NMI context (perf-event sampler) reserve degrades to a trylock and
-   * may fail; the record is re-emitted after PYSYM_REEMIT_NS. */
+   * may fail; outside the sleepable build, a retry waits PYSYM_REEMIT_NS. */
   struct pystacks_symbol_record* rec =
       bpf_ringbuf_reserve(&ringbuf_pysym_events, sizeof(*rec), 0);
-  if (!rec)
+  if (!rec) {
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+    /* Not sent and not charged to the cap: the next frame with this symbol
+     * tries again. */
+    *last_emit = 0;
+    budget->sent--;
+    budget->no_room++;
+#endif
     return;
+  }
 
   rec->symbol_id = id;
   rec->sym = *sym;

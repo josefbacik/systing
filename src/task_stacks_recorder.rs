@@ -148,17 +148,15 @@ impl TaskStackFrames {
     }
 }
 
-/// The main object's pystacks maps, which the task-stacks object reuses so it
-/// shares pystacks' Python process discovery (pid and binary configs, target
-/// pids) and symbol interning (gate map, symbol ringbuf, emission cache). Only
-/// the per-CPU scratch heaps are the object's own.
+/// The main object's pystacks maps that the task-stacks object reuses: Python
+/// process discovery, ending frames and the gate map of interned symbols. Its
+/// emission cache and symbol ringbuf are its own: it fills the cache's slots
+/// differently and has a cap of its own (`emit_symbol_record`).
 pub struct SharedPystacksMaps<'a> {
     pub targeted_pids: BorrowedFd<'a>,
     pub pid_config: BorrowedFd<'a>,
     pub binaryid_config: BorrowedFd<'a>,
     pub symbols: BorrowedFd<'a>,
-    pub pysym_events: BorrowedFd<'a>,
-    pub emitted_cache: BorrowedFd<'a>,
     pub ending_frames: BorrowedFd<'a>,
     pub ending_frame_qualnames: BorrowedFd<'a>,
 }
@@ -170,8 +168,6 @@ impl SharedPystacksMaps<'_> {
             (&mut m.pystacks_pid_config, self.pid_config),
             (&mut m.pystacks_binaryid_config, self.binaryid_config),
             (&mut m.pystacks_symbols, self.symbols),
-            (&mut m.ringbuf_pysym_events, self.pysym_events),
-            (&mut m.pystacks_emitted_cache, self.emitted_cache),
             (&mut m.pystacks_ending_frames, self.ending_frames),
             (
                 &mut m.pystacks_ending_frame_qualnames,
@@ -1064,6 +1060,8 @@ struct LoadedObject {
     prog: OwnedFd,
     walk_stats: OwnedFd,
     member_links: Vec<OwnedFd>,
+    pysym_ring: libbpf_rs::MapHandle,
+    symbol_budget: OwnedFd,
 }
 
 /// The loaded and attached task iterator.
@@ -1098,6 +1096,11 @@ pub struct TaskStacksIter {
     /// with it off a user stack is its first frame alone, and there are no
     /// Python frames and no task context.
     remote_reads: bool,
+    /// The object's symbol ringbuf, until the capture takes it to poll it.
+    pysym_ring: Option<libbpf_rs::MapHandle>,
+    /// The program's counts of the symbol records it did not send
+    /// (`pystacks_iter_budget`).
+    symbol_budget: OwnedFd,
 }
 
 /// What [`TaskStacksIter::configure`] left in the opened object's rodata, read
@@ -1197,6 +1200,8 @@ impl TaskStacksIter {
             reread_processes: AtomicU64::new(0),
             still_short_processes: AtomicU64::new(0),
             remote_reads: remote,
+            pysym_ring: Some(loaded.pysym_ring),
+            symbol_budget: loaded.symbol_budget,
         }))
     }
 
@@ -1250,6 +1255,21 @@ impl TaskStacksIter {
                 .write(true);
             bss.pystacks_prog_cfg.enable_py_src_lines.write(true);
             bss.pystacks_prog_cfg.stack_max_len = MAX_FRAMES as u32;
+        } else {
+            // No symbol is ever sent: one page and one slot, as the main
+            // object's ringbuf and cache have when pystacks is off.
+            // SAFETY: sysconf reads a constant of the running system.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+            open_skel
+                .maps
+                .ringbuf_pysym_events
+                .set_max_entries(page)
+                .context("Failed to shrink the task-stacks symbol ringbuf")?;
+            open_skel
+                .maps
+                .pystacks_emitted_cache
+                .set_max_entries(1)
+                .context("Failed to shrink the task-stacks pystacks_emitted_cache map")?;
         }
 
         // Off in the object ("?iter/cgroup"): on for the capture that reads it.
@@ -1397,6 +1417,14 @@ impl TaskStacksIter {
             .as_fd()
             .try_clone_to_owned()
             .context("Failed to keep the task-stacks walk counters")?;
+        let pysym_ring = libbpf_rs::MapHandle::try_from(&skel.maps.ringbuf_pysym_events)
+            .context("Failed to keep the task-stacks symbol ringbuf")?;
+        let symbol_budget = skel
+            .maps
+            .pystacks_iter_budget
+            .as_fd()
+            .try_clone_to_owned()
+            .context("Failed to keep the task-stacks symbol counters")?;
         let mut member_links = Vec::with_capacity(member_dirs.len());
         for dir in member_dirs {
             let mut link_info = libbpf_sys::bpf_iter_link_info::default();
@@ -1415,6 +1443,8 @@ impl TaskStacksIter {
             prog,
             walk_stats,
             member_links,
+            pysym_ring,
+            symbol_budget,
         })
     }
 
@@ -1513,6 +1543,11 @@ impl TaskStacksIter {
             crate::bpf_load_shapes::LoadReport::from_load(autoloaded, skipped, &log, outcome),
             configured,
         ))
+    }
+
+    /// The object's symbol ringbuf, for the capture to poll; `None` once taken.
+    pub fn take_pysym_ring(&mut self) -> Option<libbpf_rs::MapHandle> {
+        self.pysym_ring.take()
     }
 
     /// The walk this capture's snapshots take.
@@ -1679,6 +1714,22 @@ impl TaskStacksIter {
             )
         };
         (ret == 0).then_some(stats)
+    }
+
+    /// The symbol records the program did not send: over its cap, and for a
+    /// full ringbuf. `None` if they cannot be read.
+    pub fn symbols_not_sent(&self) -> Option<(u64, u64)> {
+        let key = 0u32;
+        let mut budget = skel::types::pystacks_iter_budget::default();
+        // SAFETY: the map's one value is a `struct pystacks_iter_budget`.
+        let ret = unsafe {
+            libbpf_sys::bpf_map_lookup_elem(
+                self.symbol_budget.as_raw_fd(),
+                &key as *const u32 as *const c_void,
+                &mut budget as *mut skel::types::pystacks_iter_budget as *mut c_void,
+            )
+        };
+        (ret == 0).then_some((budget.over, budget.no_room))
     }
 
     /// The snapshots of a scoped capture that took the full walk instead.
@@ -2070,6 +2121,16 @@ impl TaskStacksThread {
                 }
                 if failed > 1 {
                     eprintln!("task-stacks: {failed} iterations failed in all");
+                }
+                if let Some((over, no_room)) = iter.symbols_not_sent() {
+                    if over + no_room > 0 {
+                        eprintln!(
+                            "task-stacks: {} Python symbol records not sent ({over} over the \
+                             per-second cap, {no_room} with the ringbuf full); frames whose \
+                             symbol was never sent read \"<unknown python>\"",
+                            over + no_room
+                        );
+                    }
                 }
                 // What the walks cost: the tasks the program was handed
                 // against those it had records to write for.

@@ -2286,6 +2286,8 @@ struct RecorderChannels {
     /// consumed by the pystack_symbol_loader thread, which interns them and
     /// updates the BPF gate map. Present only when pystacks is enabled.
     pysym_rx: Option<Receiver<crate::pystacks::types::PystacksSymbolRecord>>,
+    /// A sender into the same channel, for the task-stacks object's ringbuf.
+    pysym_tx: Option<SyncSender<crate::pystacks::types::PystacksSymbolRecord>>,
 }
 
 fn spawn_recorder_threads(
@@ -3571,6 +3573,7 @@ fn setup_ringbuffers<'a>(
     }
 
     let mut pysym_rx = None;
+    let mut pysym_tx_for_walk = None;
     if collect_pystacks {
         for map in object.maps() {
             if map.name().to_str().unwrap() == "ringbuf_exec_events" {
@@ -3584,10 +3587,13 @@ fn setup_ringbuffers<'a>(
         for map in object.maps() {
             if map.name().to_str().unwrap() == "ringbuf_pysym_events" {
                 let (pysym_tx, rx) = sync_channel(CHANNEL_CAPACITY);
-                let ring =
-                    create_ring::<crate::pystacks::types::PystacksSymbolRecord>(&map, pysym_tx)?;
+                let ring = create_ring::<crate::pystacks::types::PystacksSymbolRecord>(
+                    &map,
+                    pysym_tx.clone(),
+                )?;
                 rings.push(("ringbuf_pysym_events".to_string(), ring));
                 pysym_rx = Some(rx);
+                pysym_tx_for_walk = Some(pysym_tx);
                 break;
             }
         }
@@ -3626,6 +3632,7 @@ fn setup_ringbuffers<'a>(
         marker_rx,
         exec_event_rx,
         pysym_rx,
+        pysym_tx: pysym_tx_for_walk,
     };
 
     Ok((rings, channels))
@@ -4577,8 +4584,6 @@ fn shared_pystacks_maps<'a>(
         pid_config: skel.maps.pystacks_pid_config.as_fd(),
         binaryid_config: skel.maps.pystacks_binaryid_config.as_fd(),
         symbols: skel.maps.pystacks_symbols.as_fd(),
-        pysym_events: skel.maps.ringbuf_pysym_events.as_fd(),
-        emitted_cache: skel.maps.pystacks_emitted_cache.as_fd(),
         ending_frames: skel.maps.pystacks_ending_frames.as_fd(),
         ending_frame_qualnames: skel.maps.pystacks_ending_frame_qualnames.as_fd(),
     }
@@ -6366,10 +6371,11 @@ pub fn systing(
         }
         let (mut rings, mut channels) =
             setup_ringbuffers(&skel, &opts, collect_pystacks, &ring_shards)?;
-        // Take exec_event_rx/pysym_rx out before channels is moved into
-        // spawn_recorder_threads
+        // Take these out before channels is moved into spawn_recorder_threads:
+        // there its `..` pattern would drop them.
         let exec_event_rx = channels.exec_event_rx.take();
         let pysym_rx = channels.pysym_rx.take();
+        let pysym_tx = channels.pysym_tx.take();
 
         // --include-task-context: its two rings join the ones polled below,
         // and the processes the capture was pointed at are looked at here,
@@ -6602,7 +6608,7 @@ pub fn systing(
         // the command rather than the forked parent. It shares the target
         // maps filled above, and takes the --cgroup targets' directories to
         // walk their processes alone where the kernel can list them.
-        let task_stacks_iter = if opts.task_stacks {
+        let mut task_stacks_iter = if opts.task_stacks {
             let cgroup_dirs: Vec<_> = cgroup_filter
                 .targets
                 .iter()
@@ -6642,6 +6648,16 @@ pub fn systing(
         } else {
             None
         };
+        // The iterator's own symbol ringbuf, polled into the same channel, and
+        // first: its first walk can fill the ringbuf before any poller runs. The
+        // map handle lives here, as the iterator's thread exits before the pollers.
+        let walk_pysym_ring = task_stacks_iter
+            .as_mut()
+            .and_then(|iter| iter.take_pysym_ring());
+        if let (Some(map), Some(tx)) = (&walk_pysym_ring, pysym_tx) {
+            let ring = create_ring::<crate::pystacks::types::PystacksSymbolRecord>(map, tx)?;
+            rings.insert(0, ("rb_pysym_walk".to_string(), ring));
+        }
 
         // Signal the traced child to exec now that BPF is fully attached.
         // All tracing is active, so we capture everything from exec onwards.
