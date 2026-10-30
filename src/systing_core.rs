@@ -5809,9 +5809,7 @@ fn run_tracing_loop(
     let capture_end_ts = {
         let _p = stop_phase("disable tracing gate");
         skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
-        let ts = get_clock_value(libc::CLOCK_BOOTTIME) as i64;
-        ringbuf_shutdown.signal();
-        ts
+        get_clock_value(libc::CLOCK_BOOTTIME) as i64
     };
     if let Some(task_stacks) = handles.task_stacks_thread {
         let _p = stop_phase("join task-stacks iterator");
@@ -5819,6 +5817,9 @@ fn run_tracing_loop(
     }
     {
         let _p = stop_phase("join ring buffer consumers");
+        // After the iterator's last walk: a poller consumes once more and
+        // exits, and nobody reads what is sent after that.
+        ringbuf_shutdown.signal();
         for thread in handles.ringbuf_threads {
             thread.join().expect("Failed to join thread");
         }
