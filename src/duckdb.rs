@@ -155,7 +155,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 32;
+pub const SCHEMA_VERSION: u32 = 33;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -1013,6 +1013,18 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- recorder was not asked for, and in traces from before schema 29,
             -- where it means unknown and never 'on'.
             task_stacks_remote_reads VARCHAR,
+            -- The full records the task-stacks recorder kept, one
+            -- task_stack_event row each, and of them the ones cut short at a
+            -- busy memory-map lock and the ones whose user stack stopped at a
+            -- frame pointer off the thread's stack. Those are the only
+            -- markers of either: no row says which. NULL means unknown and
+            -- never 0: no iterator ran, the capture could not have raised
+            -- that count, or the trace is from before schema 33. A Python-only
+            -- capture has no row for a walk refused from the start, and counts
+            -- it as cut all the same, so there cut can pass full.
+            task_stacks_full_records BIGINT,
+            task_stacks_cut_records BIGINT,
+            task_stacks_off_stack_records BIGINT,
             -- How --include-go-context ran: 'on', or 'restricted' (the
             -- kernel's confidentiality mode: nothing was read). NULL without
             -- the flag, and in traces from before schema 30.

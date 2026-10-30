@@ -5617,21 +5617,22 @@ fn test_e2e_task_stacks_goes_on_past_a_busy_lock() {
         (stderr, out_dir)
     }
 
-    // The last snapshot any event reaches, and the events of a sleeping thread
-    // that opened after the first snapshot with no time on a CPU to explain it.
-    fn walks(out_dir: &TempDir) -> (i64, i64) {
+    // The last snapshot any event reaches, the events of a sleeping thread that
+    // opened after the first snapshot with no time on a CPU to explain it, and
+    // all the events.
+    fn walks(out_dir: &TempDir) -> (i64, i64, i64) {
         let events = out_dir.path().join("task_stack_event.parquet");
         duckdb::Connection::open_in_memory()
             .expect("Failed to open DuckDB")
             .query_row(
                 &format!(
                     "SELECT max(end_iteration), count(*) FILTER (WHERE state = 'S' \
-                     AND runtime_delta_ns = 0 AND start_iteration > 1) \
+                     AND runtime_delta_ns = 0 AND start_iteration > 1), count(*) \
                      FROM read_parquet('{}')",
                     events.display()
                 ),
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("Failed to read the events")
     }
@@ -5708,8 +5709,8 @@ fn test_e2e_task_stacks_goes_on_past_a_busy_lock() {
             go_tx.write_all(b"g").expect("Failed to start the hold");
         });
         let cut = task_stacks_cut_count(&stderr);
-        let rewalked;
-        (last, rewalked) = walks(&dir);
+        let (rewalked, events);
+        (last, rewalked, events) = walks(&dir);
         if last < 45 {
             eprintln!("[busy lock] attempt {attempt}: stalled, snapshot {last} of 50");
             continue;
@@ -5720,6 +5721,15 @@ fn test_e2e_task_stacks_goes_on_past_a_busy_lock() {
             "no thread was walked again once the lock was free; the events, as \
              (utid, first, last, state, ns on a CPU):\n{}",
             event_rows(&dir)
+        );
+        // The trace says what the closing line does, and its total is the
+        // rows it holds, or the share a reader works out means nothing.
+        let (records, cut_in_trace, _) = task_stacks_sysinfo_counts(&dir);
+        assert_eq!(cut_in_trace, cut, "sysinfo against the closing line");
+        assert_eq!(records, events as u64, "sysinfo against the rows");
+        assert!(
+            records > cut,
+            "{cut} records cut of {records}: the ones from before the hold were whole"
         );
         eprintln!("[busy lock] {cut} records cut, {last} of 50 snapshots, {rewalked} walked again");
         return;
@@ -5822,6 +5832,16 @@ fn test_e2e_task_stacks_keeps_to_the_threads_stack() {
     assert!(
         deepest > CHAIN as i64,
         "the deepest user stack has {deepest} frames, of the {CHAIN} on the thread's stack"
+    );
+    let (records, _, off_stack_in_trace) = task_stacks_sysinfo_counts(&dir);
+    assert_eq!(
+        off_stack_in_trace, off_stack,
+        "sysinfo against the closing line"
+    );
+    assert_eq!(
+        records,
+        parquet_row_count(&dir.path().join("task_stack_event.parquet")) as u64,
+        "sysinfo against the rows"
     );
     eprintln!("[off the stack] {off_stack} stopped, both pages untouched, deepest {deepest}");
 }
@@ -6076,6 +6096,31 @@ fn task_stacks_closing_count(stderr: &str, marker: &str) -> u64 {
     head[head.len() - digits..]
         .parse()
         .unwrap_or_else(|_| panic!("no number before {marker:?} in {line:?}"))
+}
+
+/// What a capture left in `sysinfo`: its full records, those of them cut short
+/// and those stopped off the thread's stack.
+#[cfg(target_arch = "x86_64")]
+fn task_stacks_sysinfo_counts(out_dir: &TempDir) -> (u64, u64, u64) {
+    let sysinfo = out_dir.path().join("sysinfo.parquet");
+    duckdb::Connection::open_in_memory()
+        .expect("Failed to open DuckDB")
+        .query_row(
+            &format!(
+                "SELECT task_stacks_full_records, task_stacks_cut_records, \
+                 task_stacks_off_stack_records FROM read_parquet('{}')",
+                sysinfo.display()
+            ),
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            },
+        )
+        .expect("every capture with an iterator has the task-stacks counts in sysinfo")
 }
 
 /// The records a capture cut short at a busy lock.

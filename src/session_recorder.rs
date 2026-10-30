@@ -295,6 +295,9 @@ pub struct SessionRecorder {
     /// (`sysinfo.task_stacks_remote_reads`), set once its iterator is loaded.
     /// Unset when the recorder is not enabled (the column is then NULL).
     pub task_stacks_remote_reads: OnceLock<bool>,
+    /// What the task-stacks recorder's records came to, set as its thread
+    /// ends. Unset when no iterator ran (the columns are then NULL).
+    pub task_stacks_walk: OnceLock<crate::task_stacks_recorder::WalkTally>,
     /// How `--include-go-context` ran (`sysinfo.go_context`): `on` or
     /// `restricted`, set when it starts. Unset without the flag.
     pub go_context: OnceLock<&'static str>,
@@ -1033,6 +1036,7 @@ impl SessionRecorder {
             memory_recorder_end: OnceLock::new(),
             network_recorder_config: OnceLock::new(),
             task_stacks_remote_reads: OnceLock::new(),
+            task_stacks_walk: OnceLock::new(),
             go_context: OnceLock::new(),
         }
     }
@@ -1695,6 +1699,7 @@ impl SessionRecorder {
             let memory = self.memory_recorder_config.get();
             let memory_end = self.memory_recorder_end.get();
             let network = self.network_recorder_config.get();
+            let walk = self.task_stacks_walk.get();
             writer.set_sysinfo(crate::trace::SysInfoRecord {
                 sysname: utsname.sysname().to_string(),
                 release: utsname.release().to_string(),
@@ -1724,6 +1729,9 @@ impl SessionRecorder {
                     .task_stacks_remote_reads
                     .get()
                     .map(|&remote| remote_reads_sysinfo_value(remote).to_string()),
+                task_stacks_full_records: walk.map(|w| w.records as i64),
+                task_stacks_cut_records: walk.and_then(|w| w.cut).map(|n| n as i64),
+                task_stacks_off_stack_records: walk.and_then(|w| w.off_stack).map(|n| n as i64),
                 go_context: self.go_context.get().map(|mode| mode.to_string()),
             })?;
         }
@@ -2246,6 +2254,7 @@ mod tests {
             memory_recorder_end: OnceLock::new(),
             network_recorder_config: OnceLock::new(),
             task_stacks_remote_reads: OnceLock::new(),
+            task_stacks_walk: OnceLock::new(),
             go_context: OnceLock::new(),
         }
     }

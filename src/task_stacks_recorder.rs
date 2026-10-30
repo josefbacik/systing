@@ -259,6 +259,9 @@ const FLAG_IN_IOWAIT: u32 = 2;
 /// so the record reads none of its memory from there on, if it is a full one,
 /// and the record before it did not if it is unchanged (TASK_STACKS_USER_CUT).
 const FLAG_USER_CUT: u32 = 4;
+/// `task_stacks_event.flags`: the user stack stopped at a frame pointer off
+/// the thread's stack (TASK_STACKS_USER_OFF_STACK).
+const FLAG_USER_OFF_STACK: u32 = 8;
 
 /// What a walk found of the GIL, as pystacks' message has it
 /// (`PYSTACKS_GIL_STATE_*`, pystacks.bpf.h): free, held by the walked thread,
@@ -321,6 +324,8 @@ pub struct TaskSample {
     /// not read all it could of the thread's memory, and an unchanged one
     /// extends a record that did not.
     pub user_cut: bool,
+    /// The user stack stopped at a frame pointer off the thread's stack.
+    pub user_off_stack: bool,
     /// The thread's task_context id (`--include-task-context`); `None` for
     /// none, and always for an unchanged record, which reads none.
     pub task_context_id: Option<u64>,
@@ -447,6 +452,7 @@ fn parse_records(buf: &[u8]) -> Result<Vec<TaskSample>> {
             syscall_nr: (e.syscall_nr >= 0).then_some(e.syscall_nr),
             in_iowait: e.flags & FLAG_IN_IOWAIT != 0,
             user_cut: e.flags & FLAG_USER_CUT != 0,
+            user_off_stack: e.flags & FLAG_USER_OFF_STACK != 0,
             task_context_id: convert_task_context_id(e.task_context_id),
             kernel_stack,
             user_stack,
@@ -1705,15 +1711,61 @@ pub struct WalkStats {
     pub unsent: u64,
     /// The thread count of the thread group the walk last entered.
     pub group_threads: u64,
-    /// The full records cut short at a busy lock.
-    pub cut: u64,
-    /// The user stacks stopped at a frame pointer off the thread's stack.
-    pub off_stack: u64,
 }
 
 const _: () = assert!(
     std::mem::size_of::<WalkStats>() == std::mem::size_of::<skel::types::task_stacks_walk_stats>()
 );
+
+/// What the records a capture kept came to: the `sysinfo` columns
+/// `task_stacks_full_records`, `task_stacks_cut_records` and
+/// `task_stacks_off_stack_records`, and part of the closing line. Counted as
+/// the events are made, so a record of a snapshot that failed counts for
+/// nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkTally {
+    /// The full records kept: one `task_stack_event` row each.
+    pub records: u64,
+    /// The records cut short at a busy lock; `None` where no look can be made.
+    /// That takes in the ones with no event to show for it: a Python-only
+    /// capture leaves out a thread whose walk was refused from the start, and
+    /// to leave it out of this as well would be to say nothing was cut. So in
+    /// such a capture this can pass `records`.
+    pub cut: Option<u64>,
+    /// Those stopped at a frame pointer off the thread's stack; `None` where
+    /// no frame pointer is followed.
+    pub off_stack: Option<u64>,
+}
+
+impl WalkTally {
+    /// Nothing counted yet. A count with nothing that could raise it is
+    /// `None`, not 0, which would read as looked for and not found: a capture
+    /// that does not read other tasks' memory has no read to look ahead of and
+    /// no frame to follow, one of Python frames alone does not walk the native
+    /// stack, and a PREEMPT_RT kernel's lock has no word to look at.
+    fn new(remote_reads: bool, native: bool, realtime: bool) -> Self {
+        Self {
+            records: 0,
+            cut: (remote_reads && !realtime).then_some(0),
+            off_stack: (remote_reads && native).then_some(0),
+        }
+    }
+
+    /// One more record of a snapshot that made it, which `kept` says made an
+    /// event.
+    fn count(&mut self, sample: &TaskSample, kept: bool) {
+        if let Some(cut) = self.cut.as_mut().filter(|_| sample.user_cut) {
+            *cut += 1;
+        }
+        if !kept {
+            return;
+        }
+        self.records += 1;
+        if let Some(off) = self.off_stack.as_mut().filter(|_| sample.user_off_stack) {
+            *off += 1;
+        }
+    }
+}
 
 /// What the capture's closing line adds to its counts, each part only when
 /// there is something to say: the snapshots of a scoped capture that took the
@@ -1722,7 +1774,13 @@ const _: () = assert!(
 /// were unwound again at the next read, the records cut short at a busy lock,
 /// and the user stacks stopped at a frame pointer off the thread's stack. New
 /// parts go last: what reads the line finds the earlier ones where they were.
-fn closing_asides(full_walks: u64, reread: u64, still_short: u64, stats: &WalkStats) -> String {
+fn closing_asides(
+    full_walks: u64,
+    reread: u64,
+    still_short: u64,
+    unsent: u64,
+    tally: &WalkTally,
+) -> String {
     let mut asides = String::new();
     match full_walks {
         0 => {}
@@ -1737,19 +1795,19 @@ fn closing_asides(full_walks: u64, reread: u64, still_short: u64, stats: &WalkSt
              {still_short} of them short the second time too"
         )),
     }
-    match stats.unsent {
+    match unsent {
         0 => {}
         n => asides.push_str(&format!(
             "; {n} records did not fit the kernel's buffer and were unwound again"
         )),
     }
-    match stats.cut {
+    match tally.cut.unwrap_or(0) {
         0 => {}
         n => asides.push_str(&format!(
             "; {n} records were cut short at a busy memory-map lock"
         )),
     }
-    match stats.off_stack {
+    match tally.off_stack.unwrap_or(0) {
         0 => {}
         n => asides.push_str(&format!(
             "; {n} user stacks stopped at a frame pointer off the thread's stack"
@@ -1898,6 +1956,11 @@ impl TaskStacksThread {
                 };
                 let mut next = Instant::now();
                 let mut failed = 0u64;
+                let mut tally = WalkTally::new(
+                    iter.remote_reads(),
+                    mode.native(),
+                    std::path::Path::new("/sys/kernel/realtime").exists(),
+                );
                 for iteration in 1u64.. {
                     // The iteration starts when its walk does (the trace clock).
                     let start = get_clock_value(libc::CLOCK_BOOTTIME);
@@ -1931,7 +1994,9 @@ impl TaskStacksThread {
                                         });
                                     }
                                     let stack = sample.stack(mode, &psr);
-                                    if !mode.records(stack.is_some()) {
+                                    let kept = mode.records(stack.is_some());
+                                    tally.count(sample, kept);
+                                    if !kept {
                                         return None;
                                     }
                                     if seen_tasks.observe(&sample.task) {
@@ -2008,6 +2073,7 @@ impl TaskStacksThread {
                 }
                 // What the walks cost: the tasks the program was handed
                 // against those it had records to write for.
+                let _ = recorder.task_stacks_walk.set(tally);
                 if let Some(stats) = iter.walk_stats() {
                     eprintln!(
                         "task-stacks: walked {} and visited {} tasks for {} targeted{}",
@@ -2018,7 +2084,8 @@ impl TaskStacksThread {
                             iter.full_walk_snapshots(),
                             iter.reread_processes(),
                             iter.still_short_processes(),
-                            &stats
+                            stats.unsent,
+                            &tally
                         )
                     );
                 }
@@ -2882,13 +2949,10 @@ mod tests {
 
     #[test]
     fn the_closing_line_adds_only_what_there_is_to_say() {
-        let unsent = WalkStats {
-            unsent: 3,
-            ..WalkStats::default()
-        };
-        assert_eq!(closing_asides(0, 0, 0, &WalkStats::default()), "");
+        let none = WalkTally::default();
+        assert_eq!(closing_asides(0, 0, 0, 0, &none), "");
         assert_eq!(
-            closing_asides(0, 0, 0, &unsent),
+            closing_asides(0, 0, 0, 3, &none),
             "; 3 records did not fit the kernel's buffer and were unwound again"
         );
         assert_eq!(
@@ -2896,11 +2960,11 @@ mod tests {
                 2,
                 5,
                 1,
-                &WalkStats {
-                    unsent: 3,
-                    cut: 7,
-                    off_stack: 9,
-                    ..WalkStats::default()
+                3,
+                &WalkTally {
+                    records: 20,
+                    cut: Some(7),
+                    off_stack: Some(9),
                 }
             ),
             "; 2 snapshots walked every thread on the host instead\
@@ -3083,6 +3147,69 @@ mod tests {
 
         assert_eq!(tid(&samples[2].task), 102);
         assert!(samples[2].unchanged);
+    }
+
+    #[test]
+    fn a_count_that_nothing_could_raise_is_unknown_and_not_zero() {
+        let count = |remote, native, realtime| {
+            let tally = WalkTally::new(remote, native, realtime);
+            (tally.cut, tally.off_stack)
+        };
+        assert_eq!(count(true, true, false), (Some(0), Some(0)));
+        // Python frames alone: reads to look ahead of, no native frames.
+        assert_eq!(count(true, false, false), (Some(0), None));
+        // No reads of other tasks' memory: neither.
+        assert_eq!(count(false, true, false), (None, None));
+        // No word to look at; the walk still keeps to the stack.
+        assert_eq!(count(true, true, true), (None, Some(0)));
+    }
+
+    #[test]
+    fn the_tally_counts_what_it_is_shown_and_keeps_unknown_unknown() {
+        let t = task(100, 100, "main");
+        let mut bytes = record_bytes_in_syscall(&t, 0, -1);
+        bytes.extend(record_bytes_in_syscall(&t, FLAG_USER_CUT, -1));
+        bytes.extend(record_bytes_in_syscall(
+            &t,
+            FLAG_USER_CUT | FLAG_USER_OFF_STACK,
+            -1,
+        ));
+        let samples = parse_records(&bytes).unwrap();
+
+        let mut tally = WalkTally::new(true, true, false);
+        samples.iter().for_each(|sample| tally.count(sample, true));
+        assert_eq!(
+            tally,
+            WalkTally {
+                records: 3,
+                cut: Some(2),
+                off_stack: Some(1),
+            }
+        );
+
+        let mut tally = WalkTally::new(false, true, false);
+        samples.iter().for_each(|sample| tally.count(sample, true));
+        assert_eq!(
+            tally,
+            WalkTally {
+                records: 3,
+                cut: None,
+                off_stack: None,
+            }
+        );
+
+        // A refused walk that a Python-only capture has no row for is still a
+        // cut: 0 here would say that nothing was.
+        let mut tally = WalkTally::new(true, false, false);
+        samples.iter().for_each(|sample| tally.count(sample, false));
+        assert_eq!(
+            tally,
+            WalkTally {
+                records: 0,
+                cut: Some(2),
+                off_stack: None,
+            }
+        );
     }
 
     #[test]

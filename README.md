@@ -284,15 +284,17 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   frames whole, and no Python frames or task context from there on. A thread
   that sleeps through it is walked again once the lock is free, which opens a
   row with no CPU time. In Python-only mode a thread whose Python walk is
-  refused outright has no row while that lasts. The capture's closing line
-  counts the records cut, and only that line says so: no row does.
+  refused outright has no row while that lasts. No row says it was cut:
+  `sysinfo.task_stacks_cut_records` counts them, of
+  `sysinfo.task_stacks_full_records`, as does the capture's closing line.
 - A user stack is followed only while its frame pointers stay on the thread's
   stack: rising, aligned, and below the top of that stack, or within 1 MiB of
   the stack pointer where the top is not known. So the frames beneath a switch
   to another stack are not in it: a goroutine's beneath cgo or `systemstack`, or
-  those beneath a signal handler on an alternate stack. The closing line counts
-  the stacks that stopped this way, which includes every thread caught in code
-  built without frame pointers whose register holds something else.
+  those beneath a signal handler on an alternate stack.
+  `sysinfo.task_stacks_off_stack_records` and the closing line count the stacks
+  that stopped this way, which includes every thread caught in code built
+  without frame pointers whose register holds something else.
 - A capture with targets walks their threads alone, not every thread on the
   host, where it can. With `--pid` (or a traced command) each snapshot walks
   each target process with the task iterator scoped to it, the processes the
