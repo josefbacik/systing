@@ -84,3 +84,11 @@ path = "src/bin/systing_util.rs"
 
 [profile.release]
 lto = "thin"
+
+# libduckdb-sys builds DuckDB with its assertions on when the profile has debug
+# info, and some of them do not hold in normal use.
+[profile.dev.package.libduckdb-sys]
+debug = false
+
+[profile.release.package.libduckdb-sys]
+debug = false
