@@ -334,6 +334,28 @@ pub struct TraceSystemInfo {
     /// thread's stack. No row says which. `None` means unknown and never 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_stacks_off_stack_records: Option<i64>,
+    /// How many processes the python-function-trace recorder had probes in
+    /// (from schema 34); `None` when it was not asked for, as for the rest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_function_processes: Option<i64>,
+    /// The events it saw.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_function_events: Option<i64>,
+    /// Probe hits that found no Python thread state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_function_no_thread_state: Option<i64>,
+    /// Probe hits lost otherwise: no frame, or no name to give a function.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_function_lost_events: Option<i64>,
+    /// Records of a function's name lost to a full ring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_function_symbol_records_dropped: Option<i64>,
+    /// Whether its slice cap ended the trace before the capture ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_function_cap_reached: Option<bool>,
+    /// Processes not traced, and why; what could make the trace wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_function_notes: Option<String>,
     /// How `--include-go-context` ran (from schema 30): "on", or
     /// "restricted" (the kernel's confidentiality mode: nothing was read);
     /// `None` without the flag.
@@ -1000,7 +1022,7 @@ impl AnalyzeDb {
             }
         };
         let sql = format!(
-            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
             col("trace_id"),
             col("release"),
             col("machine"),
@@ -1027,6 +1049,13 @@ impl AnalyzeDb {
             col("task_stacks_full_records"),
             col("task_stacks_cut_records"),
             col("task_stacks_off_stack_records"),
+            col("python_function_processes"),
+            col("python_function_events"),
+            col("python_function_no_thread_state"),
+            col("python_function_lost_events"),
+            col("python_function_symbol_records_dropped"),
+            col("python_function_cap_reached"),
+            col("python_function_notes"),
         );
 
         let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -1060,6 +1089,13 @@ impl AnalyzeDb {
                 task_stacks_full_records: row.get(23)?,
                 task_stacks_cut_records: row.get(24)?,
                 task_stacks_off_stack_records: row.get(25)?,
+                python_function_processes: row.get(26)?,
+                python_function_events: row.get(27)?,
+                python_function_no_thread_state: row.get(28)?,
+                python_function_lost_events: row.get(29)?,
+                python_function_symbol_records_dropped: row.get(30)?,
+                python_function_cap_reached: row.get(31)?,
+                python_function_notes: row.get(32)?,
             })
         }) else {
             return Vec::new();
@@ -1656,6 +1692,13 @@ mod tests {
                  ALTER TABLE sysinfo DROP COLUMN task_stacks_full_records; \
                  ALTER TABLE sysinfo DROP COLUMN task_stacks_cut_records; \
                  ALTER TABLE sysinfo DROP COLUMN task_stacks_off_stack_records; \
+                 ALTER TABLE sysinfo DROP COLUMN python_function_processes; \
+                 ALTER TABLE sysinfo DROP COLUMN python_function_events; \
+                 ALTER TABLE sysinfo DROP COLUMN python_function_no_thread_state; \
+                 ALTER TABLE sysinfo DROP COLUMN python_function_lost_events; \
+                 ALTER TABLE sysinfo DROP COLUMN python_function_symbol_records_dropped; \
+                 ALTER TABLE sysinfo DROP COLUMN python_function_cap_reached; \
+                 ALTER TABLE sysinfo DROP COLUMN python_function_notes; \
                  INSERT INTO sysinfo (trace_id, sysname, release, version, machine) \
                  VALUES ('t1', 'Linux', '5.10.0', '#1 SMP', 'aarch64')",
             )

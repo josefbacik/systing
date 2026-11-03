@@ -982,14 +982,14 @@ fn process_exists(pid: u32) -> bool {
 
 /// The keys of a BPF map with `u32` keys, in the order the kernel steps
 /// through them. An error ends the keys and is kept in `err`.
-struct MapKeys<'a> {
+pub(crate) struct MapKeys<'a> {
     map: BorrowedFd<'a>,
     last: Option<u32>,
     err: Option<std::io::Error>,
 }
 
 impl<'a> MapKeys<'a> {
-    fn of(map: BorrowedFd<'a>) -> Self {
+    pub(crate) fn of(map: BorrowedFd<'a>) -> Self {
         MapKeys {
             map,
             last: None,
@@ -1918,7 +1918,7 @@ pub fn iteration_count(duration: Duration, interval: Duration) -> Option<u64> {
 /// reader per process, opened the first time one of its threads is recorded
 /// and kept, with its open /proc/pid/mem, for as long as the snapshots see the
 /// process.
-struct PythonThreadNames {
+pub(crate) struct PythonThreadNames {
     psr: Arc<StackWalkerRun>,
     /// By tgid. A process that has no reader (not Python, a Python whose
     /// objects cannot be read, or one pystacks has yet to find) has no entry
@@ -1935,12 +1935,20 @@ struct PythonThreadNames {
 const REOPEN_AFTER: Duration = Duration::from_secs(2);
 
 impl PythonThreadNames {
+    pub(crate) fn new(psr: Arc<StackWalkerRun>) -> Self {
+        Self {
+            psr,
+            readers: HashMap::new(),
+            reopen_at: HashMap::new(),
+        }
+    }
+
     /// The names of process `tgid`'s threads there are to take note of, when
     /// `changed` of them have a full record in this snapshot and `seen` are
     /// all of them it saw (see [`ThreadNames::read`]). A name's tid is the
     /// process's word (`Thread._native_id`): one that is not a thread of its
     /// own is not its to name, and is not answered for.
-    fn read(
+    pub(crate) fn read(
         &mut self,
         tgid: u32,
         changed: &HashSet<i32>,
@@ -2000,11 +2008,7 @@ impl TaskStacksThread {
             .name("task_stacks".to_string())
             .spawn(move || {
                 let mut seen_tasks = TaskSightings::new();
-                let mut thread_names = PythonThreadNames {
-                    psr: Arc::clone(&psr),
-                    readers: HashMap::new(),
-                    reopen_at: HashMap::new(),
-                };
+                let mut thread_names = PythonThreadNames::new(psr.clone());
                 let mut next = Instant::now();
                 let mut failed = 0u64;
                 let mut tally = WalkTally::new(

@@ -405,17 +405,34 @@ impl StackWalkerRun {
                 );
             }
 
-            if let Some(resolver) = &self.resolver {
-                resolver.add_pid_version(pid, info.version_major, info.version_minor);
-            }
-            self.note_python_process(pid, &info);
-            if let Some(maps) = &self.maps {
-                maps.add_targeted_pid(pid);
-                maps.update_pid_config(pid, &info.pid_data);
-            }
-            true
+            self.register_pid(pid, &info)
         } else {
             false
+        }
+    }
+
+    /// Forgets a process that has gone: nothing else takes it out without the
+    /// sched recorder, and a server's short-lived workers would fill the maps.
+    pub fn forget_pid(&self, pid: i32) {
+        if let Some(maps) = &self.maps {
+            maps.remove_pid(pid);
+        }
+    }
+
+    /// Registers a process already found to be a Python. False: the maps are full,
+    /// and the probes could not read it.
+    pub fn register_pid(&self, pid: i32, info: &discovery::PyProcessInfo) -> bool {
+        if let Some(resolver) = &self.resolver {
+            resolver.add_pid_version(pid, info.version_major, info.version_minor);
+        }
+        self.note_python_process(pid, info);
+        // A full map leaves the process unreadable, whatever it is.
+        match &self.maps {
+            Some(maps) => {
+                maps.add_targeted_pid(pid);
+                maps.update_pid_config(pid, &info.pid_data)
+            }
+            None => true,
         }
     }
 
@@ -462,12 +479,15 @@ impl StackWalkerRun {
             );
         }
 
-        if !pids.is_empty() {
-            let pid_opts: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
-            self.init(bpf_object, &pid_opts, debug);
-        } else if debug {
-            eprintln!("[pystacks debug] No PIDs provided, skipping pystacks initialization");
-        }
+        // With no process yet too: one found later through add_pid (an exec, the
+        // python-function-trace recorder) needs the maps and the resolver.
+        let pid_opts: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
+        self.init(bpf_object, &pid_opts, debug);
+    }
+
+    /// The function and source file of a symbol BPF has sent, as far as it has.
+    pub fn symbol_name(&self, symbol_id: u64) -> Option<(String, String)> {
+        self.resolver.as_ref()?.symbol_name(symbol_id)
     }
 
     pub fn get_python_frames(&self, py_stack: &[PyAddr]) -> Vec<PythonFrame> {

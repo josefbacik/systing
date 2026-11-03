@@ -302,19 +302,22 @@ fn every_shape_loads() {
         task_stacks_reports.push((shape.name.to_string(), report));
     }
 
-    // The Python function trace's object, loaded by its own tool: one row,
-    // every program.
-    let started = std::time::Instant::now();
-    let report = systing::python_function_trace::load_probe(&|_| 0)
-        .unwrap_or_else(|e| panic!("[python-function-trace] probe failed before load: {e:#}"));
-    eprintln!(
-        "[python-function-trace] loaded={} programs selected={} in {:.1?}",
-        report.loaded,
-        report.programs.iter().filter(|p| p.autoload).count(),
-        started.elapsed()
-    );
-    record_rejections("python-function-trace", &report, &mut rejected);
-    let python_function_trace_reports = vec![("python-function-trace".to_string(), report)];
+    // The python-function-trace recorder's object: a row per target filter, every
+    // program, as each filter is a path the others prune.
+    let mut python_function_trace_reports = Vec::new();
+    for (name, filter) in systing::python_function_trace::load_probe_filters() {
+        let started = std::time::Instant::now();
+        let report = systing::python_function_trace::load_probe(&filter, &|_| 0)
+            .unwrap_or_else(|e| panic!("[{name}] probe failed before load: {e:#}"));
+        eprintln!(
+            "[{name}] loaded={} programs selected={} in {:.1?}",
+            report.loaded,
+            report.programs.iter().filter(|p| p.autoload).count(),
+            started.elapsed()
+        );
+        record_rejections(name, &report, &mut rejected);
+        python_function_trace_reports.push((name.to_string(), report));
+    }
 
     let mut failures = rejection_findings(&rejected);
     failures.extend(selection_findings(&reports));

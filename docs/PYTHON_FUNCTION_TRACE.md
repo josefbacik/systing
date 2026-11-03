@@ -1,16 +1,26 @@
 # Python function trace
 
-`systing-python-function-trace` records every entry to and every exit from a
-Python function in a process, so each call becomes a slice on its thread's
-timeline. It works with or without perf trampolines and does not use ptrace.
+The `python-function-trace` recorder records every entry to and every exit from
+a Python function in the processes a capture targets, so each call becomes a
+row of `python_function_slice`, and a slice on its thread's timeline. It works
+with or without perf trampolines and does not use ptrace.
 
-**Status:** experimental. It is a tool of its own, in a workspace package of
-its own (`python-function-trace/`), so installing systing does not install
-it. It is not yet a recorder of a systing capture, and it has run only on
-x86-64, Linux 6.12, with CPython 3.12, 3.13 and 3.14. It is not for
-production hosts until it is a recorder: a run by hand stands outside the
-limits, audit and requester checks a capture service applies, and it slows
-the traced process while its probes are in.
+```
+# these processes, and what they fork, for ten seconds
+sudo systing --only-recorder python-function-trace --pid 1234 --pid 1250 -d 10
+
+# every Python process of a cgroup, beside the usual recorders
+sudo systing --add-recorder python-function-trace --cgroup /sys/fs/cgroup/app -d 10
+
+# a command
+sudo systing --only-recorder python-function-trace -d 10 -- python3 app.py
+```
+
+**It slows what it traces, many times over** (see [What it costs](#what-it-costs)).
+It is for a short, deliberate look at a process, so it is off by default, and
+takes no default target: `--pid`, `--cgroup` or a command is required, and with
+both `--pid` and `--cgroup` only processes in both are traced. It cannot run with
+`--continuous`.
 
 ## Why
 
@@ -20,7 +30,6 @@ average. They do not say when a particular call began or ended, how often a
 function was called, or in what order things happened. A request that was
 slow once in a thousand, a function called a million times for a microsecond
 each, a coroutine resumed forty times: none of these can be read off samples.
-A function trace records them.
 
 It is built to three constraints:
 
@@ -31,104 +40,72 @@ It is built to three constraints:
    probed page of the interpreter's code (11 or 12 places), and it maps one
    extra page, `[uprobes]`, from which the displaced instructions are run.
    That page stays mapped until the process exits. A thread that reaches a
-   probe enters the kernel twice, for about 1.3 µs in all; no thread is
-   stopped otherwise. (`--mode eval-frame` also rewrites a return address on
-   the thread's stack, and `-- command` holds the new process with SIGSTOP
-   until the probes are in.)
-2. **With or without trampolines.** *Perf trampolines* are small pieces of
-   machine code CPython can generate, one per Python function, so that native
-   profilers see Python frames (`python -X perf`, `PYTHONPERFSUPPORT=1`). They
-   are off by default and can only be switched on from inside the process.
-   The trace works the same in a process that has them and in one that does
-   not.
+   probe enters the kernel twice; no thread is stopped otherwise.
+2. **With or without trampolines.** Perf trampolines are off by default and can
+   only be switched on from inside the process. The trace is the same either way.
 3. **Current Pythons.** CPython 3.12, 3.13 and 3.14.
 
-## Using it
+## What it records
 
-It needs root (it loads BPF programs and places uprobes), and it is built on
-its own: `cargo build --release -p systing-python-function-trace`.
+`python_function_slice` (`ts`, `dur`, `utid`, `depth`, `function`, `file`,
+`line`, `end_kind`), one row per run of a frame. A generator or coroutine is one
+row per resumption, ending in `yield` until the last, so a slice is always time
+the function was actually running. `end_kind` is `return`, `yield`, `unwound`
+(no exit event: an exception, usually) or `open` (still running when the trace
+ended). `line` is the function's first line.
 
-```
-# a running process, for five seconds
-sudo systing-python-function-trace --pid 1234 --duration 5 -o trace.pb
-
-# a command, from its first call (held with SIGSTOP until the probes are in),
-# to its end rather than the 10 s default
-sudo systing-python-function-trace --duration 0 --slices slices.tsv -- python3 app.py
-
-# statistics for every call, slices kept only for calls of 1 ms and more
-sudo systing-python-function-trace --pid 1234 --duration 30 --min-duration-us 1000
-```
-
-Every Python call of the traced process pays for the probes while they are
-in, so a trace is bounded: by `--duration` (10 s unless given; `0` means until
-Ctrl-C or the process exits), and by `--max-slices`, whose cap ends the trace.
-SIGINT, SIGTERM and SIGHUP each end it with its files written (the files
-first, then the summary on stdout). The summary says which of these ended
-it. One process at a time (see
-[Limits](#limits)).
-
-Output files are written as root, so their names cannot be used to steer a
-write elsewhere: the directory must belong to root, the caller or the user
-who ran `sudo`, and not be open to renames by others (a sticky directory such
-as `/tmp` is fine), and an
-existing entry at the name must be the caller's own regular file with one
-link (no symlink, hard link, FIFO or device).
-
-| Output | What |
-| --- | --- |
-| Summary (stdout) | What was attached and how, why the trace ended, event counts, what was lost or inferred, and the functions by self time. |
-| `-o FILE` (default `python-function-trace.pb`) | A Perfetto trace: the slices on each thread's track, each named after its function, with `file`, `line` (the function's first line), `language` and `end` (how it ended) as its arguments, as task stacks show their frames. A track of its own, `python-function-trace`, carries the mode, why the trace ended and every loss counter. Opens at ui.perfetto.dev. |
-| `--slices FILE` | One line per slice, tab-separated: pid, tid, start, duration, depth, how it ended, function, file, line. |
-
-Before the probes go in, the tool says on stderr which mode it attaches and
-what could make the trace wrong for this process: greenlet loaded,
-`PYTHON_JIT` set, or eval-frame sites (which it refuses where greenlet is
-loaded, or where its maps cannot be read in full). Since a command is held
-before its first import, it looks for greenlet again while the trace runs
-(at 100 ms, then once a second) and at the end, in the process's maps and in
-the trace's own file names; the warnings go into the summary and the
-Perfetto file too. For `-- command` the eval-frame refusal can only use what
-is mapped before the first import.
-
-Names the traced process chooses (functions, files, threads, paths) are
-printed with control and other non-printing characters escaped, so they
-cannot drive a terminal or add a column or line to the table.
-
-With `-- command`, the command must be, or exec, the interpreter. It runs as
-the tool's user (root) and dies with the tool (unless it changes its user or
-group, which clears that). If the trace ends first, the outputs are written,
-then the command gets SIGINT and 5 s before SIGKILL, and the tool exits with
-its exit code, or 128 plus the signal that ended it. If the tool fails before
-the trace begins, the command is killed.
-
-`--mode` chooses where the probes go: `auto` (the default) is `dispatch`, and
-refuses with the reason where there are no dispatch sites; it never falls
-back to `eval-frame` on its own. See
-[Two kinds of probe site](#two-kinds-of-probe-site).
-
-The summary of a run of the test script described below, on Ubuntu's Python
-3.12 (most of a 0.2 s run is imports, so the script's own functions are far
-down the list):
-
-```
-pid 4242 (python3.12): Python 3.12, dispatch sites in /usr/bin/python3.12
-  dispatch table at 0x784760 (found by Shape); 11 probes: RESUME, INSTRUMENTED_RESUME, RETURN_VALUE, ...
-0.213 s traced, until the traced process exited: 56221 events (27914 entries, 27203 returns, 495 yields, 609 handler starts), 263810 events/s
-27914 slices of 987 functions on 4 threads; 27914 kept
-  216 slices with no return event (an exception, or a lost or unseen event)
-
-    slices      self ms     total ms     avg us     max us  function
-        77        8.728        8.855     115.00     1163.2  _compile_bytecode [<frozen importlib._bootstrap_external>:751]
-       154        5.084        5.084      33.01       93.6  FileLoader.get_data [<frozen importlib._bootstrap_external>:1183]
-        13        4.134       13.604    1046.48     2288.3  enum:EnumType._convert_ [enum.py:919]
-       274        4.134      507.450    1852.01   110301.7  _call_with_frames_removed [<frozen importlib._bootstrap>:480]
-        20        4.044        8.223     411.17      928.9  enum:_simple_enum.<locals>.convert_class [enum.py:1708]
+```sql
+-- The functions that took longest, by process
+SELECT p.name, s.function, count(*) AS runs, sum(s.dur) / 1e6 AS total_ms
+FROM python_function_slice s
+JOIN thread t ON t.trace_id = s.trace_id AND t.utid = s.utid
+JOIN process p ON p.trace_id = t.trace_id AND p.upid = t.upid
+GROUP BY 1, 2 ORDER BY 4 DESC LIMIT 20;
 ```
 
-Times include the probes' own cost (see [What it costs](#what-it-costs)), and
-"total" sums every slice, so a recursive function counts its inner calls
-again.
+A Perfetto output shows them as a `Python Functions: <thread>` track under each
+thread. `sysinfo` says what became of the trace: `python_function_processes`,
+`python_function_events`, `python_function_no_thread_state`,
+`python_function_lost_events`, `python_function_symbol_records_dropped`,
+`python_function_cap_reached`, and `python_function_notes`, a line for each process
+not traced and why (a `--pid` that was never a Python or never there among them),
+for why the recorder was off if it was, and for each thing that could make the
+trace wrong. Events lost to a full ring are the `python function` class of the
+capture's missed-events tracks, and of its closing lines. All of the columns are
+NULL for a capture without the recorder.
+
+## Which processes
+
+At the start of the capture the recorder looks at its targets: the `--pid` and
+`--cgroup` processes. After that the capture's own fork and exec events tell it of
+a new one, as they tell pystacks, so `--collect-pystacks` is on with this recorder.
+It also goes through the capture's target set twice a second, and with `--cgroup` the
+cgroups once a second, for what no event told of, such as a process moved in.
+Each process that is a Python it can read gets its 11 or 12 probes. As with every
+recorder, a `--pid` target's children are targets if they fork during the capture.
+A process's frames that are already running stay invisible until they return. The
+frames of a process that execs end there, as `unwound`. For a traced command, what
+runs before its probes are in is not traced: its first few tens of milliseconds,
+and all of a command that is over by then.
+
+Probes check the target set as every recorder's do, so a process that leaves a
+`--cgroup` target stops being recorded at once, though it pays until the capture
+ends.
+
+If the recorder cannot run (the kernel's confidentiality mode, or its BPF object
+does not load, as on arm64 today) the capture goes on with its other recorders and
+`python_function_notes` says why.
+
+A process is refused, with its reason in `python_function_notes`, for: a build
+with no dispatch table, a free-threaded build, a pre-release, a Python outside
+3.12 to 3.14, a process on musl libc, a thread id given for a process, or more
+than 64 processes in one capture. A refusal does not fail the capture.
+
+Reaching `--python-function-max-slices` (5,000,000 by default) takes the probes
+out at once, since past it every traced process would pay for nothing. The
+capture goes on, and `python_function_cap_reached` says so. The slices kept are
+those begun first, in time, over all processes, and the frames open at that point
+end there. A capture never holds more than the cap.
 
 ## How it works
 
@@ -201,25 +178,43 @@ none in the tail-calling builds that uv installs for 3.14 and
 
 ### What a probe does
 
-In the traced thread's own context:
+In the traced thread's own context, one program for every site of every process:
 
 1. Find the thread's Python thread state through its thread-local storage, as
-   the stack sampler does, and read the current frame from it. (The frame is
-   in a register at these addresses, but which one depends on the compiler.)
-2. For an entry or a handler: read the frame's code object and look its
-   address up in a cache, checked against three words of the object. On a
-   miss, read the function's qualified name and file, hash them into
-   pystacks' symbol id and send the names to user space, again every 100 ms
-   until user space has them.
-3. Write one event (time, thread, frame address, symbol, kind; 56 bytes in
-   the ring) to a ring buffer. The reader polls; the traced thread never pays
-   for a wakeup.
+   the stack sampler does, and read the current frame from it.
+2. For an entry or a handler: read the frame's code object and look its address
+   up in a per-CPU cache, checked against three words of the object. On a miss,
+   read the function's qualified name and file, hash them into pystacks' symbol
+   id and send the names to user space, again every 100 ms until user space has
+   them.
+3. Write one event (time, thread, frame address, symbol, kind; 48 bytes in the
+   ring) to this CPU's ring. The reader polls; the traced thread never pays for a
+   wakeup.
 
-Names and first line numbers come from the probe. Everything else comes from
-`/proc/PID` (`maps`, `exe`, `map_files`, `status`, `stat`, `comm`,
-`task/TID/comm`, and the first MiB of `environ`) and the interpreter's file. (Process discovery is pystacks', which on 3.13+ also tries
-one read of `/proc/PID/mem` for the GIL's address; the function trace does
-not use the result and works when that read is refused.)
+### Locks
+
+The rule is the samplers' (`src/pystacks/bpf/pystacks.bpf.c`): a probe takes no
+lock that another CPU is using. A waiter on a contended map or ring lock can halt
+its vCPU with interrupts off, and on a hypervisor that drops the kick that wakes
+it, stay halted. These probes run with interrupts on, but the kernel turns them
+off itself to wait for those locks.
+
+So the rings are a family like any other's, per CPU, `cpu % nr_rings`, at the sizes
+of `--ringbuf-size-mib` and `--ringbuf-shards`, with the same pollers and the same
+half-full wakeup. Names go on them too, and on to pystacks' resolver. The code cache
+and every counter are per-CPU arrays. Only user space writes a hash map. None of
+this depends on how many processes are traced or how many GILs they have, which
+is why several processes, and sub-interpreters, are safe. On a host with more
+than 64 CPUs some CPUs share a ring, as they do for every recorder.
+
+These programs run with preemption on, so two can be under way on one CPU. The
+one path that writes per-CPU scratch or a cache entry runs alone on its CPU; a
+miss that meets another on its CPU goes without a name for that one event.
+
+Events reach the reader by CPU and a thread moves between CPUs, so a thread's
+events are not in order as they are read. The recorder keeps them and sorts and
+pairs each thread's when the capture ends, as the task-stacks recorder keeps its
+events to the end.
 
 ### From events to slices
 
@@ -250,194 +245,79 @@ programs (1.9 million slices), 12 slices came out wrong, all after one
 A generator or coroutine is one slice per resumption, ending in `yield` until
 the last, so a slice is always time the function was actually running.
 
-### Two kinds of probe site
-
-**Dispatch sites** (the opcode handlers above) are the mechanism, with or
-without trampolines.
-
-**Eval-frame sites** are a uprobe on entry to `_PyEval_EvalFrameDefault` and
-a uretprobe on its return, for Python 3.12 and later. While trampolines are
-on, every Python call goes through that function, so these need no table and
-no opcode numbers, and they cost less per event on a build whose function
-begins with a `push` (the kernel emulates it instead of single-stepping it).
-Only `--mode eval-frame` uses them, never `auto`, because:
-
-| Limit of eval-frame sites | Measured |
-| --- | --- |
-| Without trampolines they see only calls made from C | 3 of 713 calls of a plain function |
-| The kernel keeps at most 64 nested uretprobes per thread; deeper returns are not reported | recursion 150 deep, 20 times: 1,260 of 3,020 returns (`uprobe: omit uretprobe due to nestedness limit` in the kernel log) |
-| They see only what the trampolines see | 3.13 with `-X perf`: 2 of 25 `__init__` calls (the interpreter's fast path for constructing an object bypasses the frame evaluator there; 3.12 and 3.14 show all 25) |
-| A uretprobe rewrites a return address on the thread's stack | A return that finds no record gets SIGILL from the kernel, which kills a process that switches C stacks (greenlet, fibers); the tool refuses eval-frame sites where greenlet is loaded. Not run here. Kernels 6.11 to 6.12.13 and 6.13 to 6.13.2 also segfault a process whose seccomp filter refuses the return probe's system call (CVE-2025-21834). |
-| A yield and an exception both look like a return | No `yield` end kind; `unwound` only where a return probe's record was lost |
-
-### Why not something simpler
-
-| Alternative | Why it was not used |
-| --- | --- |
-| systing's Python stack sampler (pystacks) | Samples, not entries and exits. |
-| `sys.setprofile`, `sys.monitoring` (PEP 669) | The right tool from *inside* a process, and cheap (see the cost below). But a hook has to be installed by code running in the process: either the service imports something, or it is injected, which is ptrace-class access (`sys.remote_exec` in 3.14 writes the target's memory). |
-| CPython's USDT probes `function__entry` / `function__return` | Gone in practice. Ubuntu's 3.12, built with them, carries five probes (`gc`, `import`, `audit`) and none for functions; the 3.14 source still declares the two and never fires them. |
-| A uprobe and uretprobe on `_PyEval_EvalFrameDefault` alone | Since 3.11 a Python function calling a Python function does not call it: the bytecode loop pushes the new frame and carries on (the eval-frame sites above). |
-| Perf trampolines themselves | They make samples readable; they are not a trace. They live in anonymous memory, where a uprobe cannot be placed. |
-| Uprobes on interpreter helpers (`_PyEval_FrameClearAndPop`, `PyTraceBack_Here`) | The compiler inlines them. In a clang PGO+LTO build of 3.13 neither is called from the bytecode loop at all (0 call sites; a gcc build of 3.14 has 6 and 1). |
-
-## Code
-
-A tool and BPF object of their own; the systing capture's behaviour does not
-change. Every build of the systing library does compile the new BPF object.
-
-| File | What |
-| --- | --- |
-| `src/bpf/python_function_trace.bpf.c` | The probe program. Compiles pystacks into itself, as the task-stacks recorder does, for the thread-state lookup and symbol records. |
-| `src/python_function_trace/sites.rs` | Finds and checks the dispatch table and the probe offsets in an interpreter file. |
-| `src/python_function_trace/pairing.rs` | Events to slices and per-function statistics. |
-| `src/python_function_trace/mod.rs`, `output.rs` | Load, attach, read; summary, Perfetto trace, table of slices; the load probe for the load-shape test. |
-| `python-function-trace/src/main.rs` | The command, in its own workspace package. |
-| `python-function-trace/e2e/` | The end-to-end workload and checker (`run.sh`) and the benchmarks (`bench.sh`). |
-
-The load-shape gate (`tests/bpf_load_shapes.rs`, `every_shape_loads`) loads
-the object on every kernel of CI's guest matrix, and the stack-budget test
-adds up its frames.
-
-## What was checked
-
-`python-function-trace/e2e/workload.py` makes a known number of calls of each
-kind: plain calls, recursion that raises through four frames into an
-`except`, an exception swallowed by C, generators, a generator expression,
-`__init__`, a C function calling back into Python, asyncio coroutines, and
-three threads. `check.py` compares the slices per function and how each
-ended, that the worker threads are distinct, and that every slice lies inside
-its parent (`sudo python-function-trace/e2e/run.sh PYTHON [MODE] [ARGS]`).
-
-| Interpreter | Dispatch sites | Dispatch sites, `-X perf` | Eval-frame sites, `-X perf` | Eval-frame sites, no trampolines |
-| --- | --- | --- | --- | --- |
-| 3.12.3 (Ubuntu, gcc, stripped) | all checks pass | all pass | counts right; each generator's creating call is one more slice | 9 functions short |
-| 3.13.15 (clang, PGO + LTO) | all pass | all pass | as 3.12, and 2 of 25 `__init__` | 10 functions short |
-| 3.14.7 (gcc, LTO) | all pass | all pass | as 3.12 | 10 functions short |
-
-In the dispatch columns every count is exact, including the 40 frames an
-exception unwound, the 5 `__getattr__` calls whose exception C swallowed, and
-the yields and returns of each generator and coroutine. The Perfetto file was
-checked apart from the tool: begins and ends balanced on every track.
-
-Also checked: attaching to a running multi-threaded process by pid and leaving
-it running, with no slice cut at the start; recursion 150 deep (all 3,020
-returns, depth right); function, file and thread names holding escape
-sequences, tabs and newlines (printed escaped; every line of the table has
-nine columns); a thread id given for `--pid` (refused); SIGTERM, the slice cap
-and a command that outlives the duration (each ends the trace with its
-output); unit tests for the pairing rules, the output and the escaping, and
-the table checks on every interpreter installed (in CI, finding none fails).
-
 ## What it costs
 
 Measured on one x86-64 host, Linux 6.12, CPython 3.13.15 (clang, PGO + LTO),
-best of three runs (`python-function-trace/e2e/bench.sh`).
+best of three runs, against a process with no probes:
 
-| Workload | Untraced | Dispatch sites | Eval-frame sites with `-X perf` |
-| --- | --- | --- | --- |
-| 2,000,000 calls of a one-line function, nothing else | 0.068 s (34 ns a call) | 5.37 s (2.7 µs a call, 79x) | 2.11 s (1.1 µs a call, 31x) |
-| Mixed: JSON, regex, hashing, sorting, per-record Python functions (624,000 events) | 0.36 s | 1.09 s (3.0x) | 0.65 s (1.8x) |
+| Workload | Untraced | Traced |
+| --- | --- | --- |
+| 2,000,000 calls of a one-line function, nothing else | 0.068 s (34 ns a call) | 5.37 s (2.7 µs a call, 79x) |
+| Mixed: JSON, regex, hashing, sorting, per-record Python functions (624,000 events) | 0.36 s | 1.09 s (3.0x) |
 
-- **About 1.3 µs per event, two events per call.** The BPF program is 0.2 µs
-  of that (kernel BPF statistics: 201 ns a run over 3.6 million runs). The
+- **About 1.3 µs per event, two events per call** on that host; 4.2 µs on a KVM
+  guest with no nested acceleration. The BPF program is about 0.2 µs of it. The
   rest is the kernel's breakpoint: a trap, then single-stepping the displaced
   instruction, which is a second trap.
-- It is paid by every Python function call in the process while the probes
-  are attached: filtering by function or duration reduces what is recorded,
-  not what is paid.
-- **The reported times include it.** The time stamp is taken in the first
-  trap, so each slice holds about one event's cost of its own and its
-  caller's self time the other: self time is real time plus about 1.3 µs for
-  each call the function makes, plus one. The ranking by self time therefore
-  favours functions that are called often or call often.
+- It is paid by every Python function call in a traced process while the probes
+  are in: only those processes pay, each for its own calls.
+- **The reported times include it.** The time stamp is taken in the first trap,
+  so each slice holds about one event's cost of its own and its caller's self
+  time the other. Ranking by self time therefore favours functions that are
+  called often or call often.
 - For scale, hooks *inside* the process on the same loop: `cProfile` adds
   0.14 µs a call, `sys.monitoring` with Python callbacks 0.09 µs. That is the
   price of constraint 1.
-- Trace volume: 56 bytes an event in the ring (about 4.8 million events in
-  the default 256 MiB); no events were lost at 740,000 events a second.
-- Removing the probes takes a fraction of a second per probe in the kernel;
-  the tool drops the events after the cutoff, so they are not in the trace,
-  but the process pays for any hit until the last probe is out.
+- Removing the probes takes a fraction of a second; the process pays for any hit
+  until the last probe is out. They come out before anything is written.
 
-It is for a short, deliberate look at a process, not for leaving on.
-
-## When not to use it
-
-A call-heavy service slows several-fold while the probes are in, and nothing
-in user space can make a kernel breakpoint much cheaper. Where function traces
-are wanted often, or on hot paths, and the service can load a module, a hook
-inside the process (`sys.monitoring` with a C callback) is 10 to 30 times
-cheaper and gives exact exception exits. This tool is what works on a process
-that was not prepared.
-
-Also not on:
-
-- A process checkpointed with CRIU: the `[uprobes]` page stays after the
-  trace, and CRIU refuses it (or the restored process gets SIGTRAP if it was
-  dumped with a probe in).
-- A process that uses greenlet or gevent: see [Limits](#limits).
-
-It leans on CPython internals (a dispatch table, opcode numbers, frame
-layout). The table, the numbers and the version are checked at attach, and a
-mismatch refuses rather than guesses, but each new CPython minor version
-needs a look.
+Where function traces are wanted often, or on hot paths, and the service can load
+a module, a hook inside the process is 10 to 30 times cheaper and gives exact
+exception exits. This recorder is what works on a process that was not prepared.
 
 ## Limits
 
 | Limit | Note |
 | --- | --- |
-| One process at a time | The probe takes map and ring locks. Under one process's GIL only one thread is in the probe at a time, so nobody waits; with several processes a waiter could spin, and on older kernels on a KVM guest with paravirtual spinlocks halt with interrupts off (the hash map's and ring's locks changed in 6.15, the LRU lists' later). Several need a ring and a cache per producer first. |
-| Frames already running when the trace starts are invisible until they return | Their callees are traced. The fix is to seed each thread's stack from one pystacks walk at attach. |
-| Processes forked after attach are not followed | The tool attaches by pid. |
-| greenlet and gevent | A switch between greenlets runs no probed opcode, so frames that are only switched out end as `unwound` and their callers' times are wrong (56% of slices cut early in a reviewer's switch-heavy emulation). The tool warns when greenlet is loaded. Real support needs a stack per greenlet. |
+| A process checkpointed with CRIU | The `[uprobes]` page stays after the trace, and CRIU refuses it (or the restored process gets SIGTRAP if it was dumped with a probe in). |
+| Frames already running when the process's probes go in | Invisible until they return; their callees are traced. |
+| greenlet and gevent | A switch between greenlets runs no probed opcode, so frames that are only switched out end as `unwound` and their callers' times are wrong. Noted in `python_function_notes`. Real support needs a stack per greenlet. |
 | Only Python functions | Calls into C (builtins, extension modules) are not events. |
 | Builds with no dispatch table | Built without computed gotos, or with the tail-calling interpreter (uv's 3.14 and 3.15 builds, a 3.14 option with clang 19+): refused. |
-| The JIT | Calls inside JIT-compiled code are not seen (`PYTHON_JIT=1`; the tool warns). |
-| Free-threaded builds | Refused. |
-| Pre-releases | Refused for dispatch sites (their opcodes can be renumbered); eval-frame sites take 3.12 to 3.14 only. |
-| Sub-interpreters with their own GIL | Not supported, and not detected: they run in parallel, so more than one thread can be in the probe at a time, which the one-process rule is there to prevent. Do not trace such a process. |
-| aarch64, musl | Not tested; the thread-state lookup is pystacks' and shares its limits (glibc). |
+| The JIT | Calls inside JIT-compiled code are not seen (`PYTHON_JIT=1`; noted). |
 | Python 3.15 | Needs its opcode list, and a new way to the thread state: 3.15 drops the `autoTSSkey` that pystacks finds it through. |
-| Run from another pid namespace | Refused: the probes see the initial namespace's process ids. |
-| Only the executable and `libpython*` are looked at | An interpreter in another library, or a file replaced on disk, is not found. |
-| Line numbers are the function's first line | Not the call site. |
+| A capture outside the host's pid namespace | Refused: the probes see the initial namespace's process ids. |
+| Only the executable and `libpython*` are looked at | An interpreter in another library, or a file replaced on disk, is not found. A library loaded long after the process starts is found only if its process execs again. |
 | Names | Qualified names are cut at 128 bytes, file names keep their last 192; the code-object cache can, rarely, give a function the name of a dead one whose addresses it reuses. |
-| The slice cap ends the trace | The slices kept are those that closed first, so long outer frames are the ones lost when it is reached. |
 | A re-dispatched `RESUME` shows as an extra sub-microsecond `unwound` slice | After instrumentation changes (cProfile, coverage, a debugger), at the next start of each function. |
-| The interpreter's own `__init__` clean-up frames return without having entered (3.13+) | Counted ("returns with no entry seen") and ignored, so on 3.13+ that counter is no sign of lost entries. |
+| The interpreter's own `__init__` clean-up frames return without having entered (3.13+) | Counted and ignored. |
 | On kernels 6.6 and 6.12 every probe hit takes the process's `mmap_lock` for reading | A call can wait in the trap behind a writer of that lock, holding the GIL. |
-| Memory | The ring is kernel memory (256 MiB by default); the tool keeps up to `--max-slices` slices in memory. |
+| Memory | The rings are kernel memory; the events are kept in memory until the capture ends, about 80 bytes a slice, with no spill to disk. |
 
-## Next: a systing recorder
+## Code
 
-In order:
+| File | What |
+| --- | --- |
+| `src/bpf/python_function_trace.bpf.c` | The probe program, an object of its own loaded only when the recorder runs. Compiles pystacks into itself, as the task-stacks recorder does, for the thread-state lookup and symbol records. |
+| `src/python_function_trace/sites.rs` | Finds and checks the dispatch table and the probe offsets in an interpreter file. |
+| `src/python_function_trace/pairing.rs` | Events to slices. |
+| `src/python_function_trace/mod.rs` | The recorder: attaches to the processes it is told of, keeps the events, writes the rows. |
+| `tests/python_function_trace.rs` | The end-to-end tests, with `tests/python_function_trace/workload.py`. |
 
-1. **Tests in CI** for the end-to-end script, per Python version, in the VM
-   jobs. (The load-shape gate already loads the object.)
-2. **A ring and a cache per producer**, so more than one process (or a
-   process with sub-interpreters) can be traced without a producer waiting on
-   another's lock; symbol records rate-limited per CPU as pystacks' are.
-3. **Recorder `python-function-trace`**, off by default, enabled with
-   `--add-recorder`, reusing the capture's targeting (`--pid`, `--cgroup`,
-   `-- command`) and its pystacks maps, under the capture's bounds.
-4. **A table**, `python_function_slice` (start, duration, thread, depth,
-   function, file, line, how it ended), with a schema version bump, exported
-   to Perfetto as slices on thread tracks.
-5. **Follow forks and execs** with one link set per followed process, added
-   from the existing fork and exec handling. Attaching to the file without a
-   pid would make every process that maps it trap, bystanders included. On
-   kernels with uprobe-multi links (6.6+), one attach and one detach for all
-   sites.
-6. **Seed open frames** at attach from a stack walk, and pair by the
-   interpreter's frame depth as well as by address, which repairs the
-   exception cases above in a reviewer's emulation.
-7. **A duration threshold in BPF**: keep the stack of open frames in the
-   probe and emit only slices over a threshold, so a long capture's ring
-   carries thousands of events rather than millions. It lowers what is
-   recorded, not what the process pays.
-8. **Cheaper entry probes.** The kernel emulates a few instruction kinds
-   (branches, `push`) instead of single-stepping them; the entry handlers
-   have a conditional jump early on, and a probe there should save about
-   0.6 µs on half the events. Exit and yield handlers have no such
-   instruction before the frame is unlinked, so they stay as they are.
+The load-shape gate (`tests/bpf_load_shapes.rs`, `every_shape_loads`) loads the
+object on every kernel of CI's guest matrix, and the stack-budget test adds up
+its frames.
+
+## Next
+
+1. **Seed open frames** at attach from a stack walk, and pair by the
+   interpreter's frame depth as well as by address, which repairs the exception
+   cases above in a reviewer's emulation.
+2. **A duration threshold in BPF**: keep the stack of open frames in the probe and
+   emit only slices over a threshold. It lowers what is recorded, not what the
+   process pays.
+3. **Cheaper entry probes.** The kernel emulates a few instruction kinds (branches,
+   `push`) instead of single-stepping them; the entry handlers have a conditional
+   jump early on, and a probe there should save about 0.6 µs on half the events.
+4. **One attach and one detach per process**, with uprobe-multi links (6.6+).
+5. **Take the probes' own cost out of the times** with a per-host calibration.

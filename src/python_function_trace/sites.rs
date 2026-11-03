@@ -33,8 +33,6 @@ pub enum Kind {
     /// An exception handler starts running in a frame: every frame above it
     /// is gone.
     Sync = 4,
-    /// `_PyEval_EvalFrameDefault` returned; paired by stack pointer.
-    ExitSp = 5,
 }
 
 impl Kind {
@@ -44,19 +42,9 @@ impl Kind {
             2 => Kind::Exit,
             3 => Kind::Yield,
             4 => Kind::Sync,
-            5 => Kind::ExitSp,
             _ => return None,
         })
     }
-}
-
-/// Where the BPF program finds the frame. The values are `pyft_frame_source`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FrameSource {
-    ThreadState = 0,
-    Arg2 = 1,
-    None = 2,
 }
 
 /// One place to attach a probe.
@@ -64,16 +52,14 @@ pub enum FrameSource {
 pub struct Site {
     pub name: String,
     pub kind: Kind,
-    pub source: FrameSource,
     /// Offset in the file, as `perf_event_open` takes it.
     pub file_offset: u64,
-    pub retprobe: bool,
 }
 
 impl Site {
     /// The attach cookie the BPF program decodes.
     pub fn cookie(&self) -> u64 {
-        self.kind as u64 | (self.source as u64) << 8
+        self.kind as u64
     }
 }
 
@@ -201,8 +187,6 @@ pub struct DispatchTable {
 /// What the function trace needs to know of one interpreter binary.
 #[derive(Clone, Debug)]
 pub struct Interpreter {
-    /// `_PyEval_EvalFrameDefault`: address and size.
-    pub eval_frame_default: (u64, u64),
     pub table: Option<DispatchTable>,
     /// Why there is no table, for the message that says so.
     pub no_table: Option<String>,
@@ -272,7 +256,6 @@ impl Interpreter {
             .filter(|b| &b[..8] == b"xdebugpy")
             .map(|b| u64::from_le_bytes(b[16..24].try_into().unwrap()) != 0);
         Ok(Some(Self {
-            eval_frame_default,
             table,
             no_table,
             py_version,
@@ -289,15 +272,12 @@ impl Interpreter {
     /// Refuses a file that is not the build of `major.minor` the opcode lists
     /// are for: another version or a pre-release by its own `Py_Version`, or a
     /// free-threaded build, whose objects have another layout.
-    pub fn check_build(&self, major: i32, minor: i32, dispatch: bool) -> Result<()> {
+    pub fn check_build(&self, major: i32, minor: i32) -> Result<()> {
         if self.free_threaded == Some(true) {
             bail!("a free-threaded build: not supported (its objects have another layout)");
         }
         let Some(hex) = self.py_version else {
-            if dispatch {
-                bail!("the file has no Py_Version to check the opcode numbers against");
-            }
-            return Ok(());
+            bail!("the file has no Py_Version to check the opcode numbers against");
         };
         let (file_major, file_minor) = ((hex >> 24) as i32, ((hex >> 16) & 0xff) as i32);
         if (file_major, file_minor) != (major, minor) {
@@ -306,7 +286,7 @@ impl Interpreter {
                  discovery said {major}.{minor}"
             );
         }
-        if dispatch && (hex >> 4) & 0xf != 0xf {
+        if (hex >> 4) & 0xf != 0xf {
             bail!(
                 "a pre-release of Python {major}.{minor} (Py_Version {hex:#010x}): its opcode \
                  numbers may not be the release's"
@@ -379,35 +359,10 @@ impl Interpreter {
             sites.push(Site {
                 name: name.to_string(),
                 kind: *kind,
-                source: FrameSource::ThreadState,
                 file_offset,
-                retprobe: false,
             });
         }
         Ok(sites)
-    }
-
-    /// The sites that see every frame only while the interpreter's frame
-    /// evaluator is replaced (perf trampolines, a PEP 523 evaluator): entry to
-    /// and return from `_PyEval_EvalFrameDefault`.
-    pub fn eval_frame_sites(&self) -> Result<Vec<Site>> {
-        let file_offset = self.file_offset(self.eval_frame_default.0)?;
-        Ok(vec![
-            Site {
-                name: "_PyEval_EvalFrameDefault".to_string(),
-                kind: Kind::Enter,
-                source: FrameSource::Arg2,
-                file_offset,
-                retprobe: false,
-            },
-            Site {
-                name: "_PyEval_EvalFrameDefault (return)".to_string(),
-                kind: Kind::ExitSp,
-                source: FrameSource::None,
-                file_offset,
-                retprobe: true,
-            },
-        ])
     }
 }
 
@@ -699,21 +654,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_cookie_carries_the_kind_and_the_frame_source() {
+    fn a_cookie_carries_the_kind() {
         let site = Site {
             name: "RESUME".into(),
             kind: Kind::Enter,
-            source: FrameSource::ThreadState,
             file_offset: 0,
-            retprobe: false,
         };
         assert_eq!(site.cookie(), 1);
-        let site = Site {
-            kind: Kind::ExitSp,
-            source: FrameSource::None,
-            ..site
-        };
-        assert_eq!(site.cookie(), 5 | 2 << 8);
     }
 
     #[test]
@@ -752,7 +699,7 @@ mod tests {
             };
             assert_eq!(table.targets.len(), TABLE_LEN);
             interp
-                .check_build(3, minor, true)
+                .check_build(3, minor)
                 .unwrap_or_else(|e| panic!("{path}: {e:#}"));
             let sites = interp
                 .dispatch_sites(3, minor)
@@ -762,7 +709,6 @@ mod tests {
             offsets.sort_unstable();
             offsets.dedup();
             assert_eq!(offsets.len(), sites.len(), "{path}");
-            assert_eq!(interp.eval_frame_sites().unwrap().len(), 2);
             // Another version's numbers are refused on this table.
             for other in [12, 13, 14].into_iter().filter(|m| *m != minor) {
                 assert!(

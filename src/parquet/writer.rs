@@ -33,10 +33,11 @@ use crate::trace::{
     MemoryAllocRecord, MemoryFaultRecord, MemoryIommuRecord, MemoryMapRecord, MemoryRssRecord,
     MemoryThpRecord, MemoryVfioRecord, MemoryVmstatRecord, NetworkDnsRecord,
     NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord,
-    NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord,
-    SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleEventRecord,
-    StackSampleRecord, SysInfoRecord, TaskContextRecord, TaskStackEventRecord, ThreadRecord,
-    ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, PythonFunctionSliceRecord,
+    SchedMigrateRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord,
+    StackRecord, StackSampleEventRecord, StackSampleRecord, SysInfoRecord, TaskContextRecord,
+    TaskStackEventRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord,
+    TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -149,6 +150,7 @@ pub struct StreamingParquetWriter {
     memory_thp: Vec<MemoryThpRecord>,
     memory_vmstat: Vec<MemoryVmstatRecord>,
     task_stack_events: Vec<TaskStackEventRecord>,
+    python_function_slices: Vec<PythonFunctionSliceRecord>,
     task_contexts: Vec<TaskContextRecord>,
     go_labels: Vec<GoLabelRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
@@ -205,6 +207,7 @@ pub struct StreamingParquetWriter {
     memory_thp_writer: Option<TableWriter>,
     memory_vmstat_writer: Option<TableWriter>,
     task_stack_event_writer: Option<TableWriter>,
+    python_function_slice_writer: Option<TableWriter>,
     task_context_writer: Option<TableWriter>,
     go_labels_writer: Option<TableWriter>,
     clock_snapshot_writer: Option<TableWriter>,
@@ -294,6 +297,7 @@ impl StreamingParquetWriter {
             memory_thp: Vec::new(),
             memory_vmstat: Vec::new(),
             task_stack_events: Vec::new(),
+            python_function_slices: Vec::new(),
             task_contexts: Vec::new(),
             go_labels: Vec::new(),
             clock_snapshots: Vec::new(),
@@ -338,6 +342,7 @@ impl StreamingParquetWriter {
             memory_thp_writer: None,
             memory_vmstat_writer: None,
             task_stack_event_writer: None,
+            python_function_slice_writer: None,
             task_context_writer: None,
             go_labels_writer: None,
             clock_snapshot_writer: None,
@@ -1232,6 +1237,24 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    fn flush_python_function_slices(&mut self) -> Result<()> {
+        if self.python_function_slices.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::python_function_slice_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.python_function_slice_writer,
+            &self.sink,
+            "python_function_slice",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_python_function_slice_batch(&self.python_function_slices, &schema)?;
+        writer.write(&batch)?;
+        self.python_function_slices.clear();
+        Ok(())
+    }
+
     fn flush_task_contexts(&mut self) -> Result<()> {
         if self.task_contexts.is_empty() {
             return Ok(());
@@ -1413,6 +1436,7 @@ impl StreamingParquetWriter {
         close_writer!(self.memory_thp_writer);
         close_writer!(self.memory_vmstat_writer);
         close_writer!(self.task_stack_event_writer);
+        close_writer!(self.python_function_slice_writer);
         close_writer!(self.task_context_writer);
         close_writer!(self.go_labels_writer);
         close_writer!(self.clock_snapshot_writer);
@@ -1924,6 +1948,16 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_python_function_slice(&mut self, record: PythonFunctionSliceRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.python_function_slices, self.batch_size);
+        self.python_function_slices.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.python_function_slices, self.batch_size) {
+            self.flush_python_function_slices()?;
+        }
+        Ok(())
+    }
+
     fn add_task_context(&mut self, record: TaskContextRecord) -> Result<()> {
         // A low-volume table (one row per name per new context id, rate
         // limited at the source): no batch-sized reservation up front.
@@ -2051,6 +2085,7 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_memory_thp()?;
         self.flush_memory_vmstat()?;
         self.flush_task_stack_events()?;
+        self.flush_python_function_slices()?;
         self.flush_task_contexts()?;
         self.flush_go_labels()?;
         self.flush_clock_snapshots()?;
@@ -2777,6 +2812,13 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     let mut task_stacks_cut_records_builder = Int64Builder::with_capacity(1);
     let mut task_stacks_off_stack_records_builder = Int64Builder::with_capacity(1);
     let mut go_context_builder = StringBuilder::with_capacity(1, 16);
+    let mut python_function_processes_builder = Int64Builder::with_capacity(1);
+    let mut python_function_events_builder = Int64Builder::with_capacity(1);
+    let mut python_function_no_thread_state_builder = Int64Builder::with_capacity(1);
+    let mut python_function_lost_events_builder = Int64Builder::with_capacity(1);
+    let mut python_function_symbol_records_dropped_builder = Int64Builder::with_capacity(1);
+    let mut python_function_cap_reached_builder = BooleanBuilder::with_capacity(1);
+    let mut python_function_notes_builder = StringBuilder::with_capacity(1, 32);
 
     sysname_builder.append_value(&record.sysname);
     release_builder.append_value(&record.release);
@@ -2805,6 +2847,14 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     task_stacks_cut_records_builder.append_option(record.task_stacks_cut_records);
     task_stacks_off_stack_records_builder.append_option(record.task_stacks_off_stack_records);
     go_context_builder.append_option(record.go_context.as_deref());
+    python_function_processes_builder.append_option(record.python_function_processes);
+    python_function_events_builder.append_option(record.python_function_events);
+    python_function_no_thread_state_builder.append_option(record.python_function_no_thread_state);
+    python_function_lost_events_builder.append_option(record.python_function_lost_events);
+    python_function_symbol_records_dropped_builder
+        .append_option(record.python_function_symbol_records_dropped);
+    python_function_cap_reached_builder.append_option(record.python_function_cap_reached);
+    python_function_notes_builder.append_option(record.python_function_notes.as_deref());
 
     Ok(RecordBatch::try_new(
         schema.clone(),
@@ -2836,6 +2886,13 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
             Arc::new(task_stacks_cut_records_builder.finish()),
             Arc::new(task_stacks_off_stack_records_builder.finish()),
             Arc::new(go_context_builder.finish()),
+            Arc::new(python_function_processes_builder.finish()),
+            Arc::new(python_function_events_builder.finish()),
+            Arc::new(python_function_no_thread_state_builder.finish()),
+            Arc::new(python_function_lost_events_builder.finish()),
+            Arc::new(python_function_symbol_records_dropped_builder.finish()),
+            Arc::new(python_function_cap_reached_builder.finish()),
+            Arc::new(python_function_notes_builder.finish()),
         ],
     )?)
 }
@@ -3363,6 +3420,45 @@ fn build_memory_thp_batch(
             Arc::new(addr.finish()),
             Arc::new(result.finish()),
             Arc::new(stack_id.finish()),
+        ],
+    )?)
+}
+
+fn build_python_function_slice_batch(
+    records: &[PythonFunctionSliceRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::Int64Builder;
+    let n = records.len();
+    let mut ts = Int64Builder::with_capacity(n);
+    let mut dur = Int64Builder::with_capacity(n);
+    let mut utid = Int64Builder::with_capacity(n);
+    let mut depth = Int32Builder::with_capacity(n);
+    let mut function = StringBuilder::with_capacity(n, n * 32);
+    let mut file = StringBuilder::with_capacity(n, n * 32);
+    let mut line = Int32Builder::with_capacity(n);
+    let mut end_kind = StringBuilder::with_capacity(n, n * 6);
+    for r in records {
+        ts.append_value(r.ts);
+        dur.append_value(r.dur);
+        utid.append_value(r.utid);
+        depth.append_value(r.depth);
+        function.append_value(&r.function);
+        file.append_option(r.file.as_deref());
+        line.append_value(r.line);
+        end_kind.append_value(&r.end_kind);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ts.finish()),
+            Arc::new(dur.finish()),
+            Arc::new(utid.finish()),
+            Arc::new(depth.finish()),
+            Arc::new(function.finish()),
+            Arc::new(file.finish()),
+            Arc::new(line.finish()),
+            Arc::new(end_kind.finish()),
         ],
     )?)
 }
@@ -4045,6 +4141,13 @@ mod tests {
                 task_stacks_full_records: Some(4000),
                 task_stacks_cut_records: Some(0),
                 task_stacks_off_stack_records: None,
+                python_function_processes: None,
+                python_function_events: None,
+                python_function_no_thread_state: None,
+                python_function_lost_events: None,
+                python_function_symbol_records_dropped: None,
+                python_function_cap_reached: None,
+                python_function_notes: None,
                 go_context: Some("on".to_string()),
             })
             .unwrap();

@@ -284,6 +284,17 @@ pub fn sysinfo_schema() -> Arc<Schema> {
         Field::new("task_stacks_cut_records", DataType::Int64, true),
         Field::new("task_stacks_off_stack_records", DataType::Int64, true),
         Field::new("go_context", DataType::Utf8, true),
+        Field::new("python_function_processes", DataType::Int64, true),
+        Field::new("python_function_events", DataType::Int64, true),
+        Field::new("python_function_no_thread_state", DataType::Int64, true),
+        Field::new("python_function_lost_events", DataType::Int64, true),
+        Field::new(
+            "python_function_symbol_records_dropped",
+            DataType::Int64,
+            true,
+        ),
+        Field::new("python_function_cap_reached", DataType::Boolean, true),
+        Field::new("python_function_notes", DataType::Utf8, true),
     ]))
 }
 
@@ -616,6 +627,21 @@ pub fn task_stack_event_schema() -> Arc<Schema> {
         Field::new("syscall", DataType::Utf8, true),
         Field::new("in_iowait", DataType::Boolean, false),
         Field::new("holds_gil", DataType::Boolean, true),
+    ]))
+}
+
+/// Schema for python_function_slice.parquet: one run of a Python frame, from
+/// the python-function-trace recorder (schema 34).
+pub fn python_function_slice_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("depth", DataType::Int32, false),
+        Field::new("function", DataType::Utf8, false),
+        Field::new("file", DataType::Utf8, true),
+        Field::new("line", DataType::Int32, false),
+        Field::new("end_kind", DataType::Utf8, false),
     ]))
 }
 

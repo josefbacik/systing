@@ -61,6 +61,7 @@ systing --list-recorders
 | `tpu` | off | TPU op-level profile via XLA runtime gRPC (port 8466) |
 | `tpu-metrics` | off | TPU runtime metrics polling (port 8431, lightweight) |
 | `task-stacks` | off | Periodic stack snapshots of every targeted thread, blocked ones included (`--task-stacks-interval-ms`, default 100; `--task-stacks-frames native\|python\|all`). Output: the `task_stack_event` table (each row with the system call the thread was in, whether it was blocked on I/O and whether it held the GIL) and a `Task Stacks: <thread>` track in Perfetto, whose leaf slices carry the same as arguments. Needs Linux 6.2+; not with `--continuous` |
+| `python-function-trace` | off | Every entry to and exit from a Python function in the targeted processes (`--pid`, `--cgroup` or a command is required; `--python-function-max-slices`, default 5,000,000). Slows them many times over while it runs: keep it to seconds |
 
 Enable extras with `--add-recorder`:
 ```bash

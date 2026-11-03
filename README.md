@@ -141,6 +141,7 @@ This will display all available recorders and their default states:
 - `tpu` - TPU profiling (gRPC to XLA runtime profiler service)
 - `tpu-metrics` - TPU runtime metrics polling (port 8431, always available)
 - `task-stacks` - Periodic stack snapshots of every targeted thread, blocked ones included (see [Task Stacks](#task-stacks))
+- `python-function-trace` - Every entry to and exit from a Python function in the targeted processes, which it slows many times over while it runs; needs `--pid`, `--cgroup` or a command (see [docs/PYTHON_FUNCTION_TRACE.md](docs/PYTHON_FUNCTION_TRACE.md))
 
 The three `network*` recorders are tiers of the same subsystem, ordered by event
 volume — see Network Traffic Recording below for when to use each.

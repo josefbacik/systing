@@ -257,6 +257,7 @@ pub struct SessionRecorder {
     pub memory_recorder: Mutex<MemoryRecorder>,
     pub marker_recorder: Mutex<MarkerRecorder>,
     pub task_stacks_recorder: Mutex<TaskStacksRecorder>,
+    pub python_function_recorder: Mutex<crate::python_function_trace::PythonFunctionRecorder>,
     /// The names Python processes gave their threads, by (tgid, tid): the
     /// `thread` table's `py_name`. See [`Self::note_py_thread_names`].
     py_thread_names: Mutex<HashMap<(i32, i32), String>>,
@@ -836,6 +837,7 @@ pub const MISSED_EVENT_CLASS_LABELS: &[(u32, &str)] = &[
     // written by another leg instead of pairing with it (an enter that
     // ran without its exit; see memory_syscall_leg in the BPF source).
     (9, "memory-xleg"),
+    (10, "python function"),
 ];
 
 /// One sample of one missed-event class: the cumulative (per-CPU-summed)
@@ -1018,6 +1020,11 @@ impl SessionRecorder {
                     .with_duration_threshold(marker_duration_threshold),
             ),
             task_stacks_recorder: Mutex::new(TaskStacksRecorder::new(Arc::clone(&utid_generator))),
+            python_function_recorder: Mutex::new(
+                crate::python_function_trace::PythonFunctionRecorder::new(Arc::clone(
+                    &utid_generator,
+                )),
+            ),
             py_thread_names: Mutex::new(HashMap::new()),
             tpu_metrics_recorder: if tpu_metrics_enabled {
                 Some(Mutex::new(TpuMetricsRecorder::new()))
@@ -1648,6 +1655,14 @@ impl SessionRecorder {
         // writer (the records are all in the shared inner writer, so the
         // other handles can simply be dropped) and finalize it in step 6,
         // by which point it is the only live handle.
+        // Before sysinfo, which carries what it adds. The symbol loader is done.
+        {
+            let psr = self.stack_recorder.lock().unwrap().psr.clone();
+            self.python_function_recorder
+                .lock()
+                .unwrap()
+                .note_greenlet(&psr);
+        }
         eprintln!("Flushing scheduler trace records from streaming...");
         let mut sched_collectors = Vec::new();
         for event_recorder in &self.event_recorders {
@@ -1700,6 +1715,8 @@ impl SessionRecorder {
             let memory_end = self.memory_recorder_end.get();
             let network = self.network_recorder_config.get();
             let walk = self.task_stacks_walk.get();
+            let python_functions = self.python_function_recorder.lock().unwrap();
+            let python_functions = python_functions.outcome();
             writer.set_sysinfo(crate::trace::SysInfoRecord {
                 sysname: utsname.sysname().to_string(),
                 release: utsname.release().to_string(),
@@ -1733,6 +1750,16 @@ impl SessionRecorder {
                 task_stacks_cut_records: walk.and_then(|w| w.cut).map(|n| n as i64),
                 task_stacks_off_stack_records: walk.and_then(|w| w.off_stack).map(|n| n as i64),
                 go_context: self.go_context.get().map(|mode| mode.to_string()),
+                python_function_processes: python_functions.map(|o| o.traced as i64),
+                python_function_events: python_functions.map(|o| o.kernel.events as i64),
+                python_function_no_thread_state: python_functions
+                    .map(|o| o.kernel.no_thread_state as i64),
+                python_function_lost_events: python_functions
+                    .map(|o| (o.kernel.no_frame + o.kernel.no_code) as i64),
+                python_function_symbol_records_dropped: python_functions
+                    .map(|o| o.kernel.symbol_records_dropped as i64),
+                python_function_cap_reached: python_functions.map(|o| o.cap_reached),
+                python_function_notes: python_functions.and_then(|o| o.notes()),
             })?;
         }
 
@@ -1939,6 +1966,14 @@ impl SessionRecorder {
                 task_stacks_recorder.write_records(&mut *track_writer, end_ts as u64)?;
             }
         }
+        {
+            let mut python_functions = self.python_function_recorder.lock().unwrap();
+            if python_functions.has_data() {
+                eprintln!("Writing Python function slices...");
+                let psr = self.stack_recorder.lock().unwrap().psr.clone();
+                python_functions.write_records(&mut *track_writer, &psr, end_ts as u64)?;
+            }
+        }
         track_writer.finish_boxed()?;
         stage_done("Flushed probe trace records", &mut stage_start);
 
@@ -2042,6 +2077,11 @@ mod tests {
             recorder.marker_recorder.lock().unwrap().min_timestamp(),
             recorder
                 .task_stacks_recorder
+                .lock()
+                .unwrap()
+                .min_timestamp(),
+            recorder
+                .python_function_recorder
                 .lock()
                 .unwrap()
                 .min_timestamp(),
@@ -2240,6 +2280,11 @@ mod tests {
                 Arc::clone(&track_event_ids),
             )),
             task_stacks_recorder: Mutex::new(TaskStacksRecorder::new(Arc::clone(&utid_generator))),
+            python_function_recorder: Mutex::new(
+                crate::python_function_trace::PythonFunctionRecorder::new(Arc::clone(
+                    &utid_generator,
+                )),
+            ),
             py_thread_names: Mutex::new(HashMap::new()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),

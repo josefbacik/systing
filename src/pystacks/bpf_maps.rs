@@ -83,14 +83,23 @@ impl PystacksMaps {
     }
 
     /// Write PyPidData to the pystacks_pid_config BPF map.
-    pub fn update_pid_config(&self, pid: i32, data: &PyPidData) {
+    pub fn update_pid_config(&self, pid: i32, data: &PyPidData) -> bool {
         unsafe {
             libbpf_rs::libbpf_sys::bpf_map_update_elem(
                 self.pid_config_fd,
                 &pid as *const i32 as *const std::ffi::c_void,
                 data as *const PyPidData as *const std::ffi::c_void,
                 0,
-            );
+            ) == 0
+        }
+    }
+
+    /// Forget a PID that has gone, from user space as every write here is.
+    pub fn remove_pid(&self, pid: i32) {
+        let key = &pid as *const i32 as *const std::ffi::c_void;
+        unsafe {
+            libbpf_rs::libbpf_sys::bpf_map_delete_elem(self.pid_config_fd, key);
+            libbpf_rs::libbpf_sys::bpf_map_delete_elem(self.targeted_pids_fd, key);
         }
     }
 

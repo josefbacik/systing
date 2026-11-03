@@ -1152,7 +1152,7 @@ static __always_inline int get_pthread_id_match(
 
 #if __aarch64__ || __riscv64__
   /*
-   * tls_base is the pthread descriptor derived from clear_child_tid;
+   * tls_base is the pthread descriptor from get_glibc_pthread_descriptor();
    * compare it directly. struct pthread has no header.self on these
    * architectures (the header union is plain padding), so there is
    * nothing to read.

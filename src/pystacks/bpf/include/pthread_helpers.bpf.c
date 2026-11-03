@@ -34,41 +34,44 @@
  * The descriptor of the current thread, or NULL when it is not laid out the
  * way the offsets above say.
  *
- * glibc registers two pointers INTO the descriptor with the kernel:
- * &pthread->tid as the clear-child-tid pointer (set_tid_address for the
- * main thread, CLONE_CHILD_CLEARTID for the others) and &pthread->robust_head
- * as the robust-list pointer (set_robust_list). Both sit at fixed
- * head-anchored offsets, so on x86-64 the thread pointer is the candidate
- * and on the TLS-variant-1 architectures the candidate is derived from the
- * clear-child-tid pointer; either way the candidate is trusted only when
- * both registered pointers sit where glibc puts them. A C library with
- * another layout registers the same two pointers from its own descriptor
- * (musl keeps them 0x58 apart — tid at 0x30 and the robust list at 0x88 on
- * x86-64, 0x20 and 0x78 on aarch64 — where glibc keeps them 0x10 apart), so
- * the check refuses it without reading a byte of user memory, and the
- * walker then reports no thread state instead of reading through the wrong
- * offsets.
+ * glibc registers &pthread->robust_head with the kernel as the robust-list
+ * pointer (set_robust_list), and that sits at a fixed head-anchored offset, so
+ * on x86-64 the thread pointer is the candidate and on the TLS-variant-1
+ * architectures the candidate is derived from the robust-list pointer. A C
+ * library with another layout registers its own descriptor's: musl's robust
+ * list is at 0x88 on x86-64, so the thread pointer does not match, and the check
+ * refuses it without reading a byte of user memory; the walker then reports no
+ * thread state instead of reading through the wrong offsets.
+ *
+ * The clear-child-tid pointer says less. It is &pthread->tid up to glibc 2.42.
+ * From 2.43 the main thread's points at a later field (+0x628 on x86-64, 0x348
+ * past the robust list) and a forked child's still at tid, so it cannot be
+ * required at tid. Where the thread pointer cannot witness the descriptor it is
+ * still needed to refuse musl, whose two pointers are 0x58 apart, so there it may
+ * be at either place. That later field was only seen on x86-64: a thread where
+ * it is elsewhere reports no thread state.
  */
+#define GLIBC_2_43_ROBUST_TO_CLEAR_CHILD_TID 0x348
+
 static __always_inline void* get_glibc_pthread_descriptor(
     const struct task_struct* cur_task) {
-  void* clear_child_tid = (void*)BPF_PROBE_READ(cur_task, clear_child_tid);
   void* robust_list = (void*)BPF_PROBE_READ(cur_task, robust_list);
-  if (!IS_VALID_USER_SPACE_ADDRESS(clear_child_tid) ||
-      !IS_VALID_USER_SPACE_ADDRESS(robust_list)) {
+  if (!IS_VALID_USER_SPACE_ADDRESS(robust_list)) {
     return NULL;
   }
+  void* descriptor = (char*)robust_list - GLIBC_PTHREAD_ROBUST_HEAD_OFFSET;
 #if __x86_64__
-  void* descriptor = (void*)BPF_PROBE_READ(cur_task, thread.fsbase);
-  if (!IS_VALID_USER_SPACE_ADDRESS(descriptor)) {
+  if (descriptor != (void*)BPF_PROBE_READ(cur_task, thread.fsbase)) {
     return NULL;
   }
 #else
-  void* descriptor = (char*)clear_child_tid - GLIBC_PTHREAD_TID_OFFSET;
-#endif
-  if ((char*)clear_child_tid != (char*)descriptor + GLIBC_PTHREAD_TID_OFFSET ||
-      (char*)robust_list != (char*)descriptor + GLIBC_PTHREAD_ROBUST_HEAD_OFFSET) {
+  void* clear_child_tid = (void*)BPF_PROBE_READ(cur_task, clear_child_tid);
+  if ((char*)clear_child_tid != (char*)descriptor + GLIBC_PTHREAD_TID_OFFSET &&
+      (char*)clear_child_tid !=
+          (char*)robust_list + GLIBC_2_43_ROBUST_TO_CLEAR_CHILD_TID) {
     return NULL;
   }
+#endif
   return descriptor;
 }
 

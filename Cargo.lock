@@ -3578,16 +3578,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "systing-python-function-trace"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "systing",
-]
-
-[[package]]
 name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

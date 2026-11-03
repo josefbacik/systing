@@ -22,6 +22,11 @@
 
 #define TASK_COMM_LEN 16
 
+/* The python-function-trace recorder's probes, in its own object, which reuses
+ * the main object's missed_events map. */
+#define MISSED_PYTHON_FUNCTION_EVENT 10
+#define MISSED_EVENT_MAX 11
+
 /*
  * Per-task identity shipped inline with every event that references a task.
  *
@@ -249,6 +254,22 @@ static __systing_maybe_unused bool task_in_target_set(struct task_struct *task)
 	if (target_filter.filter_cgroup) {
 		if (target_filter.cgroup_match_kernel)
 			return task_in_cgroup_filter(task);
+		return task_in_legacy_cgroup_set(task);
+	}
+	return true;
+}
+
+/*
+ * --pid and --cgroup for current, from any program type (trace_task()'s test,
+ * for an object without that function's other filters).
+ */
+static __systing_maybe_unused bool current_in_target_set(struct task_struct *task)
+{
+	if (!task_in_target_pids(task))
+		return false;
+	if (target_filter.filter_cgroup) {
+		if (target_filter.cgroup_match_kernel)
+			return current_in_cgroup_filter();
 		return task_in_legacy_cgroup_set(task);
 	}
 	return true;

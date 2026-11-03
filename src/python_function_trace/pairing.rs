@@ -12,24 +12,17 @@
 use super::sites::Kind;
 use std::collections::HashMap;
 
-/// One event as BPF sent it (`struct pyft_event`).
+/// What the recorder keeps of one event of the probes.
 #[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
 pub struct Event {
     pub ts: u64,
     pub frame: u64,
     pub symbol_id: u64,
-    pub sp: u64,
     pub tgid: u32,
     pub tid: u32,
     pub first_line: u32,
     pub kind: u8,
-    pub pad: [u8; 3],
 }
-
-// SAFETY: repr(C), integers only, and no implicit padding: 48 bytes of fields
-// in descending alignment, the last three an explicit pad.
-unsafe impl plain::Plain for Event {}
 
 /// How a slice ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,34 +65,15 @@ pub struct Slice {
 
 struct OpenFrame {
     frame: u64,
-    sp: u64,
     symbol_id: u64,
     first_line: u32,
     start: u64,
-    /// Time spent in the frames it called, for its self time.
-    child_ns: u64,
 }
 
 #[derive(Default)]
 struct Thread {
     tgid: u32,
     stack: Vec<OpenFrame>,
-}
-
-/// Per function (symbol and first line), over the whole trace.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FunctionStats {
-    /// Runs of the function's frames: for a plain function its calls, for a
-    /// generator or coroutine one per resumption.
-    pub slices: u64,
-    /// How many of those ended in a `yield`/`await`; `slices - yields` is the
-    /// number of times the function ran to its end.
-    pub yields: u64,
-    /// How many ended without an exit event.
-    pub unwound: u64,
-    pub total_ns: u64,
-    pub self_ns: u64,
-    pub max_ns: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -116,34 +90,33 @@ pub struct Counters {
     pub unwound: u64,
     /// Frames first seen in an exception handler.
     pub first_seen_in_handler: u64,
-    /// Slices shorter than the threshold: counted in the statistics, not kept.
-    pub below_threshold: u64,
-    /// Slices past the cap: counted in the statistics, not kept.
-    pub over_cap: u64,
     pub open_at_end: u64,
 }
 
+impl Counters {
+    pub fn add(&mut self, other: &Counters) {
+        self.events += other.events;
+        self.enters += other.enters;
+        self.exits += other.exits;
+        self.yields += other.yields;
+        self.syncs += other.syncs;
+        self.unmatched_exits += other.unmatched_exits;
+        self.unwound += other.unwound;
+        self.first_seen_in_handler += other.first_seen_in_handler;
+        self.open_at_end += other.open_at_end;
+    }
+}
+
+#[derive(Default)]
 pub struct Pairer {
     threads: HashMap<u32, Thread>,
-    pub stats: HashMap<(u64, u32), FunctionStats>,
     pub slices: Vec<Slice>,
     pub counters: Counters,
-    min_ns: u64,
-    max_slices: usize,
 }
 
 impl Pairer {
-    /// Keeps slices of at least `min_ns`, `max_slices` at most; the
-    /// statistics count every slice.
-    pub fn new(min_ns: u64, max_slices: usize) -> Self {
-        Self {
-            threads: HashMap::new(),
-            stats: HashMap::new(),
-            slices: Vec::new(),
-            counters: Counters::default(),
-            min_ns,
-            max_slices,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn push(&mut self, e: &Event) {
@@ -151,13 +124,10 @@ impl Pairer {
             return;
         };
         self.counters.events += 1;
-        let (at, at_sp) = {
+        let at = {
             let thread = self.threads.entry(e.tid).or_default();
             thread.tgid = e.tgid;
-            (
-                thread.stack.iter().rposition(|f| f.frame == e.frame),
-                thread.stack.iter().rposition(|f| f.sp == e.sp && f.sp != 0),
-            )
+            thread.stack.iter().rposition(|f| f.frame == e.frame)
         };
         match kind {
             Kind::Enter => {
@@ -204,22 +174,15 @@ impl Pairer {
                     }
                 }
             }
-            Kind::ExitSp => {
-                self.counters.exits += 1;
-                match at_sp {
-                    Some(i) => {
-                        self.close_down_to(e.tid, i + 1, e.ts, End::Unwound);
-                        self.close_top(e.tid, e.ts, End::Return);
-                    }
-                    None => self.counters.unmatched_exits += 1,
-                }
-            }
         }
     }
 
-    /// Whether the slice cap has been reached.
-    pub fn full(&self) -> bool {
-        self.slices.len() >= self.max_slices
+    /// Ends every frame still open as gone, at `ts`: the process exec'd.
+    pub fn close_all(&mut self, ts: u64) {
+        let tids: Vec<u32> = self.threads.keys().copied().collect();
+        for tid in tids {
+            self.close_down_to(tid, 0, ts, End::Unwound);
+        }
     }
 
     /// Ends every frame still open, at `end_ts`.
@@ -237,11 +200,9 @@ impl Pairer {
         let thread = self.threads.entry(e.tid).or_default();
         thread.stack.push(OpenFrame {
             frame: e.frame,
-            sp: e.sp,
             symbol_id: e.symbol_id,
             first_line: e.first_line,
             start: e.ts,
-            child_ns: 0,
         });
     }
 
@@ -263,37 +224,16 @@ impl Pairer {
             return;
         };
         let end = ts.max(frame.start);
-        let dur = end - frame.start;
-        if let Some(parent) = thread.stack.last_mut() {
-            parent.child_ns += dur;
-        }
-        let stats = self
-            .stats
-            .entry((frame.symbol_id, frame.first_line))
-            .or_default();
-        stats.slices += 1;
-        stats.yields += u64::from(end_kind == End::Yield);
-        stats.unwound += u64::from(end_kind == End::Unwound);
-        stats.total_ns += dur;
-        stats.self_ns += dur.saturating_sub(frame.child_ns);
-        stats.max_ns = stats.max_ns.max(dur);
-
-        if dur < self.min_ns {
-            self.counters.below_threshold += 1;
-        } else if self.slices.len() >= self.max_slices {
-            self.counters.over_cap += 1;
-        } else {
-            self.slices.push(Slice {
-                tgid: thread.tgid,
-                tid,
-                start: frame.start,
-                end,
-                symbol_id: frame.symbol_id,
-                first_line: frame.first_line,
-                depth: thread.stack.len() as u32,
-                end_kind,
-            });
-        }
+        self.slices.push(Slice {
+            tgid: thread.tgid,
+            tid,
+            start: frame.start,
+            end,
+            symbol_id: frame.symbol_id,
+            first_line: frame.first_line,
+            depth: thread.stack.len() as u32,
+            end_kind,
+        });
     }
 }
 
@@ -326,7 +266,7 @@ mod tests {
     }
 
     fn run(events: &[Event]) -> Pairer {
-        let mut p = Pairer::new(0, usize::MAX);
+        let mut p = Pairer::new();
         for e in events {
             p.push(e);
         }
@@ -334,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn calls_nest_and_self_time_leaves_out_the_callee() {
+    fn calls_nest() {
         let p = run(&[
             ev(Kind::Enter, A, 10),
             ev(Kind::Enter, B, 20),
@@ -345,9 +285,6 @@ mod tests {
             shape(&p),
             [(B, 20, 50, 1, End::Return), (A, 10, 100, 0, End::Return)]
         );
-        assert_eq!(p.stats[&(A, 0)].total_ns, 90);
-        assert_eq!(p.stats[&(A, 0)].self_ns, 60);
-        assert_eq!(p.stats[&(B, 0)].self_ns, 30);
     }
 
     #[test]
@@ -368,8 +305,6 @@ mod tests {
                 (A, 0, 50, 0, End::Return)
             ]
         );
-        let b = &p.stats[&(B, 0)];
-        assert_eq!((b.slices, b.yields), (2, 1));
     }
 
     #[test]
@@ -475,38 +410,8 @@ mod tests {
     }
 
     #[test]
-    fn eval_frame_returns_pair_by_stack_pointer() {
-        let enter = |frame, sp, ts| Event {
-            sp,
-            ..ev(Kind::Enter, frame, ts)
-        };
-        let ret = |sp, ts| Event {
-            sp,
-            ..ev(Kind::ExitSp, 0, ts)
-        };
-        // B's return was lost: A's closes both.
-        let p = run(&[enter(A, 0x7000, 0), enter(B, 0x6000, 10), ret(0x7000, 30)]);
-        assert_eq!(
-            shape(&p),
-            [(B, 10, 30, 1, End::Unwound), (A, 0, 30, 0, End::Return)]
-        );
-        let p = run(&[
-            enter(A, 0x7000, 0),
-            enter(B, 0x6000, 10),
-            ret(0x6000, 20),
-            ret(0x7000, 30),
-            ret(0x8000, 40),
-        ]);
-        assert_eq!(
-            shape(&p),
-            [(B, 10, 20, 1, End::Return), (A, 0, 30, 0, End::Return)]
-        );
-        assert_eq!(p.counters.unmatched_exits, 1);
-    }
-
-    #[test]
     fn frames_open_at_the_end_are_closed_there_and_threads_do_not_mix() {
-        let mut p = Pairer::new(0, usize::MAX);
+        let mut p = Pairer::new();
         p.push(&ev(Kind::Enter, A, 0));
         p.push(&Event {
             tid: 2,
@@ -526,27 +431,20 @@ mod tests {
     }
 
     #[test]
-    fn short_slices_and_slices_past_the_cap_still_count() {
-        let mut p = Pairer::new(10, 1);
-        for e in [
-            ev(Kind::Enter, A, 0),
-            ev(Kind::Exit, A, 5),
-            ev(Kind::Enter, A, 10),
-            ev(Kind::Exit, A, 30),
-            ev(Kind::Enter, A, 40),
-            ev(Kind::Exit, A, 90),
-        ] {
-            p.push(&e);
-        }
-        assert_eq!(shape(&p), [(A, 10, 30, 0, End::Return)]);
-        assert_eq!(p.counters.below_threshold, 1);
-        assert_eq!(p.counters.over_cap, 1);
-        assert_eq!(p.stats[&(A, 0)].slices, 3);
-        assert_eq!(p.stats[&(A, 0)].total_ns, 75);
-    }
-
-    #[test]
-    fn the_event_is_the_size_bpf_writes() {
-        assert_eq!(std::mem::size_of::<Event>(), 48);
+    fn an_exec_ends_every_frame_as_gone() {
+        let mut p = Pairer::new();
+        p.push(&ev(Kind::Enter, A, 0));
+        p.push(&ev(Kind::Enter, B, 5));
+        p.close_all(10);
+        p.push(&ev(Kind::Enter, A, 20));
+        p.push(&ev(Kind::Exit, A, 30));
+        assert_eq!(
+            shape(&p),
+            [
+                (B, 5, 10, 1, End::Unwound),
+                (A, 0, 10, 0, End::Unwound),
+                (A, 20, 30, 0, End::Return)
+            ]
+        );
     }
 }
