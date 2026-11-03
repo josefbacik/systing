@@ -44,12 +44,13 @@
  * thread state instead of reading through the wrong offsets.
  *
  * The clear-child-tid pointer says less. It is &pthread->tid up to glibc 2.42.
- * From 2.43 the main thread's points at a later field (+0x628 on x86-64, 0x348
- * past the robust list) and a forked child's still at tid, so it cannot be
- * required at tid. Where the thread pointer cannot witness the descriptor it is
- * still needed to refuse musl, whose two pointers are 0x58 apart, so there it may
- * be at either place. That later field was only seen on x86-64: a thread where
- * it is elsewhere reports no thread state.
+ * From 2.43 it points at a later field, 0x348 past the robust list on both x86-64
+ * and aarch64, except a forked child's own thread, whose is still at tid, so it
+ * cannot be required at tid. Where the thread pointer cannot witness the
+ * descriptor it is still needed to refuse musl, whose two pointers are 0x58
+ * apart, so there it may be at either place. That was measured on glibc 2.43 and
+ * not on riscv64, and no CI job runs this path on 2.43: a thread where it is
+ * elsewhere reports no thread state.
  */
 #define GLIBC_2_43_ROBUST_TO_CLEAR_CHILD_TID 0x348
 

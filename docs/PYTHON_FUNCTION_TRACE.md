@@ -93,7 +93,7 @@ Probes check the target set as every recorder's do, so a process that leaves a
 ends.
 
 If the recorder cannot run (the kernel's confidentiality mode, or its BPF object
-does not load, as on arm64 today) the capture goes on with its other recorders and
+does not load) the capture goes on with its other recorders and
 `python_function_notes` says why.
 
 A process is refused, with its reason in `python_function_notes`, for: a build
@@ -305,8 +305,9 @@ exception exits. This recorder is what works on a process that was not prepared.
 | `tests/python_function_trace.rs` | The end-to-end tests, with `tests/python_function_trace/workload.py`. |
 
 The load-shape gate (`tests/bpf_load_shapes.rs`, `every_shape_loads`) loads the
-object on every kernel of CI's guest matrix, and the stack-budget test adds up
-its frames.
+object on every kernel of CI's guest matrix, its native arm64 job loads it with
+the same target filters and runs the end-to-end tests, and the stack-budget test
+adds up its frames.
 
 ## Next
 

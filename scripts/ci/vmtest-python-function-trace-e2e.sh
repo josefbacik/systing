@@ -1,5 +1,5 @@
 #!/bin/bash
-# Guest side of the python-function-trace end-to-end step
+# The python-function-trace end-to-end step, in a guest or on the native arm64 runner
 # (.github/workflows/bpf-load-shapes.yml): run tests/python_function_trace.rs, as
 # root on the guest kernel, and require the line the main case prints once every
 # call of three processes was accounted for, so that a run that found no Python
@@ -9,7 +9,7 @@
 # without a virtio console makes the VM tool return 255 whatever the test did. The
 # host side reads the `VNG-TEST-EXIT:<rc>` line.
 #
-# Usage (from vng's --exec, as root in the guest):
+# Usage (from vng's --exec, as root in the guest, or as root on the runner):
 #   vmtest-python-function-trace-e2e.sh <test binary> <dir holding libduckdb.so> <output file>
 set -u
 BIN="$1"
