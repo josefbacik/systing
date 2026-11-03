@@ -769,7 +769,7 @@ struct {
  * ran) and dropped it instead of pairing with it -- see
  * memory_syscall_leg below. Counted so the rate is visible in the trace. */
 #define MISSED_MEMORY_XLEG_EVENT 9
-#define MISSED_EVENT_MAX 10
+/* MISSED_PYTHON_FUNCTION_EVENT and MISSED_EVENT_MAX: systing_shared.bpf.h */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -817,6 +817,11 @@ struct {
 #define RINGBUF_TEMPLATE_BYTES (64 * 1024)
 
 struct ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
+
+struct python_function_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
 };
@@ -889,6 +894,15 @@ struct {
 	__type(key, u32);
 	__array(values, struct stack_ringbuf_map);
 } stack_ringbufs SEC(".maps");
+
+/* Written only by the python-function-trace recorder's object, which reuses it
+ * (src/bpf/python_function_trace.bpf.c); no program here refers to it. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
+	__type(key, u32);
+	__array(values, struct python_function_ringbuf_map);
+} python_function_ringbufs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);

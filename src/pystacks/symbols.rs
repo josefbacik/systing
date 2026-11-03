@@ -121,6 +121,13 @@ impl SymbolResolver {
         true
     }
 
+    /// The function and source file of a symbol already ingested.
+    pub fn symbol_name(&self, id: u64) -> Option<(String, String)> {
+        let symbols = self.symbols.read().unwrap();
+        let symbol = symbols.get(&id)?;
+        Some((symbol.funcname.clone(), symbol.filename.clone()))
+    }
+
     /// Build a line table from the data carried in a symbol record.
     fn load_line_table(&self, lt: &PystacksLineTable) -> Option<PyLineTable> {
         if lt.addr == 0 || lt.length == 0 || lt.first_line == 0 || lt.pid == 0 {

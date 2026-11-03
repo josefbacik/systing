@@ -155,7 +155,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 33;
+pub const SCHEMA_VERSION: u32 = 34;
 
 /// The systing version that writes `_traces.systing_version`. A constant so
 /// the tools built on the library (`systing-heap`) record the same version
@@ -205,6 +205,7 @@ pub const DATA_TABLES: &[&str] = &[
     "memory_thp",
     "memory_vmstat",
     "task_stack_event",
+    "python_function_slice",
     "task_context",
     "go_labels",
     "heap_snapshot",
@@ -270,6 +271,7 @@ pub const PARQUET_TABLES: &[(&str, ParquetFileOf)] = &[
     ("memory_thp", |p| &p.memory_thp),
     ("memory_vmstat", |p| &p.memory_vmstat),
     ("task_stack_event", |p| &p.task_stack_event),
+    ("python_function_slice", |p| &p.python_function_slice),
     ("task_context", |p| &p.task_context),
     ("go_labels", |p| &p.go_labels),
     ("clock_snapshot", |p| &p.clock_snapshot),
@@ -811,6 +813,27 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             holds_gil BOOLEAN
         );
 
+        -- The python-function-trace recorder (schema 34): one run of a Python
+        -- frame, from its entry or resumption to its return, yield or
+        -- unwinding. A generator or coroutine has one row per resumption.
+        CREATE TABLE IF NOT EXISTS python_function_slice (
+            trace_id VARCHAR,
+            ts BIGINT,
+            dur BIGINT,
+            utid BIGINT,
+            -- How many traced frames were open on the thread below this one.
+            depth INTEGER,
+            -- module:qualname
+            function VARCHAR,
+            -- The source file, its last 192 bytes.
+            file VARCHAR,
+            -- The function's first line, not the call site.
+            line INTEGER,
+            -- return, yield, unwound (no exit event: an exception, usually) or
+            -- open (still running when the trace ended).
+            end_kind VARCHAR
+        );
+
         -- --include-task-context: one named value of one task_context id
         -- of one thread. A sample's (or a task_stack_event's) context is the
         -- rows whose utid and id equal its utid and task_context_id; exactly
@@ -1028,7 +1051,22 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- How --include-go-context ran: 'on', or 'restricted' (the
             -- kernel's confidentiality mode: nothing was read). NULL without
             -- the flag, and in traces from before schema 30.
-            go_context VARCHAR
+            go_context VARCHAR,
+            -- The python-function-trace recorder: the processes it had probes
+            -- in, the events it saw (those lost to a full ring are the 'python
+            -- function' missed-events class), the probe hits that found no
+            -- Python thread state, those lost otherwise (no frame,
+            -- no name to give), the name records lost to a full ring, whether
+            -- its slice cap ended the trace early, and the processes it refused
+            -- and what could make the trace wrong, a line each. NULL when it was
+            -- not asked for, and in traces from before schema 34.
+            python_function_processes BIGINT,
+            python_function_events BIGINT,
+            python_function_no_thread_state BIGINT,
+            python_function_lost_events BIGINT,
+            python_function_symbol_records_dropped BIGINT,
+            python_function_cap_reached BOOLEAN,
+            python_function_notes VARCHAR
         );
 
         -- Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on
@@ -1442,7 +1480,9 @@ pub fn import_order_by(table_name: &str) -> Option<&'static str> {
     match table_name {
         "sched_slice" => Some("cpu, ts"),
         "thread_state" => Some("utid, ts"),
-        "stack_sample" | "task_stack_event" | "task_context" => Some("utid, ts"),
+        "stack_sample" | "task_stack_event" | "task_context" | "python_function_slice" => {
+            Some("utid, ts")
+        }
         "go_labels" => Some("upid, id"),
         "softirq_slice" | "irq_slice" => Some("cpu, ts"),
         "counter" => Some("track_id, ts"),

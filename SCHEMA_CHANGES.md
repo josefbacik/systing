@@ -445,6 +445,37 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 34 (systing 1.31.0) — 2026-11-02
+
+The Python function trace is a recorder of a capture
+(`--add-recorder python-function-trace`), no longer a program of its own, and its
+results are in the database like any other's. It takes several processes at once
+and follows what they fork, under the capture's targeting; the
+`systing-python-function-trace` program, its `--mode eval-frame` return probes and
+its `-- command` handling are gone.
+
+### Added tables
+- `python_function_slice` (`ts`, `dur`, `utid`, `depth`, `function`, `file`, `line`,
+  `end_kind`): one run of a Python frame, from its entry or resumption to its
+  return, yield or unwinding. See `docs/PYTHON_FUNCTION_TRACE.md`.
+
+### Added columns
+All NULL when the recorder was not asked for, and in traces from before schema 34.
+- `sysinfo.python_function_processes` (BIGINT): the processes it had probes in.
+- `sysinfo.python_function_events` (BIGINT): the events it saw. Those lost to a
+  full ring are the `python function` class of the missed-events tracks.
+- `sysinfo.python_function_no_thread_state` (BIGINT): probe hits that found no
+  Python thread state.
+- `sysinfo.python_function_lost_events` (BIGINT): probe hits lost otherwise: no
+  frame, or no name to give a function.
+- `sysinfo.python_function_symbol_records_dropped` (BIGINT): records of a
+  function's name lost to a full ring; its slices read `<unknown python 0x...>`.
+- `sysinfo.python_function_cap_reached` (BOOLEAN): its slice cap took the probes
+  out before the capture ended.
+- `sysinfo.python_function_notes` (VARCHAR): the processes that were a Python and
+  were not traced, with why, and what could make the trace wrong for those that
+  were, a line each. NULL where there is nothing to say.
+
 ## Schema Version 33 (systing 1.30.0) — 2026-10-28
 
 The task-stacks recorder's walks leave counts in the trace. A record cut short

@@ -227,6 +227,12 @@ struct Command {
     /// With the task-stacks recorder, the interval between snapshots of the targeted threads, in milliseconds. With --duration the recorder takes ceil(duration / interval) snapshots, numbered from 1 (10 s at 100 ms: iterations 1-100)
     #[arg(long, default_value = "100", value_parser = clap::value_parser!(u64).range(1..))]
     task_stacks_interval_ms: u64,
+    // python-function-trace recording enabled state (set by recorder management, not a CLI flag)
+    #[arg(skip)]
+    python_function_trace: bool,
+    /// With the python-function-trace recorder, the slices to keep. Reaching this takes its probes out, and the rest of the capture has no slices
+    #[arg(long, default_value_t = systing::python_function_trace::DEFAULT_MAX_SLICES, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    python_function_max_slices: usize,
     /// Read each sampled thread's task_context: the named values a program sets on its threads with the task-context library (`crates/task-context`). Every running-stack sample then carries the id of the thread's current context (`stack_sample.task_context_id`, and every event of the task-stacks recorder `task_stack_event.task_context_id`) and the values of each id are stored once, in the `task_context` table. A process is found when its executable carries the library or names it as a direct dependency; one that loads it later (`dlopen`, a preloaded or indirect dependency) is not. Without this flag none of the feature's BPF programs or maps is loaded. Written for Linux 6.12 and newer
     #[arg(long)]
     include_task_context: bool,
@@ -355,6 +361,8 @@ impl From<Command> for Config {
             tpu_metrics_interval: cmd.tpu_metrics_interval,
             task_stacks: cmd.task_stacks,
             task_stacks_interval_ms: cmd.task_stacks_interval_ms,
+            python_function_trace: cmd.python_function_trace,
+            python_function_max_slices: cmd.python_function_max_slices,
             include_task_context: cmd.include_task_context,
             include_go_context: cmd.include_go_context,
             task_context_force_restricted: false,
@@ -436,6 +444,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool, select
         "markers" => opts.markers = enable,
         "tpu-metrics" => opts.tpu_metrics = enable,
         "task-stacks" => opts.task_stacks = enable,
+        "python-function-trace" => opts.python_function_trace = enable,
         _ => unreachable!("validated recorder name not handled: {recorder_name}"),
     }
 }
@@ -461,6 +470,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.tpu_profile = false;
         opts.tpu_metrics = false;
         opts.task_stacks = false;
+        opts.python_function_trace = false;
 
         // Then enable exactly the specified recorders — no companion
         // defaults, so `--only-recorder network` yields state-only tracing.
@@ -476,6 +486,29 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
     for recorder_name in &recorders {
         enable_recorder(opts, recorder_name, true, Selection::WithCompanions);
     }
+    // It slows what it traces, so it takes no default target, and it keeps every
+    // event until the capture ends.
+    if opts.python_function_trace {
+        // The processes, their fork and exec events and the names are pystacks'.
+        // Under the kernel's confidentiality mode the recorder does not run, and
+        // the main object could not load with pystacks' reads in it.
+        if systing::systing_core::detect_confidentiality_mode() == 0 {
+            opts.collect_pystacks = true;
+        }
+        if opts.pid.is_empty() && opts.cgroup.is_empty() && opts.run_command.is_empty() {
+            anyhow::bail!(
+                "the python-function-trace recorder needs a target: --pid, --cgroup or a command \
+                 to run"
+            );
+        }
+        if opts.continuous > 0 {
+            anyhow::bail!(
+                "the python-function-trace recorder cannot be used with --continuous: it keeps \
+                 every event until the capture ends"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -755,6 +788,41 @@ mod tests {
         let opts = opts_from(&["--include-go-context"]);
         assert!(opts.include_go_context && !opts.include_task_context);
         assert!(!opts.no_sched && !opts.no_cpu_stack_traces);
+    }
+
+    #[test]
+    fn python_function_trace_is_off_by_default_and_needs_a_target() {
+        let opts = opts_from(&[]);
+        assert!(!opts.python_function_trace);
+        assert_eq!(
+            opts.python_function_max_slices,
+            systing::python_function_trace::DEFAULT_MAX_SLICES
+        );
+
+        let opts = opts_from(&["--only-recorder", "python-function-trace", "--pid", "1"]);
+        assert!(opts.python_function_trace);
+        assert!(opts.no_sched);
+
+        let mut no_target =
+            Command::try_parse_from(["systing", "--add-recorder", "python-function-trace"])
+                .unwrap();
+        let e = process_recorder_options(&mut no_target).unwrap_err();
+        assert!(e.to_string().contains("needs a target"), "{e}");
+
+        let mut continuous = Command::try_parse_from([
+            "systing",
+            "--add-recorder",
+            "python-function-trace",
+            "--pid",
+            "1",
+            "--continuous",
+            "10",
+        ])
+        .unwrap();
+        let e = process_recorder_options(&mut continuous).unwrap_err();
+        assert!(e.to_string().contains("--continuous"), "{e}");
+
+        assert!(Command::try_parse_from(["systing", "--python-function-max-slices", "0"]).is_err());
     }
 
     #[test]

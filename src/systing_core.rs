@@ -581,6 +581,16 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             bpf_programs: &[],
             ringbuf_families: &[],
         },
+        RecorderInfo {
+            name: "python-function-trace",
+            description: "Every entry to and exit from a Python function in the targeted processes, which it slows many times over while it runs (--pid, --cgroup or a command; --python-function-max-slices)",
+            default_enabled: false,
+            // Its programs are their own BPF object
+            // (src/bpf/python_function_trace.bpf.c), loaded only when this
+            // recorder runs. Its rings are a family of the main object's.
+            bpf_programs: &[],
+            ringbuf_families: &["python_function_ringbufs"],
+        },
     ]
 }
 
@@ -619,6 +629,7 @@ fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
         "tpu" => opts.tpu_profile,
         "tpu-metrics" => opts.tpu_metrics,
         "task-stacks" => opts.task_stacks,
+        "python-function-trace" => opts.python_function_trace,
         _ => false,
     }
 }
@@ -670,6 +681,7 @@ const RINGBUF_FAMILIES: &[(&str, &str, bool)] = &[
     ("packet_ringbufs", "rb_pkt_", false),
     ("epoll_ringbufs", "rb_epl_", false),
     ("memory_ringbufs", "rb_mem_", false),
+    ("python_function_ringbufs", "rb_pyf_", false),
 ];
 
 /// The first kernel whose BPF_MAP_UPDATE_BATCH on a map-of-maps waits ONE RCU
@@ -857,8 +869,10 @@ pub fn get_required_bpf_programs(
         }
     }
 
-    // PID filtering needs fork tracking to follow child processes
-    if !opts.pid.is_empty() {
+    // PID filtering needs fork tracking to follow child processes, and the
+    // python-function-trace recorder learns of its processes from these events
+    // however it was targeted.
+    if !opts.pid.is_empty() || opts.python_function_trace {
         required.insert("systing_sched_process_fork");
     }
 
@@ -871,7 +885,7 @@ pub fn get_required_bpf_programs(
     }
 
     // Pystacks with PID filtering needs exec tracking to discover new Python processes
-    if collect_pystacks && !opts.pid.is_empty() {
+    if collect_pystacks && (!opts.pid.is_empty() || opts.python_function_trace) {
         required.insert("systing_sched_process_exec");
     }
 
@@ -1710,6 +1724,11 @@ pub struct Config {
     pub task_stacks: bool,
     /// Interval between task-stacks snapshots in milliseconds
     pub task_stacks_interval_ms: u64,
+    /// Enable the python-function-trace recorder. Needs a target
+    /// (`pid` or `cgroup`): every process it traces is slowed.
+    pub python_function_trace: bool,
+    /// The slices that recorder keeps; reaching this takes its probes out.
+    pub python_function_max_slices: usize,
     /// Read each sampled thread's task_context (`--include-task-context`):
     /// the id of the thread's current context goes into every running-stack
     /// sample (and, with the task-stacks recorder, into every event of it)
@@ -1814,6 +1833,8 @@ impl Default for Config {
             tpu_metrics_interval: 1000,
             task_stacks: false,
             task_stacks_interval_ms: 100,
+            python_function_trace: false,
+            python_function_max_slices: crate::python_function_trace::DEFAULT_MAX_SLICES,
             include_task_context: false,
             task_context_force_restricted: false,
             task_context_planted_recipes: Vec::new(),
@@ -1852,7 +1873,7 @@ fn prepare_output_dir(dir: &std::path::Path) -> Result<()> {
 
 /// Get the device and inode number of our PID namespace
 /// Returns (dev, ino) or (0, 0) if the file doesn't exist or fails
-fn detect_confidentiality_mode() -> u32 {
+pub fn detect_confidentiality_mode() -> u32 {
     // Read /sys/kernel/security/lockdown to check if confidentiality mode is enabled
     match fs::read_to_string("/sys/kernel/security/lockdown") {
         Ok(content) => {
@@ -2270,6 +2291,7 @@ struct RecorderChannels {
     /// every channel is used SPSC and consumers never contend with each other.
     event_rxs: Vec<Receiver<task_event>>,
     stack_rx: Receiver<stack_event>,
+    python_function_rx: Receiver<crate::python_function_trace::WireEvent>,
     cache_rx: Receiver<perf_counter_event>,
     probe_rx: Receiver<probe_event>,
     network_rx: Receiver<network_event>,
@@ -2301,6 +2323,7 @@ fn spawn_recorder_threads(
     let RecorderChannels {
         event_rxs,
         stack_rx,
+        python_function_rx,
         cache_rx,
         probe_rx,
         network_rx,
@@ -2378,6 +2401,25 @@ fn spawn_recorder_threads(
                     consume_loop::<SystingProbeRecorder, probe_event>(
                         &session_recorder.probe_recorder,
                         probe_rx,
+                        my_stop_tx,
+                        my_task_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    if opts.python_function_trace {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("py_func_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<crate::python_function_trace::PythonFunctionRecorder, _>(
+                        &session_recorder.python_function_recorder,
+                        python_function_rx,
                         my_stop_tx,
                         my_task_tx,
                     );
@@ -3151,6 +3193,7 @@ fn handle_exec_events(
     psr: Arc<crate::pystacks::stack_walker::StackWalkerRun>,
     pids_map: libbpf_rs::MapHandle,
     pystacks_debug: bool,
+    python_function_trace: Option<Sender<u32>>,
 ) {
     // Pids we've successfully registered with pystacks. Used only to keep the
     // logging quiet on repeat events; it does NOT short-circuit re-discovery,
@@ -3165,6 +3208,12 @@ fn handle_exec_events(
         let pid = event.pid;
         let is_fork = event.is_fork != 0;
         let kind = if is_fork { "Fork" } else { "Exec" };
+        // At once, whether it is a Python yet or not: the retries below are this
+        // thread's, an embedder's libpython can be mapped later than them, and the
+        // recorder goes on looking for itself.
+        if let Some(tx) = &python_function_trace {
+            let _ = tx.send(pid);
+        }
         let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
             if pystacks_debug {
                 eprintln!(
@@ -3567,6 +3616,8 @@ fn setup_ringbuffers<'a>(
                     let ring = create_memory_ring(inner, memory_tx.clone())?;
                     rings.push((poller, ring));
                 }
+                // After the Python symbol channel, below: its rings carry both.
+                "python_function_ringbufs" => {}
                 other => anyhow::bail!("unknown ring family '{other}'"),
             }
         }
@@ -3614,6 +3665,26 @@ fn setup_ringbuffers<'a>(
         }
     }
 
+    // Events and symbol records on one per-CPU ring, told apart by their size: a
+    // probe never waits for another CPU, even to send a name.
+    let (python_function_tx, python_function_rx) = sync_channel(CHANNEL_CAPACITY);
+    for (outer, prefix, inners) in &shards.families {
+        if *outer != "python_function_ringbufs" {
+            continue;
+        }
+        let symbols_tx = pysym_tx_for_walk
+            .clone()
+            .context("the python-function-trace recorder needs collect_pystacks")?;
+        for (i, inner) in inners.iter().enumerate() {
+            let ring = crate::python_function_trace::create_ring(
+                inner,
+                python_function_tx.clone(),
+                symbols_tx.clone(),
+            )?;
+            rings.push((format!("{prefix}{i}"), ring));
+        }
+    }
+
     let exec_event_rx = if has_exec_ringbuf {
         Some(exec_rx)
     } else {
@@ -3623,6 +3694,7 @@ fn setup_ringbuffers<'a>(
     let channels = RecorderChannels {
         event_rxs,
         stack_rx,
+        python_function_rx,
         cache_rx,
         probe_rx,
         memory_rx,
@@ -5666,6 +5738,7 @@ struct ThreadHandles {
     /// Holds a `task_info_tx` clone, so it is stopped before the discovery
     /// thread is joined.
     task_stacks_thread: Option<crate::task_stacks_recorder::TaskStacksThread>,
+    python_function_trace: Option<crate::python_function_trace::Running>,
     /// `--include-task-context`: finished once the ring pollers are joined
     /// (two of `ringbuf_threads` poll its rings).
     task_context: Option<crate::task_context::Running>,
@@ -5719,6 +5792,7 @@ fn run_tracing_loop(
     shutdown_signal: Arc<AtomicBool>,
     skel: &mut SystingSystemSkel,
     traced_child: &Option<crate::traced_command::TracedChild>,
+    recorder: &SessionRecorder,
 ) -> Result<i64> {
     sd_notify()?;
 
@@ -5811,6 +5885,20 @@ fn run_tracing_loop(
         skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
         get_clock_value(libc::CLOCK_BOOTTIME) as i64
     };
+    // First of all: the processes it traces pay until its probes are out.
+    if let Some(python_function_trace) = handles.python_function_trace {
+        let _p = stop_phase("take out the Python function probes");
+        // Not under the recorder's lock: its consumer keeps taking events from the
+        // rings while the probes come out.
+        match python_function_trace.stop() {
+            Ok(finished) => recorder
+                .python_function_recorder
+                .lock()
+                .unwrap()
+                .finish(finished),
+            Err(e) => eprintln!("Warning: the python-function-trace recorder failed: {e:#}"),
+        }
+    }
     if let Some(task_stacks) = handles.task_stacks_thread {
         let _p = stop_phase("join task-stacks iterator");
         task_stacks.stop();
@@ -5907,6 +5995,12 @@ fn run_tracing_loop(
         "Missed cache events: {}",
         dump_missed_events(&skel.maps.missed_events, 3)
     );
+    if opts.python_function_trace {
+        println!(
+            "Missed python function events: {}",
+            dump_missed_events(&skel.maps.missed_events, 10)
+        );
+    }
     if opts.network {
         println!(
             "Missed network events: {}",
@@ -6010,6 +6104,32 @@ pub fn systing(
         );
     }
 
+    // Every Python call of a traced process pays: never all of a host's.
+    let python_function_trace_off =
+        opts.python_function_trace && detect_confidentiality_mode() == 1;
+    if python_function_trace_off {
+        // Nothing of any process is read in this mode: no rings, and no programs.
+        // The capture's others run on, and its trace says why (below).
+        opts.python_function_trace = false;
+    }
+    if opts.python_function_trace {
+        if !opts.collect_pystacks {
+            bail!("the python-function-trace recorder needs collect_pystacks");
+        }
+        if opts.pid.is_empty() && opts.cgroup.is_empty() {
+            bail!(
+                "the python-function-trace recorder needs a target: --pid, --cgroup or a \
+                 command to run"
+            );
+        }
+        if opts.continuous > 0 {
+            bail!(
+                "the python-function-trace recorder cannot be used with continuous mode: it \
+                 keeps every event until the capture ends"
+            );
+        }
+    }
+
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     if opts.ringbuf_size_mib >= 4096 {
         bail!(
@@ -6050,7 +6170,11 @@ pub fn systing(
         get_required_ringbuf_families(&opts).len() as u32 + 1,
         num_cpus,
         is_recorder_enabled("memory", &opts),
-    );
+    ) + if opts.python_function_trace {
+        crate::python_function_trace::MAX_LINKS
+    } else {
+        0
+    };
     match fd_limits {
         Some(FdLimits {
             soft_before,
@@ -6314,6 +6438,17 @@ pub fn systing(
                     );
                 }
                 opts.pystacks_pids.clone()
+            } else if opts.pid.is_empty() && opts.python_function_trace {
+                // Pystacks is on for this recorder, whose targets are the cgroups':
+                // not worth registering, or room for, every Python on the host.
+                let mut in_cgroups = HashSet::new();
+                for cgroup in &opts.cgroup {
+                    crate::cgroup::collect_cgroup_procs(
+                        std::path::Path::new(cgroup),
+                        &mut in_cgroups,
+                    );
+                }
+                in_cgroups.into_iter().collect()
             } else if opts.pid.is_empty() {
                 // No PIDs specified, discover all Python processes
                 let discovered = discover_python_processes(pystacks_debug);
@@ -6649,6 +6784,47 @@ pub fn systing(
         } else {
             None
         };
+        // The Python function trace: loaded here for the same reason. Its look
+        // at the targets begins once pystacks is up, below. A recorder that cannot
+        // run leaves the capture's others running, and says why in the trace.
+        let mut python_function_trace = None;
+        if python_function_trace_off {
+            eprintln!(
+                "python-function-trace: off for this capture: the kernel's confidentiality mode"
+            );
+            recorder
+                .python_function_recorder
+                .lock()
+                .unwrap()
+                .set_off("the kernel's confidentiality mode: nothing of any process is read");
+        }
+        if opts.python_function_trace {
+            match crate::python_function_trace::load(
+                crate::python_function_trace::Options {
+                    pids: opts.pid.clone(),
+                    cgroups: opts.cgroup.iter().map(std::path::PathBuf::from).collect(),
+                    max_slices: opts.python_function_max_slices,
+                    cgroup_match_kernel: target_filter.cgroup_match_kernel,
+                    nr_rings: ring_plan.nr_rings,
+                    wakeup_bytes: u64::from(ring_plan.ring_bytes) / 2,
+                },
+                target_filter,
+                &target_filter_maps(&skel),
+                &shared_pystacks_maps(&skel),
+                skel.maps.python_function_ringbufs.as_fd(),
+                skel.maps.missed_events.as_fd(),
+            ) {
+                Ok(running) => python_function_trace = Some(running),
+                Err(e) => {
+                    eprintln!("python-function-trace: off for this capture: {e:#}");
+                    recorder
+                        .python_function_recorder
+                        .lock()
+                        .unwrap()
+                        .set_off(&format!("{e:#}"));
+                }
+            }
+        }
         // The iterator's own symbol ringbuf, polled into the same channel, and
         // first: its first walk can fill the ringbuf before any poller runs. The
         // map handle lives here, as the iterator's thread exits before the pollers.
@@ -6731,6 +6907,8 @@ pub fn systing(
             None => None,
         };
 
+        let python_function_psr = psr.clone();
+
         // Spawn exec event handler thread to dynamically add Python PIDs.
         // See handle_exec_events() for details.
         let mut exec_handler_thread: Option<thread::JoinHandle<()>> = None;
@@ -6739,11 +6917,18 @@ pub fn systing(
             let pystacks_debug = opts.pystacks_debug;
             let pids_map = libbpf_rs::MapHandle::try_from(&skel.maps.pids)
                 .context("Failed to get handle to BPF pids map")?;
+            let python_function_tx = python_function_trace.as_ref().map(|t| t.notifier());
             exec_handler_thread = Some(
                 thread::Builder::new()
                     .name("pystacks_exec_handler".to_string())
                     .spawn(move || {
-                        handle_exec_events(exec_rx, exec_psr, pids_map, pystacks_debug);
+                        handle_exec_events(
+                            exec_rx,
+                            exec_psr,
+                            pids_map,
+                            pystacks_debug,
+                            python_function_tx,
+                        );
                     })?,
             );
         }
@@ -6802,6 +6987,12 @@ pub fn systing(
                 }
                 0
             })?);
+        }
+
+        // With the pollers and the symbol loader running: a process with its probes
+        // in fills its ring, and sends its names, from that moment.
+        if let Some(running) = python_function_trace.as_mut() {
+            running.begin(python_function_psr, recorder.clone());
         }
 
         // Start the sysinfo recorder if it's enabled. Skip it when the kernel
@@ -6872,6 +7063,9 @@ pub fn systing(
             }
             if opts.memory || opts.memory_alloc {
                 classes.push(8);
+            }
+            if opts.python_function_trace {
+                classes.push(10);
             }
             if opts.memory {
                 // The cross-leg scratch drops (class 9): a counter track
@@ -7022,6 +7216,7 @@ pub fn systing(
             task_info_tx,
             tpu_metrics_thread,
             task_stacks_thread,
+            python_function_trace,
             task_context,
             go_context,
         };
@@ -7035,6 +7230,7 @@ pub fn systing(
             shutdown_signal,
             &mut skel,
             &traced_child,
+            &recorder,
         )?;
 
         // The packets tier's honesty line: the exit summary above prints

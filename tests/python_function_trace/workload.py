@@ -1,5 +1,25 @@
+"""What tests/python_function_trace.rs traces: a known number of calls of each kind.
+
+Waits for the file named by its first argument, so that the probes are in before
+any of the calls. With `fork` and a third argument, it waits for the file named by
+that argument, forks, and parent and child each make all of them. With `exec` and a
+third argument, it makes them, then execs itself to wait for the file named by that
+argument and make them again.
+"""
 import asyncio
+import os
+import sys
 import threading
+import time
+
+forked = len(sys.argv) > 3 and sys.argv[2] == "fork"
+if forked:
+    while not os.path.exists(sys.argv[3]):
+        time.sleep(0.01)
+child = forked and os.fork()
+print("ready", flush=True)
+while not os.path.exists(sys.argv[1]):
+    time.sleep(0.01)
 
 
 def leaf(x):
@@ -78,4 +98,7 @@ for t in threads:
     t.start()
 for t in threads:
     t.join()
-print("ok")
+if forked and child:
+    os.waitpid(child, 0)
+if len(sys.argv) > 3 and sys.argv[2] == "exec":
+    os.execv(sys.executable, [sys.executable, sys.argv[0], sys.argv[3]])

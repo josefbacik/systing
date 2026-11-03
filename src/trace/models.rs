@@ -705,6 +705,24 @@ pub struct SysInfoRecord {
     /// given, and in traces from before schema 30. With it NULL, a NULL
     /// `stack_sample.go_goid` says nothing about the program.
     pub go_context: Option<String>,
+    /// How many processes the python-function-trace recorder had probes in.
+    /// `None` when the recorder was not asked for, and in traces from before
+    /// schema 34: the next six are `None` with it.
+    pub python_function_processes: Option<i64>,
+    /// Events it saw. Those lost to a full ring are counted as every recorder's
+    /// are: the `python function` missed-events class.
+    pub python_function_events: Option<i64>,
+    /// Probe hits that found no Python thread state behind the TLS slot.
+    pub python_function_no_thread_state: Option<i64>,
+    /// Probe hits lost otherwise: no frame, or no name to give a function.
+    pub python_function_lost_events: Option<i64>,
+    /// Records of a function's name lost to a full ring.
+    pub python_function_symbol_records_dropped: Option<i64>,
+    /// Whether its slice cap ended the trace before the capture ended.
+    pub python_function_cap_reached: Option<bool>,
+    /// Processes that were a Python and were not traced, and what could make
+    /// the trace wrong for those that were, one per line. `None` where none.
+    pub python_function_notes: Option<String>,
 }
 
 /// Per-CPU static frequency limits from sysfs cpufreq, in kHz.
@@ -950,6 +968,25 @@ pub struct TaskStackEventRecord {
     pub holds_gil: Option<bool>,
 }
 
+/// One run of a Python frame (the python-function-trace recorder): from the
+/// frame's entry or resumption to its return, yield or unwinding.
+#[derive(Clone, Debug)]
+pub struct PythonFunctionSliceRecord {
+    pub ts: i64,
+    pub dur: i64,
+    pub utid: i64,
+    /// How many traced frames were open on the thread below this one.
+    pub depth: i32,
+    /// `module:qualname`.
+    pub function: String,
+    /// The source file, its last 192 bytes; `None` where there was none.
+    pub file: Option<String>,
+    /// The function's first line.
+    pub line: i32,
+    /// `return`, `yield`, `unwound` or `open`.
+    pub end_kind: String,
+}
+
 /// One named value of one task_context id of one thread
 /// (`--include-task-context`): what the thread had set under `name` while its
 /// context id was `id`. A thread's id changes with every set or clear, so the
@@ -1041,6 +1078,7 @@ pub struct ExtractedData {
     pub memory_thp: Vec<MemoryThpRecord>,
     pub memory_vmstat: Vec<MemoryVmstatRecord>,
     pub task_stack_events: Vec<TaskStackEventRecord>,
+    pub python_function_slices: Vec<PythonFunctionSliceRecord>,
     pub task_contexts: Vec<TaskContextRecord>,
     pub go_labels: Vec<GoLabelRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,

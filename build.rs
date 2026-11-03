@@ -316,8 +316,8 @@ fn build_task_stacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &
     println!("cargo:rerun-if-changed=crates/task-context/include/task_context.h");
 }
 
-/// Build the Python function trace's BPF object and its skeleton: an
-/// object of its own, loaded only by `systing-python-function-trace`. Like the
+/// Build the python-function-trace recorder's BPF object and its skeleton: an
+/// object of its own, loaded only when that recorder runs. Like the
 /// task-stacks object it compiles `pystacks.bpf.c` into itself (here in its
 /// plain, non-sleepable form) for the symbol records and the thread-state
 /// lookup.
@@ -340,10 +340,13 @@ fn build_python_function_trace_bpf(
     let pystacks_include_arg = include("src/pystacks/bpf/include");
     // For `#include "pystacks.bpf.c"`.
     let pystacks_src_arg = include("src/pystacks/bpf");
+    // For `#include "systing_shared.bpf.h"`.
+    let bpf_include_arg = include("src/bpf");
 
     let obj_path = out_dir.join("python_function_trace.bpf.o");
     let mut object_args = vec![
         OsStr::new(&out_dir_include_arg),
+        OsStr::new(&bpf_include_arg),
         OsStr::new(&pystacks_include_arg),
         OsStr::new(&pystacks_src_arg),
         OsStr::new(arch_define),

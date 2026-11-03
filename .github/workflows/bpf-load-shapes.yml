@@ -175,6 +175,11 @@ jobs:
           test -x "$SYSTING"
           cp "$BIN" gate/trace_validation
           cp "$SYSTING" gate/systing
+          cargo test --test python_function_trace --no-run --no-default-features --message-format=json > /tmp/build-pyft.json
+          PYFT="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "python_function_trace") | .executable' /tmp/build-pyft.json | tail -n 1)"
+          test -x "$PYFT"
+          cp "$PYFT" gate/python_function_trace
+          strip --strip-debug gate/python_function_trace
           # Debug builds carry most of their size in debug sections nothing in the guest
           # reads; drop them from the shipped COPIES only, so the artifact stays small.
           strip --strip-debug gate/trace_validation gate/systing
@@ -353,6 +358,25 @@ jobs:
           cat "$OUT" || cat "$OUT.raw" || true
           echo "::endgroup::"
           grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      - name: Boot the kernel again and run the python-function-trace end-to-end cases
+        run: |
+          chmod +x gate/python_function_trace scripts/ci/vmtest-python-function-trace-e2e.sh
+          mkdir -p guest-tmp
+          OUT="$GITHUB_WORKSPACE/python-function-trace-e2e-${{ matrix.kernel.id }}.log"
+          KVM_FLAG=""
+          [ -w /dev/kvm ] || KVM_FLAG="--disable-kvm"
+          set +e
+          timeout 1800 vng --run "kernels/${{ matrix.kernel.id }}/kernel" $KVM_FLAG --force-9p --cpus 4 --memory 8G \
+            --rwdir "$GITHUB_WORKSPACE" --rwdir "/tmp=$GITHUB_WORKSPACE/guest-tmp" \
+            --append oops=panic --append virtme_root_user=1 --verbose \
+            -- bash "$GITHUB_WORKSPACE/scripts/ci/vmtest-python-function-trace-e2e.sh" \
+                 "$GITHUB_WORKSPACE/gate/python_function_trace" "$GITHUB_WORKSPACE/gate" "$OUT"
+          echo "vng exited $? (informational, as above: the guest-written file decides)"
+          set -e
+          echo "::group::guest output (${{ matrix.kernel.id }})"
+          cat "$OUT" || cat "$OUT.raw" || true
+          echo "::endgroup::"
+          grep -q '^VNG-TEST-EXIT:0$' "$OUT"
       - name: Boot the kernel again and run the go_context end-to-end cases
         run: |
           chmod +x gate/go_context_record scripts/ci/vmtest-go-context-e2e.sh
@@ -389,6 +413,15 @@ jobs:
             task-context-e2e-${{ matrix.kernel.id }}.log
             task-context-e2e-${{ matrix.kernel.id }}.log.raw
             task-context-e2e-${{ matrix.kernel.id }}.log.counters
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-function-trace-e2e-${{ matrix.kernel.id }}
+          path: |
+            python-function-trace-e2e-${{ matrix.kernel.id }}.log
+            python-function-trace-e2e-${{ matrix.kernel.id }}.log.raw
           if-no-files-found: ignore
           retention-days: 7
       - uses: actions/upload-artifact@v4

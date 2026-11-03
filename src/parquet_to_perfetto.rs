@@ -36,7 +36,7 @@ use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
-use perfetto_protos::track_event::TrackEvent;
+use perfetto_protos::track_event::{EventName, TrackEvent};
 
 use crate::perfetto::{StreamingTraceWriter, TraceWriter};
 
@@ -169,6 +169,9 @@ impl ParquetToPerfettoConverter {
 
         // 9b. Write the task-stacks recorder's events: a stack track per thread
         self.write_task_stack_events(input_dir, writer)?;
+
+        // 9c. The python-function-trace recorder's slices: a track per thread
+        self.write_python_function_slices(input_dir, writer)?;
 
         // 10. Write network data (sockets, packets, syscalls, polls)
         self.write_network_data(input_dir, writer)?;
@@ -1654,28 +1657,8 @@ impl ParquetToPerfettoConverter {
                 continue;
             }
 
-            // The thread's own track is the parent. A main thread has none: its
-            // utid stands for the process track, where the stack would show as
-            // the process's and the thread stay nameless. Give it one.
             let info = thread_info.get(&utid);
-            let parent = match info {
-                Some((tid, name, upid)) if self.resolve_tgid(*upid, *tid) == *tid => {
-                    let uuid = self.alloc_uuid();
-                    let mut thread = ThreadDescriptor::default();
-                    thread.set_tid(*tid);
-                    thread.set_pid(*tid);
-                    thread.set_thread_name(name.clone());
-                    let mut desc = TrackDescriptor::default();
-                    desc.set_uuid(uuid);
-                    desc.set_name(name.clone());
-                    desc.thread = Some(thread).into();
-                    let mut packet = TracePacket::default();
-                    packet.set_track_descriptor(desc);
-                    writer.write_packet(&packet)?;
-                    Some(uuid)
-                }
-                _ => self.utid_to_uuid.get(&utid).copied(),
-            };
+            let parent = self.thread_track_parent(utid, info, writer)?;
 
             let track = self.alloc_uuid();
             let mut desc = TrackDescriptor::default();
@@ -1716,6 +1699,197 @@ impl ParquetToPerfettoConverter {
                     (frame.start, frame.end),
                     annotations,
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The track a track of a thread's own goes under: the thread's. A main
+    /// thread has none: its utid stands for the process track, where the track
+    /// would show as the process's and the thread stay nameless. Give it one.
+    fn thread_track_parent(
+        &mut self,
+        utid: i64,
+        info: Option<&ThreadInfo>,
+        writer: &mut dyn TraceWriter,
+    ) -> Result<Option<u64>> {
+        Ok(match info {
+            Some((tid, name, upid)) if self.resolve_tgid(*upid, *tid) == *tid => {
+                let uuid = self.alloc_uuid();
+                let mut thread = ThreadDescriptor::default();
+                thread.set_tid(*tid);
+                thread.set_pid(*tid);
+                thread.set_thread_name(name.clone());
+                let mut desc = TrackDescriptor::default();
+                desc.set_uuid(uuid);
+                desc.set_name(name.clone());
+                desc.thread = Some(thread).into();
+                let mut packet = TracePacket::default();
+                packet.set_track_descriptor(desc);
+                writer.write_packet(&packet)?;
+                Some(uuid)
+            }
+            _ => self.utid_to_uuid.get(&utid).copied(),
+        })
+    }
+
+    /// Write the python-function-trace recorder's slices
+    /// (python_function_slice.parquet) as a `Python Functions: <thread>` track
+    /// under each thread. A function called a million times is named once: the
+    /// names are interned on a packet sequence of this track family's own. A
+    /// slice is named after the function alone; where it is from and how it
+    /// ended go in its arguments.
+    fn write_python_function_slices(
+        &mut self,
+        input_dir: &Path,
+        writer: &mut dyn TraceWriter,
+    ) -> Result<()> {
+        let path = input_dir.join("python_function_slice.parquet");
+        if !path.exists() {
+            return Ok(());
+        }
+        let thread_path = input_dir.join("thread.parquet");
+        let thread_info = if thread_path.exists() {
+            self.build_utid_to_thread_map(&thread_path)?
+        } else {
+            HashMap::new()
+        };
+
+        struct Row {
+            ts: i64,
+            dur: i64,
+            depth: i32,
+            function: u64,
+            file: Option<String>,
+            line: i32,
+            end_kind: String,
+        }
+        // The names by interning id, and the rows by thread in the order the
+        // threads first appear.
+        let mut name_ids: HashMap<String, u64> = HashMap::new();
+        let mut threads: Vec<(i64, Vec<Row>)> = Vec::new();
+        let mut thread_idx: HashMap<i64, usize> = HashMap::new();
+        for batch in &read_parquet_file(&path)? {
+            let int = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .with_context(|| format!("Missing {name} column in python_function_slice"))
+            };
+            let int32 = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .with_context(|| format!("Missing {name} column in python_function_slice"))
+            };
+            let string = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .with_context(|| format!("Missing {name} column in python_function_slice"))
+            };
+            let (ts, dur, utids) = (int("ts")?, int("dur")?, int("utid")?);
+            let (depths, lines) = (int32("depth")?, int32("line")?);
+            let (functions, files, ends) =
+                (string("function")?, string("file")?, string("end_kind")?);
+            for i in 0..batch.num_rows() {
+                let utid = utids.value(i);
+                let idx = *thread_idx.entry(utid).or_insert_with(|| {
+                    threads.push((utid, Vec::new()));
+                    threads.len() - 1
+                });
+                let next = name_ids.len() as u64 + 1;
+                let function = *name_ids
+                    .entry(functions.value(i).to_string())
+                    .or_insert(next);
+                threads[idx].1.push(Row {
+                    ts: ts.value(i),
+                    dur: dur.value(i),
+                    depth: depths.value(i),
+                    function,
+                    file: get_optional_string(Some(files), i),
+                    line: lines.value(i),
+                    end_kind: ends.value(i).to_string(),
+                });
+            }
+        }
+
+        let seq_id = self.alloc_seq_id();
+        let mut names = InternedData::default();
+        for (name, iid) in &name_ids {
+            let mut event_name = EventName::default();
+            event_name.set_iid(*iid);
+            event_name.set_name(name.clone());
+            names.event_names.push(event_name);
+        }
+        let mut interned = Some(names);
+
+        for (utid, mut rows) in threads {
+            // Outermost first: an end closes whichever slice began last.
+            rows.sort_by_key(|r| (r.ts, r.depth));
+            let info = thread_info.get(&utid);
+            let parent = self.thread_track_parent(utid, info, writer)?;
+            let track = self.alloc_uuid();
+            let mut desc = TrackDescriptor::default();
+            desc.set_uuid(track);
+            desc.set_name(format!(
+                "Python Functions: {}",
+                info.map_or("thread", |(_, name, _)| name.as_str())
+            ));
+            if let Some(parent) = parent {
+                desc.set_parent_uuid(parent);
+            }
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            writer.write_packet(&packet)?;
+
+            let mut emit =
+                |writer: &mut dyn TraceWriter, at: i64, row: Option<&Row>| -> Result<()> {
+                    let mut event = TrackEvent::default();
+                    event.set_track_uuid(track);
+                    let mut packet = TracePacket::default();
+                    match row {
+                        Some(row) => {
+                            event.set_type(Type::TYPE_SLICE_BEGIN);
+                            event.set_name_iid(row.function);
+                            event.categories.push("python".to_string());
+                            let mut text = |name: &str, value: &str| {
+                                let mut annotation = DebugAnnotation::default();
+                                annotation.set_name(name.to_string());
+                                annotation.set_string_value(value.to_string());
+                                event.debug_annotations.push(annotation);
+                            };
+                            if let Some(file) = &row.file {
+                                text("file", file);
+                            }
+                            text("line", &row.line.to_string());
+                            text("language", "python");
+                            text("end", &row.end_kind);
+                        }
+                        None => event.set_type(Type::TYPE_SLICE_END),
+                    }
+                    packet.set_timestamp(at as u64);
+                    packet.set_track_event(event);
+                    packet.set_trusted_packet_sequence_id(seq_id);
+                    let mut flags = SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32;
+                    if let Some(names) = interned.take() {
+                        packet.interned_data = Some(names).into();
+                        flags |= SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32;
+                    }
+                    packet.set_sequence_flags(flags);
+                    writer.write_packet(&packet)
+                };
+            let mut open: Vec<&Row> = Vec::new();
+            for row in &rows {
+                while let Some(top) = open.last().filter(|top| top.depth >= row.depth) {
+                    emit(writer, top.ts + top.dur, None)?;
+                    open.pop();
+                }
+                emit(writer, row.ts, Some(row))?;
+                open.push(row);
+            }
+            while let Some(top) = open.pop() {
+                emit(writer, top.ts + top.dur, None)?;
             }
         }
         Ok(())
@@ -3014,6 +3188,7 @@ fn merge_frames<'a>(
 /// scheduler tables (e.g. only the task-stacks or marker recorders).
 const TRACE_START_FALLBACK_TABLES: &[&str] = &[
     "task_stack_event",
+    "python_function_slice",
     "slice",
     "instant",
     "counter",
@@ -4442,6 +4617,91 @@ mod tests {
             .map(|f| (f.start, f.end))
             .collect();
         assert_eq!(got, [(1_000, 2_000), (3_000, 4_000)]);
+    }
+
+    #[test]
+    fn python_function_slices_nest_on_a_track_with_each_name_once() {
+        use crate::perfetto::VecTraceWriter;
+        let dir = tempfile::TempDir::new().unwrap();
+        create_test_thread_parquet(dir.path(), 100, 2000, Some(1)).unwrap();
+        // (ts, dur, depth, function, file, line, end): written out of order.
+        #[allow(clippy::type_complexity)]
+        let rows: [(i64, i64, i32, &str, Option<&str>, i32, &str); 3] = [
+            (20, 10, 1, "m:leaf", Some("/a/m.py"), 3, "return"),
+            (10, 90, 0, "m:main", None, 1, "open"),
+            (40, 10, 1, "m:leaf", Some("/a/m.py"), 3, "unwound"),
+        ];
+        let schema = crate::trace::python_function_slice_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|_| 100))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.2))),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.3))),
+                Arc::new(StringArray::from_iter(rows.iter().map(|r| r.4))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.5))),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.6))),
+            ],
+        )
+        .unwrap();
+        let file = File::create(dir.path().join("python_function_slice.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut out = VecTraceWriter::default();
+        converter
+            .write_python_function_slices(dir.path(), &mut out)
+            .unwrap();
+
+        // (ts, begin or end) in order: main opens first and closes last.
+        let events: Vec<(u64, bool)> = out
+            .packets
+            .iter()
+            .filter(|p| p.has_track_event())
+            .map(|p| {
+                (
+                    p.timestamp(),
+                    p.track_event().type_() == Type::TYPE_SLICE_BEGIN,
+                )
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [
+                (10, true),
+                (20, true),
+                (30, false),
+                (40, true),
+                (50, false),
+                (100, false)
+            ]
+        );
+        // The first packet of the sequence clears its state and carries each
+        // name once; every packet says it needs that state.
+        let first = out.packets.iter().find(|p| p.has_track_event()).unwrap();
+        assert!(first.sequence_flags() & SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32 != 0);
+        let mut names: Vec<&str> = first
+            .interned_data
+            .event_names
+            .iter()
+            .map(|n| n.name())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["m:leaf", "m:main"]);
+        let titles: Vec<&str> = out
+            .packets
+            .iter()
+            .filter(|p| p.has_track_descriptor())
+            .map(|p| p.track_descriptor().name())
+            .collect();
+        assert!(
+            titles.iter().any(|t| t.starts_with("Python Functions: ")),
+            "{titles:?}"
+        );
     }
 
     #[test]
