@@ -124,6 +124,12 @@ pub struct KernelCounters {
     pub symbol_busy: u64,
     /// Entry and handler events, what [`slice_cutoff`] counts and the cap holds.
     pub begun: u64,
+    /// Every run of the probe, and those that stopped for want of a target or a
+    /// config: with `events`, what tells a process that made no calls from one
+    /// whose probes never fire or find nothing.
+    pub hits: u64,
+    pub not_targeted: u64,
+    pub no_config: u64,
 }
 
 /// One event as BPF sends it (`struct pyft_event`), with the thread's identity as
@@ -324,8 +330,9 @@ impl PythonFunctionRecorder {
         }
     }
 
+    /// Whether it ran: its closing line matters most when it has no slices.
     pub fn has_data(&self) -> bool {
-        !self.threads.is_empty()
+        self.outcome.is_some()
     }
 
     /// When the first process began to be traced.
@@ -347,20 +354,9 @@ impl PythonFunctionRecorder {
         capture_end: u64,
     ) -> Result<()> {
         let threads = std::mem::take(&mut self.threads);
-        let (cap_reached, traced, no_state, no_frame, no_code, dropped_names) = self
-            .outcome
-            .as_ref()
-            .map(|o| {
-                (
-                    o.cap_reached,
-                    o.traced,
-                    o.kernel.no_thread_state,
-                    o.kernel.no_frame,
-                    o.kernel.no_code,
-                    o.kernel.symbol_records_dropped,
-                )
-            })
-            .unwrap_or_default();
+        let outcome = self.outcome.clone().unwrap_or_default();
+        let cap_reached = outcome.cap_reached;
+        let k = outcome.kernel;
         let end = if cap_reached {
             slice_cutoff(&threads, &self.started, self.max_slices)
                 .map_or(capture_end, |at| at.min(capture_end))
@@ -427,12 +423,22 @@ impl PythonFunctionRecorder {
             counters.add(&pairer.counters);
         }
         eprintln!(
-            "python-function-trace: {written} slices of {traced} processes; {no_state} events \
-             with no thread state, {no_frame} with no frame, {no_code} with no name to give \
-             ({dropped_names} name records lost); {} slices with no return event (an exception, \
-             or a lost or unseen event), {} returns with no entry seen (frames from before the \
-             trace, the interpreter's own)",
-            counters.unwound, counters.unmatched_exits
+            "python-function-trace: {written} slices of {} processes; {} probe hits, {} events, \
+             {} out of the target set, {} with no config, {} with no thread state, {} with no \
+             frame, {} with no name to give ({} name records lost); {} slices with no return \
+             event (an exception, or a lost or unseen event), {} returns with no entry seen \
+             (frames from before the trace, the interpreter's own)",
+            outcome.traced,
+            k.hits,
+            k.events,
+            k.not_targeted,
+            k.no_config,
+            k.no_thread_state,
+            k.no_frame,
+            k.no_code,
+            k.symbol_records_dropped,
+            counters.unwound,
+            counters.unmatched_exits
         );
         Ok(())
     }
@@ -1465,6 +1471,9 @@ fn read_counters(map: &impl MapCore) -> KernelCounters {
         symbol_records_dropped: read(6),
         symbol_busy: read(7),
         begun: read(8),
+        hits: read(9),
+        not_targeted: read(10),
+        no_config: read(11),
     }
 }
 

@@ -97,6 +97,10 @@ fn capture_with(
         let line = line.expect("systing's stderr");
         stderr.push_str(&line);
         stderr.push('\n');
+        // What a failed run in a guest has to go on: the probes' own counts.
+        if line.starts_with("python-function-trace: ") {
+            println!("{line}");
+        }
         if line.starts_with("python-function-trace: process ") {
             in_place += 1;
             on_probes(in_place);

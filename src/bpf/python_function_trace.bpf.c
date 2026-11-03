@@ -78,7 +78,10 @@ enum pyft_counter {
 	PYFT_C_SYM_DROPPED = 6, /* the ring was full for a symbol record */
 	PYFT_C_SYM_BUSY = 7,   /* a miss met another miss on its CPU */
 	PYFT_C_BEGUN = 8,      /* entry and handler events submitted */
-	PYFT_NR_COUNTERS = 9,
+	PYFT_C_HITS = 9,       /* every run of the probe */
+	PYFT_C_NOT_TARGETED = 10, /* the process is out of the target set */
+	PYFT_C_NO_CONFIG = 11, /* pystacks has no config for the process */
+	PYFT_NR_COUNTERS = 12,
 };
 
 struct {
@@ -334,11 +337,16 @@ int pyft_site(struct pt_regs *ctx)
 	u64 pid_tgid = bpf_get_current_pid_tgid();
 	pid_t tgid = pid_tgid >> 32;
 
-	if (!current_in_target_set(task))
+	pyft_count(PYFT_C_HITS);
+	if (!current_in_target_set(task)) {
+		pyft_count(PYFT_C_NOT_TARGETED);
 		return 0;
+	}
 	PyPidData *pid_data = bpf_map_lookup_elem(&pystacks_pid_config, &tgid);
-	if (!pid_data)
+	if (!pid_data) {
+		pyft_count(PYFT_C_NO_CONFIG);
 		return 0;
+	}
 
 	u64 now = bpf_ktime_get_boot_ns();
 	void *tstate = get_thread_state(pid_data, NULL);
