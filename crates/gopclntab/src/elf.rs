@@ -214,15 +214,26 @@ impl ElfPclntab {
             _ => 2,
         });
         for section in sections {
+            // A compressed section is not read; [`read_named_section`] and
+            // [`ImageWords::section_bytes`] read none either. The loader maps a
+            // section's bytes as stored, so no table in use can be compressed.
+            if !matches!(
+                section.compressed_file_range(),
+                Ok(range) if range.format == object::CompressionFormat::None
+            ) {
+                continue;
+            }
             if section.size() == 0 || section.size() > budget {
                 continue;
             }
+            // Charged before the read, as the reader of the module data
+            // record charges before its own.
+            budget -= section.size();
             // A section claiming bytes past end-of-input cannot be read;
             // uncompressed_data fails and the section is skipped.
             let Ok(data) = section.uncompressed_data() else {
                 continue;
             };
-            budget = budget.saturating_sub(data.len() as u64);
             if let Some((offset, mut table)) = GoPclntab::scan_at(&data, text_vaddr) {
                 let table_vaddr = section.address().saturating_add(offset as u64);
                 if !settle_text_start(&elf, &mut table, table_vaddr, input_len) {
@@ -607,9 +618,9 @@ impl<'data, 'file, R: ReadRef<'data>> ImageWords<'data, 'file, R> {
         if range.uncompressed_size > self.budget {
             return None;
         }
-        let bytes = section.data().ok()?;
+        // Charged before the read.
         self.budget -= range.uncompressed_size;
-        Some(bytes)
+        section.data().ok()
     }
 
     /// The bytes backing `[vaddr, vaddr + len)`, reading (once) the
