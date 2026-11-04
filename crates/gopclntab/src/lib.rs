@@ -44,6 +44,7 @@ mod elf;
 mod error;
 
 pub use elf::ElfPclntab;
+pub use elf::LoadSegments;
 pub use error::Error;
 
 /// Go 1.2 through 1.15. Predates every Go release still in support;

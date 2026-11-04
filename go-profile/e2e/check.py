@@ -15,7 +15,16 @@ linker, each as built and stripped):
   (equal where the profile did not move); block and mutex delays may be a
   little beyond (1 us, and a part in a million): they are CPU ticks turned
   into nanoseconds, and until the program has worked out its tick rate the
-  reader works it out itself, a moment apart;
+  reader works it out itself, a moment apart. A stack that neither read holds
+  is looked for under one other name: where the compiler inlined a call into
+  the wrapper it made for a go or defer statement or a method value, Go names
+  the call and leaves the wrapper out, and the reader, which expands no
+  inlined call, names the wrapper. The stack is then held to the same rule
+  against the stack of the reads that has such a wrapper in that frame's place
+  and is the same in every other frame, if there is just one, and the
+  profile's line names the call. A wrapper counts only where the compiler puts
+  it: a go statement's at the root, a defer statement's above the function
+  that made it, a method value's in its own method's place;
 - goroutines: the 1000 parked goroutines on one stack on both sides, and the
   totals apart by no more than the goroutines that were running (which keep
   no stack in memory) and the one serving pprof;
@@ -32,6 +41,7 @@ import urllib.request
 
 EV_EVENT_BATCH, EV_EXPERIMENTAL_BATCH, EV_END_OF_GENERATION = 1, 49, 52
 PARKED = 1000
+WRAPPER = re.compile(r"\.(gowrap|deferwrap)\d+$")
 
 
 def run_json_lines(args):
@@ -42,12 +52,12 @@ def run_json_lines(args):
     return json.loads(lines[0]), [json.loads(line) for line in lines[1:]]
 
 
-def norm(stack):
+def norm(stack, wrappers=False):
     """Both sides alike: no unnamed frames, no wrappers a go or defer
-    statement made, no runtime.goexit at the root, and a function repeated in
-    a row once (Go's block and mutex stacks give inlined calls PCs of their
-    own)."""
-    s = [f for f in stack if f and f != "?" and not re.search(r"\.(gowrap|deferwrap)\d+$", f)]
+    statement made (`wrappers` keeps them), no runtime.goexit at the root, and
+    a function repeated in a row once (Go's block and mutex stacks give inlined
+    calls PCs of their own)."""
+    s = [f for f in stack if f and f != "?" and (wrappers or not WRAPPER.search(f))]
     while s and s[-1] == "runtime.goexit":
         s.pop()
     return tuple(f for i, f in enumerate(s) if i == 0 or s[i - 1] != f)
@@ -64,20 +74,61 @@ def by_stack(rows, skip_running=False):
     return d
 
 
-def between(before, pp, after, delays):
+def with_wrappers(rows):
+    return {norm(r["stack"], wrappers=True) for r in rows}
+
+
+def inlined_call(read, own):
+    """The one frame of `own`, a stack of the program's profile, in whose place
+    `read`, a stack out of memory that is otherwise the same, has a wrapper
+    (both with their wrappers kept); None if there is no such frame. A wrapper
+    counts only where the compiler puts it: a go statement's at the root, a
+    defer statement's above the function that made it (the body of a
+    range-over-function loop, "-rangeN", defers for the function around it), a
+    method value's ("-fm") in its own method's place."""
+    differ = [i for i, (r, o) in enumerate(zip(read, own)) if r != o]
+    if len(read) != len(own) or len(differ) != 1:
+        return None
+    i = differ[0]
+    if re.search(r"\.gowrap\d+$", read[i]):
+        fits = i == len(read) - 1
+    elif re.search(r"\.deferwrap\d+$", read[i]):
+        fits = re.sub(r"(-range\d+)*\.deferwrap\d+$", "", read[i]) in read[i + 1 :]
+    else:
+        fits = read[i] == own[i] + "-fm"
+    return own[i] if fits else None
+
+
+def between(before, pp, after, delays, own, reads):
     """The stacks whose pprof values are not between the two reads; with
-    `delays`, the second value is a delay converted from CPU ticks."""
+    `delays`, the second value is a delay converted from CPU ticks. And
+    {stack: (the reads' name for it, the inlined call)} of those that neither
+    read holds and that were looked up under the one stack of the reads that
+    has a wrapper for one of their calls: one that the program's profile does
+    not hold as well, and that stands for no other of its stacks. `own` and
+    `reads` are the two sides' stacks with their wrappers kept."""
+    claims = {}
+    for o in own:
+        if norm(o) not in before and norm(o) not in after:
+            found = {norm(w): inlined_call(w, o) for w in reads if inlined_call(w, o) and norm(w) not in pp}
+            if len(found) == 1:
+                r, call = found.popitem()
+                claims.setdefault(r, {})[norm(o)] = (r, call)
+    read_as = {k: v for ks in claims.values() if len(ks) == 1 for k, v in ks.items()}
     bad = []
     for k, p in pp.items():
-        b = before.get(k, [0] * len(p))
-        a = after.get(k, [0] * len(p))
+        r = read_as.get(k, (k,))[0]
+        b = before.get(r, [0] * len(p))
+        a = after.get(r, [0] * len(p))
         for i, (x, y, z) in enumerate(zip(b, p, a)):
             slack = 1000 + max(x, z) // 1_000_000 if delays and i == 1 else 0
             lo, hi = min(x, z) - slack, max(x, z) + slack
             if not lo <= y <= hi:
-                bad.append({"stack": list(k)[:5], "before": b, "pprof": p, "after": a})
+                bad.append({"stack": list(k), "before": b, "pprof": p, "after": a})
+                if r != k:
+                    bad[-1]["read_as"] = list(r)
                 break
-    return bad
+    return bad, read_as
 
 
 def uvarint(b, i):
@@ -151,8 +202,13 @@ def check_one(tool, workload, tmp):
                 if not 0 <= gap <= hb["running_without_stack"] + 1 + os.cpu_count():
                     failures.append(f"{kind}: {total(b)} read against {total(pp)} from pprof")
             else:
-                for bad in between(b, pp, a, kind != "heap")[:3]:
-                    failures.append(f"{kind}: {json.dumps(bad)}")
+                own, reads = with_wrappers(pprof), with_wrappers(before + after)
+                bad, read_as = between(b, pp, a, kind != "heap", own, reads)
+                if read_as:
+                    calls = sorted({call for _, call in read_as.values()})
+                    line += f"; {len(read_as)} matched at a wrapper ({', '.join(calls)})"
+                for one in bad[:3]:
+                    failures.append(f"{kind}: {json.dumps(one)}")
                 if not pp:
                     failures.append(f"{kind}: the program's own profile is empty")
             print(line)

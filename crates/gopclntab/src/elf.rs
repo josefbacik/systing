@@ -34,8 +34,8 @@
 //! section larger than what is left of its 256 MiB budget, so a binary
 //! whose module data record can be reached only through a larger section
 //! is "not a candidate"; and so is an image with more than 4,096
-//! sections, a hundred times what a Go binary has, with more segments
-//! than the file header's own field can count, with more than 256 MiB of
+//! sections, a hundred times what a Go binary has, with more than 256
+//! program headers, twenty times what one has, with more than 256 MiB of
 //! symbol tables, or with a function table of more than 256 MiB.
 //!
 //! Policy is deliberately left to the caller: this module reports whether
@@ -51,6 +51,7 @@ use object::read::ReadCache;
 use object::read::ReadRef;
 use object::Object;
 use object::ObjectSection;
+use object::ObjectSegment;
 
 use crate::Error;
 use crate::GoPclntab;
@@ -67,6 +68,55 @@ pub struct ElfPclntab {
     /// the pclntab is most valuable when this is `false`, i.e. the binary
     /// is stripped.
     pub has_symtab: bool,
+    /// The image's loadable segments: which ranges of the file's bytes are
+    /// loaded, and at which virtual addresses, in the order of the program
+    /// header table.
+    pub load_segments: LoadSegments,
+}
+
+/// The loadable segments (`PT_LOAD` program headers) of an ELF image, in
+/// the order of the program header table.
+#[derive(Clone, Debug)]
+pub struct LoadSegments(Vec<LoadSegment>);
+
+/// One loadable segment: `file_size` bytes at `file_offset` of the file
+/// are loaded at `vaddr`.
+#[derive(Clone, Copy, Debug)]
+struct LoadSegment {
+    file_offset: u64,
+    file_size: u64,
+    vaddr: u64,
+}
+
+impl LoadSegments {
+    fn of<'data, R: ReadRef<'data>>(elf: &object::File<'data, R>) -> Self {
+        Self(
+            elf.segments()
+                .map(|segment| {
+                    let (file_offset, file_size) = segment.file_range();
+                    LoadSegment {
+                        file_offset,
+                        file_size,
+                        vaddr: segment.address(),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// The virtual address at which the byte at `offset` of the file is
+    /// loaded, by the first segment that holds it at an address that does
+    /// not overflow. `None` when no segment does.
+    pub fn file_offset_to_vaddr(&self, offset: u64) -> Option<u64> {
+        self.0.iter().find_map(|segment| {
+            let within = offset.checked_sub(segment.file_offset)?;
+            if within < segment.file_size {
+                segment.vaddr.checked_add(within)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 impl ElfPclntab {
@@ -97,8 +147,8 @@ impl ElfPclntab {
             return Ok(None);
         }
         let Ok(elf) = object::File::parse(source) else {
-            // Not an object file this build recognizes (only the ELF
-            // format is compiled in): not a candidate.
+            // Its first bytes say ELF, but the parser does not accept it:
+            // not a candidate.
             return Ok(None);
         };
 
@@ -118,7 +168,11 @@ impl ElfPclntab {
             if !settle_text_start(&elf, &mut table, section.address(), input_len) {
                 return Ok(None);
             }
-            return Ok(Some(Self { table, has_symtab }));
+            return Ok(Some(Self {
+                table,
+                has_symtab,
+                load_segments: LoadSegments::of(&elf),
+            }));
         }
 
         // No dedicated section. The scan below reads whole data sections,
@@ -160,21 +214,36 @@ impl ElfPclntab {
             _ => 2,
         });
         for section in sections {
+            // A compressed section is not read; [`read_named_section`] and
+            // [`ImageWords::section_bytes`] read none either. The loader maps a
+            // section's bytes as stored, so no table in use can be compressed.
+            if !matches!(
+                section.compressed_file_range(),
+                Ok(range) if range.format == object::CompressionFormat::None
+            ) {
+                continue;
+            }
             if section.size() == 0 || section.size() > budget {
                 continue;
             }
+            // Charged before the read, as the reader of the module data
+            // record charges before its own.
+            budget -= section.size();
             // A section claiming bytes past end-of-input cannot be read;
             // uncompressed_data fails and the section is skipped.
             let Ok(data) = section.uncompressed_data() else {
                 continue;
             };
-            budget = budget.saturating_sub(data.len() as u64);
             if let Some((offset, mut table)) = GoPclntab::scan_at(&data, text_vaddr) {
                 let table_vaddr = section.address().saturating_add(offset as u64);
                 if !settle_text_start(&elf, &mut table, table_vaddr, input_len) {
                     return Ok(None);
                 }
-                return Ok(Some(Self { table, has_symtab }));
+                return Ok(Some(Self {
+                    table,
+                    has_symtab,
+                    load_segments: LoadSegments::of(&elf),
+                }));
             }
         }
         Ok(None)
@@ -182,10 +251,11 @@ impl ElfPclntab {
 }
 
 /// Whether an image's header tables and symbol tables are of sizes a real
-/// binary has: at most [`MAX_SECTIONS`] section headers, no extended
-/// numbering of sections or segments, and at most [`MAX_SYMBOL_TABLES`] bytes
-/// of symbol tables in all. Judged from the file header and the section
-/// headers alone. What is no ELF file passes: the parse says so itself.
+/// binary has: at most [`MAX_SECTIONS`] section headers and
+/// [`MAX_SEGMENTS`] program headers, no extended numbering of either, and
+/// at most [`MAX_SYMBOL_TABLES`] bytes of symbol tables in all. Judged from
+/// the file header and the section headers alone. A file that is not an
+/// ELF file, or whose headers cannot be read here, does not pass.
 fn stated_sizes_are_plausible<'data, R: ReadRef<'data>>(source: R) -> bool {
     fn check<'data, Elf, R>(source: R) -> Option<bool>
     where
@@ -199,6 +269,7 @@ fn stated_sizes_are_plausible<'data, R: ReadRef<'data>>(source: R) -> bool {
             || header.e_shstrndx(endian) == object::elf::SHN_XINDEX
             || (header.e_shnum(endian) == 0 && header.e_shoff(endian).into() != 0)
             || usize::from(header.e_shnum(endian)) > MAX_SECTIONS
+            || usize::from(header.e_phnum(endian)) > MAX_SEGMENTS
         {
             return Some(false);
         }
@@ -226,9 +297,9 @@ fn stated_sizes_are_plausible<'data, R: ReadRef<'data>>(source: R) -> bool {
         Ok(object::FileKind::Elf64) => {
             check::<object::elf::FileHeader64<object::Endianness>, R>(source)
         }
-        _ => None,
+        _ => Some(false),
     }
-    .unwrap_or(true)
+    .unwrap_or(false)
 }
 
 /// Read a named pclntab section's bytes, validating its metadata against
@@ -271,6 +342,10 @@ fn read_named_section<'data>(
 /// Most sections an image may have to be looked at. A Go binary has a few
 /// dozen.
 const MAX_SECTIONS: usize = 4096;
+
+/// Most program headers an image may have to be looked at. A Go binary has
+/// about a dozen.
+const MAX_SEGMENTS: usize = 256;
 
 /// Most bytes of symbol tables, in all, an image may state to be looked at.
 const MAX_SYMBOL_TABLES: u64 = 256 << 20;
@@ -543,9 +618,9 @@ impl<'data, 'file, R: ReadRef<'data>> ImageWords<'data, 'file, R> {
         if range.uncompressed_size > self.budget {
             return None;
         }
-        let bytes = section.data().ok()?;
+        // Charged before the read.
         self.budget -= range.uncompressed_size;
-        Some(bytes)
+        section.data().ok()
     }
 
     /// The bytes backing `[vaddr, vaddr + len)`, reading (once) the
@@ -682,6 +757,19 @@ mod tests {
         }
         assert!(seen_main, "main.main not found in pclntab");
         assert!(seen_helper, "main.helper not found in pclntab");
+
+        {
+            let bytes = std::fs::read(&stripped).unwrap();
+            let parsed = object::File::parse(&*bytes).unwrap();
+            let text = parsed.section_by_name(".text").unwrap();
+            let (offset, size) = text.file_range().unwrap();
+            for within in [0, size - 1] {
+                assert_eq!(
+                    elf.load_segments.file_offset_to_vaddr(offset + within),
+                    Some(text.address() + within)
+                );
+            }
+        }
 
         // The unstripped twin: same table, but the symtab is reported so
         // callers preferring symtab+DWARF can decline.
@@ -1030,6 +1118,80 @@ mod tests {
     }
 
     #[test]
+    fn file_offsets_translate_by_the_load_segments() {
+        let segment = |file_offset, file_size, vaddr| LoadSegment {
+            file_offset,
+            file_size,
+            vaddr,
+        };
+        let segments = LoadSegments(vec![
+            segment(0, 0x1000, 0x40_0000),
+            segment(0x2000, 0x500, 0x40_3000),
+            // Overlaps the first; where they overlap, the first wins.
+            segment(0x800, 0x1000, 0x90_0000),
+            segment(0x9000, 0x10, u64::MAX - 7),
+        ]);
+        for (offset, want) in [
+            (0, Some(0x40_0000)),
+            (0xfff, Some(0x40_0fff)),
+            (0x1000, Some(0x90_0800)),
+            (0x17ff, Some(0x90_0fff)),
+            (0x1800, None),
+            (0x2000, Some(0x40_3000)),
+            (0x24ff, Some(0x40_34ff)),
+            (0x2500, None),
+            (0x9007, Some(u64::MAX)),
+            (0x9008, None),
+            (u64::MAX, None),
+        ] {
+            assert_eq!(
+                segments.file_offset_to_vaddr(offset),
+                want,
+                "offset {offset:#x}"
+            );
+        }
+        assert_eq!(LoadSegments(Vec::new()).file_offset_to_vaddr(0), None);
+    }
+
+    #[test]
+    fn program_header_count_is_bounded() {
+        let header_with = |e_phnum: usize| {
+            let mut ehdr = vec![0u8; 64];
+            ehdr[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+            ehdr[4] = 2;
+            ehdr[5] = 1;
+            ehdr[6] = 1;
+            ehdr[0x38..0x3a].copy_from_slice(&u16::try_from(e_phnum).unwrap().to_le_bytes());
+            ehdr
+        };
+        assert!(stated_sizes_are_plausible(&*header_with(MAX_SEGMENTS)));
+        assert!(!stated_sizes_are_plausible(&*header_with(MAX_SEGMENTS + 1)));
+    }
+
+    #[test]
+    fn another_object_format_is_not_a_candidate() {
+        let mut header = vec![0u8; 64];
+        header[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        assert!(!stated_sizes_are_plausible(&*header));
+        assert!(matches!(ElfPclntab::from_bytes(&header), Ok(None)));
+    }
+
+    #[test]
+    fn headers_that_cannot_be_read_are_not_plausible() {
+        // One section header, stated to begin where the input ends.
+        let mut ehdr = vec![0u8; 64];
+        ehdr[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        ehdr[4] = 2;
+        ehdr[5] = 1;
+        ehdr[6] = 1;
+        ehdr[0x28..0x30].copy_from_slice(&64u64.to_le_bytes());
+        ehdr[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
+        ehdr[0x3c..0x3e].copy_from_slice(&1u16.to_le_bytes());
+        assert!(!stated_sizes_are_plausible(&*ehdr));
+        assert!(matches!(ElfPclntab::from_bytes(&ehdr), Ok(None)));
+    }
+
+    #[test]
     fn non_elf_and_truncated_inputs_are_not_candidates() {
         assert!(ElfPclntab::from_bytes(b"").unwrap().is_none());
         assert!(ElfPclntab::from_bytes(b"not an elf at all")
@@ -1042,5 +1204,159 @@ mod tests {
         ehdr[4] = 2;
         ehdr[5] = 1;
         assert!(matches!(ElfPclntab::from_bytes(&ehdr), Ok(None)));
+    }
+
+    /// A minimal ELF64 x86-64 image with five section headers (the null header,
+    /// `.text`, `.gopclntab`, `.rela.dyn` and `.shstrtab`): `.text` at
+    /// 0x401000, a one-function `.gopclntab` at 0x500000 (first entry offset 0,
+    /// end of text 0x100), and `.rela.dyn` holding `relas` as (`r_offset`,
+    /// `r_addend`) pairs of relative relocations.
+    fn small_elf(relas: impl Iterator<Item = (u64, u64)>) -> Vec<u8> {
+        let names = b"\0.text\0.gopclntab\0.rela.dyn\0.shstrtab\0";
+        let name_at = |name: &str| {
+            names
+                .windows(name.len())
+                .position(|w| w == name.as_bytes())
+                .unwrap() as u32
+        };
+        let mut table = vec![0xf1, 0xff, 0xff, 0xff, 0, 0, 1, 8];
+        for word in [1u64, 0, 0, 84, 84, 84, 84, 72] {
+            table.extend(word.to_le_bytes());
+        }
+        for field in [0u32, 0, 0x100] {
+            table.extend(field.to_le_bytes());
+        }
+        table.extend([0u8; 12]);
+        let text = vec![0x90u8; 0x1000];
+        let mut rela_bytes = Vec::new();
+        for (offset, addend) in relas {
+            rela_bytes.extend(offset.to_le_bytes());
+            rela_bytes.extend(u64::from(object::elf::R_X86_64_RELATIVE).to_le_bytes());
+            rela_bytes.extend(addend.to_le_bytes());
+        }
+        let mut image = vec![0u8; 64 + 64 * 5];
+        // name, sh_type, sh_flags, sh_addr, bytes, sh_entsize
+        type Body<'a> = (&'a str, u32, u64, u64, &'a [u8], u64);
+        let bodies: [Body<'_>; 4] = [
+            (".text", 1, 6, 0x401000, &text, 0),
+            (".gopclntab", 1, 2, 0x500000, &table, 0),
+            (".rela.dyn", 4, 2, 0x480000, &rela_bytes, 24),
+            (".shstrtab", 3, 0, 0, names, 0),
+        ];
+        for (i, (name, kind, flags, address, body, entsize)) in bodies.into_iter().enumerate() {
+            let offset = image.len() as u64;
+            let header = &mut image[64 * (i + 2)..64 * (i + 3)];
+            header[0..4].copy_from_slice(&name_at(name).to_le_bytes());
+            header[4..8].copy_from_slice(&kind.to_le_bytes());
+            header[8..16].copy_from_slice(&flags.to_le_bytes());
+            header[16..24].copy_from_slice(&address.to_le_bytes());
+            header[24..32].copy_from_slice(&offset.to_le_bytes());
+            header[32..40].copy_from_slice(&(body.len() as u64).to_le_bytes());
+            header[48..56].copy_from_slice(&1u64.to_le_bytes());
+            header[56..64].copy_from_slice(&entsize.to_le_bytes());
+            image.extend_from_slice(body);
+        }
+        image[..8].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
+        image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        image[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        image[20..24].copy_from_slice(&1u32.to_le_bytes());
+        image[40..48].copy_from_slice(&64u64.to_le_bytes()); // e_shoff
+        image[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        image[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        image[60..62].copy_from_slice(&5u16.to_le_bytes()); // e_shnum
+        image[62..64].copy_from_slice(&4u16.to_le_bytes()); // e_shstrndx
+        image
+    }
+
+    /// Relocations for the module data record of [`small_elf`]'s table: the
+    /// pointer to the table at word 0, then the triple at words 20 to 22.
+    fn module_data_record(record: u64) -> [(u64, u64); 4] {
+        [
+            (record, 0x500000),
+            (record + 8 * 20, 0x401000),
+            (record + 8 * 21, 0x401100),
+            (record + 8 * 22, 0x401000),
+        ]
+    }
+
+    #[test]
+    fn a_word_reads_the_first_relocation_that_names_it() {
+        let settled = |relas: Vec<(u64, u64)>| {
+            ElfPclntab::from_bytes(&small_elf(relas.into_iter()))
+                .unwrap()
+                .and_then(|elf| elf.table.func_entry(0))
+        };
+        let record = 0x600000;
+        assert_eq!(settled(module_data_record(record).to_vec()), Some(0x401000));
+        // A later entry for the same word, and an earlier entry whose offset lies
+        // between two words, change nothing.
+        let mut relas = vec![(record + 8 * 22 + 1, 0x401008)];
+        relas.extend(module_data_record(record));
+        relas.push((record + 8 * 22, 0x401008));
+        assert_eq!(settled(relas), Some(0x401000));
+    }
+
+    /// The test binary's global allocator. It adds the size of each allocation,
+    /// zeroed allocation and reallocation to the current thread's `BYTES_ASKED`,
+    /// so that a test can count the bytes that one call asks the allocator for.
+    /// Test builds only.
+    struct CountingAllocator;
+
+    thread_local! {
+        static BYTES_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn count_bytes(size: usize) {
+        // `try_with`: the allocator also runs while a thread is torn down.
+        let _ = BYTES_ASKED.try_with(|asked| asked.set(asked.get().wrapping_add(size)));
+    }
+
+    // SAFETY: every call is handed to the system allocator unchanged.
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            count_bytes(layout.size());
+            std::alloc::System.alloc(layout)
+        }
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            count_bytes(layout.size());
+            std::alloc::System.alloc_zeroed(layout)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            std::alloc::System.dealloc(ptr, layout)
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+            count_bytes(size);
+            std::alloc::System.realloc(ptr, layout, size)
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    #[test]
+    fn reading_many_relocations_stays_under_the_bar() {
+        // 256 KiB, a bar made up for this test.
+        const BAR: usize = 1 << 18;
+        // The image holds 4,016 relocations: 4,000 at one address, a number made
+        // up for this test, and 16 that name 16 records. Reading it must ask the
+        // allocator for less than 256 KiB.
+        let records = (0..16).map(|k| (0x600000 + 8 * k, 0x500000));
+        let many = std::iter::repeat_n((0x600000 + 8 * 16, 0x1234), 4_000);
+        let image = small_elf(many.clone().chain(records));
+        let before = BYTES_ASKED.get();
+        assert!(ElfPclntab::from_bytes(&image).unwrap().is_none());
+        let asked = BYTES_ASKED.get().wrapping_sub(before);
+        assert!(
+            asked < BAR,
+            "reading an image of {} bytes asked the allocator for {asked} bytes; the test allows less than {BAR}",
+            image.len()
+        );
+        // The same 4,000 relocations, then the four of a record that validates.
+        // Reading this image must resolve the function.
+        let image = small_elf(many.chain(module_data_record(0x600000)));
+        let entry = ElfPclntab::from_bytes(&image)
+            .unwrap()
+            .and_then(|elf| elf.table.func_entry(0));
+        assert_eq!(entry, Some(0x401000));
     }
 }
