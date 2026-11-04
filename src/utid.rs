@@ -67,14 +67,23 @@ const INITIAL_TID_CAPACITY: usize = 4096;
 /// Initial capacity for process ID map. Typically fewer processes than threads.
 const INITIAL_PID_CAPACITY: usize = 1024;
 
+/// Shards of each map, a power of two.
+///
+/// Left to itself, DashMap sizes a map by `std::thread::available_parallelism`,
+/// which opens /proc/self/cgroup to look for a CPU quota. On kernels without
+/// commit 9067d90006df that read takes the lock on all cgroup changes, so on a
+/// host that is busy changing cgroups it sleeps behind those changes, and the
+/// generator is built at the very start of a trace.
+const MAP_SHARDS: usize = 1024;
+
 impl UtidGenerator {
     /// Create a new UtidGenerator with counters starting at 1.
     pub fn new() -> Self {
         Self {
             next_utid: AtomicI64::new(1),
-            tid_to_utid: DashMap::with_capacity(INITIAL_TID_CAPACITY),
+            tid_to_utid: DashMap::with_capacity_and_shard_amount(INITIAL_TID_CAPACITY, MAP_SHARDS),
             next_upid: AtomicI64::new(1),
-            pid_to_upid: DashMap::with_capacity(INITIAL_PID_CAPACITY),
+            pid_to_upid: DashMap::with_capacity_and_shard_amount(INITIAL_PID_CAPACITY, MAP_SHARDS),
         }
     }
 
