@@ -5838,9 +5838,16 @@ fn run_tracing_loop(
         eprintln!("Press Ctrl-C to stop early");
         let _ = stop_rx.recv();
     } else if opts.duration > 0 {
-        // Duration mode (no command): trace for a fixed time
+        // Duration mode (no command): trace for a fixed time, or until Ctrl-C.
+        // ctrlc allows one handler per process and drops a later one. The handler
+        // gets a clone, so that stop_tx still keeps the channel open for the wait.
+        let stop_for_ctrlc = stop_tx.clone();
+        let _ = ctrlc::set_handler(move || {
+            let _ = stop_for_ctrlc.send(());
+        });
+        // Printed after the handler is installed: whoever sees it may send SIGINT.
         println!("Tracing for {} seconds", opts.duration);
-        thread::sleep(Duration::from_secs(opts.duration));
+        let _ = stop_rx.recv_timeout(Duration::from_secs(opts.duration));
     } else {
         // Indefinite mode: trace until Ctrl-C
         let _ = ctrlc::set_handler(move || {

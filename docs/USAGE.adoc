@@ -105,6 +105,7 @@ The second is the current wakeup latency for this CPU at the given timestamp.
 === *--duration*
 
 Specifies the duration of the trace in seconds.
+Ctrl-C (SIGINT) ends the trace early and keeps what was recorded.
 
 === *--enable-debuginfod*
 

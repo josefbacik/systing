@@ -36,6 +36,11 @@ This will generate a `trace.pb` file which can be uploaded to a
 `.systing.gz`) writes a lightweight profile export any tool can parse without
 DuckDB — see [docs/PROFILE_EXPORT_FORMAT.md](docs/PROFILE_EXPORT_FORMAT.md).
 
+Ctrl-C (SIGINT) ends a capture early, with or without `--duration`, and systing
+still writes the trace of what it recorded up to then (with `--continuous`, one
+second later). Before the `Tracing ...` line, while systing sets up, Ctrl-C ends
+it without a finished trace.
+
 ## Shell completions
 
 All three binaries can print their own completion script. `systing` uses a
