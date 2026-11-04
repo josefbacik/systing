@@ -819,8 +819,9 @@ impl SysinfoRecorder {
     }
 }
 
-/// Labels for the BPF `missed_events` map classes, index-matched to the
-/// MISSED_*_EVENT defines in systing_system.bpf.c. Wording matches the exit
+/// Labels for the missed-event classes. Those below 100 are the BPF
+/// `missed_events` map's, index-matched to the MISSED_*_EVENT defines in
+/// systing_system.bpf.c. Wording matches the exit
 /// summary lines so the in-trace tracks and the final printout name the same
 /// things.
 pub const MISSED_EVENT_CLASS_LABELS: &[(u32, &str)] = &[
@@ -838,10 +839,16 @@ pub const MISSED_EVENT_CLASS_LABELS: &[(u32, &str)] = &[
     // ran without its exit; see memory_syscall_leg in the BPF source).
     (9, "memory-xleg"),
     (10, "python function"),
+    (MISSED_CLASS_KERNEL_SKIPPED, "kernel-skipped"),
 ];
 
-/// One sample of one missed-event class: the cumulative (per-CPU-summed)
-/// counter for `class` as read from the BPF `missed_events` map at `ts`.
+/// Not a class of the `missed_events` map: runs of this capture's programs that
+/// the kernel skipped, so none of our code ran to count them (see
+/// `kernel_skipped_runs` in systing_core.rs).
+pub const MISSED_CLASS_KERNEL_SKIPPED: u32 = 101;
+
+/// One sample of one missed-event class: the cumulative counter for `class` at
+/// `ts`.
 #[derive(Default, Clone, Copy)]
 pub struct MissedEvent {
     pub ts: u64,
@@ -852,8 +859,8 @@ pub struct MissedEvent {
 /// Records per-class missed-event counts as counter tracks, so event loss is
 /// visible and time-localized in the trace instead of only in the exit
 /// summary. Same streaming shape as `SysinfoRecorder`: one counter track per
-/// class, created lazily on the first sample; values are the map's cumulative
-/// totals, so a loss burst shows up as a step at the second it happened.
+/// class, created lazily on the first sample; values are cumulative totals, so
+/// a loss burst shows up as a step at the second it happened.
 pub struct MissedEventsRecorder {
     pub ringbuf: RingBuffer<MissedEvent>,
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,

@@ -21,11 +21,12 @@ use tempfile::TempDir;
 const RECORDING_SECS: u64 = 3;
 
 /// Classes polled on every run (their subsystems are always active).
-const ALWAYS_ON_TRACKS: [&str; 4] = [
+const ALWAYS_ON_TRACKS: [&str; 5] = [
     "Missed sched/IRQ events",
     "Missed stack events",
     "Missed probe events",
     "Missed cache events",
+    "Missed kernel-skipped events",
 ];
 
 /// Classes whose subsystems are off in this run's config: no tracks allowed.

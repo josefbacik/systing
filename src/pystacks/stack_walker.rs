@@ -560,6 +560,13 @@ impl Default for StackWalkerRun {
 impl Drop for StackWalkerRun {
     fn drop(&mut self) {
         self.print_debug_stats();
+        let refused = self.resolver.as_ref().map_or(0, |r| r.refused_records());
+        if refused > 0 {
+            eprintln!(
+                "[pystacks] Warning: dropped {refused} Python symbol records that did not match \
+                 their ID; a function whose record never came intact shows as <unknown python>"
+            );
+        }
     }
 }
 
