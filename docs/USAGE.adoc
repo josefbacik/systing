@@ -242,6 +242,9 @@ The default is 1000.
 Sampling runs in fixed-period mode: with `--sw-event` (cpu-clock) the rate is exact; with the cpu-cycles hardware event it is the rate at the CPU's maximum frequency, so a throttled CPU samples proportionally slower.
 The chosen period is recorded in the trace's `sysinfo.sample_period` column.
 Higher values give finer-grained profiles at the cost of more overhead and larger traces; very high rates may be throttled by the kernel's perf interrupt-rate limit and can increase ringbuf drops (raise `--ringbuf-size-mib` if needed). Ring buffers are sharded per CPU, up to 64 rings per family at a constant family byte budget; `--ringbuf-shards N` sets the count explicitly (`8` is the fixed layout of older releases), and kernels before 6.8 stay at 8 by default because inserting each ring costs them an RCU grace period at start.
+With the software clock (`--sw-event`, or the fallback where there is no PMU), rates up to 1000 Hz set `exclude_idle` on the sampling event, so that idle firings cannot use up the kernel's limit on samples and switch the sampler off.
+Idle CPUs then wake at this rate, whichever recorders are on, until systing detaches the sampler, after collection has stopped and before the trace is written.
+Above 1000 Hz the flag is not set: idle CPUs can wake far less, and what runs first on a CPU after an idle spell can go unsampled.
 
 === *--sw-event*
 
