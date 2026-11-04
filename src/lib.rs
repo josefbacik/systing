@@ -37,6 +37,7 @@ pub mod bpf_stack_budget;
 pub mod build_id_store;
 pub mod cgroup;
 pub mod duckdb;
+mod import_memory;
 pub mod parquet_paths;
 pub mod validation;
 
