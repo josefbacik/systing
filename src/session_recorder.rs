@@ -1795,10 +1795,18 @@ impl SessionRecorder {
         let processes = self.processes.read().unwrap();
         let kernel_threads = self.kernel_threads.read().unwrap();
         let process_cgroups = self.process_cgroups.read().unwrap();
+        // Not stage_done(): that would restart `stage_start`, and "Wrote metadata
+        // records" must still cover the walk.
+        let walk_start = std::time::Instant::now();
         // Snapshot the live cgroup hierarchy once so we can resolve the numeric
         // cgroup id recorded for each process into a human-readable path. This is
         // best-effort: cgroups removed before this point simply will not resolve.
         let cgroup_id_map = crate::cgroup::build_cgroup_id_map();
+        eprintln!(
+            "Walked the cgroup hierarchy in {:.2}s ({} cgroups)",
+            walk_start.elapsed().as_secs_f64(),
+            cgroup_id_map.len()
+        );
         for (tgidpid, process) in self.process_descriptors.read().unwrap().iter() {
             let pid = process.pid();
             let upid = self.utid_generator.get_or_create_upid(pid);

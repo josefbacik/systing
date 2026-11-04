@@ -8,6 +8,7 @@ use duckdb::Connection;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::import_memory::ImportMemoryWatch;
 use crate::parquet_paths::ParquetPaths;
 use crate::trace::ManifestRecord;
 
@@ -1180,7 +1181,8 @@ pub fn parquet_to_duckdb(parquet_dir: &Path, db_path: &Path, trace_id: &str) -> 
 /// error after the database file was created — leaves nothing behind: the
 /// file this call created (and DuckDB's write-ahead log beside it) is removed,
 /// so a caller never finds a hollow-but-valid `.duckdb` where a refusal
-/// happened.
+/// happened. Two notes on stderr say how much memory this process held as the
+/// import began, and the most that it held until the database was closed.
 pub fn parquet_to_duckdb_with_options(
     parquet_dir: &Path,
     db_path: &Path,
@@ -1197,12 +1199,16 @@ pub fn parquet_to_duckdb_with_options(
     let mut conn = open_for_bulk_io(db_path)
         .with_context(|| format!("Failed to create DuckDB database: {}", db_path.display()))?;
 
+    // After the open, so that at a task limit DuckDB gets its threads and the watch goes without.
+    let watch = ImportMemoryWatch::start();
     let result = import_directory(&mut conn, parquet_dir, db_path, trace_id, options);
+    // Close the connection first so DuckDB releases the file and its WAL.
+    drop(conn);
     if result.is_err() {
-        // Close the connection first so DuckDB releases the file and its WAL.
-        drop(conn);
         remove_partial_database(db_path);
     }
+    // After the close, which checkpoints, so that the peak covers it.
+    drop(watch);
     result
 }
 
@@ -2995,6 +3001,63 @@ mod tests {
             tables, 0,
             "the transaction rolled back: no table survives on the import's own connection"
         );
+    }
+
+    const IMPORT_DIR_VARIABLE: &str = "SYSTING_TEST_IMPORT_DIR";
+
+    #[test]
+    #[ignore = "test_an_import_reports_its_memory_on_stderr runs it in a process of its own"]
+    fn import_the_directory_that_the_environment_names() {
+        let Some(dir) = std::env::var_os(IMPORT_DIR_VARIABLE).map(PathBuf::from) else {
+            return;
+        };
+        let _ = parquet_to_duckdb(&dir.join("traces"), &dir.join("test.duckdb"), "test_trace");
+    }
+
+    #[test]
+    fn test_an_import_reports_its_memory_on_stderr() {
+        for refused in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let parquet_dir = temp_dir.path().join("traces");
+            fs::create_dir(&parquet_dir).unwrap();
+            if refused {
+                fs::write(
+                    parquet_dir.join("sched_slice.parquet"),
+                    b"not a parquet file",
+                )
+                .unwrap();
+            }
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--nocapture", "--exact"])
+                .arg("duckdb::tests::import_the_directory_that_the_environment_names")
+                .env(IMPORT_DIR_VARIABLE, temp_dir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(temp_dir.path().join("test.duckdb").exists(), !refused);
+
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let only_line_that_starts_with = |start: &str| {
+                let found: Vec<usize> = stderr
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.starts_with(start))
+                    .map(|(number, _)| number)
+                    .collect();
+                match found.as_slice() {
+                    [only] => *only,
+                    _ => panic!("not one line that starts with {start:?} in:\n{stderr}"),
+                }
+            };
+            // The line on DuckDB's limits is the import's first, so the start note comes ahead of
+            // the import and the peak note after its start. A table that is big enough to be
+            // imported in parts would bring a second line that starts with "  duckdb: ".
+            let start = only_line_that_starts_with("Note: DuckDB import start: anon RSS ");
+            let limits = only_line_that_starts_with("  duckdb: ");
+            let peak = only_line_that_starts_with("Note: DuckDB import peak: anon RSS ");
+            assert!(start < limits && limits < peak, "{stderr}");
+        }
     }
 
     const TEST_TRACE_ID: &str = "3f2b8c1e-7a54-4d09-9c6b-1e0f5a7d2b43";

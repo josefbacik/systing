@@ -600,7 +600,7 @@ impl StackSpill {
 
 /// Approximate anonymous RSS of this process in bytes (resident minus
 /// file-backed shared pages, from /proc/self/statm).
-fn current_anon_rss_bytes() -> Option<u64> {
+pub(crate) fn current_anon_rss_bytes() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/statm").ok()?;
     let mut it = s.split_whitespace();
     let _size = it.next()?;

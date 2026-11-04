@@ -281,7 +281,12 @@ fn visit_child_cgroup_dirs(
         if seen.insert(meta.ino()) {
             let path = entry.path();
             visit(&path, &meta);
-            visit_child_cgroup_dirs(&path, seen, visit);
+            // On cgroupfs a link count of 2 means that no child could be seen at the time
+            // of the stat: a child is counted for as long as a listing can show it. The test
+            // is not `> 2` because a file system without such a count may report 1 throughout.
+            if meta.nlink() != 2 {
+                visit_child_cgroup_dirs(&path, seen, visit);
+            }
         }
     }
 }
@@ -398,6 +403,31 @@ mod tests {
         assert_eq!(ids[0], fs::metadata(&pod).unwrap().ino());
         // No duplicates.
         assert_eq!(ids.len(), got.len());
+    }
+
+    #[test]
+    fn test_walk_does_not_list_a_cgroup_without_children() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pod = tmp.path().join("pod");
+        let leaf = pod.join("leaf");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(leaf.join("cgroup.procs"), b"").unwrap();
+        if fs::metadata(&leaf).unwrap().nlink() != 2 {
+            eprintln!("skipping: this file system does not count sub-directories");
+            return;
+        }
+
+        // A child made after its parent's stat is seen only if the parent is listed.
+        let mut visited = HashSet::new();
+        for_each_cgroup_dir(&pod, &mut |path, _| {
+            visited.insert(path.to_path_buf());
+            if path == leaf {
+                fs::create_dir(leaf.join("late")).unwrap();
+            }
+        })
+        .unwrap();
+
+        assert_eq!(visited, HashSet::from([pod, leaf]));
     }
 
     #[test]

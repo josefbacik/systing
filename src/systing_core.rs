@@ -3116,24 +3116,9 @@ fn discover_python_processes(debug: bool) -> Vec<u32> {
 
         let proc_path = entry.path();
 
-        // Skip threads - only process thread group leaders
-        if let Ok(status) = std::fs::read_to_string(proc_path.join("status")) {
-            let mut is_thread = false;
-            for line in status.lines() {
-                if let Some(tgid_str) = line.strip_prefix("Tgid:\t") {
-                    if let Ok(tgid) = tgid_str.trim().parse::<u32>() {
-                        if tgid != pid_u32 {
-                            is_thread = true;
-                            break;
-                        }
-                    }
-                    break;
-                }
-            }
-            if is_thread {
-                continue;
-            }
-        }
+        // /proc lists only thread group leaders (the kernel's proc_pid_readdir walks
+        // them by PIDTYPE_TGID), so this walk does not check Tgid. It could meet a
+        // thread only if a listed number went to a new thread in the meantime.
 
         // Check /proc/PID/exe for python
         if let Ok(exe) = std::fs::read_link(proc_path.join("exe")) {
@@ -3378,24 +3363,8 @@ fn discover_processes_with_mapping(
 
         let proc_path = entry.path();
 
-        // Skip threads - only process thread group leaders
-        if let Ok(status) = std::fs::read_to_string(proc_path.join("status")) {
-            let mut is_thread = false;
-            for line in status.lines() {
-                if let Some(tgid_str) = line.strip_prefix("Tgid:\t") {
-                    if let Ok(tgid) = tgid_str.trim().parse::<u32>() {
-                        if tgid != pid_u32 {
-                            is_thread = true;
-                            break;
-                        }
-                    }
-                    break;
-                }
-            }
-            if is_thread {
-                continue;
-            }
-        }
+        // As in discover_python_processes: /proc lists only thread group leaders,
+        // so this walk does not check Tgid either.
 
         if let Ok(exe) = std::fs::read_link(proc_path.join("exe")) {
             if is_absolute {
@@ -5869,9 +5838,16 @@ fn run_tracing_loop(
         eprintln!("Press Ctrl-C to stop early");
         let _ = stop_rx.recv();
     } else if opts.duration > 0 {
-        // Duration mode (no command): trace for a fixed time
+        // Duration mode (no command): trace for a fixed time, or until Ctrl-C.
+        // ctrlc allows one handler per process and drops a later one. The handler
+        // gets a clone, so that stop_tx still keeps the channel open for the wait.
+        let stop_for_ctrlc = stop_tx.clone();
+        let _ = ctrlc::set_handler(move || {
+            let _ = stop_for_ctrlc.send(());
+        });
+        // Printed after the handler is installed: whoever sees it may send SIGINT.
         println!("Tracing for {} seconds", opts.duration);
-        thread::sleep(Duration::from_secs(opts.duration));
+        let _ = stop_rx.recv_timeout(Duration::from_secs(opts.duration));
     } else {
         // Indefinite mode: trace until Ctrl-C
         let _ = ctrlc::set_handler(move || {
@@ -7858,6 +7834,58 @@ mod tests {
             sightings.observe(&info(7, "late-name")),
             "real comm after zeroed first sight forwards"
         );
+    }
+
+    #[test]
+    fn proc_walks_report_a_process_and_not_its_threads() {
+        let pid = process::id();
+        if pid <= 2 {
+            eprintln!("skipping: running as process {pid}, which both walks ignore");
+            return;
+        }
+
+        // Give this process a mapping that both walks look for.
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("libpython3.so");
+        fs::write(&library, [0u8; 4096]).unwrap();
+        let file = fs::File::open(&library).unwrap();
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+
+        let (tid_tx, tid_rx) = channel();
+        let (exit_tx, exit_rx) = channel::<()>();
+        let other_thread = thread::spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+            tid_tx.send(tid as u32).unwrap();
+            let _ = exit_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        assert_ne!(tid, pid);
+        // The thread's own /proc entry shows the same mapping, so a walk that listed
+        // threads would report the thread too.
+        let thread_maps = fs::read_to_string(format!("/proc/{tid}/maps")).unwrap();
+        assert!(thread_maps.contains("libpython3.so"));
+
+        let python = discover_python_processes(false);
+        assert_eq!(python.iter().filter(|&&found| found == pid).count(), 1);
+        assert!(!python.contains(&tid));
+
+        let mapped = discover_processes_with_mapping("libpython3.so", true).unwrap();
+        assert!(mapped.contains_key(&pid));
+        assert!(!mapped.contains_key(&tid));
+
+        drop(exit_tx);
+        other_thread.join().unwrap();
+        unsafe { libc::munmap(mapping, 4096) };
     }
 
     const MIB: u32 = 1024 * 1024;
