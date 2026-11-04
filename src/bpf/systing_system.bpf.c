@@ -2795,8 +2795,8 @@ int systing_kprobe(struct pt_regs *ctx)
 	return 0;
 }
 
-SEC("raw_tracepoint")
-int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
+static __always_inline int handle_raw_tracepoint(struct bpf_raw_tracepoint_args *args,
+						 bool may_capture_stack)
 {
 	if (tool_config.confidentiality_mode)
 		return 0;
@@ -2865,11 +2865,31 @@ int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 	}
 	bpf_ringbuf_submit(event, flags);
 
+	if (!may_capture_stack)
+		return 0;
+
 	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
 	if (should_capture_stack && *should_capture_stack)
 		emit_stack_event(args, task, STACK_RUNNING);
 
 	return 0;
+}
+
+SEC("raw_tracepoint")
+int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
+{
+	return handle_raw_tracepoint(args, true);
+}
+
+/*
+ * For events that capture no stack. The kernel skips a run of a program that is
+ * already running on the CPU, so a tracepoint firing in an interrupt during a
+ * stack walk in systing_raw_tracepoint would be lost if it ran that program too.
+ */
+SEC("raw_tracepoint")
+int systing_raw_tracepoint_no_stack(struct bpf_raw_tracepoint_args *args)
+{
+	return handle_raw_tracepoint(args, false);
 }
 
 SEC("tracepoint")

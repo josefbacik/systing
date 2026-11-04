@@ -66,11 +66,15 @@ const SELECTED_ELSEWHERE: &[(&str, &str)] = &[
     ),
     (
         "systing_tracepoint",
-        "kernels before 6.10 load it in place of systing_raw_tracepoint",
+        "kernels before 6.10 load it in place of the two raw tracepoint programs",
     ),
     (
         "systing_raw_tracepoint",
         "kernels from 6.10 load it in place of systing_tracepoint",
+    ),
+    (
+        "systing_raw_tracepoint_no_stack",
+        "kernels from 6.10 load it beside systing_raw_tracepoint",
     ),
     (
         "systing_rss_stat_btf",
