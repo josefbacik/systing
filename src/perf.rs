@@ -717,6 +717,12 @@ mod tests {
 
     #[test]
     fn generic_names_resolve_without_sysfs() {
+        // The names need no sysfs, but the CPUs that event() lists for them do:
+        // libbpf counts them there, and a build sandbox may not mount it.
+        if libbpf_rs::num_possible_cpus().is_err() {
+            eprintln!("skipping: /sys/devices/system/cpu/possible unreadable");
+            return;
+        }
         // No discover(): the generic tables alone back the prefixed names.
         let counters = PerfCounters::default();
         let events = counters.event("software:task-clock").unwrap();
