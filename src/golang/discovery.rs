@@ -741,6 +741,34 @@ mod tests {
     }
 
     #[test]
+    fn a_global_is_the_symbol_with_its_whole_name() {
+        // name offsets: 1 "runtime.allgs", 15 "runtime.allgsX", 30 "xruntime.ticks",
+        // 45 "runtime.mbuckets"
+        let names = b"\0runtime.allgs\0runtime.allgsX\0xruntime.ticks\0runtime.mbuckets";
+        let sym = |name: u32, value: u64| {
+            let mut bytes = [0u8; 24];
+            bytes[..4].copy_from_slice(&name.to_le_bytes());
+            bytes[8..16].copy_from_slice(&value.to_le_bytes());
+            bytes
+        };
+        let bytes: Vec<u8> = [
+            sym(0, 0),
+            sym(1, 0x1000),    // the name itself
+            sym(15, 0x2000),   // a longer name that starts with it
+            sym(31, 0x3000),   // the tail of another name: a name all the same
+            sym(45, 0x4000),   // a name that no NUL ends
+            sym(9999, 0x5000), // a name outside the table
+        ]
+        .concat();
+        let symbols = object::pod::slice_from_all_bytes(&bytes).unwrap();
+        let found = globals_in(symbols, names, Endianness::Little, 0x10);
+        assert_eq!(
+            found,
+            HashMap::from([(Global::AllGs, 0x1010), (Global::Ticks, 0x3010)])
+        );
+    }
+
+    #[test]
     fn a_text_is_read_up_to_its_cap() {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().unwrap();
