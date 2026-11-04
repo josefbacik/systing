@@ -900,6 +900,30 @@ impl MissedEventsRecorder {
         self.streaming_collector = Some(collector);
     }
 
+    /// Write each limit that was `reached` (see [`crate::limits`]) as a counter
+    /// track named "Limit reached: <name>", with one sample at `ts` whose value is
+    /// the count. It is done here because this recorder's handle on the shared
+    /// counter writer is the last to be finished. Without a collector, a no-op.
+    pub fn record_limits(&mut self, ts: i64, reached: &[(&'static str, u64)]) -> Result<()> {
+        let Some(ref mut collector) = self.streaming_collector else {
+            return Ok(());
+        };
+        for (name, times) in reached {
+            let track_id = self.counter_track_ids.next_id();
+            collector.add_counter_track(CounterTrackRecord {
+                id: track_id,
+                name: format!("Limit reached: {name}"),
+                unit: Some("count".to_string()),
+            })?;
+            collector.add_counter(CounterRecord {
+                ts,
+                track_id,
+                value: *times as f64,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Finish streaming and return the collector for finalization.
     pub fn finish(&mut self) -> Result<Option<Box<dyn RecordCollector + Send>>> {
         if let Some(mut collector) = self.streaming_collector.take() {
@@ -1923,6 +1947,23 @@ impl SessionRecorder {
         stage_done("Flushed sysinfo records", &mut stage_start);
 
         eprintln!("Flushing missed-event records from streaming...");
+        // The limits reached go to stdout and into the trace, since a kept trace
+        // travels without the tracer's output. Symbolization is over here; a
+        // limit reached after this point is not reported.
+        let reached = crate::limits::take_reached();
+        for (name, times) in &reached {
+            println!("Limit reached: {name}: {times}");
+        }
+        if let Err(e) = self
+            .missed_events_recorder
+            .lock()
+            .unwrap()
+            .record_limits(end_ts, &reached)
+        {
+            eprintln!(
+                "Warning: could not write the limits reached into the trace (they are printed on stdout): {e}"
+            );
+        }
         if let Some(missed_collector) = self.missed_events_recorder.lock().unwrap().finish()? {
             missed_collector.finish_boxed()?;
         }
@@ -3306,6 +3347,169 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 1, "drained sample reaches the collector");
+    }
+
+    #[test]
+    fn test_missed_events_recorder_writes_the_limits_reached() {
+        use crate::parquet::StreamingParquetWriter;
+        use crate::systing_core::SystingRecordEvent;
+        use arrow::array::{Float64Array, Int64Array, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let mut rec = MissedEventsRecorder::new(
+            Arc::new(UtidGenerator::new()),
+            Arc::new(CounterTrackIdGenerator::new()),
+        );
+        // Without a collector there is nowhere to write, and that is no error.
+        rec.record_limits(9_000, &[("lines cut short", 3)]).unwrap();
+
+        rec.set_streaming_collector(Box::new(StreamingParquetWriter::new(dir.path()).unwrap()));
+        rec.record_event(MissedEvent {
+            ts: 1_000,
+            class: 0,
+            count: 0,
+        });
+        rec.record_limits(9_000, &[("lines cut short", 3), ("tables left out", 1)])
+            .unwrap();
+        let collector = rec.finish().unwrap().expect("collector was set");
+        collector.finish_boxed().unwrap();
+
+        let file = File::open(dir.path().join("counter_track.parquet")).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut tracks = Vec::new(); // (name, unit, id)
+        for batch in reader.collect::<Result<Vec<_>, _>>().unwrap() {
+            let column = |name: &str| batch.column_by_name(name).unwrap().clone();
+            let (ids, names, units) = (column("id"), column("name"), column("unit"));
+            let ids = ids.as_any().downcast_ref::<Int64Array>().unwrap();
+            let names = names.as_any().downcast_ref::<StringArray>().unwrap();
+            let units = units.as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..batch.num_rows() {
+                tracks.push((
+                    names.value(i).to_string(),
+                    units.value(i).to_string(),
+                    ids.value(i),
+                ));
+            }
+        }
+        tracks.sort();
+        let named: Vec<_> = tracks
+            .iter()
+            .map(|(name, unit, _)| (name.as_str(), unit.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("Limit reached: lines cut short", "count"),
+                ("Limit reached: tables left out", "count"),
+                ("Missed sched/IRQ events", "count"),
+            ]
+        );
+
+        let file = File::open(dir.path().join("counter.parquet")).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut samples = Vec::new(); // (track_id, ts, value)
+        for batch in reader.collect::<Result<Vec<_>, _>>().unwrap() {
+            let column = |name: &str| batch.column_by_name(name).unwrap().clone();
+            let (ids, ts, values) = (column("track_id"), column("ts"), column("value"));
+            let ids = ids.as_any().downcast_ref::<Int64Array>().unwrap();
+            let ts = ts.as_any().downcast_ref::<Int64Array>().unwrap();
+            let values = values.as_any().downcast_ref::<Float64Array>().unwrap();
+            for i in 0..batch.num_rows() {
+                samples.push((ids.value(i), ts.value(i), values.value(i)));
+            }
+        }
+        samples.sort_by_key(|(id, ts, _)| (*id, *ts));
+        let mut expected = vec![
+            (tracks[0].2, 9_000, 3.0),
+            (tracks[1].2, 9_000, 1.0),
+            (tracks[2].2, 1_000, 0.0),
+        ];
+        expected.sort_by_key(|(id, ts, _)| (*id, *ts));
+        assert_eq!(samples, expected);
+    }
+
+    /// The counter writer shared as `init_streaming_output` shares it, its
+    /// handles finished in `generate_parquet_trace`'s order.
+    #[test]
+    fn test_limits_reach_the_files_through_the_shared_counter_writer() {
+        use crate::parquet::StreamingParquetWriter;
+        use crate::record::{RecordCollector, SharedCollector};
+        use crate::systing_core::SystingRecordEvent;
+        use arrow::array::StringArray;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let shared =
+            SharedCollector::new(Box::new(StreamingParquetWriter::new(dir.path()).unwrap()));
+        let mut perf: Box<dyn RecordCollector + Send> = Box::new(shared.clone());
+        let sysinfo: Box<dyn RecordCollector + Send> = Box::new(shared.clone());
+        let mut rec = MissedEventsRecorder::new(
+            Arc::new(UtidGenerator::new()),
+            Arc::new(CounterTrackIdGenerator::new()),
+        );
+        rec.set_streaming_collector(Box::new(shared));
+        perf.add_counter_track(CounterTrackRecord {
+            id: 1_000,
+            name: "a perf counter".to_string(),
+            unit: Some("count".to_string()),
+        })
+        .unwrap();
+        perf.add_counter(CounterRecord {
+            ts: 500,
+            track_id: 1_000,
+            value: 1.0,
+        })
+        .unwrap();
+        rec.record_event(MissedEvent {
+            ts: 1_000,
+            class: 0,
+            count: 0,
+        });
+        perf.finish_boxed().unwrap();
+        sysinfo.finish_boxed().unwrap();
+        rec.record_limits(9_000, &[("lines cut short", 3)]).unwrap();
+        let collector = rec.finish().unwrap().expect("collector was set");
+        collector.finish_boxed().unwrap();
+
+        let file = File::open(dir.path().join("counter_track.parquet")).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut names = Vec::new();
+        for batch in reader.collect::<Result<Vec<_>, _>>().unwrap() {
+            let column = batch.column_by_name("name").unwrap();
+            let column = column.as_any().downcast_ref::<StringArray>().unwrap();
+            names.extend((0..batch.num_rows()).map(|i| column.value(i).to_string()));
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "Limit reached: lines cut short",
+                "Missed sched/IRQ events",
+                "a perf counter"
+            ]
+        );
+        let file = File::open(dir.path().join("counter.parquet")).unwrap();
+        let rows: usize = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum();
+        assert_eq!(rows, 3);
     }
 
     /// The netns inode of this test process, read the same way
