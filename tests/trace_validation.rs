@@ -4725,6 +4725,10 @@ enum EventsWorkload {
     FileOpen,
     /// Send SIGUSR1 to self in a loop (triggers signal_generate).
     Signal,
+    /// Touch fresh pages, each at an address of its own, and give them back, one in four
+    /// of them late. Collects each address with the page frame number that
+    /// /proc/self/pagemap gives for it.
+    TouchPages(std::sync::Arc<std::sync::Mutex<Vec<(i64, i64)>>>),
 }
 
 /// Helper to run a systing recording with a workload and custom config overrides.
@@ -4761,6 +4765,55 @@ fn run_events_recording_with(
             unsafe {
                 libc::signal(libc::SIGUSR1, prev);
             }
+        }
+        EventsWorkload::TouchPages(touched) => {
+            use std::os::unix::fs::FileExt;
+            // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let round_len = 16 * page_size;
+            // More rounds than SLOW_MACHINE_BUDGET allows for. Only a touched page costs memory.
+            let len = (1 << 16) * round_len;
+            let pagemap = std::fs::File::open("/proc/self/pagemap").expect("open pagemap");
+            // SAFETY: a new anonymous mapping, which only this thread knows of.
+            let start = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(start, libc::MAP_FAILED);
+            // Keeps each fault to one page, so that the kprobe sees every page.
+            // SAFETY: as for every call below, the range is in that mapping.
+            unsafe { libc::madvise(start, len, libc::MADV_NOHUGEPAGE) };
+            for round in (start as usize..start as usize + len).step_by(round_len) {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                for addr in (round..round + round_len).step_by(page_size) {
+                    unsafe { std::ptr::write_volatile(addr as *mut u8, 1) };
+                    let mut entry = [0; 8];
+                    pagemap
+                        .read_exact_at(&mut entry, (addr / page_size * 8) as u64)
+                        .expect("read pagemap");
+                    // Bits 0 to 54 of a present page's entry.
+                    let pfn = u64::from_ne_bytes(entry) & ((1 << 55) - 1);
+                    assert_ne!(pfn, 0, "pagemap hides page frame numbers");
+                    touched.lock().unwrap().push((addr as i64, pfn as i64));
+                }
+                // Later addresses get these frames again, so a frame is seen twice. The other
+                // four stay mapped for 256 rounds, so the frames in use spread past one block.
+                unsafe { libc::madvise(round as *mut _, 12 * page_size, libc::MADV_DONTNEED) };
+                if round - start as usize >= 256 * round_len {
+                    let kept = round - 256 * round_len + 12 * page_size;
+                    unsafe { libc::madvise(kept as *mut _, 4 * page_size, libc::MADV_DONTNEED) };
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            unsafe { libc::munmap(start, len) };
         }
     });
 
@@ -4840,6 +4893,189 @@ fn test_e2e_tracepoint_instant() {
     );
 
     eprintln!("  All tracepoint instant checks passed");
+}
+
+/// Integration test: the "id" arg type, against /proc/self/pagemap.
+///
+/// Ids must tell pages apart as page frame numbers do, and with a `group_shift` that
+/// spans the `struct page`s of 512 pages, their groups must be the blocks of 512 pages.
+/// No allocation is sure to fail, so an allocation's order of 0 stands in for a NULL page.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_id_arg() {
+    use libbpf_rs::btf::HasSize;
+    use std::collections::{HashMap, HashSet};
+
+    // `group_shift` stays 0 where 512 `struct page`s do not fill a power of two bytes, since no
+    // group could then match a block.
+    let pages_span = libbpf_rs::btf::Btf::from_vmlinux()
+        .ok()
+        .and_then(|btf| {
+            btf.type_by_name::<libbpf_rs::btf::types::Struct<'_>>("page")
+                .map(|page| 512 * page.size())
+        })
+        .filter(|span| span.is_power_of_two());
+    let group_shift = pages_span.map_or(0, usize::trailing_zeros);
+
+    let (tracepoints, tracepoint_instants) = if systing::systing_core::is_old_kernel() {
+        (String::new(), "")
+    } else {
+        (
+            format!(
+                r#",
+            {{
+                "name": "alloc",
+                "event": "tracepoint:kmem:mm_page_alloc",
+                "args": [
+                    {{ "arg_index": 0, "arg_type": "id", "group_shift": {group_shift}, "arg_name": "page" }},
+                    {{ "arg_index": 1, "arg_type": "long", "arg_name": "order" }},
+                    {{ "arg_index": 1, "arg_type": "id", "group_shift": {group_shift}, "arg_name": "order_id" }}
+                ]
+            }}"#
+            ),
+            r#", { "event": "alloc" }"#,
+        )
+    };
+    let config_json = format!(
+        r#"
+    {{
+        "events": [
+            {{
+                "name": "new_anon_page",
+                "event": "kprobe:folio_add_new_anon_rmap",
+                "args": [
+                    {{ "arg_index": 0, "arg_type": "id", "group_shift": {group_shift}, "arg_name": "folio" }},
+                    {{ "arg_index": 2, "arg_type": "long", "arg_name": "address" }}
+                ]
+            }}{tracepoints}
+        ],
+        "tracks": [
+            {{ "track_name": "Pages", "instants": [{{ "event": "new_anon_page" }}{tracepoint_instants}] }}
+        ]
+    }}
+    "#
+    );
+
+    let touched = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dir = run_events_recording(&config_json, EventsWorkload::TouchPages(touched.clone()));
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "id")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    let rows = |sql: &str| -> Vec<[i64; 3]> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?]))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+
+    // Each new page of the workload, with the page that its thread allocated last, which should
+    // be the same page. The last column is -2 where is_old_kernel() holds, since the config then
+    // has no tracepoint.
+    let new_pages = rows(
+        "WITH ids AS (
+             SELECT i.id, i.ts, i.utid, x.key, x.int_value AS value
+             FROM instant i JOIN instant_args x ON x.instant_id = i.id)
+         SELECT address.value, folio.value, coalesce(page.value, -2)
+         FROM (SELECT * FROM ids WHERE key = 'folio') folio
+         JOIN (SELECT * FROM ids WHERE key = 'address') address USING (id)
+         ASOF LEFT JOIN (SELECT * FROM ids WHERE key = 'page') page
+             ON folio.utid = page.utid AND folio.ts > page.ts",
+    );
+    // A raw address would leave gaps.
+    let groups = rows(&format!(
+        "SELECT count(DISTINCT int_value >> {group_shift}), max(int_value >> {group_shift}), 0
+         FROM instant_args WHERE key IN ('folio', 'page', 'order_id') AND int_value != 0"
+    ));
+    assert_eq!(
+        groups[0][0], groups[0][1],
+        "the groups are not numbered 1, 2, 3 ..."
+    );
+
+    let pfn_at: HashMap<i64, i64> = touched.lock().unwrap().drain(..).collect();
+    let mut pfn_of_id = HashMap::new();
+    let mut id_of_pfn = HashMap::new();
+    let (mut hits, mut as_allocated) = (0, 0);
+    for [address, id, allocated] in new_pages {
+        let Some(pfn) = pfn_at.get(&address) else {
+            continue;
+        };
+        assert_eq!(
+            pfn_of_id.insert(id, *pfn).unwrap_or(*pfn),
+            *pfn,
+            "id {id:#x} stands for two pages"
+        );
+        assert_eq!(
+            id_of_pfn.insert(*pfn, id).unwrap_or(id),
+            id,
+            "page {pfn:#x} has two ids"
+        );
+        hits += 1;
+        as_allocated += (allocated == id) as usize;
+    }
+    eprintln!(
+        "  id arg: {hits} new pages on {} page frames",
+        id_of_pfn.len()
+    );
+    assert!(
+        id_of_pfn.len() > 512,
+        "too few page frames to lie in more than one block"
+    );
+    assert!(hits > id_of_pfn.len(), "no page frame was used twice");
+
+    if pages_span.is_some() {
+        let mut block_of_group = HashMap::new();
+        let mut group_of_block = HashMap::new();
+        for (id, pfn) in &pfn_of_id {
+            let (group, block) = (id >> group_shift, pfn >> 9);
+            assert_eq!(
+                block_of_group.insert(group, block).unwrap_or(block),
+                block,
+                "group {group} spans two blocks"
+            );
+            assert_eq!(
+                group_of_block.insert(block, group).unwrap_or(group),
+                group,
+                "block {block:#x} has two groups"
+            );
+        }
+        eprintln!("  id arg: in {} blocks", group_of_block.len());
+        assert!(
+            group_of_block.len() < pfn_of_id.len(),
+            "no two page frames share a block"
+        );
+    }
+    if tracepoints.is_empty() {
+        return;
+    }
+
+    // An interrupt's allocation may come between a page's own and its mapping.
+    eprintln!("  id arg: {as_allocated} have the id of the page just allocated");
+    assert!(
+        as_allocated * 100 >= hits * 99,
+        "the tracepoint and the kprobe differ on {} of {hits} pages",
+        hits - as_allocated
+    );
+
+    let orders = rows(
+        "SELECT value.int_value, id.int_value, 0 FROM instant_args value
+         JOIN instant_args id USING (instant_id) WHERE value.key = 'order' AND id.key = 'order_id'",
+    );
+    let pairs: HashSet<(i64, i64)> = orders.iter().map(|r| (r[0], r[1])).collect();
+    let values: HashSet<i64> = orders.iter().map(|r| r[0]).collect();
+    let ids: HashSet<i64> = orders.iter().map(|r| r[1]).collect();
+    eprintln!("  id arg: {} orders", values.len());
+    assert!(values.contains(&0), "the allocations have no order of 0");
+    assert!(
+        pairs.iter().all(|(order, id)| (*order == 0) == (*id == 0)),
+        "an id arg must read 0 for 0, and only for 0"
+    );
+    assert!(
+        pairs.len() == values.len() && pairs.len() == ids.len(),
+        "some id stands for two orders, or some order has two ids"
+    );
 }
 
 /// Integration test: tracepoint range event via JSON config.

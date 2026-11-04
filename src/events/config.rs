@@ -37,10 +37,10 @@ pub(super) struct ThresholdStopTrigger {
 //
 //   Args are optional and will show up as debug annotations on the events in the trace.
 //   Up to 4 args can be specified per event. The arg_index specifies which argument
-//   to capture (0-based), arg_type specifies the type ("string", "long", or "retval"),
-//   and arg_name specifies the name of the annotation. The "retval" type captures the
-//   function return value and is only valid for kretprobe and uretprobe events. The
-//   arg_index field is not used for "retval" type and should be omitted.
+//   to capture (0-based), arg_type specifies the type ("string", "long", "retval", or
+//   "id"), and arg_name specifies the name of the annotation. "retval" captures the
+//   function return value, takes no arg_index, and is only valid for kretprobe and
+//   uretprobe events. docs/TRACE_CONFIG_FORMAT.md describes "id" and its "group_shift".
 //
 //   The "stack" field is optional (defaults to false). When set to true, systing will
 //   capture and emit a stack trace whenever this event fires.
@@ -158,7 +158,14 @@ struct SystingJSONEventKey {
     arg_index: u8,
     arg_type: String,
     arg_name: String,
+    group_shift: Option<u8>,
 }
+
+/// Groups are cut at multiples of `1 << group_shift`. In a region that starts at no such
+/// multiple, which values share a group depends on the start, which KASLR picks. x86-64 starts
+/// its direct map, vmalloc area and `struct page` array on multiples of 1 GiB, which sets this
+/// limit. Other regions, such as the kernel's image, are aligned less.
+const MAX_GROUP_SHIFT: u8 = 30;
 
 impl SystingProbeRecorder {
     pub fn add_event_from_str(&mut self, event: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
@@ -234,8 +241,32 @@ impl SystingProbeRecorder {
                 "string" => EventKeyType::String,
                 "long" => EventKeyType::Long,
                 "retval" => EventKeyType::Retval,
+                "id" => EventKeyType::Id,
                 _ => return Err(anyhow::anyhow!("Invalid arg type: {}", json_arg.arg_type)),
             };
+
+            if arg_type == EventKeyType::Id {
+                let group_shift = json_arg.group_shift.unwrap_or(0);
+                if group_shift > MAX_GROUP_SHIFT {
+                    return Err(anyhow::anyhow!(
+                        "group_shift must be 0 to {MAX_GROUP_SHIFT} in event: {}",
+                        event.name
+                    ));
+                }
+                // One table numbers all the ids of a capture, at one shift.
+                let earlier = self.ids.set_shift(group_shift);
+                if earlier != group_shift {
+                    return Err(anyhow::anyhow!(
+                        "every id arg of a capture must have the same group_shift (0 if left out): event {} has {group_shift}, an earlier arg has {earlier}",
+                        event.name
+                    ));
+                }
+            } else if json_arg.group_shift.is_some() {
+                return Err(anyhow::anyhow!(
+                    "group_shift is only valid for id type in event: {}",
+                    event.name
+                ));
+            }
 
             // Validate arg_index is not used with retval
             if arg_type == EventKeyType::Retval && json_arg.arg_index != 0 {
@@ -278,6 +309,28 @@ impl SystingProbeRecorder {
                 ));
             }
             stack = perf.period > 0;
+        }
+
+        for arg in args.iter().filter(|arg| arg.arg_type == EventKeyType::Id) {
+            let at_return = match &probe {
+                EventProbe::UProbe(uprobe) => uprobe.retprobe,
+                EventProbe::KProbe(kprobe) => kprobe.retprobe,
+                _ => false,
+            };
+            if at_return {
+                return Err(anyhow::anyhow!(
+                    "id arg type is not supported for return probes, which no longer have the arguments: {}",
+                    event.name
+                ));
+            }
+            // All but USDT probes leave 0 for an index above 5, which an "id" would take for a
+            // real 0.
+            if arg.arg_index > 5 && !matches!(probe, EventProbe::Usdt(_)) {
+                return Err(anyhow::anyhow!(
+                    "arg_index must be 0 to 5 for id type (only usdt probes read a higher argument) in event: {}",
+                    event.name
+                ));
+            }
         }
 
         // Validate retval args are only used with retprobes

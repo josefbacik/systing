@@ -2783,7 +2783,9 @@ pub(crate) fn projected_fd_need(
     nr_rings * families * PER_RING + num_cpus * per_cpu + FIXED
 }
 
-fn is_old_kernel() -> bool {
+/// Whether tracepoints take the classic program here, which has no args. attach_probes then
+/// refuses a tracepoint's args.
+pub fn is_old_kernel() -> bool {
     if let Some(kernel_version) = sysinfo::System::kernel_version() {
         let parts = kernel_version.split('.').collect::<Vec<&str>>();
 
@@ -5465,7 +5467,8 @@ fn attach_probes(
         for (i, arg) in event.args.iter().enumerate() {
             let bpf_arg_type = match arg.arg_type {
                 EventKeyType::String => arg_type::ARG_STRING,
-                EventKeyType::Long => arg_type::ARG_LONG,
+                // The recorder turns the value into its number.
+                EventKeyType::Long | EventKeyType::Id => arg_type::ARG_LONG,
                 EventKeyType::Retval => arg_type::ARG_RETVAL,
             };
 

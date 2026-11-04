@@ -101,6 +101,8 @@ pub enum EventKeyType {
     #[default]
     Long,
     Retval,
+    /// A number that stands for the value, in place of the value.
+    Id,
 }
 
 #[derive(Clone, Default)]
