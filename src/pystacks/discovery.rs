@@ -5,6 +5,7 @@
 use super::offsets;
 use super::process::{self, MemoryMapping};
 use super::types::{BpfLibBinaryId, PyPidData, BPF_LIB_DEFAULT_FIELD_OFFSET};
+use crate::root::Root;
 use object::read::{ReadCache, ReadRef};
 use object::{Object, ObjectSymbol};
 use std::collections::HashMap;
@@ -29,18 +30,19 @@ struct ElfPyInfo {
 /// Per-binary ELF parse results keyed by (st_dev, st_ino, st_size). `None`
 /// records a binary that is not a Python runtime — rejections cost a full
 /// ELF parse too, so they're worth remembering. A file that fails a
-/// readability probe (see `elf_py_info`) is not cached: a transient read
+/// readability probe (see `elf_py_info_of`) is not cached: a transient read
 /// error (ESTALE, a /proc/pid/root path vanishing when the process exits
 /// mid-check) must not blacklist an interpreter for the rest of the session.
 type ElfCache = HashMap<(u64, u64, u64), Option<Arc<ElfPyInfo>>>;
 
 static ELF_CACHE: LazyLock<Mutex<ElfCache>> = LazyLock::new(Default::default);
 
-/// Parse the ELF at `file_path` for Python runtime facts, going through the
-/// (st_dev, st_ino, st_size) cache. Returns `None` when the file is
-/// unreadable or is not a Python runtime.
-fn elf_py_info(file_path: &str) -> Option<Arc<ElfPyInfo>> {
-    // Open first and stat through the handle so the cache key describes the
+/// Parse the ELF `file` for Python runtime facts, going through the
+/// (st_dev, st_ino, st_size) cache. `file_path` is the path the process knows
+/// the file by, for messages and for the version fallback on its name. Returns
+/// `None` when the file is unreadable or is not a Python runtime.
+fn elf_py_info_of(file_path: &str, file: fs::File) -> Option<Arc<ElfPyInfo>> {
+    // Stat through the open handle so the cache key describes the
     // file we actually read. The inode is pinned while any process maps the
     // binary, but a cache entry can outlive every mapper; st_size in the key
     // guards against a freed (dev, ino) being reused by a different file
@@ -49,7 +51,6 @@ fn elf_py_info(file_path: &str) -> Option<Arc<ElfPyInfo>> {
     // Known limit: the version fallback in detect_python_version keys off
     // the basename, so hardlinks to one inode under different names share
     // whichever result was cached first.
-    let file = fs::File::open(file_path).ok()?;
     let meta = file.metadata().ok()?;
     let key = (meta.dev(), meta.ino(), meta.len());
     if let Some(cached) = ELF_CACHE.lock().unwrap().get(&key) {
@@ -239,8 +240,7 @@ fn try_python_module(
 ) -> Option<PyProcessInfo> {
     // ELF facts come from the per-binary cache — forked workers of the same
     // interpreter share one parse instead of re-reading the binary per PID.
-    let file_path = resolve_proc_path(pid, module_path);
-    let elf_info = elf_py_info(&file_path)?;
+    let elf_info = elf_py_info_of(module_path, open_in_process_root(pid, module_path)?)?;
 
     let is_pie = elf_info.is_dynamic && is_exe;
     let is_shared = elf_info.is_dynamic && !is_exe;
@@ -357,7 +357,6 @@ fn try_python_module(
     })
 }
 
-/// Resolve a path through /proc/pid/root for containerized processes.
 /// Where the GIL's `locked` and `last_holder` are in an interpreter's state,
 /// as the process's own `_Py_DebugOffsets` has them (3.13+): `word` reads
 /// eight bytes of the process at an address, `runtime_addr` is its
@@ -382,13 +381,15 @@ fn own_gil_offsets(
     Some((own(o.debug_gil_locked)?, own(o.debug_gil_holder)?))
 }
 
-fn resolve_proc_path(pid: i32, path: &str) -> String {
-    let proc_root = format!("/proc/{pid}/root{path}");
-    if Path::new(&proc_root).exists() {
-        proc_root
-    } else {
-        path.to_string()
-    }
+/// Open a file of process `pid` by the path that its `exe` link or its `maps`
+/// show. The process chooses what is at that path, so it is resolved beneath
+/// the process's own root, and only a regular file is opened. There is no
+/// falling back to the same path in the tracer's namespace, where it can name
+/// another file.
+fn open_in_process_root(pid: i32, path: &str) -> Option<fs::File> {
+    Root::of_process(pid)
+        .and_then(|root| root.open_regular(Path::new(path), 0))
+        .ok()
 }
 
 /// Find a symbol's address in an ELF file.
@@ -411,9 +412,7 @@ fn find_symbol_address<'data, R: ReadRef<'data>>(
 }
 
 /// Detect the Python version from an ELF file.
-/// Tries _PySys_ImplCacheTag first, then falls back to filename pattern
-/// (the resolved on-disk path has the same basename as the mapped module,
-/// so the pattern match is unaffected by /proc/pid/root resolution).
+/// Tries _PySys_ImplCacheTag first, then falls back to filename pattern.
 fn detect_python_version<'data, R: ReadRef<'data>>(
     elf: &object::File<'data, R>,
     reader: R,
@@ -633,6 +632,12 @@ mod tests {
         assert_eq!(read(table(b"xdebugpy", 7800, 1 << 20)), None);
     }
 
+    /// [`elf_py_info_of`] on a file opened by its path in this process's own
+    /// namespace.
+    fn elf_py_info(file_path: &str) -> Option<Arc<ElfPyInfo>> {
+        elf_py_info_of(file_path, fs::File::open(file_path).ok()?)
+    }
+
     #[test]
     fn test_parse_cpython_version() {
         assert_eq!(parse_cpython_version("cpython-38"), Some((3, 8, 0)));
@@ -684,6 +689,25 @@ mod tests {
     #[test]
     fn test_elf_py_info_unreadable_path() {
         assert!(elf_py_info("/nonexistent/definitely-not-a-file").is_none());
+    }
+
+    #[test]
+    fn test_open_in_process_root_opens_only_regular_files() {
+        let me = std::process::id() as i32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        fs::write(path("python3"), b"not an ELF").unwrap();
+        let fifo = std::ffi::CString::new(path("libpython3.so")).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        assert!(open_in_process_root(me, &path("python3")).is_some());
+        // A FIFO: refused without being opened.
+        assert!(open_in_process_root(me, &path("libpython3.so")).is_none());
+        assert!(open_in_process_root(me, "/dev/null").is_none());
+        // No such process, so no root to look beneath:
+        // nothing is opened.
+        assert!(open_in_process_root(i32::MAX, &path("python3")).is_none());
     }
 
     fn mapping(start: usize, offset: u64, name: &str) -> MemoryMapping {
