@@ -34,8 +34,8 @@
 //! section larger than what is left of its 256 MiB budget, so a binary
 //! whose module data record can be reached only through a larger section
 //! is "not a candidate"; and so is an image with more than 4,096
-//! sections, a hundred times what a Go binary has, with more segments
-//! than the file header's own field can count, with more than 256 MiB of
+//! sections, a hundred times what a Go binary has, with more than 256
+//! program headers, twenty times what one has, with more than 256 MiB of
 //! symbol tables, or with a function table of more than 256 MiB.
 //!
 //! Policy is deliberately left to the caller: this module reports whether
@@ -240,10 +240,11 @@ impl ElfPclntab {
 }
 
 /// Whether an image's header tables and symbol tables are of sizes a real
-/// binary has: at most [`MAX_SECTIONS`] section headers, no extended
-/// numbering of sections or segments, and at most [`MAX_SYMBOL_TABLES`] bytes
-/// of symbol tables in all. Judged from the file header and the section
-/// headers alone. What is no ELF file passes: the parse says so itself.
+/// binary has: at most [`MAX_SECTIONS`] section headers and
+/// [`MAX_SEGMENTS`] program headers, no extended numbering of either, and
+/// at most [`MAX_SYMBOL_TABLES`] bytes of symbol tables in all. Judged from
+/// the file header and the section headers alone. What is no ELF file
+/// passes: the parse says so itself.
 fn stated_sizes_are_plausible<'data, R: ReadRef<'data>>(source: R) -> bool {
     fn check<'data, Elf, R>(source: R) -> Option<bool>
     where
@@ -257,6 +258,7 @@ fn stated_sizes_are_plausible<'data, R: ReadRef<'data>>(source: R) -> bool {
             || header.e_shstrndx(endian) == object::elf::SHN_XINDEX
             || (header.e_shnum(endian) == 0 && header.e_shoff(endian).into() != 0)
             || usize::from(header.e_shnum(endian)) > MAX_SECTIONS
+            || usize::from(header.e_phnum(endian)) > MAX_SEGMENTS
         {
             return Some(false);
         }
@@ -329,6 +331,10 @@ fn read_named_section<'data>(
 /// Most sections an image may have to be looked at. A Go binary has a few
 /// dozen.
 const MAX_SECTIONS: usize = 4096;
+
+/// Most program headers an image may have to be looked at. A Go binary has
+/// about a dozen.
+const MAX_SEGMENTS: usize = 256;
 
 /// Most bytes of symbol tables, in all, an image may state to be looked at.
 const MAX_SYMBOL_TABLES: u64 = 256 << 20;
@@ -1134,6 +1140,21 @@ mod tests {
             );
         }
         assert_eq!(LoadSegments(Vec::new()).file_offset_to_vaddr(0), None);
+    }
+
+    #[test]
+    fn program_header_count_is_bounded() {
+        let header_with = |e_phnum: usize| {
+            let mut ehdr = vec![0u8; 64];
+            ehdr[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+            ehdr[4] = 2;
+            ehdr[5] = 1;
+            ehdr[6] = 1;
+            ehdr[0x38..0x3a].copy_from_slice(&u16::try_from(e_phnum).unwrap().to_le_bytes());
+            ehdr
+        };
+        assert!(stated_sizes_are_plausible(&*header_with(MAX_SEGMENTS)));
+        assert!(!stated_sizes_are_plausible(&*header_with(MAX_SEGMENTS + 1)));
     }
 
     #[test]
