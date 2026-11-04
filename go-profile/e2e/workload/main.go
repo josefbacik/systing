@@ -1,7 +1,8 @@
 // The workload of systing-go-profile's end-to-end check: a known heap,
-// lock and channel waits (with both profiles switched on), parked
-// goroutines, a pprof port, and Go's flight recorder, so every profile can be
-// read out of memory and compared with what the program itself serves.
+// lock and channel waits (with both profiles switched on), calls inlined into
+// the compiler's wrappers, parked goroutines, a pprof port, and Go's flight
+// recorder, so every profile can be read out of memory and compared with what
+// the program itself serves.
 //
 // It prints "port <port> pid <pid>" once listening. GET /flight?out=<path>
 // writes the flight recorder's window through the program's own WriteTo.
@@ -58,6 +59,31 @@ func consumer(c <-chan int) {
 //go:noinline
 func parked(c chan int) { <-c }
 
+// Pass is inlined into the wrappers the compiler makes for a defer statement,
+// a method value and a go statement. There Go's profiles name Pass and leave
+// the wrapper out, and the function table names the wrapper.
+type door struct {
+	mu sync.Mutex
+	wg sync.WaitGroup
+}
+
+func (d *door) Pass() { d.pass() }
+
+//go:noinline
+func (d *door) pass() {
+	d.mu.Lock()
+	keep = append(keep, make([]byte, 4<<20))
+	time.Sleep(time.Millisecond)
+	d.mu.Unlock()
+	d.wg.Done()
+}
+
+//go:noinline
+func byDefer(d *door) { defer d.Pass() }
+
+//go:noinline
+func byValue(f func()) { f() }
+
 func main() {
 	runtime.SetBlockProfileRate(1)
 	runtime.SetMutexProfileFraction(1)
@@ -67,6 +93,16 @@ func main() {
 	for i := 0; i < 20000; i++ {
 		retainSmall()
 	}
+	// Each way twice at once, so that each keeps memory, waits for the lock
+	// and makes another wait; all six have ended before anything is read.
+	var d door
+	d.wg.Add(6)
+	for i := 0; i < 2; i++ {
+		go byDefer(&d)
+		go byValue(d.Pass)
+		go d.Pass()
+	}
+	d.wg.Wait()
 	// About 70 MB/s of garbage: a collection every few seconds.
 	go func() {
 		for {
