@@ -746,6 +746,65 @@ mod tests {
         assert!(open_in_process_root(i32::MAX, &path("python3")).is_none());
     }
 
+    /// Compile `source` with the host's C compiler. False where there is none,
+    /// which in CI (`CI` set) is a failure: the caller's check would prove nothing.
+    fn cc_builds(source: &str, flags: &[&str], out: &Path) -> bool {
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let mut words = cc.split_whitespace();
+        let src = out.with_extension("c");
+        fs::write(&src, source).unwrap();
+        let built = std::process::Command::new(words.next().unwrap_or("cc"))
+            .args(words)
+            .args(flags)
+            .arg("-o")
+            .args([out, src.as_path()])
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            built || std::env::var_os("CI").is_none(),
+            "{cc} could not build {}",
+            out.display()
+        );
+        built
+    }
+
+    /// A stand-in CPython: it has `_PyRuntime` and no version tag, so its version
+    /// can only come from a file name. As a program it writes a byte and sleeps.
+    const UNTAGGED_RUNTIME: &str = "#include <unistd.h>\n\
+                                    char _PyRuntime[64];\n\
+                                    int main(void) {\n\
+                                        if (write(1, _PyRuntime, 1) != 1) return 1;\n\
+                                        sleep(120);\n\
+                                        return 0;\n\
+                                    }\n";
+
+    struct Child(std::process::Child);
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn run(program: &Path) -> Child {
+        use std::io::Read;
+
+        let mut child = std::process::Command::new(program)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // spawn() can return before the kernel has mapped the program. Its byte
+        // says that it runs.
+        let stdout = child.stdout.as_mut().unwrap();
+        stdout.read_exact(&mut [0]).unwrap();
+        Child(child)
+    }
+
+    fn version_of(pid: u32) -> Option<(i32, i32)> {
+        check_python_process(pid as i32).map(|info| (info.version_major, info.version_minor))
+    }
+
     #[test]
     fn test_the_next_entry_is_tried_only_after_one_that_is_gone() {
         let tries_until = |failure: io::ErrorKind| {
@@ -808,6 +867,84 @@ mod tests {
         unsafe { libc::munmap(at, page) };
         assert!(within);
         assert!(!beyond);
+    }
+
+    #[test]
+    fn test_a_running_interpreter_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("python3.12");
+        if !cc_builds(UNTAGGED_RUNTIME, &[], &exe) {
+            eprintln!("no C compiler on this host: skipping the running-interpreter check");
+            return;
+        }
+        // The second process is served from the per-file cache.
+        let (first, second) = (run(&exe), run(&exe));
+
+        assert_eq!(version_of(first.0.id()), Some((3, 12)));
+        assert_eq!(version_of(second.0.id()), Some((3, 12)));
+    }
+
+    #[test]
+    fn test_an_interpreter_is_recognised_after_its_file_was_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("python3.12");
+        if !cc_builds(UNTAGGED_RUNTIME, &[], &exe) {
+            eprintln!("no C compiler on this host: skipping the removed-file check");
+            return;
+        }
+        let child = run(&exe);
+        fs::remove_file(&exe).unwrap();
+
+        assert_eq!(version_of(child.0.id()), Some((3, 12)));
+    }
+
+    #[test]
+    fn test_copies_take_their_versions_from_their_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["python3.12", "python3.8", "python"];
+        if !cc_builds(UNTAGGED_RUNTIME, &[], &dir.path().join(names[0])) {
+            eprintln!("no C compiler on this host: skipping the copies check");
+            return;
+        }
+        for name in &names[1..] {
+            fs::copy(dir.path().join(names[0]), dir.path().join(name)).unwrap();
+        }
+        let versions = names.map(|name| version_of(run(&dir.path().join(name)).0.id()));
+
+        assert_eq!(versions, [Some((3, 12)), Some((3, 8)), None]);
+    }
+
+    /// A program that maps the file `LIB` as a loader does, writes a byte and sleeps.
+    const MAPS_A_LIBRARY: &str = "#include <fcntl.h>\n\
+                                  #include <sys/mman.h>\n\
+                                  #include <sys/stat.h>\n\
+                                  #include <unistd.h>\n\
+                                  int main(void) {\n\
+                                      struct stat s;\n\
+                                      void *m;\n\
+                                      int fd = open(LIB, O_RDONLY);\n\
+                                      if (fd < 0 || fstat(fd, &s) != 0) return 1;\n\
+                                      m = mmap(0, s.st_size, PROT_READ, MAP_PRIVATE, fd, 0);\n\
+                                      if (m == MAP_FAILED) return 1;\n\
+                                      if (write(1, \"x\", 1) != 1) return 1;\n\
+                                      sleep(120);\n\
+                                      return 0;\n\
+                                  }\n";
+
+    #[test]
+    fn test_a_mapped_library_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, app) = (dir.path().join("libpython3.12.so"), dir.path().join("app"));
+        let define = format!("-DLIB=\"{}\"", lib.display());
+        if !cc_builds(UNTAGGED_RUNTIME, &["-shared", "-fPIC"], &lib)
+            || !cc_builds(MAPS_A_LIBRARY, &[&define], &app)
+        {
+            eprintln!("no C compiler on this host: skipping the mapped-library check");
+            return;
+        }
+        let child = run(&app);
+
+        assert_eq!(version_of(child.0.id()), Some((3, 12)));
     }
 
     fn mapping(start: usize, offset: u64, name: &str) -> MemoryMapping {
