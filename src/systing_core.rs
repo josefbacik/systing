@@ -8,7 +8,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
@@ -28,7 +28,7 @@ use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{
     get_clock_value, ClockSamplingConfig, MemoryFaultLeg, MemoryRecorderConfig, MemoryRecorderEnd,
-    MissedEvent, NetworkRecorderConfig, SessionRecorder, SysInfoEvent,
+    MissedEvent, NetworkRecorderConfig, SessionRecorder, SysInfoEvent, MISSED_CLASS_KERNEL_SKIPPED,
 };
 use crate::stack_recorder::StackRecorder;
 
@@ -2644,6 +2644,23 @@ pub struct MemoryIommuHistEntry {
     pub order: u32,
     pub count: u64,
     pub bytes: u64,
+}
+
+/// How many runs of `program` the kernel skipped because a run was already under
+/// way on that CPU (`bpf_prog_info.recursion_misses`, kept with or without
+/// `kernel.bpf_stats_enabled`), or `None` if the count cannot be read. No code of
+/// ours runs for such an event, so `missed_events` cannot count it. The kernel
+/// keeps no such count for perf_event programs, and for kprobe and classic
+/// tracepoint programs only from Linux 6.7 on.
+fn kernel_skipped_runs(program: BorrowedFd<'_>) -> Option<u64> {
+    let mut info = libbpf_rs::libbpf_sys::bpf_prog_info::default();
+    let mut len = std::mem::size_of_val(&info) as u32;
+    // SAFETY: `info` is `len` bytes of plain integers, all zero, so the kernel
+    // fills its fixed part and follows no pointer in it.
+    let ret = unsafe {
+        libbpf_rs::libbpf_sys::bpf_prog_get_info_by_fd(program.as_raw_fd(), &mut info, &mut len)
+    };
+    (ret == 0).then_some(info.recursion_misses)
 }
 
 fn sum_percpu_counter(map: &dyn libbpf_rs::MapCore) -> u64 {
@@ -6033,6 +6050,30 @@ fn run_tracing_loop(
             dump_missed_events(&skel.maps.missed_events, 9)
         );
     }
+    {
+        // Runs, not events: a call's enter and its exit each count.
+        let skipped: Option<Vec<(String, u64)>> = skel
+            .object()
+            .progs()
+            .filter(|prog| prog.autoload())
+            .map(|prog| {
+                let runs = kernel_skipped_runs(prog.as_fd())?;
+                Some((prog.name().to_string_lossy().into_owned(), runs))
+            })
+            .collect();
+        match skipped {
+            Some(skipped) => {
+                println!(
+                    "Missed kernel-skipped events: {}",
+                    skipped.iter().map(|(_, runs)| runs).sum::<u64>()
+                );
+                for (name, runs) in skipped.iter().filter(|(_, runs)| *runs > 0) {
+                    println!("  {name}: {runs}");
+                }
+            }
+            None => println!("Missed kernel-skipped events: unknown"),
+        }
+    }
     if opts.memory && opts.memory_vfio {
         let dropped = sum_percpu_counter(&skel.maps.memory_iommu_overflow);
         if dropped > 0 {
@@ -7048,10 +7089,11 @@ pub fn systing(
         // Poll the per-class missed-event counters into counter tracks so
         // event loss is visible and time-localized in the trace instead of
         // only in the exit summary. Always on: it's a handful of map lookups
-        // per second, and "loss was zero the whole run" is itself useful
-        // signal. Only the classes whose subsystems are active this run are
-        // polled - same conditions as the exit summary. The map handle is
-        // duplicated so the thread doesn't borrow the skeleton.
+        // and one system call per program, per second, and "loss was zero the
+        // whole run" is itself useful signal. Only the classes whose subsystems
+        // are active this run are polled - same conditions as the exit summary.
+        // Map handles and program descriptors are duplicated so the thread
+        // doesn't borrow the skeleton.
         let missed_poller_thread = {
             let missed_map = libbpf_rs::MapHandle::try_from(&skel.maps.missed_events)?;
             let mut classes: Vec<u32> = vec![0, 1, 2, 3];
@@ -7073,6 +7115,12 @@ pub fn systing(
                 // time-localized like a loss burst.
                 classes.push(9);
             }
+            let programs = skel
+                .object()
+                .progs()
+                .filter(|prog| prog.autoload())
+                .map(|prog| prog.as_fd().try_clone_to_owned())
+                .collect::<io::Result<Vec<OwnedFd>>>()?;
             let shutdown_clone = shutdown_signal.clone();
             let missed_recorder = recorder.clone();
             thread::Builder::new()
@@ -7086,6 +7134,17 @@ pub fn systing(
                             for &class in &classes {
                                 let count = dump_missed_events(&missed_map, class);
                                 rec.record_event(MissedEvent { ts, class, count });
+                            }
+                            let skipped: Option<u64> = programs
+                                .iter()
+                                .map(|program| kernel_skipped_runs(program.as_fd()))
+                                .sum();
+                            if let Some(count) = skipped {
+                                rec.record_event(MissedEvent {
+                                    ts,
+                                    class: MISSED_CLASS_KERNEL_SKIPPED,
+                                    count,
+                                });
                             }
                         }
                         if stopping {
@@ -7739,6 +7798,12 @@ pub fn bpf_load_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_kernel_skipped_runs_of_no_program_is_unknown() {
+        let file = fs::File::open("/dev/null").unwrap();
+        assert_eq!(kernel_skipped_runs(file.as_fd()), None);
+    }
 
     fn info(tgidpid: u64, comm: &str) -> task_info {
         let mut task = task_info {
