@@ -51,6 +51,7 @@ use object::read::ReadCache;
 use object::read::ReadRef;
 use object::Object;
 use object::ObjectSection;
+use object::ObjectSegment;
 
 use crate::Error;
 use crate::GoPclntab;
@@ -67,6 +68,55 @@ pub struct ElfPclntab {
     /// the pclntab is most valuable when this is `false`, i.e. the binary
     /// is stripped.
     pub has_symtab: bool,
+    /// The image's loadable segments: which ranges of the file's bytes are
+    /// loaded, and at which virtual addresses, in the order of the program
+    /// header table.
+    pub load_segments: LoadSegments,
+}
+
+/// The loadable segments (`PT_LOAD` program headers) of an ELF image, in
+/// the order of the program header table.
+#[derive(Clone, Debug)]
+pub struct LoadSegments(Vec<LoadSegment>);
+
+/// One loadable segment: `file_size` bytes at `file_offset` of the file
+/// are loaded at `vaddr`.
+#[derive(Clone, Copy, Debug)]
+struct LoadSegment {
+    file_offset: u64,
+    file_size: u64,
+    vaddr: u64,
+}
+
+impl LoadSegments {
+    fn of<'data, R: ReadRef<'data>>(elf: &object::File<'data, R>) -> Self {
+        Self(
+            elf.segments()
+                .map(|segment| {
+                    let (file_offset, file_size) = segment.file_range();
+                    LoadSegment {
+                        file_offset,
+                        file_size,
+                        vaddr: segment.address(),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// The virtual address at which the byte at `offset` of the file is
+    /// loaded, by the first segment that holds it at an address that does
+    /// not overflow. `None` when no segment does.
+    pub fn file_offset_to_vaddr(&self, offset: u64) -> Option<u64> {
+        self.0.iter().find_map(|segment| {
+            let within = offset.checked_sub(segment.file_offset)?;
+            if within < segment.file_size {
+                segment.vaddr.checked_add(within)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 impl ElfPclntab {
@@ -118,7 +168,11 @@ impl ElfPclntab {
             if !settle_text_start(&elf, &mut table, section.address(), input_len) {
                 return Ok(None);
             }
-            return Ok(Some(Self { table, has_symtab }));
+            return Ok(Some(Self {
+                table,
+                has_symtab,
+                load_segments: LoadSegments::of(&elf),
+            }));
         }
 
         // No dedicated section. The scan below reads whole data sections,
@@ -174,7 +228,11 @@ impl ElfPclntab {
                 if !settle_text_start(&elf, &mut table, table_vaddr, input_len) {
                     return Ok(None);
                 }
-                return Ok(Some(Self { table, has_symtab }));
+                return Ok(Some(Self {
+                    table,
+                    has_symtab,
+                    load_segments: LoadSegments::of(&elf),
+                }));
             }
         }
         Ok(None)
@@ -683,6 +741,19 @@ mod tests {
         assert!(seen_main, "main.main not found in pclntab");
         assert!(seen_helper, "main.helper not found in pclntab");
 
+        {
+            let bytes = std::fs::read(&stripped).unwrap();
+            let parsed = object::File::parse(&*bytes).unwrap();
+            let text = parsed.section_by_name(".text").unwrap();
+            let (offset, size) = text.file_range().unwrap();
+            for within in [0, size - 1] {
+                assert_eq!(
+                    elf.load_segments.file_offset_to_vaddr(offset + within),
+                    Some(text.address() + within)
+                );
+            }
+        }
+
         // The unstripped twin: same table, but the symtab is reported so
         // callers preferring symtab+DWARF can decline.
         let unstripped = dir.path().join("fixture-unstripped");
@@ -1027,6 +1098,42 @@ mod tests {
             tab.text_start,
         );
         assert_eq!(named, tab.func_count());
+    }
+
+    #[test]
+    fn file_offsets_translate_by_the_load_segments() {
+        let segment = |file_offset, file_size, vaddr| LoadSegment {
+            file_offset,
+            file_size,
+            vaddr,
+        };
+        let segments = LoadSegments(vec![
+            segment(0, 0x1000, 0x40_0000),
+            segment(0x2000, 0x500, 0x40_3000),
+            // Overlaps the first; where they overlap, the first wins.
+            segment(0x800, 0x1000, 0x90_0000),
+            segment(0x9000, 0x10, u64::MAX - 7),
+        ]);
+        for (offset, want) in [
+            (0, Some(0x40_0000)),
+            (0xfff, Some(0x40_0fff)),
+            (0x1000, Some(0x90_0800)),
+            (0x17ff, Some(0x90_0fff)),
+            (0x1800, None),
+            (0x2000, Some(0x40_3000)),
+            (0x24ff, Some(0x40_34ff)),
+            (0x2500, None),
+            (0x9007, Some(u64::MAX)),
+            (0x9008, None),
+            (u64::MAX, None),
+        ] {
+            assert_eq!(
+                segments.file_offset_to_vaddr(offset),
+                want,
+                "offset {offset:#x}"
+            );
+        }
+        assert_eq!(LoadSegments(Vec::new()).file_offset_to_vaddr(0), None);
     }
 
     #[test]

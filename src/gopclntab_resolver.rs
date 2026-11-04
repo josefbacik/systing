@@ -23,7 +23,6 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use blazesym::helper::ElfResolver;
 use blazesym::symbolize::FindSymOpts;
 use blazesym::symbolize::Reason;
 use blazesym::symbolize::Resolve;
@@ -35,18 +34,22 @@ use blazesym::Addr;
 
 use gopclntab::ElfPclntab;
 use gopclntab::GoPclntab;
+use gopclntab::LoadSegments;
 
 /// A [`Resolve`] implementation answering symbol lookups from a Go
 /// binary's pclntab.
 ///
 /// File-offset translation (needed by the process symbolization flow to
 /// map memory offsets into ELF virtual addresses before calling
-/// [`Symbolize::find_sym`]) is delegated to a regular [`ElfResolver`] over
-/// the same file, which reads it from the program headers.
+/// [`Symbolize::find_sym`]) goes by the program headers that the probe read
+/// along with the table, in [`try_gopclntab_resolver`].
+///
+/// Symbols are reported under the module name that the probe takes from
+/// the mapping's symbolic path.
 #[derive(Debug)]
 pub struct GoPclntabResolver {
     pclntab: GoPclntab,
-    elf: ElfResolver,
+    load_segments: LoadSegments,
     /// Reporting name for the module, from the mapping's symbolic path.
     module: OsString,
 }
@@ -77,7 +80,7 @@ impl Symbolize for GoPclntabResolver {
 
 impl TranslateFileOffset for GoPclntabResolver {
     fn file_offset_to_virt_offset(&self, file_offset: u64) -> blazesym::Result<Option<Addr>> {
-        self.elf.file_offset_to_virt_offset(file_offset)
+        Ok(self.load_segments.file_offset_to_vaddr(file_offset))
     }
 }
 
@@ -105,7 +108,6 @@ pub fn try_gopclntab_resolver(maps_file: &Path, symbolic_path: &Path) -> Option<
     if elf.has_symtab {
         return None;
     }
-    let resolver = ElfResolver::open(maps_file).ok()?;
     let module = symbolic_path
         .file_name()
         .unwrap_or(symbolic_path.as_os_str())
@@ -117,7 +119,7 @@ pub fn try_gopclntab_resolver(maps_file: &Path, symbolic_path: &Path) -> Option<
     );
     Some(Box::new(GoPclntabResolver {
         pclntab: elf.table,
-        elf: resolver,
+        load_segments: elf.load_segments,
         module,
     }))
 }
