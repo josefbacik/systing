@@ -123,3 +123,83 @@ pub fn try_gopclntab_resolver(maps_file: &Path, symbolic_path: &Path) -> Option<
         module,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::process::Command;
+
+    use object::Object as _;
+    use object::ObjectSection as _;
+
+    /// A stripped Go binary is claimed: a file offset inside `main.main`
+    /// translates and resolves. Skips (with a notice) when no `go` binary is
+    /// on PATH.
+    #[test]
+    fn names_a_stripped_go_binary() {
+        if Command::new("go").arg("version").output().is_err() {
+            eprintln!("skipping: no go toolchain on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("main.go");
+        std::fs::write(&src, b"package main\n\nfunc main() {\n\tprintln(42)\n}\n").unwrap();
+        let built = dir.path().join("fixture");
+        let result = Command::new("go")
+            .arg("build")
+            .arg("-trimpath")
+            .arg("-ldflags=-s -w")
+            .arg("-o")
+            .arg(&built)
+            .arg(&src)
+            .env("GOCACHE", dir.path().join("gocache"))
+            .env("CGO_ENABLED", "0")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "go build failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        let bytes = std::fs::read(&built).unwrap();
+        let parsed = object::File::parse(&*bytes).unwrap();
+        let text = parsed.section_by_name(".text").unwrap();
+        let table = ElfPclntab::from_path(&built).unwrap().unwrap().table;
+        let entry = (0..table.func_count())
+            .filter_map(|i| table.func_entry(i))
+            .find(|entry| {
+                table
+                    .find_func(*entry)
+                    .is_some_and(|f| f.name == "main.main")
+            })
+            .expect("main.main not found in pclntab");
+
+        let resolver = try_gopclntab_resolver(&built, Path::new("/somewhere/fixture"))
+            .expect("the probe declined a stripped Go binary");
+        let vaddr = resolver
+            .file_offset_to_virt_offset(entry - text.address() + text.file_range().unwrap().0)
+            .unwrap()
+            .expect("an offset inside .text did not translate");
+        assert_eq!(vaddr, entry);
+        let sym = resolver
+            .find_sym(vaddr, &FindSymOpts::Basic)
+            .unwrap()
+            .expect("the entry of main.main did not resolve");
+        assert_eq!(sym.name, "main.main");
+        assert_eq!(sym.module, Some(std::ffi::OsStr::new("fixture")));
+    }
+
+    /// Files without a Go table are left to the default handling: this test's
+    /// own executable, and a file that is not an ELF image.
+    #[test]
+    fn leaves_other_files_to_the_default_handling() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(try_gopclntab_resolver(&exe, &exe).is_none());
+
+        let text = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(text.path(), b"not an image\n").unwrap();
+        assert!(try_gopclntab_resolver(text.path(), text.path()).is_none());
+    }
+}
