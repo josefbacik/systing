@@ -6,6 +6,34 @@
 #include "task_helpers.bpf.h"
 
 /*
+ * Linux 7.2 moved task->robust_list to task->futex.robust_list (kernel commit
+ * c1ffc9c6e4f8, "futex: Move futex task related data into a struct"). CO-RE
+ * ignores the ___ suffixes, so these match the running kernel's structs.
+ */
+struct task_struct___pre72 {
+  struct robust_list_head* robust_list;
+} __attribute__((preserve_access_index));
+
+struct futex_sched_data___post72 {
+  struct robust_list_head* robust_list;
+} __attribute__((preserve_access_index));
+
+struct task_struct___post72 {
+  struct futex_sched_data___post72 futex;
+} __attribute__((preserve_access_index));
+
+static __always_inline void* get_task_robust_list(
+    const struct task_struct* task) {
+  struct task_struct___post72* post72 = (void*)task;
+  struct task_struct___pre72* pre72 = (void*)task;
+
+  if (bpf_core_field_exists(post72->futex.robust_list)) {
+    return BPF_CORE_READ(post72, futex.robust_list);
+  }
+  return BPF_CORE_READ(pre72, robust_list);
+}
+
+/*
  * glibc's struct pthread, head-anchored: the three offsets the walker relies
  * on, per architecture. On x86-64 the thread pointer (fsbase) IS the
  * descriptor and its head is the full tcbhead_t (0x2c0 bytes); on the
@@ -55,7 +83,7 @@
 
 static __always_inline void* get_glibc_pthread_descriptor(
     const struct task_struct* cur_task) {
-  void* robust_list = (void*)BPF_PROBE_READ(cur_task, robust_list);
+  void* robust_list = get_task_robust_list(cur_task);
   if (!IS_VALID_USER_SPACE_ADDRESS(robust_list)) {
     return NULL;
   }
