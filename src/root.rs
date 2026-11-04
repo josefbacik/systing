@@ -10,6 +10,9 @@
 //! opens every path with `openat2(2)` and `RESOLVE_IN_ROOT`: the kernel then
 //! resolves absolute paths, absolute symlinks and `..` as it would for a
 //! process whose root that directory is, and nothing resolves outside it.
+//!
+//! Whoever controls the root also chooses what kind of file is at each of its
+//! paths. [`Root::open_regular`] opens a path only if a regular file is there.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -37,6 +40,11 @@ impl Root {
             .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(dir)?;
         Root::from_dir(handle)
+    }
+
+    /// The root directory of process `pid`, as `/proc/<pid>/root` gives it.
+    pub fn of_process(pid: impl std::fmt::Display) -> io::Result<Root> {
+        Root::open(Path::new(&format!("/proc/{pid}/root")))
     }
 
     /// The root at an open directory descriptor inherited from the caller.
@@ -76,6 +84,14 @@ impl Root {
     /// anywhere on the way, the last name included, is refused (`ELOOP`).
     pub fn open_at_no_symlinks(&self, path: &Path, flags: libc::c_int) -> io::Result<File> {
         self.open_how(path, flags, libc::RESOLVE_NO_SYMLINKS)
+    }
+
+    /// Open `path` beneath the root for reading, if it is a regular file; a
+    /// file of any other kind is refused without being opened (see
+    /// [`reopen_regular`]). `flags` go to the first, `O_PATH` open and may be 0
+    /// or `O_NOFOLLOW`, with which a symlink as the last name is refused too.
+    pub fn open_regular(&self, path: &Path, flags: libc::c_int) -> io::Result<File> {
+        reopen_regular(&self.open_at(path, libc::O_PATH | flags)?)
     }
 
     fn open_how(&self, path: &Path, flags: libc::c_int, resolve: u64) -> io::Result<File> {
@@ -138,6 +154,27 @@ pub fn inherited(fd: RawFd) -> io::Result<File> {
     Ok(File::from(owned))
 }
 
+/// Open for reading the file that `handle` holds, if it is a regular file.
+///
+/// Opening a file has effects before its type can be checked: opening a FIFO
+/// waits for a writer, and opening a device node runs its driver. So a path
+/// that someone else chose is first opened as a bare handle (`O_PATH`), which
+/// does neither, and the handle is passed here. The file opened is the one the
+/// handle holds, whatever has been put at its path since.
+pub fn reopen_regular(handle: &File) -> io::Result<File> {
+    if !handle.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+}
+
 /// Whether `file` is on a filesystem whose files live somewhere else: FUSE, or
 /// a network filesystem. Beneath a root the paths opened are chosen by whoever
 /// wrote the dumps; a read from such a mount would be made with the reader's
@@ -181,7 +218,7 @@ fn is_remote_fs_type(f_type: u32) -> bool {
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, MetadataExt};
 
     fn read_at(root: &Root, path: &str) -> io::Result<String> {
         let mut text = String::new();
@@ -263,6 +300,129 @@ mod tests {
             .open_at(Path::new("/proc/self/exe"), libc::O_RDONLY)
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+    }
+
+    fn read_regular(root: &Root, path: &str, flags: libc::c_int) -> io::Result<String> {
+        let mut text = String::new();
+        root.open_regular(Path::new(path), flags)?
+            .read_to_string(&mut text)?;
+        Ok(text)
+    }
+
+    #[test]
+    fn only_a_regular_file_is_opened_for_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), "text").unwrap();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        symlink("file", dir.path().join("link")).unwrap();
+        symlink("fifo", dir.path().join("link-to-fifo")).unwrap();
+        let fifo = CString::new(dir.path().join("fifo").as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let root = Root::open(dir.path()).unwrap();
+
+        assert_eq!(read_regular(&root, "/file", 0).unwrap(), "text");
+        assert_eq!(read_regular(&root, "/link", 0).unwrap(), "text");
+        // Nobody has the FIFO open for writing: a plain open of it would never
+        // return, so that this test ends at all is part of what it shows.
+        for (path, flags) in [
+            ("/fifo", 0),
+            ("/link-to-fifo", 0),
+            ("/dir", 0),
+            ("/link", libc::O_NOFOLLOW),
+        ] {
+            assert_eq!(
+                read_regular(&root, path, flags).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            read_regular(&root, "/none", 0).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    /// How many times inotify sees `path` opened while `act` runs. inotify does
+    /// not report an `O_PATH` open.
+    fn opens_seen(path: &Path, act: impl FnOnce()) -> usize {
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the call takes nothing but flags.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: the kernel just returned this descriptor.
+        let watch = unsafe { File::from_raw_fd(fd) };
+        // SAFETY: an open inotify descriptor and a NUL-terminated path.
+        let added =
+            unsafe { libc::inotify_add_watch(watch.as_raw_fd(), c_path.as_ptr(), libc::IN_OPEN) };
+        assert!(added >= 0);
+        act();
+        // Each event is a bare inotify_event: a watch on the file itself gives
+        // no name.
+        let mut events = [0u8; 1024];
+        (&watch).read(&mut events).unwrap_or(0) / std::mem::size_of::<libc::inotify_event>()
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_being_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo");
+        let fifo = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let root = Root::open(dir.path()).unwrap();
+
+        let refused = || assert!(root.open_regular(Path::new("/fifo"), 0).is_err());
+        assert_eq!(opens_seen(&path, refused), 0);
+        // The watch does see an open that looks at the file's type afterwards.
+        let opened = || drop(root.open_at(Path::new("/fifo"), libc::O_RDONLY | libc::O_NONBLOCK));
+        assert_eq!(opens_seen(&path, opened), 1);
+    }
+
+    #[test]
+    fn a_device_node_is_refused() {
+        // Creating a device node needs privilege, so this uses the system's own.
+        let root = Root::open(Path::new("/dev")).unwrap();
+        for node in ["/null", "/zero"] {
+            assert_eq!(
+                read_regular(&root, node, 0).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{node}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_out_of_the_root_is_not_read_as_a_regular_file() {
+        let outside = outside();
+        let dir = tempfile::tempdir().unwrap();
+        symlink(outside.path().join("secret"), dir.path().join("abs")).unwrap();
+        let climb = format!(
+            "../../../../../../../../../../../..{}/secret",
+            outside.path().display()
+        );
+        symlink(climb, dir.path().join("rel")).unwrap();
+        let root = Root::open(dir.path()).unwrap();
+
+        for path in ["/abs", "/rel"] {
+            assert_eq!(
+                read_regular(&root, path, 0).unwrap_err().kind(),
+                io::ErrorKind::NotFound,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_of_a_process_resolves_beneath_its_root() {
+        let exe = std::fs::read_link("/proc/self/exe").unwrap();
+        let root = Root::of_process(std::process::id()).unwrap();
+        let by_root = root.open_regular(&exe, 0).unwrap().metadata().unwrap();
+        let by_link = std::fs::metadata("/proc/self/exe").unwrap();
+        assert_eq!(
+            (by_root.dev(), by_root.ino()),
+            (by_link.dev(), by_link.ino())
+        );
     }
 
     #[test]
