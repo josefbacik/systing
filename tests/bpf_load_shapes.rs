@@ -25,6 +25,9 @@
 //! the rest. It is still the slow one; run it on its own with a bound that
 //! fits the host.
 //!
+//! `python_function_trace_loads_with_every_target_filter` is that recorder's rows
+//! of the gate alone, for CI's native arm64 runner.
+//!
 //! `closed_task_stacks_rows_call_nothing_that_reads_another_task` reads the
 //! same log for one question: the rows of the task-stacks object that may not
 //! read other tasks' memory (the shape an aarch64 host loads below the kernel
@@ -302,9 +305,26 @@ fn every_shape_loads() {
         task_stacks_reports.push((shape.name.to_string(), report));
     }
 
-    // The python-function-trace recorder's object: a row per target filter, every
-    // program, as each filter is a path the others prune.
-    let mut python_function_trace_reports = Vec::new();
+    let python_function_trace_reports = load_python_function_trace_rows(&mut rejected);
+
+    let mut failures = rejection_findings(&rejected);
+    failures.extend(selection_findings(&reports));
+    failures.extend(selection_findings(&task_stacks_reports));
+    failures.extend(selection_findings(&python_function_trace_reports));
+    assert!(
+        failures.is_empty(),
+        "{} finding(s):\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
+/// The python-function-trace recorder's object: a row per target filter, every
+/// program, as each filter is a path the others prune.
+fn load_python_function_trace_rows(
+    rejected: &mut BTreeMap<String, Vec<String>>,
+) -> Vec<(String, LoadReport)> {
+    let mut reports = Vec::new();
     for (name, filter) in systing::python_function_trace::load_probe_filters() {
         let started = std::time::Instant::now();
         let report = systing::python_function_trace::load_probe(&filter, &|_| 0)
@@ -315,14 +335,22 @@ fn every_shape_loads() {
             report.programs.iter().filter(|p| p.autoload).count(),
             started.elapsed()
         );
-        record_rejections(name, &report, &mut rejected);
-        python_function_trace_reports.push((name.to_string(), report));
+        record_rejections(name, &report, rejected);
+        reports.push((name.to_string(), report));
     }
+    reports
+}
 
-    let mut failures = rejection_findings(&rejected);
-    failures.extend(selection_findings(&reports));
-    failures.extend(selection_findings(&task_stacks_reports));
-    failures.extend(selection_findings(&python_function_trace_reports));
+/// This recorder's rows alone, for CI's arm64 runner, which does not run the main
+/// object's shapes: its object has to load there as on x86-64, and its failing to
+/// is otherwise only a note in a trace, with the capture going on without it.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn python_function_trace_loads_with_every_target_filter() {
+    let mut rejected = BTreeMap::new();
+    load_python_function_trace_rows(&mut rejected);
+
+    let failures = rejection_findings(&rejected);
     assert!(
         failures.is_empty(),
         "{} finding(s):\n  {}",

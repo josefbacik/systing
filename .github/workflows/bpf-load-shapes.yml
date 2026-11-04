@@ -594,6 +594,55 @@ jobs:
           cat "$OUT" || true
           echo "::endgroup::"
           grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      # Last among the cases, so that a failure here leaves the results above. The
+      # end-to-end cases trace each Python they find, and the step requires all three.
+      - name: Install Python 3.13 and 3.14 beside the runner's Python
+        run: |
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt-get update
+          sudo apt-get install -y python3.13 python3.14
+          python3 --version
+          python3.13 --version
+          python3.14 --version
+      - name: Load the python-function-trace object with every target filter
+        # The one load of this object on arm64 that does not depend on a capture, where
+        # a refusal would only be a note in a trace, with the capture going on without it.
+        run: |
+          sudo -E env LD_LIBRARY_PATH="$GITHUB_WORKSPACE/gate" "$GITHUB_WORKSPACE/gate/bpf_load_shapes" \
+            --ignored --test-threads=1 --nocapture python_function_trace_loads_with_every_target_filter
+      - name: Build the python_function_trace test binary
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo test --test python_function_trace --no-run --no-default-features --message-format=json > /tmp/build-pyft.json
+          BIN="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "python_function_trace") | .executable' /tmp/build-pyft.json | tail -n1)"
+          test -x "$BIN"
+          cp "$BIN" gate/python_function_trace
+          strip --strip-debug gate/python_function_trace
+      - name: Run the python-function-trace end-to-end cases as root
+        # Every call of three processes accounted for, on real arm64 cores and for each
+        # Python: the sites found in an arm64 interpreter, its uprobes, and the thread
+        # state read through glibc (this image's: the runner has no glibc 2.43).
+        run: |
+          chmod +x gate/python_function_trace scripts/ci/vmtest-python-function-trace-e2e.sh
+          OUT="$GITHUB_WORKSPACE/python-function-trace-e2e-arm64.log"
+          set +e
+          sudo -E timeout 1800 bash "$GITHUB_WORKSPACE/scripts/ci/vmtest-python-function-trace-e2e.sh" \
+            "$GITHUB_WORKSPACE/gate/python_function_trace" "$GITHUB_WORKSPACE/gate" "$OUT"
+          echo "the script exited $? (informational: the file it wrote decides)"
+          set -e
+          echo "::group::python-function-trace output (arm64)"
+          cat "$OUT" || cat "$OUT.raw" || true
+          echo "::endgroup::"
+          grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+          for python in python3.12 python3.13 python3.14; do
+            grep -q "^$python: .*every call accounted for" "$OUT"
+          done
       - name: Say which task-stacks contract this runner's kernel was held to
         # The recorder decides by the kernel's release, with nothing forcing it either way.
         # A runner image on a release known to carry the fix runs the cases open, and the

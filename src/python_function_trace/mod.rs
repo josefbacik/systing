@@ -1309,7 +1309,7 @@ fn shrink_unused_maps(open_skel: &mut skel::OpenPythonFunctionTraceSkel<'_>) -> 
 
 /// The target filters a capture can load this object with, for the load-shape
 /// test: each one is a path the verifier walks and the others prune.
-pub fn load_probe_filters() -> [(&'static str, TargetFilter); 3] {
+pub fn load_probe_filters() -> [(&'static str, TargetFilter); 5] {
     [
         (
             "python-function-trace-pid",
@@ -1335,12 +1335,30 @@ pub fn load_probe_filters() -> [(&'static str, TargetFilter); 3] {
                 ..Default::default()
             },
         ),
+        (
+            "python-function-trace-pid-and-cgroup",
+            TargetFilter {
+                filter_pid: true,
+                filter_cgroup: true,
+                cgroup_match_kernel: true,
+                num_cgroup_targets: 1,
+            },
+        ),
+        (
+            "python-function-trace-pid-and-cgroup-legacy",
+            TargetFilter {
+                filter_pid: true,
+                filter_cgroup: true,
+                num_cgroup_targets: 1,
+                ..Default::default()
+            },
+        ),
     ]
 }
 
 /// Loads this object's programs and nothing else (no map is shared, no probe
 /// attached): for the load-shape test, which runs it on every kernel of CI's
-/// matrix. `log_level` gives the verifier log level per program.
+/// matrix and on its native arm64 runner. `log_level` gives the verifier log level per program.
 pub fn load_probe(
     filter: &TargetFilter,
     log_level: &dyn Fn(&str) -> u32,
