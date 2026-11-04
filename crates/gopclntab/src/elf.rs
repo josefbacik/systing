@@ -147,8 +147,8 @@ impl ElfPclntab {
             return Ok(None);
         }
         let Ok(elf) = object::File::parse(source) else {
-            // Not an object file this build recognizes (only the ELF
-            // format is compiled in): not a candidate.
+            // Its first bytes say ELF, but the parser does not accept it:
+            // not a candidate.
             return Ok(None);
         };
 
@@ -243,8 +243,8 @@ impl ElfPclntab {
 /// binary has: at most [`MAX_SECTIONS`] section headers and
 /// [`MAX_SEGMENTS`] program headers, no extended numbering of either, and
 /// at most [`MAX_SYMBOL_TABLES`] bytes of symbol tables in all. Judged from
-/// the file header and the section headers alone. What is no ELF file
-/// passes: the parse says so itself.
+/// the file header and the section headers alone. A file that is not an
+/// ELF file, or whose headers cannot be read here, does not pass.
 fn stated_sizes_are_plausible<'data, R: ReadRef<'data>>(source: R) -> bool {
     fn check<'data, Elf, R>(source: R) -> Option<bool>
     where
@@ -286,9 +286,9 @@ fn stated_sizes_are_plausible<'data, R: ReadRef<'data>>(source: R) -> bool {
         Ok(object::FileKind::Elf64) => {
             check::<object::elf::FileHeader64<object::Endianness>, R>(source)
         }
-        _ => None,
+        _ => Some(false),
     }
-    .unwrap_or(true)
+    .unwrap_or(false)
 }
 
 /// Read a named pclntab section's bytes, validating its metadata against
@@ -1155,6 +1155,29 @@ mod tests {
         };
         assert!(stated_sizes_are_plausible(&*header_with(MAX_SEGMENTS)));
         assert!(!stated_sizes_are_plausible(&*header_with(MAX_SEGMENTS + 1)));
+    }
+
+    #[test]
+    fn another_object_format_is_not_a_candidate() {
+        let mut header = vec![0u8; 64];
+        header[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        assert!(!stated_sizes_are_plausible(&*header));
+        assert!(matches!(ElfPclntab::from_bytes(&header), Ok(None)));
+    }
+
+    #[test]
+    fn headers_that_cannot_be_read_are_not_plausible() {
+        // One section header, stated to begin where the input ends.
+        let mut ehdr = vec![0u8; 64];
+        ehdr[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        ehdr[4] = 2;
+        ehdr[5] = 1;
+        ehdr[6] = 1;
+        ehdr[0x28..0x30].copy_from_slice(&64u64.to_le_bytes());
+        ehdr[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
+        ehdr[0x3c..0x3e].copy_from_slice(&1u16.to_le_bytes());
+        assert!(!stated_sizes_are_plausible(&*ehdr));
+        assert!(matches!(ElfPclntab::from_bytes(&ehdr), Ok(None)));
     }
 
     #[test]
