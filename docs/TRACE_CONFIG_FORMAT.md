@@ -1014,6 +1014,8 @@ Only enable stack traces when needed, as they add significant overhead:
 }
 ```
 
+A stack on one tracepoint can also cost events on another. The kernel skips a run of a BPF program that is already running on the same CPU, so a tracepoint that fires in an interrupt is lost while its program is busy with another tracepoint, and walking a stack keeps a program busy for longer. The summary at the end of a capture counts these runs as `Missed kernel-skipped events`, with the programs they came from. From Linux 6.10 on, tracepoints with `"stack": true` and tracepoints without it run two different programs, so neither kind is skipped because of a run of the other. Two tracepoints of the same kind can still skip each other, so leave `"stack"` off a tracepoint that fires in interrupts unless you need it there. Kprobes, and tracepoints before Linux 6.10, are worse off: one is skipped while any other is running on the CPU, whatever its program, and the kernel counts that only from Linux 6.7 on. Uprobes and USDT probes are not skipped this way.
+
 ---
 
 ### 3. Argument Selection

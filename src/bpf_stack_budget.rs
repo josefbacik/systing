@@ -615,6 +615,26 @@ mod tests {
         );
     }
 
+    /// The kernel skips a hit that lands on a run of its own program, so this one stays short.
+    #[test]
+    fn the_raw_tracepoint_without_a_stack_does_not_reach_the_stack_walk() {
+        fn reaches(functions: &BTreeMap<String, Function>, from: &str, target: &str) -> bool {
+            from == target
+                || functions[from]
+                    .callees
+                    .iter()
+                    .any(|callee| reaches(functions, callee, target))
+        }
+        let (functions, _) = chains_of("systing_system.bpf.o");
+        let walk = "emit_stack_event_with_ts";
+        assert!(reaches(&functions, "systing_raw_tracepoint", walk));
+        assert!(!reaches(
+            &functions,
+            "systing_raw_tracepoint_no_stack",
+            walk
+        ));
+    }
+
     /// The same for the reader of a Go program's goroutine.
     #[test]
     fn the_go_context_reader_is_in_no_frame_but_its_own() {

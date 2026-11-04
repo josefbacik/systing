@@ -4939,6 +4939,108 @@ fn test_e2e_kprobe_range() {
     eprintln!("  All kprobe range checks passed");
 }
 
+/// The raw tracepoint links that this process holds: each one's tracepoint, with the id of the BPF
+/// program attached to it.
+fn raw_tracepoint_programs() -> std::collections::HashMap<String, u32> {
+    let mut programs = std::collections::HashMap::new();
+    for entry in std::fs::read_dir("/proc/self/fdinfo").unwrap().flatten() {
+        // A descriptor can close between the listing and the read.
+        let Ok(info) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let field = |key: &str| {
+            info.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .map(str::trim)
+        };
+        // Newer kernels print a tp_name for the classic program's links too.
+        if field("link_type:") != Some("raw_tracepoint") {
+            continue;
+        }
+        if let (Some(tracepoint), Some(program)) = (field("tp_name:"), field("prog_id:")) {
+            programs.insert(tracepoint.to_string(), program.parse().unwrap());
+        }
+    }
+    programs
+}
+
+/// Integration test: two tracepoints in one capture, one with a stack and one without.
+///
+/// Both must record, and only the hits of the first must have a stack. Where they attach as raw
+/// tracepoints, they must run two different BPF programs.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_tracepoint_with_and_without_stack() {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+
+    let config_json = r#"
+    {
+        "events": [
+            { "name": "with", "event": "tracepoint:signal:signal_generate", "stack": true },
+            { "name": "without", "event": "tracepoint:raw_syscalls:sys_enter" }
+        ],
+        "tracks": [
+            { "track_name": "WithStack", "instants": [{ "event": "with" }] },
+            { "track_name": "WithoutStack", "instants": [{ "event": "without" }] }
+        ]
+    }
+    "#;
+
+    // systing runs in this process, so its links are among this process's descriptors.
+    let links = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let seen = links.clone();
+    let watcher = stoppable_workload(move |stop| {
+        while !stop.load(Ordering::Relaxed) {
+            seen.lock().unwrap().extend(raw_tracepoint_programs());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    let dir = run_events_recording(config_json, EventsWorkload::Signal);
+    watcher.stop();
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "stack")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+    let instants = |track: &str| {
+        count(&format!(
+            "SELECT count(*) FROM instant i JOIN track t ON i.track_id = t.id
+             WHERE t.name = '{track}'"
+        ))
+    };
+
+    let (with, without) = (instants("WithStack"), instants("WithoutStack"));
+    // No other source of stacks is on.
+    let stacks = count("SELECT count(*) FROM stack_sample");
+    eprintln!(
+        "  tracepoint stacks: {with} instants with a stack, {without} without, {stacks} stacks"
+    );
+    // The workload sends a signal and sleeps, about 300 times, with a system call for each.
+    assert!(with > 100, "too few hits of the tracepoint with a stack");
+    assert!(
+        without > 100,
+        "too few hits of the tracepoint without a stack"
+    );
+    // A hit at the very end of the capture can leave its instant without its stack.
+    assert!(
+        (with - stacks).abs() <= 2,
+        "the hits of the tracepoint with a stack, and no others, must have one stack each"
+    );
+
+    // Where systing attaches the classic program, it holds no such links.
+    let links = links.lock().unwrap();
+    let programs = (links.get("signal_generate"), links.get("sys_enter"));
+    eprintln!("  tracepoint stacks: the two tracepoints' programs are {programs:?}");
+    if programs != (None, None) {
+        assert!(
+            programs.0.is_some() && programs.1.is_some() && programs.0 != programs.1,
+            "the two tracepoints must run two different programs"
+        );
+    }
+}
+
 /// Integration test: syscall tracking via `--syscalls` flag.
 ///
 /// Enables built-in syscall tracking (no JSON config needed). A workload opens

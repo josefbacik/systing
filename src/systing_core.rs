@@ -866,6 +866,7 @@ pub fn get_required_bpf_programs(
             required.insert("systing_tracepoint");
         } else {
             required.insert("systing_raw_tracepoint");
+            required.insert("systing_raw_tracepoint_no_stack");
         }
     }
 
@@ -3767,8 +3768,8 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
             "tcp_poll_exit" => skel.links.tcp_poll_exit.is_none(),
             // Programs that are manually attached (skip auto-attach check)
             // These include: systing_usdt, systing_uprobe, systing_kprobe,
-            // systing_tracepoint, systing_raw_tracepoint, systing_perf_event_clock,
-            // systing_perf_event_sample
+            // systing_tracepoint, systing_raw_tracepoint, systing_raw_tracepoint_no_stack,
+            // systing_perf_event_clock, systing_perf_event_sample
             _ => continue,
         };
 
@@ -5686,15 +5687,19 @@ fn attach_probes(
                         },
                     )
                 } else {
-                    skel.progs
-                        .systing_raw_tracepoint
-                        .attach_raw_tracepoint_with_opts(
-                            &tracepoint.name,
-                            RawTracepointOpts {
-                                cookie: event.cookie,
-                                ..Default::default()
-                            },
-                        )
+                    let raw_opts = RawTracepointOpts {
+                        cookie: event.cookie,
+                        ..Default::default()
+                    };
+                    if event.stack {
+                        skel.progs
+                            .systing_raw_tracepoint
+                            .attach_raw_tracepoint_with_opts(&tracepoint.name, raw_opts)
+                    } else {
+                        skel.progs
+                            .systing_raw_tracepoint_no_stack
+                            .attach_raw_tracepoint_with_opts(&tracepoint.name, raw_opts)
+                    }
                 }
                 .with_context(|| format!(
                     "Failed to attach tracepoint '{}:{}'. Verify the tracepoint exists with: ls /sys/kernel/debug/tracing/events/{}/{}",
