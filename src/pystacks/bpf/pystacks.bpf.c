@@ -271,7 +271,8 @@ static __always_inline void read_shadow_frame_data(
  * (including the explicit padding) hash deterministically. The result is
  * the symbol ID: content-derived, so every CPU computes the same ID
  * independently and no shared counter or map insert is needed from probe
- * context.
+ * context. User space recomputes it (hash_symbol() in symbols.rs) and refuses
+ * a record that does not match, so change both together.
  */
 static symbol_id_t hash_symbol(const struct pystacks_symbol* const sym) {
   _Static_assert(

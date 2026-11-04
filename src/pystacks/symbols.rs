@@ -13,6 +13,7 @@ use super::linetable::PyLineTable;
 use super::process;
 use super::types::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// A resolved Python symbol with optional line table.
@@ -27,6 +28,8 @@ pub struct SymbolResolver {
     symbols: RwLock<HashMap<SymbolIdT, PySymbol>>,
     /// Map of PID -> version info for line table construction.
     pid_versions: RwLock<HashMap<i32, (i32, i32)>>,
+    /// Records refused because their ID is not the hash of their symbol.
+    refused_records: AtomicU64,
 }
 
 impl SymbolResolver {
@@ -39,6 +42,7 @@ impl SymbolResolver {
         Self {
             symbols: RwLock::new(HashMap::new()),
             pid_versions: RwLock::new(pid_versions),
+            refused_records: AtomicU64::new(0),
         }
     }
 
@@ -54,6 +58,11 @@ impl SymbolResolver {
         self.symbols.read().unwrap().len()
     }
 
+    /// Number of records that `ingest_record` refused.
+    pub fn refused_records(&self) -> u64 {
+        self.refused_records.load(Ordering::Relaxed)
+    }
+
     /// Ingest one symbol record emitted by BPF.
     ///
     /// Returns true if the symbol is cached after this call (newly resolved
@@ -61,11 +70,19 @@ impl SymbolResolver {
     /// the BPF gate map. Returns false if resolution failed (e.g. the
     /// faulted qualname could not be read back); the ID is left out of the
     /// gate map so BPF re-emits it (rate-limited) and we retry — the page
-    /// may be resident on a later attempt.
+    /// may be resident on a later attempt. The same for a record that is
+    /// refused because its ID is not the hash of its symbol.
     pub fn ingest_record(&self, record: &PystacksSymbolRecord) -> bool {
         let id = record.symbol_id;
         if id == 0 {
             // 0 is reserved as "no symbol".
+            return false;
+        }
+
+        // The first record for an ID names it in every stack of the capture, so
+        // one whose symbol does not hash to its ID must not be taken.
+        if hash_symbol(&record.sym) != id {
+            self.refused_records.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
@@ -191,6 +208,28 @@ impl SymbolResolver {
             None => ("unknown".to_string(), None),
         }
     }
+}
+
+/// The ID BPF gives `sym`: `hash_symbol()` in pystacks.bpf.c, over the same
+/// bytes in the same order.
+fn hash_symbol(sym: &PystacksSymbol) -> SymbolIdT {
+    let mut bytes = Vec::with_capacity(std::mem::size_of::<PystacksSymbol>());
+    bytes.extend_from_slice(&sym.filename.value);
+    bytes.extend_from_slice(&sym.filename.fault_addr.to_ne_bytes());
+    bytes.extend_from_slice(&sym.qualname.value);
+    bytes.extend_from_slice(&sym.qualname.fault_addr.to_ne_bytes());
+    bytes.extend_from_slice(&sym.fault_pid.to_ne_bytes());
+    bytes.extend_from_slice(&sym.pad_.to_ne_bytes());
+
+    let hash = bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, word| {
+            (hash ^ u64::from_ne_bytes(*word)).wrapping_mul(0x100000001b3)
+        });
+    // 0 is reserved as "no symbol".
+    hash.max(1)
 }
 
 /// Extract a C string from a byte array (up to first null byte).
@@ -397,15 +436,40 @@ mod tests {
         assert_eq!(get_symbol_name(&sym), "MyClass.my_method");
     }
 
+    fn symbol(filename: &[u8], qualname: &[u8]) -> PystacksSymbol {
+        let mut sym = PystacksSymbol::default();
+        sym.filename.value[..filename.len()].copy_from_slice(filename);
+        sym.qualname.value[..qualname.len()].copy_from_slice(qualname);
+        sym
+    }
+
+    /// The expected IDs are what `hash_symbol()` of pystacks.bpf.c returns for
+    /// these symbols, compiled for the host.
+    #[test]
+    fn test_hash_symbol_is_the_bpf_hash() {
+        assert_eq!(
+            hash_symbol(&symbol(b"/app/main.py", b"MyClass.my_func")),
+            0xbd18c65c9706b8be
+        );
+        assert_eq!(
+            hash_symbol(&symbol(b"", b"[Frame Error]")),
+            0xba6a0aa82ae5a61a
+        );
+        let mut faulted = PystacksSymbol::default();
+        faulted.qualname.fault_addr = 0x7f0012345678;
+        faulted.fault_pid = 4242;
+        assert_eq!(hash_symbol(&faulted), 0x22795d86d48cd545);
+    }
+
     #[test]
     fn test_ingest_record_caches_symbol() {
         let resolver = SymbolResolver::new(&HashMap::new());
-        let mut record = PystacksSymbolRecord {
-            symbol_id: 0xdeadbeefcafef00d,
+        let sym = symbol(b"", b"my_func");
+        let record = PystacksSymbolRecord {
+            symbol_id: hash_symbol(&sym),
+            sym,
             ..Default::default()
         };
-        let name = b"my_func";
-        record.sym.qualname.value[..name.len()].copy_from_slice(name);
 
         assert!(resolver.ingest_record(&record));
         assert_eq!(resolver.symbol_count(), 1);
@@ -414,11 +478,41 @@ mod tests {
         assert_eq!(resolver.symbol_count(), 1);
 
         let frame = StackWalkerFrame {
-            symbol_id: 0xdeadbeefcafef00d,
+            symbol_id: record.symbol_id,
             inst_idx: -1,
             pad_: 0,
         };
         assert_eq!(resolver.symbolize_function(&frame), "my_func");
+    }
+
+    #[test]
+    fn test_ingest_record_refuses_a_record_whose_id_is_not_its_hash() {
+        let resolver = SymbolResolver::new(&HashMap::new());
+        let sym = symbol(b"/app/main.py", b"my_func");
+        let good = PystacksSymbolRecord {
+            symbol_id: hash_symbol(&sym),
+            sym,
+            ..Default::default()
+        };
+        let garbled = PystacksSymbolRecord {
+            sym: symbol(b"", b"[Frame Error]"),
+            ..good.clone()
+        };
+
+        assert!(!resolver.ingest_record(&garbled));
+        assert_eq!(resolver.symbol_count(), 0);
+        assert_eq!(resolver.refused_records(), 1);
+
+        assert!(resolver.ingest_record(&good));
+        let frame = StackWalkerFrame {
+            symbol_id: good.symbol_id,
+            inst_idx: -1,
+            pad_: 0,
+        };
+        assert_eq!(resolver.symbolize_function(&frame), "my_func");
+
+        assert!(!resolver.ingest_record(&garbled));
+        assert_eq!(resolver.refused_records(), 2);
     }
 
     #[test]
