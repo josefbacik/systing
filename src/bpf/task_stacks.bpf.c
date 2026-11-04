@@ -280,6 +280,17 @@ struct {
 	__type(value, struct task_stacks_walk_stats);
 } task_stacks_walk_stats SEC(".maps");
 
+/*
+ * Up to Linux 7.1 on_cpu is an int; from 7.2 a u8 with other flags after it
+ * (kernel commit 4c2a20413d7f, "sched: Add is_blocked task flag"). The bitfield
+ * macro takes the size from the kernel; BPF_CORE_READ() would read four bytes.
+ */
+static __always_inline bool task_on_cpu(struct task_struct *task)
+{
+	return bpf_core_field_exists(task->on_cpu) &&
+	       BPF_CORE_READ_BITFIELD_PROBED(task, on_cpu);
+}
+
 static __always_inline void read_status(struct task_struct *task, bool on_cpu,
 					struct task_status *now)
 {
@@ -407,8 +418,7 @@ static __always_inline s32 task_syscall_nr(struct task_struct *task, u32 state)
 	    (BPF_CORE_READ(task, flags) &
 	     (TASK_STACKS_PF_IO_WORKER | TASK_STACKS_PF_USER_WORKER)))
 		return TASK_STACKS_NO_SYSCALL;
-	on_cpu = bpf_core_field_exists(task->on_cpu) ?
-			 BPF_CORE_READ(task, on_cpu) : 0;
+	on_cpu = task_on_cpu(task);
 	/* TASK_RUNNING is 0. */
 	if (on_cpu && !state)
 		return TASK_STACKS_NO_SYSCALL;
@@ -741,8 +751,7 @@ int systing_task_stacks(struct bpf_iter__task *ctx)
 
 	/* Before the status, not after: see status_delta(). A uniprocessor
 	 * kernel has no on_cpu, nor a CPU for the thread to be on but ours. */
-	on_cpu = bpf_core_field_exists(task->on_cpu) ?
-			 BPF_CORE_READ(task, on_cpu) : 0;
+	on_cpu = task_on_cpu(task);
 	read_status(task, on_cpu, &now);
 	if (status_delta(tid, &now, on_cpu, e)) {
 		/* The header alone: userspace extends the thread's last record
