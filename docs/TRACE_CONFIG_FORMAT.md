@@ -281,9 +281,10 @@ The `args` field allows capturing probe arguments that appear as debug annotatio
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `arg_index` | Integer (0-7) | Conditional | Argument position (0-based). Required for `long` and `string`, must be 0 or omitted for `retval` |
-| `arg_type` | String | **Yes** | Type of argument: `"long"`, `"string"`, or `"retval"` |
+| `arg_index` | Integer (0-7) | Conditional | Argument position (0-based). Required for `long`, `string` and `id` (0-5 for `id`, except on `usdt`), must be 0 or omitted for `retval` |
+| `arg_type` | String | **Yes** | Type of argument: `"long"`, `"string"`, `"retval"`, or `"id"` |
 | `arg_name` | String | **Yes** | Name displayed in Perfetto annotations |
+| `group_shift` | Integer (0-30) | No | For `id` only: values that are equal above this many low bits form a group |
 
 ### Argument Types
 
@@ -351,6 +352,62 @@ Captures the function's return value. Only valid for return probes.
 - **NOT valid for tracepoints** (use `sys_exit_*` tracepoints with `arg_index: 0` instead)
 
 **Valid for:** `kretprobe`, `uretprobe` only
+
+---
+
+#### `"id"` - Identifier
+
+Captures a number that stands for the argument's value, in place of the value. A value gets the same number in every event of a capture, so events that name the same value can be paired, counted or grouped. 0 is captured as 0, so a NULL pointer still reads as NULL. The exception is a USDT argument that is 0, which is not captured at all, as for `"long"`.
+
+Use it when the trace should not hold the address: the kernel is careful about who sees its addresses. Otherwise a `"long"` does the same in SQL (`dense_rank()`, `value >> N`) and takes no memory in systing.
+
+```json
+{
+  "arg_index": 0,
+  "arg_type": "id",
+  "arg_name": "lock"
+}
+```
+
+systing numbers the values from 1, in the order in which it first sees them. The numbers hold within one capture: the next capture numbers the same values anew. Numbers are given out as events are handled for writing, so with `--continuous` an event that has left the window takes none. An event that then writes no arg, as the end of a range does, still takes one, so a trace can skip numbers.
+
+An id names a value, not an object:
+- Memory that is freed and used again keeps its id, so one id can stand for many objects in turn. To pair an allocation with its free, take the first free after it
+- In a `uprobe` or `usdt` arg, two processes can hold the same address for different objects. Join on the process as well
+- A probe's return value (`"retval"`) cannot be an id, so `malloc`'s result cannot be paired with `free`'s argument. Use events that take the pointer as an argument, such as `kmem:kmalloc` and `kmem:kfree` (`arg_index` 1)
+
+**Groups:** with `"group_shift": N`, values that are equal above their low N bits form a group. `id >> N` is then the group's number, from 1, and the low N bits of the id number the values within the group, from 0.
+
+```json
+{
+  "arg_index": 0,
+  "arg_type": "id",
+  "group_shift": 15,
+  "arg_name": "page_id_15"
+}
+```
+
+Nothing in the trace says that an arg is an id, or what its `group_shift` was. Keep that in the `arg_name`, as here.
+
+**Use cases:**
+- Pairing events by the value that they name: a lock's acquire with its release, an allocation with its free
+- Counting the distinct values that a code path touches
+- Grouping values that lie together in memory. `arg_index` 0 of `kmem:mm_page_alloc` is the `struct page *`. Where a `struct page` is 64 bytes, the 512 `struct page`s of an aligned 2 MiB block of 4 KiB pages fill 2^15 bytes, so `"group_shift": 15` makes each such block a group, and a reader can count over how many blocks a workload's pages are spread
+
+The number is stored as an integer, like a `"long"`.
+
+**Requirements:**
+- Every `"id"` arg of a capture must have the same `group_shift` (leaving it out counts as 0), because one table numbers them all. The shift changes how an id is written, not which events share it, so an arg that needs no groups can take the shift of one that does, and its ids then show groups too
+- `group_shift` must be 0 to 30. Groups are cut at multiples of 2^N, so if a region of memory does not start at a multiple of 2^N, which of its addresses share a group depends on where it starts, and a trace can show something of that start, which KASLR picks at random. On x86-64 the direct map, the vmalloc area and the `struct page` array start on multiples of 1 GiB. Other regions, such as the kernel's image or a user mapping, are aligned less
+- `arg_index` must be 0 to 5, except for `usdt`: other probes read no higher argument
+
+**Limits:**
+- systing keeps every value that it has numbered in memory until the capture ends: at most 136 MiB with a `group_shift` of 0 and at most 272 MiB with a larger one, and for a moment while the table grows 204 MiB and 340 MiB. Only a capture with an `"id"` arg pays this
+- A capture numbers at most 7,340,032 different values. A new value after that is captured as -1, and values numbered before then keep their numbers. -1 does not stand for any one value, so leave it out when pairing, counting or grouping (`-1 >> N` is -1). When the capture ends, systing prints how many args were captured as -1. To stay under the limit, take a shorter capture or trace fewer tasks
+
+**What a trace still shows:** an id replaces that arg's value and nothing else. Each event keeps its time, its task and any stack, and a stack's kernel frames are written with their addresses. The ids themselves show which events name the same value, which values share a group, and in what order systing first saw them. Where an allocator hands out neighbouring addresses in turn, that order can show which values are neighbours. If any event of the capture also records a value as a `"long"` or a `"retval"`, that gives away the value behind its id in every event.
+
+**Valid for:** `usdt`, `uprobe`, `kprobe`, `tracepoint`
 
 ### Argument Count Limit
 
@@ -861,6 +918,8 @@ Creates a separate "Context Switches" track for each CPU in the system.
 3. **Argument type restrictions:**
    - `retval` only valid for `kretprobe` and `uretprobe`
    - `retval` must have `arg_index: 0` or omitted
+   - `id` not valid for `kretprobe` and `uretprobe`; its `arg_index` must be 0 to 5, except on `usdt`
+   - `group_shift` only valid for `id`, 0 to 30, the same for every `id` arg of a capture
    - Tracepoint argument capture requires kernel 6.10+
 4. **Probe format requirements:**
    - USDT: `usdt:<path>:<provider>:<name>` (4 parts)
@@ -1234,7 +1293,7 @@ If this fails, you have invalid JSON.
 This document covered:
 - ✅ Complete JSON schema for trace configuration files
 - ✅ All 4 event types: USDT, uprobe/uretprobe, kprobe/kretprobe, tracepoint
-- ✅ Argument capture with 3 types: long, string, retval
+- ✅ Argument capture with 4 types: long, string, retval, id
 - ✅ Track visualization: ranges and instants
 - ✅ Stop triggers: thresholds and instants
 - ✅ Validation rules and restrictions

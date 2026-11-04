@@ -1,7 +1,9 @@
 mod config;
+mod ids;
 mod probe;
 
 use config::ThresholdStopTrigger;
+use ids::IdTable;
 
 #[cfg(test)]
 mod tests;
@@ -123,6 +125,9 @@ pub struct SystingProbeRecorder {
 
     // Shared utid generator for consistent thread IDs across all recorders
     utid_generator: Arc<UtidGenerator>,
+
+    // The numbers that stand for the values of "id" args
+    ids: IdTable,
 }
 
 impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
@@ -164,7 +169,10 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
                 crate::systing_core::types::arg_type::ARG_LONG => {
                     let mut bytes: [u8; 8] = [0; 8];
                     let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
-                    let val = u64::from_ne_bytes(bytes);
+                    let mut val = u64::from_ne_bytes(bytes);
+                    if event_key.arg_type == EventKeyType::Id {
+                        val = self.ids.id(val);
+                    }
                     arg_data.push((event_key.arg_name.clone(), ArgValue::Long(val)));
                 }
                 crate::systing_core::types::arg_type::ARG_RETVAL => {
@@ -280,6 +288,7 @@ impl SystingProbeRecorder {
             track_event_ids,
             track_cache: HashMap::new(),
             utid_generator,
+            ids: IdTable::default(),
         }
     }
 
@@ -318,6 +327,9 @@ impl SystingProbeRecorder {
     /// Finish streaming and return the collector.
     /// Incomplete events (outstanding_ranges, pending_syscalls) are discarded.
     pub fn finish(&mut self) -> Result<Option<Box<dyn RecordCollector + Send>>> {
+        if let Some(not_numbered) = self.ids.not_numbered() {
+            println!("\"id\" args recorded as -1 because the table was full: {not_numbered}");
+        }
         if let Some(mut collector) = self.streaming_collector.take() {
             collector.flush()?;
             Ok(Some(collector))

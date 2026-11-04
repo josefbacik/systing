@@ -1498,6 +1498,205 @@ fn test_event_with_args() {
     assert_eq!(event.args[0].arg_name, "size");
 }
 
+/// Loads `events` (the JSON of the "events" list) with each event as an instant of one track.
+fn recorder_with_instants(events: &str, names: &[&str]) -> Result<SystingProbeRecorder> {
+    let mut recorder = create_test_recorder();
+    let instants: Vec<String> = names
+        .iter()
+        .map(|name| format!(r#"{{"event": "{name}"}}"#))
+        .collect();
+    recorder.load_config_from_json(
+        &format!(
+            r#"{{"events": [{events}], "tracks": [{{"track_name": "t", "instants": [{}]}}]}}"#,
+            instants.join(", ")
+        ),
+        &mut StepRng::new(0, 1),
+    )?;
+    Ok(recorder)
+}
+
+/// Two events, "get" and "put", that record their first argument as an "id".
+fn recorder_with_two_id_events(group_shift: u8) -> SystingProbeRecorder {
+    let event = |name: &str| {
+        format!(
+            r#"{{"name": "{name}", "event": "kprobe:{name}", "args": [{{"arg_index": 0,
+                "arg_type": "id", "group_shift": {group_shift}, "arg_name": "thing"}}]}}"#
+        )
+    };
+    recorder_with_instants(
+        &format!("{}, {}", event("get"), event("put")),
+        &["get", "put"],
+    )
+    .unwrap()
+}
+
+fn hit(recorder: &SystingProbeRecorder, name: &str, value: u64) -> probe_event {
+    let mut event = create_syscall_enter_event(1, 2, 1000, value);
+    event.cookie = recorder.config_events[name].cookie;
+    event
+}
+
+/// What the recorder writes for hits with these values, of "get" and "put" in turn.
+fn ids_of(mut recorder: SystingProbeRecorder, values: &[u64]) -> Vec<i64> {
+    for (value, name) in values.iter().zip(["get", "put"].iter().cycle()) {
+        let event = hit(&recorder, name, *value);
+        recorder.handle_event(event);
+    }
+    let args = recorder.finish_in_memory().instant_args;
+    args.iter().map(|arg| arg.int_value.unwrap()).collect()
+}
+
+#[test]
+fn test_where_an_id_arg_is_valid() {
+    let load = |event: &str, arg: &str| {
+        recorder_with_instants(
+            &format!(r#"{{"name": "e", "event": "{event}", "args": [{arg}]}}"#),
+            &["e"],
+        )
+    };
+    let error = |event: &str, arg: &str| load(event, arg).err().unwrap().to_string();
+    let id = |arg_index: u8| {
+        format!(r#"{{"arg_index": {arg_index}, "arg_type": "id", "arg_name": "a"}}"#)
+    };
+
+    for event in [
+        "tracepoint:kmem:mm_page_alloc",
+        "kprobe:foo",
+        "uprobe:/path/to/file:symbol",
+    ] {
+        let recorder = load(event, &id(5)).unwrap();
+        assert!(matches!(
+            recorder.config_events["e"].args[0].arg_type,
+            EventKeyType::Id
+        ));
+        assert_eq!(
+            error(event, &id(6)),
+            "arg_index must be 0 to 5 for id type (only usdt probes read a higher argument) in event: e"
+        );
+    }
+    assert!(load("usdt:/path/to/file:provider:name", &id(6)).is_ok());
+    for event in ["kretprobe:foo", "uretprobe:/path/to/file:symbol"] {
+        assert_eq!(
+            error(event, &id(0)),
+            "id arg type is not supported for return probes, which no longer have the arguments: e"
+        );
+    }
+
+    let shifted = |arg_type: &str, group_shift: u8| {
+        format!(
+            r#"{{"arg_index": 0, "arg_type": "{arg_type}", "group_shift": {group_shift}, "arg_name": "a"}}"#
+        )
+    };
+    assert!(load("kprobe:foo", &shifted("id", 30)).is_ok());
+    assert_eq!(
+        error("kprobe:foo", &shifted("id", 31)),
+        "group_shift must be 0 to 30 in event: e"
+    );
+    assert_eq!(
+        error("kprobe:foo", &shifted("long", 0)),
+        "group_shift is only valid for id type in event: e"
+    );
+    let same = format!("{}, {}", shifted("id", 15), shifted("id", 15));
+    assert!(load("kprobe:foo", &same).is_ok());
+    assert_eq!(
+        error("kprobe:foo", &format!("{}, {}", shifted("id", 15), id(0))),
+        "every id arg of a capture must have the same group_shift (0 if left out): event e has 0, an earlier arg has 15"
+    );
+    // The rule holds across the config files of a capture.
+    let second = format!(
+        r#"{{"events": [{{"name": "f", "event": "kprobe:bar", "args": [{}]}}]}}"#,
+        shifted("id", 12)
+    );
+    assert_eq!(
+        load("kprobe:foo", &shifted("id", 15))
+            .unwrap()
+            .load_config_from_json(&second, &mut StepRng::new(9, 1))
+            .unwrap_err()
+            .to_string(),
+        "every id arg of a capture must have the same group_shift (0 if left out): event f has 12, an earlier arg has 15"
+    );
+}
+
+#[test]
+fn test_id_arg_numbers_values_and_groups() {
+    // Groups of 16: 0x1230 to 0x123f, 0x50 to 0x5f, 0x1220 to 0x122f. The first and the
+    // last would share a group of 32.
+    assert_eq!(
+        ids_of(
+            recorder_with_two_id_events(4),
+            &[0x1234, 0x1230, 0x55, 0x1234, 0, 0x123f, 0x1220, 0x55]
+        ),
+        [0x10, 0x11, 0x20, 0x10, 0, 0x12, 0x30, 0x20]
+    );
+    assert_eq!(
+        ids_of(recorder_with_two_id_events(0), &[0x1234, 0x1230, 0, 0x1234]),
+        [1, 2, 0, 1]
+    );
+
+    // All 16 values of a group stay below the next group's numbers.
+    let group: Vec<u64> = (0x70..0x80).rev().collect();
+    let numbers: Vec<i64> = (0x10..0x20).collect();
+    assert_eq!(ids_of(recorder_with_two_id_events(4), &group), numbers);
+
+    // Every bit of a value counts.
+    let values: Vec<u64> = (0..64).map(|bit| !(1 << bit)).chain([u64::MAX]).collect();
+    let ids: HashSet<i64> = ids_of(recorder_with_two_id_events(4), &values)
+        .into_iter()
+        .collect();
+    assert_eq!(ids.len(), values.len());
+}
+
+#[test]
+fn test_id_arg_depends_on_the_pattern_alone() {
+    // (group, value in the group), laid out in two ways that share no value. The numbers hold
+    // nothing of the values but the pattern in which they appear.
+    let pattern = [(3, 5), (3, 6), (9, 5), (3, 5), (9, 1), (7, 7)];
+    let lay_out = |base: u64, group_step: u64, value_step: u64| -> Vec<u64> {
+        pattern
+            .iter()
+            .map(|(group, value)| base + (group * group_step % 64) * 16 + value * value_step % 16)
+            .collect()
+    };
+    assert_eq!(
+        ids_of(
+            recorder_with_two_id_events(4),
+            &lay_out(0xffff_ea00_0000_0000, 1, 1)
+        ),
+        ids_of(
+            recorder_with_two_id_events(4),
+            &lay_out(0xff11_2233_4000_0000, 13, 3)
+        )
+    );
+}
+
+#[test]
+fn test_id_arg_in_continuous_mode() {
+    let mut recorder = recorder_with_two_id_events(4);
+    recorder.ringbuf_mut().set_max_duration(1000);
+    // The first hit falls out of the ring before it is read, so the second gets the first number.
+    for (ts, value) in [(0, 0x1234), (1000, 0x55), (2000, 0x1234)] {
+        let mut event = hit(&recorder, "get", value);
+        event.ts = ts;
+        recorder.record_event(event);
+    }
+    recorder.drain_ringbuf();
+    assert_eq!(ids_of(recorder, &[]), [0x10, 0x20]);
+}
+
+#[test]
+fn test_id_arg_table_is_bounded() {
+    let mut recorder = recorder_with_two_id_events(4);
+    recorder.ids = IdTable::with_max_values(2);
+    recorder.ids.set_shift(4);
+    for value in [0x1234, 0x1235, 0x66, 0x1234, 0, 0x66] {
+        let event = hit(&recorder, "get", value);
+        recorder.handle_event(event);
+    }
+    assert_eq!(recorder.ids.not_numbered(), Some(2));
+    assert_eq!(ids_of(recorder, &[]), [0x10, 0x11, -1, 0x10, 0, -1]);
+    assert_eq!(new_recorder().ids.not_numbered(), None);
+}
+
 #[test]
 fn test_event_bad_arg_type() {
     let mut rng = StepRng::new(0, 1);
