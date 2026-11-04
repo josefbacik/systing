@@ -25,8 +25,19 @@ use std::time::Instant;
 #[derive(Debug)]
 struct ElfPyInfo {
     py_runtime_addr: usize,
-    version: (i32, i32, i32),
+    /// What the file's own version tag says; `None` for a file without one.
+    version: Option<(i32, i32, i32)>,
     is_dynamic: bool,
+}
+
+impl ElfPyInfo {
+    /// The version of the runtime that a process knows as `module_path`. A file
+    /// without a tag is judged by that name, anew for each process: one file can
+    /// go by several names.
+    fn version_as(&self, module_path: &str) -> Option<(i32, i32, i32)> {
+        self.version
+            .or_else(|| parse_version_from_path(module_path))
+    }
 }
 
 /// Per-binary ELF parse results keyed by (st_dev, st_ino, st_size). `None`
@@ -41,18 +52,14 @@ static ELF_CACHE: LazyLock<Mutex<ElfCache>> = LazyLock::new(Default::default);
 
 /// Parse the ELF `file` for Python runtime facts, going through the
 /// (st_dev, st_ino, st_size) cache. `file_path` is the path the process knows
-/// the file by, for messages and for the version fallback on its name. Returns
-/// `None` when the file is unreadable or is not a Python runtime.
+/// the file by, for messages. Returns `None` when the file is unreadable or is
+/// not a Python runtime.
 fn elf_py_info_of(file_path: &str, file: fs::File) -> Option<Arc<ElfPyInfo>> {
     // Stat through the open handle so the cache key describes the
     // file we actually read. The inode is pinned while any process maps the
     // binary, but a cache entry can outlive every mapper; st_size in the key
     // guards against a freed (dev, ino) being reused by a different file
     // later in the session.
-    //
-    // Known limit: the version fallback in detect_python_version keys off
-    // the basename, so hardlinks to one inode under different names share
-    // whichever result was cached first.
     let meta = file.metadata().ok()?;
     let key = (meta.dev(), meta.ino(), meta.len());
     if let Some(cached) = ELF_CACHE.lock().unwrap().get(&key) {
@@ -107,7 +114,7 @@ fn parse_elf_py_info(file_path: &str, file: &fs::File) -> Option<Arc<ElfPyInfo>>
     let reader = ReadCache::new(file);
     let result = object::File::parse(&reader).ok().and_then(|elf| {
         let py_runtime_addr = find_symbol_address(&elf, "_PyRuntime")?;
-        let version = detect_python_version(&elf, &reader, file_path)?;
+        let version = detect_python_version(&elf, &reader);
         Some(Arc::new(ElfPyInfo {
             py_runtime_addr,
             version,
@@ -248,7 +255,7 @@ fn try_python_module(
     let is_shared = elf_info.is_dynamic && !is_exe;
 
     let py_runtime_addr = elf_info.py_runtime_addr;
-    let (major, minor, micro) = elf_info.version;
+    let (major, minor, micro) = elf_info.version_as(module_path)?;
 
     // Get offset config for this version
     let offsets = offsets::for_version(major, minor)?;
@@ -450,22 +457,12 @@ fn find_symbol_address<'data, R: ReadRef<'data>>(
     None
 }
 
-/// Detect the Python version from an ELF file.
-/// Tries _PySys_ImplCacheTag first, then falls back to filename pattern.
+/// Detect the Python version from an ELF file, by its _PySys_ImplCacheTag.
 fn detect_python_version<'data, R: ReadRef<'data>>(
     elf: &object::File<'data, R>,
     reader: R,
-    module_path: &str,
 ) -> Option<(i32, i32, i32)> {
-    // Try to find version from _PySys_ImplCacheTag symbol value
-    if let Some(version_str) = read_impl_cache_tag(elf, reader) {
-        if let Some(ver) = parse_cpython_version(&version_str) {
-            return Some(ver);
-        }
-    }
-
-    // Fallback: try to extract version from filename (e.g., python3.10, libpython3.11.so)
-    parse_version_from_path(module_path)
+    parse_cpython_version(&read_impl_cache_tag(elf, reader)?)
 }
 
 /// Try to read the _PySys_ImplCacheTag string from ELF.
@@ -1008,7 +1005,7 @@ mod tests {
         // build carries `_PySys_ImplCacheTag` the tag read is checked
         // directly against the expected string — `(major, minor)` alone
         // would also be satisfied by the filename fallback in
-        // `detect_python_version`, so it cannot tell the two apart.
+        // `ElfPyInfo::version_as`, so it cannot tell the two apart.
         let runtimes = real_runtimes();
         if runtimes.is_empty() {
             skip_or_fail_without_runtime("real-interpreter");
@@ -1020,8 +1017,8 @@ mod tests {
             let info = elf_py_info(&path)
                 .unwrap_or_else(|| panic!("{} not recognized as a runtime", rt.path.display()));
             assert_eq!(
-                (info.version.0, info.version.1),
-                (rt.major, rt.minor),
+                info.version_as(&path).map(|v| (v.0, v.1)),
+                Some((rt.major, rt.minor)),
                 "{}",
                 rt.path.display()
             );
@@ -1190,8 +1187,8 @@ mod tests {
             let info = elf_py_info(&path.to_string_lossy())
                 .unwrap_or_else(|| panic!("{} not recognized as a runtime", path.display()));
             assert_eq!(
-                (info.version.0, info.version.1),
-                (3, 99),
+                info.version,
+                Some((3, 99, 0)),
                 "{}: the version must come from the tag, not the filename",
                 path.display()
             );
