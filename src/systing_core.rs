@@ -58,6 +58,14 @@ pub const DEFAULT_SAMPLE_FREQ_HZ: u64 = 1000;
 /// cpufreq data is available from sysfs.
 const FALLBACK_CPU_FREQ_HZ: u64 = 3_000_000_000;
 
+/// The highest `--sample-freq` at which the software clock sampler sets
+/// `PerfHwEvent::exclude_idle`. Above it the kernel's limit stays in place as a
+/// brake on idle wake-ups: from 5000 Hz on, the flag kept every virtual CPU of
+/// an idle KVM guest busy on its host.
+const SW_CLOCK_EXCLUDE_IDLE_MAX_HZ: u64 = 1000;
+// A default rate above the bound would lose the flag without a word.
+const _: () = assert!(DEFAULT_SAMPLE_FREQ_HZ <= SW_CLOCK_EXCLUDE_IDLE_MAX_HZ);
+
 /// Sleep duration before stopping in continuous mode (1 second)
 const CONTINUOUS_MODE_STOP_DELAY_SECS: u64 = 1;
 
@@ -4104,8 +4112,6 @@ fn attach_clock_sampler(
     ClockSamplingConfig,
     Option<MemoryFaultLeg>,
 )> {
-    use crate::perf;
-
     let mut perf_links = Vec::new();
 
     // The hardware:/software: trace events' samplers ride this last slot
@@ -4139,24 +4145,7 @@ fn attach_clock_sampler(
     // Set up clock perf events with automatic VM detection and fallback
     let (clock_files, clock_sampling) = {
         let mut clock_files = PerfOpenEvents::default();
-        let mut clock_event = PerfHwEvent {
-            name: "clock".to_string(),
-            event_type: if opts.sw_event {
-                perf::PERF_TYPE_SOFTWARE
-            } else {
-                perf::PERF_TYPE_HARDWARE
-            },
-            event_config: if opts.sw_event {
-                perf::PERF_COUNT_SW_CPU_CLOCK
-            } else {
-                perf::PERF_COUNT_HW_CPU_CYCLES
-            },
-            disabled: false,
-            need_slots: false,
-            exclude_kernel: false,
-            sample_addr: false,
-            cpus: (0..num_cpus).collect(),
-        };
+        let mut clock_event = clock_sampler_event(opts.sw_event, target_hz, num_cpus);
         let mut clock_sampling = if opts.sw_event {
             sw_clock_sampling.clone()
         } else {
@@ -4176,8 +4165,7 @@ fn attach_clock_sampler(
                 eprintln!("Detected virtualized environment, automatically switching to software events (--sw-event)");
 
                 // Modify the event to use software events
-                clock_event.event_type = perf::PERF_TYPE_SOFTWARE;
-                clock_event.event_config = perf::PERF_COUNT_SW_CPU_CLOCK;
+                clock_event = clock_sampler_event(true, target_hz, num_cpus);
                 clock_sampling = sw_clock_sampling;
 
                 // Recreate clock_files with the modified event
@@ -4244,6 +4232,32 @@ fn attach_clock_sampler(
     };
 
     Ok((perf_links, clock_sampling, memory_fault_leg))
+}
+
+/// The perf event that drives the CPU stack sampler on every CPU: the software
+/// cpu-clock, or the hardware cpu-cycles counter.
+fn clock_sampler_event(software: bool, target_hz: u64, num_cpus: u32) -> PerfHwEvent {
+    use crate::perf;
+
+    PerfHwEvent {
+        name: "clock".to_string(),
+        event_type: if software {
+            perf::PERF_TYPE_SOFTWARE
+        } else {
+            perf::PERF_TYPE_HARDWARE
+        },
+        event_config: if software {
+            perf::PERF_COUNT_SW_CPU_CLOCK
+        } else {
+            perf::PERF_COUNT_HW_CPU_CYCLES
+        },
+        disabled: false,
+        need_slots: false,
+        exclude_kernel: false,
+        sample_addr: false,
+        exclude_idle: software && target_hz <= SW_CLOCK_EXCLUDE_IDLE_MAX_HZ,
+        cpus: (0..num_cpus).collect(),
+    }
 }
 
 /// Name the cause of a fault-leg open/attach failure for the sysinfo row:
@@ -4445,6 +4459,7 @@ fn attach_page_fault_sw_events(
         need_slots: false,
         exclude_kernel: true,
         sample_addr: true,
+        exclude_idle: false,
         cpus: (0..num_cpus).collect(),
     })?;
     // 0 or 1 means every fault (the x86 path's convention for
@@ -7809,6 +7824,26 @@ mod tests {
         let len = bytes.len().min(15);
         task.comm[..len].copy_from_slice(&bytes[..len]);
         task
+    }
+
+    #[test]
+    fn only_the_software_clock_excludes_idle_and_only_up_to_the_bound() {
+        use crate::perf;
+        let max = SW_CLOCK_EXCLUDE_IDLE_MAX_HZ;
+
+        for hz in [1, DEFAULT_SAMPLE_FREQ_HZ, max] {
+            let event = clock_sampler_event(true, hz, 2);
+            assert_eq!(event.event_type, perf::PERF_TYPE_SOFTWARE);
+            assert_eq!(event.event_config, perf::PERF_COUNT_SW_CPU_CLOCK);
+            assert!(event.exclude_idle, "{hz} Hz");
+        }
+        assert!(!clock_sampler_event(true, max + 1, 2).exclude_idle);
+        // The arm64 PMU driver refuses a hardware event that has the flag.
+        for hz in [1, max, max + 1] {
+            let event = clock_sampler_event(false, hz, 2);
+            assert_eq!(event.event_type, perf::PERF_TYPE_HARDWARE);
+            assert!(!event.exclude_idle, "{hz} Hz");
+        }
     }
 
     #[test]
