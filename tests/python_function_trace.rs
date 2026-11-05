@@ -249,6 +249,16 @@ fn pid_args(pids: &[u32]) -> Vec<String> {
         .collect()
 }
 
+/// Where cgroup v2 is mounted, if it is.
+fn cgroup2_root() -> Option<PathBuf> {
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap();
+    mounts
+        .lines()
+        .find(|l| l.split(' ').nth(2) == Some("cgroup2"))
+        .and_then(|l| l.split(' ').nth(1))
+        .map(PathBuf::from)
+}
+
 #[test]
 #[ignore = "needs root and a CPython 3.12 to 3.14"]
 fn every_call_of_every_process_is_a_slice() {
@@ -488,13 +498,7 @@ fn a_traced_command_is_traced() {
 #[test]
 #[ignore = "needs root, cgroup v2 and a CPython 3.12 to 3.14"]
 fn a_cgroup_target_takes_its_processes_and_leaves_the_rest() {
-    let mounts = std::fs::read_to_string("/proc/mounts").unwrap();
-    let Some(root) = mounts
-        .lines()
-        .find(|l| l.split(' ').nth(2) == Some("cgroup2"))
-        .and_then(|l| l.split(' ').nth(1))
-        .map(PathBuf::from)
-    else {
+    let Some(root) = cgroup2_root() else {
         eprintln!("skipping: no cgroup v2 mount");
         return;
     };
@@ -543,6 +547,88 @@ fn a_cgroup_target_takes_its_processes_and_leaves_the_rest() {
             "{python}:\n{stderr}"
         );
         assert!(counts(&conn, Some(outside_id)).is_empty(), "{python}");
+    }
+}
+
+/// Pystacks takes a program under `.pyenv/` that is no Python for a launcher whose
+/// workers live elsewhere, and adds every Python on the host to the `pids` map.
+/// A process outside the cgroup has no slices either way, so what tells is how
+/// many processes had probes.
+#[test]
+#[ignore = "needs root, cgroup v2 and a CPython 3.12 to 3.14"]
+fn a_pyenv_launcher_in_the_cgroup_brings_no_probes_to_a_process_outside() {
+    let Some(root) = cgroup2_root() else {
+        eprintln!("skipping: no cgroup v2 mount");
+        return;
+    };
+    let sleep = Command::new("sh")
+        .args(["-c", "command -v sleep"])
+        .output()
+        .expect("sh");
+    let sleep = PathBuf::from(String::from_utf8(sleep.stdout).unwrap().trim());
+    for python in pythons() {
+        let dir = TempDir::new().unwrap();
+        let go = dir.path().join("go");
+        // Any program will do that is still there when its path is looked at. It
+        // keeps its name, by which a multi-call binary knows what to be.
+        let launcher = dir.path().join(".pyenv/bin/sleep");
+        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        std::fs::copy(&sleep, &launcher).expect("a program under .pyenv");
+        let cgroup = root.join(format!("pyft_test_launcher_{}", std::process::id()));
+        std::fs::create_dir(&cgroup).expect("a cgroup of the test's own");
+        let inside = Workload::start(&python, &go);
+        // It waits for a file that never comes, so it is there to be found all along.
+        let outside = Workload::start(&python, &dir.path().join("never"));
+        std::fs::write(cgroup.join("cgroup.procs"), inside.child.id().to_string())
+            .expect("into the cgroup");
+        // The shell moves itself in, so the exec is one of the cgroup's.
+        let enter_and_exec = format!(
+            "echo $$ > '{}' && exec '{}' 2",
+            cgroup.join("cgroup.procs").display(),
+            launcher.display()
+        );
+        let args: Vec<String> = vec![
+            "--cgroup".to_string(),
+            cgroup.display().to_string(),
+            "--duration".to_string(),
+            "5".to_string(),
+        ];
+        let out = TempDir::new().unwrap();
+        let mut launched = None;
+        let (conn, stderr) = capture_with(
+            &args,
+            |in_place| {
+                if in_place == 1 {
+                    launched = Some(Command::new("sh").args(["-c", &enter_and_exec]).spawn());
+                    touch(&go);
+                }
+            },
+            &out,
+        );
+        let launched = launched.map(|sh| sh.expect("sh").wait().expect("sh"));
+        let outside_id = outside.child.id();
+        let inside_id = i64::from(inside.child.id());
+        drop((inside, outside));
+        let _ = std::fs::remove_dir(&cgroup);
+
+        assert!(
+            launched.is_some_and(|status| status.success()),
+            "{python}: no exec under .pyenv:\n{stderr}"
+        );
+        assert_eq!(
+            counts(&conn, Some(inside_id)),
+            expected(),
+            "{python}:\n{stderr}"
+        );
+        assert_eq!(sysinfo(&conn).0, 1, "{python}:\n{stderr}");
+        assert!(
+            !stderr.contains(&format!("python-function-trace: process {outside_id}:")),
+            "{python}:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(" 0 out of the target set,"),
+            "{python}:\n{stderr}"
+        );
     }
 }
 
