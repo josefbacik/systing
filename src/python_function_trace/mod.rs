@@ -1003,8 +1003,21 @@ impl Tracer<'_, '_> {
         let mut found: Vec<u32> = if both {
             Vec::new()
         } else {
-            MapKeys::of(pids).collect()
+            MapKeys::of(pids)
+                .filter(|pid| !self.seen.contains_key(pid))
+                .collect()
         };
+        // The map is the whole capture's, and with `--cgroup` alone no filter reads
+        // it, so a key need not be a target. The probes of a process outside the
+        // cgroups would refuse it, and it would pay for nothing.
+        if !found.is_empty() && !opts.cgroups.is_empty() {
+            let mut in_cgroups = HashSet::new();
+            for cgroup in &opts.cgroups {
+                crate::cgroup::collect_cgroup_procs(cgroup, &mut in_cgroups);
+            }
+            // One that has gone is in no cgroup: `look_at` notes that, once.
+            found.retain(|pid| in_cgroups.contains(pid) || !is_running(*pid));
+        }
         // A cgroup made since the start counts only where the kernel decides: the
         // probes of a process in one would refuse it, and it would pay for nothing.
         if walk_cgroups && !opts.cgroups.is_empty() && opts.cgroup_match_kernel {

@@ -3185,7 +3185,9 @@ fn discover_python_processes(debug: bool) -> Vec<u32> {
 /// dropped any stale pystacks config for the pid; if the new image is Python
 /// (or embeds libpython) we re-register it. When the exec'd binary is a pyenv
 /// launcher (e.g., forkapple's `fa`), we additionally scan /proc once for
-/// Python workers that may live outside the traced process tree.
+/// Python workers that may live outside the traced process tree. Not with the
+/// python-function-trace recorder, which slows what it traces and so takes only
+/// the targets it was given.
 ///
 /// Fork events: a registered Python process forked. The BPF side already
 /// copied the parent's pystacks config to the child (the address space is
@@ -3292,7 +3294,15 @@ fn handle_exec_events(
                 pid, exe_str, kind
             );
         }
-        if !did_scan && !is_fork && exe_str.contains(".pyenv/") && !exe_str.contains("python") {
+        // Never with the python-function-trace recorder: it looks through the pids
+        // map for processes to put its probes in, so every Python on the host
+        // would be slowed. At the start it registers its targets alone, too.
+        if !did_scan
+            && python_function_trace.is_none()
+            && !is_fork
+            && exe_str.contains(".pyenv/")
+            && !exe_str.contains("python")
+        {
             // A pyenv binary but not Python itself (e.g., forkapple's `fa`).
             // The actual Python process may be outside our traced tree.
             // Scan /proc for all Python processes and add them.
