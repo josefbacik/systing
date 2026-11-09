@@ -2617,7 +2617,12 @@ pub fn format_symbolized_frame_forced_module(
     elide_generics: bool,
 ) -> String {
     let location_info = format_location_info(sym.code_info.as_deref());
-    let name: &str = &sym.name;
+    // A symbol table can hold an entry that has no name.
+    let name: &str = if sym.name.is_empty() {
+        "unknown"
+    } else {
+        &sym.name
+    };
     let name = if elide_generics {
         crate::symbol_shorten::shorten_name(name)
     } else {
@@ -4340,6 +4345,32 @@ mod tests {
         assert_eq!(rec.guest_samples, 0);
         assert_eq!(rec.dropped_frameless, 1);
         assert_eq!(rec.interner.total(), 1);
+    }
+
+    #[test]
+    fn test_a_symbol_without_a_name_reads_unknown() {
+        let sym = |name: &'static str| Sym {
+            name: name.into(),
+            module: None,
+            addr: 0x1200,
+            offset: 0x34,
+            size: None,
+            code_info: None,
+            inlined: Box::new([]),
+            _non_exhaustive: (),
+        };
+        for elide_generics in [false, true] {
+            let frame = |name| {
+                format_symbolized_frame_forced_module(
+                    &sym(name),
+                    0x1234,
+                    "libfoo.so",
+                    elide_generics,
+                )
+            };
+            assert_eq!(frame(""), "unknown (libfoo.so) <0x1234>");
+            assert_eq!(frame("foo"), "foo (libfoo.so) <0x1234>");
+        }
     }
 
     /// End-to-end run of the finish()-time symbolization over the real
