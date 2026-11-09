@@ -125,7 +125,9 @@ Frame strings are exactly systing's symbolized frame names:
   `<0xaddr>` optional pieces depending on available symbol data. `module`
   may be a label rather than a binary basename: `[kernel]`,
   `[gvisor:runtime]`, `[gvisor:guest]`, `[jit:<runtime>]`, `[exited]`,
-  `[vdso]` and similar. Unresolvable frames use the function name `unknown`.
+  `[anon]`, `[anon:exec]`, `[unmapped]`, or the kernel's own name for the
+  mapping that holds the address (`[heap]`, `[stack]`, `[vdso]` and
+  similar). Unresolvable frames use the function name `unknown`.
 - Guest execution: `unknown ([guest])` — a CPU sample that interrupted a
   hypervisor vCPU thread while it was running its virtual machine. There is
   no host address (the kernel does not walk callchains for guest-mode

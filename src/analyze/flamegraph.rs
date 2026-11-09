@@ -496,8 +496,9 @@ fn format_folded_stack_into(
 /// mapping rather than reading left to right. `mapping` is a real object
 /// name (`vmlinux`, `myapp`) or one of the recorder's bracketed pseudo-mapping
 /// labels (`[kernel]`, `[guest]`, `[exited]`, `[gvisor:*]`, `[jit:*]`,
-/// `[anon]`, `[buildid:…]`, `[stack-store-full]`); the label's own brackets
-/// are the only ones it ever gets.
+/// `[anon]`, `[unmapped]`, `[heap]`, `[stack]`, `[vdso]`, `[buildid:…]`,
+/// `[stack-store-full]`); the label's own brackets are the only ones it ever
+/// gets.
 static MAPPING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r" \(([^()]+?)(?: \[([^\[\]:]+)(?::(\d+))?\])?\)$").unwrap());
 
@@ -740,6 +741,12 @@ mod tests {
             "[jit:python]",
             "[anon]",
             "[anon:exec]",
+            "[unmapped]",
+            "[heap]",
+            "[stack]",
+            "[vdso]",
+            "[vvar_vclock]",
+            "[uprobes-trampoline]",
             "[buildid:5a5a5a5a]",
             "[stack-store-full]",
         ] {

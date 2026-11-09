@@ -4452,6 +4452,27 @@ mod tests {
         }
     }
 
+    /// Addresses at the start of this process's own heap, stack and vvar mappings.
+    #[test]
+    fn test_finish_inner_labels_addresses_in_kernel_mappings() {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let (addrs, want): (Vec<u64>, Vec<String>) = maps
+            .lines()
+            .filter_map(|line| {
+                let name = ["[heap]", "[stack]", "[vvar]"]
+                    .into_iter()
+                    .find(|name| line.ends_with(name))?;
+                let start = u64::from_str_radix(line.split('-').next()?, 16).ok()?;
+                Some((start, format!("unknown ({name}) <{start:#x}>")))
+            })
+            .unzip();
+        assert!(want.iter().any(|frame| frame.contains("[stack]")), "{maps}");
+
+        let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        let frames = finish_one(&mut rec, ips(&addrs), std::process::id() as i32);
+        assert_eq!(frames, want);
+    }
+
     /// Names-only mode must still resolve live-process symbols — the ELF
     /// symbol table carries the same function names DWARF does — while the
     /// dead-process path is unchanged.

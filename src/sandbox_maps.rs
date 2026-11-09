@@ -25,7 +25,8 @@
 //! The labels reuse systing's existing miss format (`unknown (<module>)
 //! <0xADDR>`), so downstream consumers see a module-shaped string:
 //! `[gvisor:runtime]`, `[jit:<runtime>]`, `[anon:exec]`, `[anon]`,
-//! `[unmapped]`, or the real module basename when only the symbol lookup
+//! `[unmapped]`, the kernel's own name for a mapping (`[heap]`, `[stack]`,
+//! `[vdso]`, ...), or the real module basename when only the symbol lookup
 //! failed.
 
 use std::fs;
@@ -39,11 +40,12 @@ enum Backing {
     File(PathBuf),
     /// A memfd (`/memfd:<name> (deleted)`); gVisor's memory pools land here.
     Memfd(String),
-    /// No backing object at all (pure anonymous).
+    /// No backing file: pure anonymous memory, and memory under any name that
+    /// is neither a path nor one of [`KERNEL_MAPPINGS`] (`[anon:<name>]`,
+    /// `anon_inode:...`).
     Anon,
-    /// Bracketed pseudo-entries (`[vdso]`, `[stack]`, ...) and
-    /// `anon_inode:...` style components.
-    Special(String),
+    /// One of [`KERNEL_MAPPINGS`].
+    Special(&'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +122,23 @@ pub struct ProcessMaps {
 /// memfd names used by gVisor for application/stub memory. Entries here mark
 /// a process as sandbox-related and their mappings as pool-backed.
 const GVISOR_MEMFDS: &[&str] = &["runsc-memory", "systrap-memory"];
+
+/// The kernel's own names for mappings; an address in one is labeled with the
+/// name. The list is closed: other names that are not paths differ from program
+/// to program and from thread to thread (`[anon:<name>]`, `[stack:<tid>]`), and
+/// there is no end to them.
+const KERNEL_MAPPINGS: &[&str] = &[
+    "[heap]",
+    "[sigpage]",
+    "[stack]",
+    "[uprobes]",
+    "[uprobes-trampoline]",
+    "[vdso]",
+    "[vectors]",
+    "[vsyscall]",
+    "[vvar]",
+    "[vvar_vclock]",
+];
 
 /// Module basenames whose presence marks a process as running a JIT runtime;
 /// anonymous executable pages in such a process are labeled `[jit:<tag>]`,
@@ -445,10 +464,8 @@ impl ProcessMaps {
     }
 
     /// Most specific module-slot label for an address that did not
-    /// symbolize. Returns `None` only for bracketed pseudo-entries
-    /// (`[vdso]`, `[stack]`, ...) — those are the symbolizer's business;
-    /// everything else gets at least a class name, so raw hex from a live
-    /// process means the maps themselves were unreadable.
+    /// symbolize. Every address gets at least a class name, so raw hex from a
+    /// live process means the maps themselves were unreadable.
     ///
     /// gVisor classification leans on which backing object a mapping uses:
     /// ALL guest-created memory is served from the `runsc-memory` pool, the
@@ -457,66 +474,62 @@ impl ProcessMaps {
     /// itself (a guest cannot create host mappings outside the pool). The
     /// one exception is the usertrap trampoline table, which the Sentry
     /// injects from the pool *below* the guest image.
-    pub fn label_for(&self, addr: u64) -> Option<String> {
+    pub fn label_for(&self, addr: u64) -> String {
         let entry = self.entry_for(addr);
         let gvisor = self.is_gvisor();
         match entry.map(|e| (&e.backing, e.exec)) {
             // Symbol lookup failed but the module is known — report it.
             // Covers stripped binaries (incl. release runsc builds) and
             // parse failures; strictly more information than hex.
-            Some((Backing::File(path), _)) => Some(
-                path.file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-            ),
+            Some((Backing::File(path), _)) => path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
             Some((Backing::Memfd(name), exec)) if gvisor && name == "runsc-memory" => {
                 let below_guest_image = self.file_span.map(|(lo, _)| addr < lo).unwrap_or(false);
                 if below_guest_image && exec {
                     // usertrap trampoline table.
-                    Some("[gvisor:runtime]".to_string())
+                    "[gvisor:runtime]".to_string()
                 } else {
                     // Guest memory: JIT output if a JIT runtime is mapped
                     // and the page is executable, otherwise unidentifiable
                     // guest pages (COW'd data, heap made executable, ...).
                     match self.jit_runtime {
-                        Some(rt) if exec => Some(format!("[jit:{rt}]")),
-                        _ => Some("[gvisor:guest]".to_string()),
+                        Some(rt) if exec => format!("[jit:{rt}]"),
+                        _ => "[gvisor:guest]".to_string(),
                     }
                 }
             }
             // systrap-memory (sysmsg stacks/state) and stub-created host
             // mappings: sandbox runtime cost.
             Some((Backing::Memfd(_), _)) | Some((Backing::Anon, _)) if gvisor => {
-                Some("[gvisor:runtime]".to_string())
+                "[gvisor:runtime]".to_string()
             }
             // Non-gVisor JIT runtimes: anonymous executable pages are JIT
             // output with the same confidence as in the sandboxed case;
             // without a recognized runtime the page is still nameable as
             // what it observably is.
             Some((Backing::Memfd(_), true)) | Some((Backing::Anon, true)) => {
-                Some(match self.jit_runtime {
+                match self.jit_runtime {
                     Some(rt) => format!("[jit:{rt}]"),
                     None => "[anon:exec]".to_string(),
-                })
+                }
             }
             // Non-executable anonymous memory: heap, arenas, or a W^X
             // code page caught in its writable phase. A PC here is either
             // recycled code or unwind garbage — name the class without
             // claiming a runtime.
-            Some((Backing::Memfd(_), false)) | Some((Backing::Anon, false)) => {
-                Some("[anon]".to_string())
-            }
-            // Bracketed pseudo-entries stay with the symbolizer.
-            Some((Backing::Special(_), _)) => None,
+            Some((Backing::Memfd(_), false)) | Some((Backing::Anon, false)) => "[anon]".to_string(),
+            Some((Backing::Special(name), _)) => name.to_string(),
             // In no current mapping at all. JIT runtimes allocate and free
             // code pages faster than a recording tick, so in a process
             // running one this is almost always reclaimed JIT code; the
             // maps snapshot postdates the sample. Otherwise unknowable.
-            None => Some(match self.jit_runtime {
+            None => match self.jit_runtime {
                 Some(rt) => format!("[jit:{rt}]"),
                 None => "[unmapped]".to_string(),
-            }),
+            },
         }
     }
 }
@@ -545,8 +558,10 @@ fn parse_maps_line(line: &str) -> Option<MapEntry> {
     } else if path.starts_with('/') {
         let p = path.strip_suffix(" (deleted)").unwrap_or(path);
         Backing::File(PathBuf::from(p))
+    } else if let Some(name) = KERNEL_MAPPINGS.iter().find(|name| **name == path) {
+        Backing::Special(name)
     } else {
-        Backing::Special(path.to_string())
+        Backing::Anon
     };
 
     Some(MapEntry {
@@ -560,11 +575,11 @@ fn parse_maps_line(line: &str) -> Option<MapEntry> {
 }
 
 /// Render the standard "symbolization failed" frame for `addr` given an
-/// optional maps analysis: `unknown (<label>) <0xADDR>` when something is
-/// known, plain `0xADDR` otherwise (preserving the historical format).
+/// optional maps analysis: `unknown (<label>) <0xADDR>` with one, plain
+/// `0xADDR` without (preserving the historical format).
 pub fn format_unresolved(addr: u64, maps: Option<&ProcessMaps>) -> String {
-    match maps.and_then(|m| m.label_for(addr)) {
-        Some(label) => format!("unknown ({label}) <{addr:#x}>"),
+    match maps {
+        Some(maps) => format!("unknown ({}) <{addr:#x}>", maps.label_for(addr)),
         None => format!("0x{addr:x}"),
     }
 }
@@ -900,16 +915,13 @@ mod tests {
     fn test_labels() {
         let pm = ProcessMaps::parse(510, STUB_MAPS, "");
         // Below the guest image: runtime scaffolding.
-        assert_eq!(pm.label_for(0x64100).as_deref(), Some("[gvisor:runtime]"));
+        assert_eq!(pm.label_for(0x64100), "[gvisor:runtime]");
         // Above the guest image (stub text): runtime scaffolding.
-        assert_eq!(
-            pm.label_for(0x7fa398efc100).as_deref(),
-            Some("[gvisor:runtime]")
-        );
+        assert_eq!(pm.label_for(0x7fa398efc100), "[gvisor:runtime]");
         // Known module, failed symbol lookup: module basename.
-        assert_eq!(pm.label_for(0x400100).as_deref(), Some("guestbox"));
+        assert_eq!(pm.label_for(0x400100), "guestbox");
         // Unmapped address in a non-JIT process: named as such.
-        assert_eq!(pm.label_for(0xdead0000).as_deref(), Some("[unmapped]"));
+        assert_eq!(pm.label_for(0xdead0000), "[unmapped]");
 
         // Guest-anon exec page inside the image span of a JIT-runtime
         // process labels as JIT output.
@@ -918,30 +930,27 @@ mod tests {
 600000-700000 r-xs 3f000000 00:01 4   /memfd:runsc-memory (deleted)
 800000-900000 r-xs 00400000 00:13 426 /usr/bin/node";
         let pmj = ProcessMaps::parse(1, jit_maps, "");
-        assert_eq!(pmj.label_for(0x600100).as_deref(), Some("[jit:node]"));
+        assert_eq!(pmj.label_for(0x600100), "[jit:node]");
 
         // Same shape without a JIT runtime: guest pages.
         let pm_nojit = ProcessMaps::parse(510, STUB_MAPS, "");
         assert_eq!(
-            pm_nojit.label_for(0x711100).as_deref(),
-            Some("[gvisor:guest]"),
+            pm_nojit.label_for(0x711100),
+            "[gvisor:guest]",
             "non-exec runsc-memory page (COW'd guest data) is guest memory"
         );
         // sysmsg machinery (systrap-memory) is runtime cost.
-        assert_eq!(
-            pm_nojit.label_for(0x7fee63d08100).as_deref(),
-            Some("[gvisor:runtime]")
-        );
+        assert_eq!(pm_nojit.label_for(0x7fee63d08100), "[gvisor:runtime]");
 
         // Non-gVisor process: anonymous exec page with a JIT runtime mapped.
         let plain_jit = "\
 400000-500000 r-xp 00000000 08:01 42 /usr/lib/libjvm.so
 7f0000000000-7f0000100000 rwxp 00000000 00:00 0 ";
         let pmp = ProcessMaps::parse(2, plain_jit, "java");
-        assert_eq!(pmp.label_for(0x7f0000000100).as_deref(), Some("[jit:jvm]"));
+        assert_eq!(pmp.label_for(0x7f0000000100), "[jit:jvm]");
         // An unmapped address in the same process: reclaimed JIT code —
         // pages are recycled between the sample and the maps read.
-        assert_eq!(pmp.label_for(0xdead0000).as_deref(), Some("[jit:jvm]"));
+        assert_eq!(pmp.label_for(0xdead0000), "[jit:jvm]");
 
         // Non-JIT, non-gVisor process: anon pages are named by observable
         // class instead of falling back to hex.
@@ -952,11 +961,97 @@ mod tests {
              7f0000100000-7f0000101000 rwxp 00000000 00:00 0 ",
             "foo",
         );
-        assert_eq!(pm_none.label_for(0x7f0000000100).as_deref(), Some("[anon]"));
+        assert_eq!(pm_none.label_for(0x7f0000000100), "[anon]");
+        assert_eq!(pm_none.label_for(0x7f0000100100), "[anon:exec]");
+    }
+
+    /// A plain process with every kind of entry whose name is not a path.
+    const NAMED_MAPS: &str = "\
+10000-11000 r-xp 00000000 00:00 0                          [sigpage]
+12000-13000 r-xp 00000000 00:00 0                          [vectors]
+400000-500000 r-xp 00000000 08:01 42                       /usr/bin/foo
+1000000-1021000 rw-p 00000000 00:00 0                      [heap]
+7f0000000000-7f0000001000 rw-p 00000000 00:00 0            [anon:my pool (v2)]
+7f0000100000-7f0000101000 r-xp 00000000 00:00 0            [anon:code cache]
+7f0000200000-7f0000201000 rw-s 00000000 00:01 7            [anon_shmem:ring]
+7f0000300000-7f0000301000 rw-p 00000000 00:00 0            [stack:4242]
+7f0000400000-7f0000401000 rw-s 00000000 00:0e 9            anon_inode:[io_uring]
+7ffd1c000000-7ffd1c021000 rw-p 00000000 00:00 0            [stack]
+7ffd1c100000-7ffd1c104000 r--p 00000000 00:00 0            [vvar]
+7ffd1c104000-7ffd1c105000 r--p 00000000 00:00 0            [vvar_vclock]
+7ffd1c105000-7ffd1c107000 r-xp 00000000 00:00 0            [vdso]
+7fffffffd000-7fffffffe000 r-xp 00000000 00:00 0            [uprobes-trampoline]
+7fffffffe000-7ffffffff000 --xp 00000000 00:00 0            [uprobes]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0    [vsyscall]";
+
+    #[test]
+    fn test_kernel_mappings_are_labeled_by_name() {
+        let pm = ProcessMaps::parse(4, NAMED_MAPS, "foo");
+        for (addr, name) in [
+            (0x10010, "[sigpage]"),
+            (0x12010, "[vectors]"),
+            (0x1000010, "[heap]"),
+            (0x7ffd1c000010, "[stack]"),
+            (0x7ffd1c100010, "[vvar]"),
+            (0x7ffd1c104010, "[vvar_vclock]"),
+            (0x7ffd1c105010, "[vdso]"),
+            (0x7fffffffd010, "[uprobes-trampoline]"),
+            (0x7fffffffe010, "[uprobes]"),
+            (0xffffffffff600010, "[vsyscall]"),
+        ] {
+            assert_eq!(pm.label_for(addr), name);
+        }
         assert_eq!(
-            pm_none.label_for(0x7f0000100100).as_deref(),
-            Some("[anon:exec]")
+            format_unresolved(0x1000010, Some(&pm)),
+            "unknown ([heap]) <0x1000010>"
         );
+    }
+
+    /// A name outside the list never becomes a label: such memory is classed
+    /// as the anonymous memory that it is.
+    #[test]
+    fn test_other_names_that_are_not_paths_count_as_anonymous() {
+        let pm = ProcessMaps::parse(4, NAMED_MAPS, "foo");
+        for (addr, label) in [
+            (0x7f0000000010, "[anon]"),
+            (0x7f0000100010, "[anon:exec]"),
+            (0x7f0000200010, "[anon]"),
+            (0x7f0000300010, "[anon]"),
+            (0x7f0000400010, "[anon]"),
+        ] {
+            assert_eq!(pm.label_for(addr), label);
+        }
+
+        let named_code = "7f0000100000-7f0000101000 r-xp 00000000 00:00 0 [anon:code cache]";
+        let jit = ProcessMaps::parse(
+            5,
+            &format!("400000-500000 r-xp 00000000 08:01 42 /usr/bin/node\n{named_code}"),
+            "node",
+        );
+        assert_eq!(jit.label_for(0x7f0000100010), "[jit:node]");
+        let sentry = ProcessMaps::parse(6, named_code, "runsc");
+        assert_eq!(sentry.label_for(0x7f0000100010), "[gvisor:runtime]");
+    }
+
+    /// Wherever an address points in these maps, its frame has the
+    /// `symbol (module) <0xADDR>` shape.
+    #[test]
+    fn test_every_address_of_a_mapped_process_gets_a_label() {
+        for pm in [
+            ProcessMaps::parse(1, "", ""),
+            ProcessMaps::parse(4, NAMED_MAPS, "foo"),
+            ProcessMaps::parse(510, STUB_MAPS, ""),
+        ] {
+            let edges = pm.entries.iter().flat_map(|e| [e.start, e.end - 1, e.end]);
+            for addr in edges.chain([1, 0x1234_5678, 0xffff_ffff_ffff]) {
+                let frame = format_unresolved(addr, Some(&pm));
+                let label = frame
+                    .strip_prefix("unknown (")
+                    .and_then(|f| f.strip_suffix(&format!(") <{addr:#x}>")))
+                    .unwrap_or_else(|| panic!("{frame}"));
+                assert!(!label.contains(['(', ')', '<', '>']), "{frame}");
+            }
+        }
     }
 
     #[test]
@@ -1014,7 +1109,7 @@ mod tests {
         // Special entries.
         let v = parse_maps_line("7ffe1000-7ffe2000 r-xp 00000000 00:00 0                  [vdso]")
             .unwrap();
-        assert_eq!(v.backing, Backing::Special("[vdso]".to_string()));
+        assert_eq!(v.backing, Backing::Special("[vdso]"));
 
         // Pure anonymous (trailing spaces, no path).
         let a = parse_maps_line("7f00000-7f01000 rw-p 00000000 00:00 0 ").unwrap();
