@@ -2383,10 +2383,10 @@ mod tests {
                 "--inhibit-cache",
                 "--preload",
                 "libhook.so",
-                "/opt/worker/bin/mycro-worker",
+                "/opt/worker/bin/my-worker",
                 "--worker-arg",
             ])),
-            Some("mycro-worker".to_string())
+            Some("my-worker".to_string())
         );
     }
 
