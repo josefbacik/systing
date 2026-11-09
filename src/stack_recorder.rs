@@ -1443,6 +1443,11 @@ fn reconstruct_build_id_addr(
     None
 }
 
+/// Whether `/proc/<tgid>` is there. A zombie still counts.
+fn process_exists(tgid: i32) -> bool {
+    Path::new("/proc").join(tgid.to_string()).exists()
+}
+
 /// Convert BPF stack_event_type (u32) to i8, clamping to valid range.
 /// Valid values are 0 (STACK_SLEEP_UNINTERRUPTIBLE), 1 (STACK_RUNNING), 2 (STACK_SLEEP_INTERRUPTIBLE).
 /// Unknown values are preserved but clamped to i8::MAX to avoid truncation issues.
@@ -1937,7 +1942,7 @@ impl StackRecorder {
             interner.spill.drain(|stack, tgid, stack_id| {
                 let alive = *tgid_alive
                     .entry(tgid)
-                    .or_insert_with(|| Path::new("/proc").join(tgid.to_string()).exists());
+                    .or_insert_with(|| process_exists(tgid));
                 if alive {
                     respill[(tgid as u32 as usize) % RESPILL_BUCKETS].push(stack, tgid, stack_id);
                     return Ok(());
@@ -1958,6 +1963,9 @@ impl StackRecorder {
         }
         drop(tgid_alive);
         phase_rss("exited-process pass done");
+        // Here a test can end a process that pass 1 has seen alive.
+        #[cfg(test)]
+        tests::between_passes();
 
         // Pass 2: symbolize live processes one re-spill bucket at a time, and
         // within each bucket one tgid at a time. blazesym accumulates parsed
@@ -2080,9 +2088,11 @@ impl StackRecorder {
                 proc_source.debug_syms = !self.names_only;
                 let proc_src = Source::Process(proc_source);
                 // One maps analysis per process, powering island bridging and
-                // frame labels for its whole group. `None` (process raced to
-                // exit, unreadable maps) degrades to plain symbolization.
+                // frame labels for its whole group.
                 let maps_info = ProcessMaps::load(tgid);
+                // Symbolizing the groups before this one takes time: a process
+                // that pass 1 saw alive can be gone by now.
+                let exited = maps_info.is_none() && !process_exists(tgid);
                 // Record this process's mapped ELF files so the valve can evict
                 // the fattest ones when the symbol-file cache exceeds its budget.
                 // exec_file_links yields (map_files link, display path). We key
@@ -2135,7 +2145,7 @@ impl StackRecorder {
                         &mut symbolizer,
                         &stack,
                         self.native_paths_from.is_some_and(|from| stack_id >= from),
-                        Some((&ctx, &mut user_cache, &mut live_bid_cache)),
+                        (!exited).then_some((&ctx, &mut user_cache, &mut live_bid_cache)),
                         &kernel_src,
                         &mut kernel_cache,
                         &mut bid_store,
@@ -2811,6 +2821,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     /// Raw addresses as Ip frames (the classic-capture shape).
     fn ips(addrs: &[u64]) -> Vec<UserFrame> {
@@ -2822,6 +2833,35 @@ mod tests {
             id: [seed; 20],
             offset,
         }
+    }
+
+    thread_local! {
+        /// What `finish_inner` runs between its two passes, for the test on
+        /// this thread.
+        static BETWEEN_PASSES: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn between_passes() {
+        if let Some(hook) = BETWEEN_PASSES.take() {
+            hook();
+        }
+    }
+
+    /// The frames that `finish_inner` writes for one user stack of `tgid`.
+    fn finish_one(rec: &mut StackRecorder, user_stack: Vec<UserFrame>, tgid: i32) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        rec.set_spill_dir(dir.path());
+        let stack = Stack {
+            kernel_stack: vec![],
+            user_stack,
+            py_stack: vec![],
+        };
+        let id = rec.interner.intern(stack, tgid);
+        let mut collector = crate::record::InMemoryCollector::new();
+        rec.finish_inner(&mut collector).unwrap();
+        let stacks = &collector.data().stacks;
+        let stack = stacks.iter().find(|s| s.id == id).unwrap();
+        stack.frame_names.clone()
     }
 
     #[test]
@@ -4375,6 +4415,41 @@ mod tests {
             .find(|s| s.id == plain_id)
             .expect("plain stack");
         assert_eq!(plain.frame_names[0], format!("0x{dead_addr:x}"));
+    }
+
+    /// A process that pass 1 saw alive and that is gone when pass 2 reaches
+    /// it reads like one that was gone before pass 1.
+    #[test]
+    fn test_finish_inner_labels_a_process_that_exits_between_the_passes() {
+        let id = "5a".repeat(20);
+        for (labels, want) in [
+            (
+                true,
+                [
+                    "unknown ([exited]) <0x12345678>".to_string(),
+                    format!("unknown ([buildid:{id}]) <0x1234>"),
+                ],
+            ),
+            (
+                false,
+                ["0x12345678".to_string(), format!("buildid:{id}+0x1234")],
+            ),
+        ] {
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+            let tgid = child.id() as i32;
+            BETWEEN_PASSES.set(Some(Box::new(move || {
+                child.kill().unwrap();
+                child.wait().unwrap();
+            })));
+
+            let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+            rec.set_frame_labels(labels);
+            let stack = vec![UserFrame::Ip(0x1234_5678), bid_frame(0x5a, 0x1234)];
+            assert_eq!(finish_one(&mut rec, stack, tgid), want, "labels: {labels}");
+        }
     }
 
     /// Names-only mode must still resolve live-process symbols — the ELF
