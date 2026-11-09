@@ -4473,6 +4473,51 @@ mod tests {
         assert_eq!(frames, want);
     }
 
+    /// The kernel refuses the maps of a process that runs a program file which
+    /// it may execute but not read, unless the reader is privileged.
+    #[test]
+    fn test_finish_inner_labels_a_live_process_whose_maps_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::var_os("PATH").unwrap();
+        let sleep = std::env::split_paths(&path)
+            .map(|dir| dir.join("sleep"))
+            .find(|file| file.is_file())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("sleep");
+        std::fs::copy(sleep, &copy).unwrap();
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o111)).unwrap();
+        if std::fs::File::open(&copy).is_ok() {
+            eprintln!("skipping: this user can read a file whatever its mode");
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut child = loop {
+            match std::process::Command::new(&copy).arg("600").spawn() {
+                Ok(child) => break child,
+                // A child that another test forked meanwhile can still hold
+                // the copy open for writing.
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
+                    std::thread::yield_now()
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        let tgid = child.id() as i32;
+        // exec starts the program a moment after spawn() has returned.
+        while ProcessMaps::load(tgid).is_some() {
+            assert!(Instant::now() < deadline, "the child's maps stay readable");
+            std::thread::yield_now();
+        }
+
+        let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        let frames = finish_one(&mut rec, ips(&[0x1234_5678]), tgid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(frames, ["unknown ([no-maps]) <0x12345678>"]);
+    }
+
     /// Names-only mode must still resolve live-process symbols — the ELF
     /// symbol table carries the same function names DWARF does — while the
     /// dead-process path is unchanged.

@@ -26,8 +26,8 @@
 //! <0xADDR>`), so downstream consumers see a module-shaped string:
 //! `[gvisor:runtime]`, `[jit:<runtime>]`, `[anon:exec]`, `[anon]`,
 //! `[unmapped]`, the kernel's own name for a mapping (`[heap]`, `[stack]`,
-//! `[vdso]`, ...), or the real module basename when only the symbol lookup
-//! failed.
+//! `[vdso]`, ...), the real module basename when only the symbol lookup
+//! failed, or `[no-maps]` when the maps could not be read.
 
 use std::fs;
 use std::path::PathBuf;
@@ -190,7 +190,7 @@ pub(crate) fn detect_jit_runtime(base: &str) -> Option<&'static str> {
 
 impl ProcessMaps {
     /// Read and analyze `/proc/<tgid>/maps`. Returns `None` when the process
-    /// is gone or unreadable — callers fall back to plain hex rendering.
+    /// is gone, or its maps cannot be read.
     pub fn load(tgid: i32) -> Option<Self> {
         let maps = fs::read_to_string(format!("/proc/{tgid}/maps")).ok()?;
         let exe = fs::read_link(format!("/proc/{tgid}/exe"))
@@ -464,8 +464,7 @@ impl ProcessMaps {
     }
 
     /// Most specific module-slot label for an address that did not
-    /// symbolize. Every address gets at least a class name, so raw hex from a
-    /// live process means the maps themselves were unreadable.
+    /// symbolize. Every address gets at least a class name.
     ///
     /// gVisor classification leans on which backing object a mapping uses:
     /// ALL guest-created memory is served from the `runsc-memory` pool, the
@@ -574,14 +573,11 @@ fn parse_maps_line(line: &str) -> Option<MapEntry> {
     })
 }
 
-/// Render the standard "symbolization failed" frame for `addr` given an
-/// optional maps analysis: `unknown (<label>) <0xADDR>` with one, plain
-/// `0xADDR` without (preserving the historical format).
+/// Render the standard "symbolization failed" frame for `addr`:
+/// `unknown (<label>) <0xADDR>`. With no maps analysis the label is `[no-maps]`.
 pub fn format_unresolved(addr: u64, maps: Option<&ProcessMaps>) -> String {
-    match maps {
-        Some(maps) => format!("unknown ({}) <{addr:#x}>", maps.label_for(addr)),
-        None => format!("0x{addr:x}"),
-    }
+    let label = maps.map_or_else(|| "[no-maps]".to_string(), |m| m.label_for(addr));
+    format!("unknown ({label}) <{addr:#x}>")
 }
 
 #[cfg(test)]
@@ -1093,8 +1089,11 @@ ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0    [vsyscall]";
             format_unresolved(0xdead0000, Some(&pm)),
             "unknown ([unmapped]) <0xdead0000>"
         );
-        // No maps at all (unreadable /proc): hex is all that is left.
-        assert_eq!(format_unresolved(0x1234, None), "0x1234");
+        // No maps at all (unreadable /proc): the label says so.
+        assert_eq!(
+            format_unresolved(0x1234, None),
+            "unknown ([no-maps]) <0x1234>"
+        );
     }
 
     #[test]

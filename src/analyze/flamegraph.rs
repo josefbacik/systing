@@ -495,10 +495,10 @@ fn format_folded_stack_into(
 /// generics, C++ templates), so the parse anchors on the trailing pc and
 /// mapping rather than reading left to right. `mapping` is a real object
 /// name (`vmlinux`, `myapp`) or one of the recorder's bracketed pseudo-mapping
-/// labels (`[kernel]`, `[guest]`, `[exited]`, `[gvisor:*]`, `[jit:*]`,
-/// `[anon]`, `[unmapped]`, `[heap]`, `[stack]`, `[vdso]`, `[buildid:…]`,
-/// `[stack-store-full]`); the label's own brackets are the only ones it ever
-/// gets.
+/// labels (`[kernel]`, `[guest]`, `[exited]`, `[no-maps]`, `[gvisor:*]`,
+/// `[jit:*]`, `[anon]`, `[unmapped]`, `[heap]`, `[stack]`, `[vdso]`,
+/// `[buildid:…]`, `[stack-store-full]`); the label's own brackets are the only
+/// ones it ever gets.
 static MAPPING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r" \(([^()]+?)(?: \[([^\[\]:]+)(?::(\d+))?\])?\)$").unwrap());
 
@@ -736,6 +736,7 @@ mod tests {
         for label in [
             "[guest]",
             "[exited]",
+            "[no-maps]",
             "[gvisor:runtime]",
             "[gvisor:guest]",
             "[jit:python]",
