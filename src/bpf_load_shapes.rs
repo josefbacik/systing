@@ -230,8 +230,8 @@ fn base() -> Config {
     }
 }
 
-/// The configurations that ship, as the agent's launcher and the on-demand
-/// lane build them. Every row is one load; a new knob is one new row. The
+/// The configurations worth verifying, continuous and on-demand captures
+/// alike. Every row is one load; a new knob is one new row. The
 /// values are the ones a continuous capture runs with, not the CLI
 /// defaults, wherever the two differ.
 pub fn shape_table() -> Vec<LoadShape> {
@@ -431,7 +431,7 @@ pub fn shape_table() -> Vec<LoadShape> {
 
     // The opt-in raw-tracepoint form (`--kernel-hooks raw-tracepoint`): the
     // tp_btf sys_enter/sys_exit pair loads beside its classic fallback, so
-    // the pair meets the verifier at the agent's memory shape even though no
+    // the pair meets the verifier at the memory shape even though no
     // shipped configuration selects it by default. (A kernel whose BTF lacks
     // the pair's typedefs selects the classic set here instead — the probe
     // decides at load, as it does for the trampoline rows.)
@@ -455,7 +455,7 @@ pub fn shape_table() -> Vec<LoadShape> {
     // The opt-in trampoline form (`--kernel-hooks trampoline`): the
     // fentry/fexit syscall hooks and the fentry TIME_WAIT trio load beside
     // their classic fallbacks, so the trampoline programs meet the verifier
-    // at the agent's memory and network shapes even though no shipped
+    // at the memory and network shapes even though no shipped
     // configuration selects them by default.
     add("memory-trampoline", &|c| {
         c.memory = true;

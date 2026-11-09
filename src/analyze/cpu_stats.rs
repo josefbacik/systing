@@ -249,11 +249,11 @@ fn build_runqueue_query(trace_id: Option<&str>) -> String {
     // qualifies per wakeup, and an ASOF JOIN -- one ordered merge over both
     // sides -- yields the same matches as the range join
     // `w.ts BETWEEN COALESCE(s.prev_end_ts, 0) AND s.ts` it replaces. That
-    // range join built an intermediate DuckDB cannot spill: on a 192-CPU trace
-    // of 62 M rows it took 58 s and failed with an out-of-memory error under a
-    // 1.5 GiB memory_limit, and at 186 M rows it took 428 s at 8 GiB and
-    // failed at 4 GiB, while this form takes 15 s / 53 s and spills gracefully
-    // under the same limits.
+    // range join built an intermediate DuckDB cannot spill: on a many-core
+    // host's trace of tens of millions of rows it ran for minutes or failed
+    // with an out-of-memory error under a bounded memory_limit, while this
+    // form is several times faster and spills gracefully under the same
+    // limits.
     format!(
         "WITH wakeups AS (\
              SELECT DISTINCT ts.ts, ts.utid, ts.cpu as target_cpu \

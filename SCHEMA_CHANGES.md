@@ -1196,10 +1196,10 @@ writer whose columns it dropped.
 The network-packets recorder learns to sample, and says so. On a big host
 the packets tier — one `packet_event` per skb at every transmit and
 delivery hook — loses most of its events to the userspace consumer, not
-the ring: a 192-vCPU host running 90 s of `--only-recorder network-packets
---ringbuf-size-mib 256` (already a 2 GiB packet family, 64 rings of 32 MiB)
-printed `Missed packet events: 81,428,216` — about 1 M events/s — with
-`Missed network events: 0` on the same run, and the `.duckdb` packet table
+the ring: even at `--only-recorder network-packets --ringbuf-size-mib 256`
+(a 2 GiB packet family, 64 rings of 32 MiB) a busy many-core host reports
+`Missed packet events` in the millions with `Missed network events: 0` on
+the same run, and the `.duckdb` packet table
 was an unlabelled sample. A ring step only delays the overrun by seconds
 (2 GiB of ~130-byte events is ~16 s of a 1 M/s deficit); the cure is to
 record fewer packets, and to say how many. The tables keep their columns;

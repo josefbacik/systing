@@ -1646,7 +1646,7 @@ impl SessionRecorder {
         tpu_recorder: Option<crate::tpu::recorder::TpuRecorder>,
         end_ts: i64,
     ) -> Result<()> {
-        // Per-stage elapsed lines below let fleet log pipelines attribute
+        // Per-stage elapsed lines below let log pipelines attribute
         // stop-phase cost without relying on collector timestamp granularity.
         let gen_start = std::time::Instant::now();
         let mut stage_start = gen_start;

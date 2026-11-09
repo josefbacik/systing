@@ -739,7 +739,7 @@ pub(crate) struct RingbufPlan {
 /// On a kernel older than [`MAP_OF_MAPS_BATCH_WAIT_ONCE_KERNEL`] (or one whose
 /// version cannot be read) the automatic count stays at the legacy eight:
 /// there every inserted ring costs an RCU grace period at start.
-/// The old layout had a compile-time eight: on a 192-CPU host that put 24
+/// The old layout had a compile-time eight: that put an eighth of a host's
 /// CPUs behind one ring and one consumer, and `__bpf_ringbuf_reserve` takes
 /// the ring's spinlock before it checks for space, so a full ring is also a
 /// lock every producer on those CPUs spins on.
@@ -749,8 +749,8 @@ pub(crate) struct RingbufPlan {
 /// static rings, 25 MiB -> 32 MiB), so hosts with at most eight CPUs get
 /// exactly the footprint they had. Above eight rings the family keeps the
 /// budget eight such rings implied and splits it: `8 * ring / nr_rings`,
-/// rounded down to a power of two, never below 1 MiB. A 192-CPU host at
-/// `--ringbuf-size-mib 25` therefore runs 64 rings of 4 MiB = 256 MiB per
+/// rounded down to a power of two, never below 1 MiB. A host of 64 CPUs or
+/// more at `--ringbuf-size-mib 25` therefore runs 64 rings of 4 MiB = 256 MiB per
 /// family, the same 8 x 32 MiB it ran before; the per-CPU share is unchanged
 /// and the consumer count is eight times higher.
 pub(crate) fn plan_ringbufs(
@@ -3184,7 +3184,7 @@ fn discover_python_processes(debug: bool) -> Vec<u32> {
 /// Exec events: a traced process replaced its image. The BPF side already
 /// dropped any stale pystacks config for the pid; if the new image is Python
 /// (or embeds libpython) we re-register it. When the exec'd binary is a pyenv
-/// launcher (e.g., forkapple's `fa`), we additionally scan /proc once for
+/// launcher (a client of a pre-forked server), we additionally scan /proc once for
 /// Python workers that may live outside the traced process tree. Not with the
 /// python-function-trace recorder, which slows what it traces and so takes only
 /// the targets it was given.
@@ -3208,7 +3208,7 @@ fn handle_exec_events(
     // must re-register the new image) and forks always carry a fresh pid.
     let mut added_pids = std::collections::HashSet::new();
     // Single scan flag: we only scan /proc once per trace session because
-    // the forkapple server's Python workers are long-lived and pre-forked,
+    // such a server's Python workers are long-lived and pre-forked,
     // so subsequent pyenv exec events won't reveal new Python PIDs.
     let mut did_scan = false;
     while let Ok(event) = exec_rx.recv() {
@@ -3303,7 +3303,7 @@ fn handle_exec_events(
             && exe_str.contains(".pyenv/")
             && !exe_str.contains("python")
         {
-            // A pyenv binary but not Python itself (e.g., forkapple's `fa`).
+            // A pyenv binary but not Python itself (e.g., a native launcher).
             // The actual Python process may be outside our traced tree.
             // Scan /proc for all Python processes and add them.
             if pystacks_debug {
@@ -4090,8 +4090,8 @@ fn cycles_sample_period(target_freq_hz: u64) -> u64 {
 /// raw_tp or fentry link goes through `text_poke_bp`, whose IPI batches stall
 /// every CPU on a many-core host; a sampler that is already live records that
 /// stall (kworkers spinning on `text_mutex`, the IPI handlers themselves) as
-/// if it were the workload. On a 224-CPU host mid IPI storm the attach phase
-/// ran ~9 s and read as ~6 cores of lock contention in a 10 s capture.
+/// if it were the workload: an attach phase of seconds reads as several
+/// cores of lock contention in a short capture.
 /// The capture window is unchanged: `--duration` starts counting after the
 /// whole attach sequence either way.
 fn attach_clock_sampler(
@@ -7289,8 +7289,8 @@ pub fn systing(
         // The packets tier's honesty line: the exit summary above prints
         // the ring's `Missed packet events` counter, but nothing said what
         // share of the traffic that was. On a big host the userspace
-        // consumer, not the ring, is the ceiling (a 192-vCPU host misses
-        // ~1 M packet events/s at a 2 GiB family), so the requester's packet
+        // consumer, not the ring, is the ceiling (events are missed however
+        // large the ring family is), so the requester's packet
         // tables are a sample — say so, with the rate that would have kept
         // up, beside the counter track the trace already carries.
         if opts.network_packets {
