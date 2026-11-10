@@ -4545,7 +4545,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         // Two recorders sharing one writer (the perf-counter and CPU-frequency
-        // recorders do this in production): both write counter tracks and
+        // recorders do this in a capture): both write counter tracks and
         // counter samples, and every row must survive in the single
         // counter.parquet / counter_track.parquet pair.
         let shared =

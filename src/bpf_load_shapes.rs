@@ -356,9 +356,8 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.include_task_context = true;
     });
 
-    // Memory lane: the continuous launcher's shape (default rss threshold,
-    // fault/map sample rates 0 = every event), then each knob the launcher
-    // or the on-demand lane can set.
+    // Memory recorder: the default shape (default rss threshold and
+    // sample rates), then each knob that can be set.
     add("memory-default", &|c| c.memory = true);
     add("memory-sw-event", &|c| {
         c.memory = true;
@@ -431,8 +430,8 @@ pub fn shape_table() -> Vec<LoadShape> {
 
     // The opt-in raw-tracepoint form (`--kernel-hooks raw-tracepoint`): the
     // tp_btf sys_enter/sys_exit pair loads beside its classic fallback, so
-    // the pair meets the verifier at the memory shape even though no
-    // shipped configuration selects it by default. (A kernel whose BTF lacks
+    // the pair meets the verifier at the memory shape even though
+    // nothing selects it by default. (A kernel whose BTF lacks
     // the pair's typedefs selects the classic set here instead — the probe
     // decides at load, as it does for the trampoline rows.)
     add("memory-raw-tracepoint", &|c| {
@@ -455,8 +454,8 @@ pub fn shape_table() -> Vec<LoadShape> {
     // The opt-in trampoline form (`--kernel-hooks trampoline`): the
     // fentry/fexit syscall hooks and the fentry TIME_WAIT trio load beside
     // their classic fallbacks, so the trampoline programs meet the verifier
-    // at the memory and network shapes even though no shipped
-    // configuration selects them by default.
+    // at the memory and network shapes even though nothing selects
+    // them by default.
     add("memory-trampoline", &|c| {
         c.memory = true;
         c.kernel_hooks = KernelHooks::Trampoline;
@@ -926,7 +925,7 @@ R0 unbounded memory access\n\
         assert!(shapes
             .iter()
             .any(|s| s.config.network && s.legs == LegSelection::NetworkTwKprobeOnly));
-        // The shipped shapes take the default (classic) form; the opt-in
+        // The other shapes take the default (classic) form; the opt-in
         // raw-tracepoint form has its row for the memory leg and the opt-in
         // trampoline form its rows for both legs, so the raw pair and the
         // trampoline programs still meet the verifier on every run of the

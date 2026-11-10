@@ -74,8 +74,8 @@ pub(crate) fn detect_cgroup_memory_limit() -> Option<u64> {
 ///
 /// Threads are capped at one per ~512 MiB of memory budget: a parallel scan
 /// keeps roughly a row-group's worth of state live per thread, so the thread
-/// count follows the memory budget (two per GiB) instead of the host's CPU
-/// count. Without a cgroup limit we still cap at 32 — an unbounded thread
+/// count tops out at two per GiB of budget instead of one per host CPU.
+/// Without a cgroup limit we still cap at 32 — an unbounded thread
 /// count can run the import out of memory.
 pub(crate) fn duckdb_resource_limits(mem_fraction_pct: u64, min_mib: u64) -> (Option<u64>, u64) {
     const MIB: u64 = 1024 * 1024;

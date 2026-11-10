@@ -271,8 +271,8 @@ const MEMORY_SYSCALL_FENTRY_PROGS: &[&str] = &[
 /// before the exit program was live wrote a scratch entry nobody consumed;
 /// a later brk of the same thread whose own enter fell before its enter
 /// program was live then paired its exit with that stale munmap/mmap entry
-/// and recorded `new_brk − unmapped_address` — page-aligned negative brk
-/// deltas of 13–46 TB, a handful of rows a week across thousands of hosts.
+/// and recorded `new_brk − unmapped_address` — rare page-aligned negative
+/// brk deltas of tens of TB.
 /// Exit first, a syscall spanning the gap can only exit without an enter,
 /// which the exit programs ignore; the BPF side additionally tags each entry
 /// with its leg and drops a cross-leg pairing (counted as the `memory-xleg`
@@ -3208,7 +3208,7 @@ fn handle_exec_events(
     // must re-register the new image) and forks always carry a fresh pid.
     let mut added_pids = std::collections::HashSet::new();
     // Single scan flag: we only scan /proc once per trace session because
-    // such a server's Python workers are long-lived and pre-forked,
+    // a pre-forked server's Python workers are long-lived,
     // so subsequent pyenv exec events won't reveal new Python PIDs.
     let mut did_scan = false;
     while let Ok(event) = exec_rx.recv() {
@@ -7289,10 +7289,10 @@ pub fn systing(
         // The packets tier's honesty line: the exit summary above prints
         // the ring's `Missed packet events` counter, but nothing said what
         // share of the traffic that was. On a big host the userspace
-        // consumer, not the ring, is the ceiling (events are missed however
-        // large the ring family is), so the requester's packet
-        // tables are a sample — say so, with the rate that would have kept
-        // up, beside the counter track the trace already carries.
+        // consumer, not the ring, is the ceiling (a larger ring family only
+        // delays the overrun), so the packet tables are a sample — say so,
+        // with the rate that would have kept up, beside the counter track
+        // the trace already carries.
         if opts.network_packets {
             let recorded = recorder
                 .network_recorder

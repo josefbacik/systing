@@ -956,11 +956,10 @@ struct {
  * before its enter to close that window; this tag catches any other
  * source). Untagged, a stale munmap entry was read by the thread's next
  * brk exit as the previous break: `ret - saved->addr` with `addr` the
- * unmapped address recorded page-aligned negative brk deltas of 13-46 TB
- * (the mmap region minus the PIE heap) on real hosts -- rare, a handful of
- * rows a week across thousands of hosts, each under an ordinary glibc
- * systrim stack. An exit that finds another leg's entry drops it and
- * counts MISSED_MEMORY_XLEG_EVENT. */
+ * unmapped address recorded page-aligned negative brk deltas of tens of
+ * TB (the mmap region minus the PIE heap) -- rare, and each under an
+ * ordinary glibc systrim stack. An exit that finds another leg's entry
+ * drops it and counts MISSED_MEMORY_XLEG_EVENT. */
 enum memory_syscall_leg {
 	MEMORY_SYSCALL_LEG_NONE = 0,
 	MEMORY_SYSCALL_LEG_MMAP = 1,
@@ -1024,7 +1023,7 @@ struct {
  * 1. The VFIO DMA regions themselves (MEMORY_VFIO_MAP / MEMORY_VFIO_UNMAP
  *    events with stacks), from kprobes on the vfio_iommu_type1 ioctl
  *    handlers vfio_dma_do_map / vfio_dma_do_unmap — one event per region, so
- *    the ring sees tens to thousands of events per model load.
+ *    the event rate is that of the ioctls, not of the pages behind them.
  *
  * 2. How fragmented the memory behind those regions is. vfio_iommu_type1
  *    pins a DMA region one physically contiguous run at a time
@@ -1034,8 +1033,8 @@ struct {
  *    the iommu:map / iommu:unmap tracepoints once per call with that run's
  *    size. So the size of each tracepoint event IS the contiguity of the
  *    backing memory: a THP-backed region maps in >=2 MiB runs, a
- *    4 KiB-fragmented one in 4 KiB runs. A 146 GiB region backed by 4 KiB
- *    pages is ~38M events, far beyond any ring budget, so the tracepoints
+ *    4 KiB-fragmented one in 4 KiB runs. A region backed by 4 KiB pages
+ *    is 262,144 events per GiB, far beyond any ring budget, so the tracepoints
  *    never emit events — they count into this histogram, keyed by the
  *    mapping process, the operation and log2(size), drained by userspace
  *    at the end of the capture into memory_iommu rows — and only while the
@@ -5754,7 +5753,7 @@ int BPF_PROG(systing_rss_stat_exit_flush, struct task_struct *task)
 
 /* Sample 1:N mmap/munmap/brk events. The map legs were originally
  * unsampled on the assumption that map-call rates are low; allocator
- * churn breaks that (a workload can unmap at a sustained rate), and on such
+ * churn breaks that (a workload can unmap continuously), and on such
  * hosts unsampled map events dominate the memory lane end to end:
  * per-event stack capture, ringbuf traffic, trace size, and the
  * post-capture processing whose memory footprint scales with row
@@ -6114,7 +6113,7 @@ static __always_inline int memory_brk_exit_common(void *ctx, struct task_struct 
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	/* A stale entry of another leg (a munmap's unmapped address) read here
 	 * as the previous break is what recorded page-aligned negative deltas
-	 * of 13-46 TB on real hosts; the take drops it. */
+	 * of tens of TB; the take drops it. */
 	struct memory_syscall_args *saved =
 		memory_syscall_scratch_take(tgidpid, MEMORY_SYSCALL_LEG_BRK);
 	if (!saved)
@@ -6127,8 +6126,9 @@ static __always_inline int memory_brk_exit_common(void *ctx, struct task_struct 
 	 * total_vm bound skips on). There is then no previous break to diff
 	 * against, and ret - 0 would record the new break ADDRESS as the
 	 * "delta": a page-aligned value in the tens of TB on a 47-bit VA,
-	 * for example on a process that exits during the capture. An unknown previous break is not a
-	 * delta of that size; emit nothing, as a failed or query brk does. */
+	 * for example on a process that exits during the capture. An unknown
+	 * previous break is not a delta of that size; emit nothing, as a
+	 * failed or query brk does. */
 	if (!old_brk)
 		return 0;
 
@@ -6463,10 +6463,10 @@ int systing_page_fault_sw(struct bpf_perf_event_data *ctx)
  * userspace only loads and attaches these programs when kallsyms carries the
  * symbol (attach_memory_vfio_legs in systing_core.rs) and records the leg as
  * off in sysinfo.memory_vfio_leg otherwise — the other memory legs run
- * regardless. One event per DMA region (a model load is tens to thousands
- * of regions), so no sampling. The pin/unpin cost of the region is charged
- * to the calling task in the same ioctl, which is why the stacks are kept:
- * they name the runtime thread doing the mapping.
+ * regardless. One event per DMA region, orders of magnitude fewer than the
+ * pages behind them, so no sampling. The pin/unpin cost of the region is
+ * charged to the calling task in the same ioctl, which is why the stacks are
+ * kept: they name the runtime thread doing the mapping.
  */
 struct vfio_iommu_type1_dma_map_uapi {
 	u32 argsz;

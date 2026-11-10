@@ -846,11 +846,11 @@ mod tests {
 /// Every leg drives N shard threads the way the `sched_rec_{i}` consumers
 /// run: each shard owns one `SchedEventRecorder` behind its own mutex and
 /// feeds it 4,096-event batches under that lock; the shards share only what
-/// production shares — the utid generator's DashMap and, in the legs that
+/// a real capture shares — the utid generator's DashMap and, in the legs that
 /// have one, the collector. Three collector shapes separate the candidate
 /// ceilings: a private `InMemoryCollector` per shard (the record cost plus
 /// the DashMap), one `SharedCollector(InMemoryCollector)` (adds the shared
-/// lock without an encode) and the production
+/// lock without an encode) and a capture's own
 /// `SharedCollector(StreamingParquetWriter)` (adds the parquet flushes).
 /// A batch under the lock that takes longer than a few milliseconds is a
 /// stall — a flush of the shared writer, or a wait on the shard that is
@@ -864,7 +864,7 @@ mod sched_consumer_bench {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    /// The host shape the finding came from: 144 CPUs, ~29K threads.
+    /// The simulated host: many CPUs and far more threads than CPUs.
     const CPUS: u64 = 144;
     const TIDS: u64 = 29_000;
     /// Events handed to the recorder per lock acquisition, as `consume_loop`.

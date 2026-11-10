@@ -661,7 +661,8 @@ fn symbolizer_memory_budget() -> u64 {
 /// peak, yet it is invisible to the anon watch — so it needs its own, tighter
 /// bound. Kept well under the anon budget so the symbolization footprint
 /// leaves headroom in the cgroup for the later DuckDB build phase, which is
-/// where large captures OOM.
+/// where large captures OOM: an eighth of the cgroup limit, or 1 GiB
+/// without one.
 fn symbolizer_file_budget() -> u64 {
     const DEFAULT_BUDGET: u64 = 1 << 30; // 1 GiB
     crate::duckdb::detect_cgroup_memory_limit()
@@ -1896,8 +1897,8 @@ impl StackRecorder {
         // across processes and mounts, bounded in files and time, the
         // sampled processes first; nothing here runs during capture. Its
         // cost line goes to stdout beside the other per-phase cost lines,
-        // because on a host running thousands of containers the unbounded
-        // walk once cost more than the capture.
+        // because on a host with many processes an unbounded walk can
+        // cost more than the capture.
         if self.build_id_mode {
             let sampled: HashSet<i32> = interners
                 .iter()

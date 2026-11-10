@@ -249,8 +249,8 @@ fn build_runqueue_query(trace_id: Option<&str>) -> String {
     // qualifies per wakeup, and an ASOF JOIN -- one ordered merge over both
     // sides -- yields the same matches as the range join
     // `w.ts BETWEEN COALESCE(s.prev_end_ts, 0) AND s.ts` it replaces. That
-    // range join built an intermediate DuckDB cannot spill: on a many-core
-    // host's trace of tens of millions of rows it ran for minutes or failed
+    // range join built an intermediate DuckDB cannot spill: on a large
+    // trace from a many-core host it ran for minutes or failed
     // with an out-of-memory error under a bounded memory_limit, while this
     // form is several times faster and spills gracefully under the same
     // limits.
