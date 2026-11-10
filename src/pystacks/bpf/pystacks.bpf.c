@@ -76,9 +76,9 @@ struct {
  * sampler runs in NMI context). bpf_map_update_elem on a HASH map takes a
  * per-bucket raw spinlock; on a large guest under contention those waiters
  * fall into the paravirt qspinlock slow path, where kvm_wait executes HLT
- * with IF=0 and depends on the hypervisor's PV kick to ever wake up. AWS
- * Nitro does not deliver that kick to an IF=0 halt, so a contended map
- * update from these probes permanently halts the vCPU and wedges the node
+ * with IF=0 and depends on the hypervisor's PV kick to ever wake up. Not
+ * every hypervisor delivers that kick to an IF=0 halt, so a contended map
+ * update from these probes can halt the vCPU for good and hang the guest
  * (rq lock never released). Therefore BPF code here may only do lock-free
  * map *lookups* on shared hash maps; all inserts are done by userspace from
  * process context (IF=1 waiters fall back to safe_halt and are woken by the

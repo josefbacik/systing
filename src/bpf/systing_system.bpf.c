@@ -63,7 +63,7 @@
  * the BPF/tracing entry glue between the traced site and the program
  * (bpf_trace_run*, __traceiter_*). The exact glue depth varies by
  * kernel version, so some kernels leak residual glue frames past this
- * skip; fold-side leaf handling owns that remainder. Perf-event
+ * skip; a consumer's leaf handling owns that remainder. Perf-event
  * sampling captures must NOT use this: there the walk starts at the
  * sample's interrupted registers -- no glue exists, and a nonzero skip
  * discards the interrupted IP plus real return addresses (every kernel
@@ -357,7 +357,7 @@ struct network_event {
 	u32 recv_seq_end;      // TCP copied_seq at recvmsg exit (TCP recv only)
 	u32 rcv_nxt_at_entry;  // TCP rcv_nxt at entry - kernel's next expected seq (TCP recv only)
 	u64 netns_inum;    // Inode of the socket's network namespace (sk->__sk_common.skc_net).
-	                   // Lets the fold attribute a flow to its owning netns (hence pod)
+	                   // Lets a consumer attribute a flow to its owning netns (hence pod)
 	                   // directly, instead of inferring it from src_ip against the
 	                   // interface map — which cannot disambiguate loopback (every netns
 	                   // has 127.0.0.1). 0 when the sock pointer was unavailable.
@@ -812,7 +812,7 @@ struct {
  * one batch. The kernel's inner-map compatibility check for ringbufs
  * (bpf_map_meta_equal) compares type, key/value size and flags, not
  * max_entries, so the template size is free; 64 KiB is a legal ring on
- * every page size we run (power of two, page aligned).
+ * any page size up to 64 KiB (power of two, page aligned).
  */
 #define RINGBUF_TEMPLATE_BYTES (64 * 1024)
 
@@ -1066,9 +1066,9 @@ struct memory_iommu_value {
 
 /* Keyed per process AND per GiB of IOVA so the rows say where in the
  * device's address space the fragmentation sits, not only how much. Bound:
- * a 150 GiB arena touches ~150 IOVA GiBs x 19 size orders (4 KiB..1 GiB) x 2
- * ops = 5.7K entries per process, so 131072 preallocated entries hold ~23
- * such processes; an update that finds the map full is counted in
+ * 131072 entries, one per process, operation, IOVA GiB
+ * and size order (a run counts under the GiB where it
+ * starts); an update that finds the map full is counted in
  * memory_iommu_overflow and dropped (the histogram is then a floor). */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -3212,8 +3212,8 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 // Read the inode of a socket's network namespace from a struct sock pointer.
 // The netns is stable over the socket's lifetime, so reading it at event-emit
 // time is equivalent to reading it at socket creation. Returns 0 if sk_ptr is
-// null. The inode matches what userspace reads via /proc/<pid>/ns/net, so the
-// fold can join a flow's netns_inum to the interface map's per-netns inode.
+// null. The inode matches what userspace reads via /proc/<pid>/ns/net, so a
+// consumer can join a flow's netns_inum to the interface map's per-netns inode.
 static __always_inline u64 read_sk_netns_inum(u64 sk_ptr)
 {
 	if (!sk_ptr)
@@ -6589,8 +6589,8 @@ int BPF_KRETPROBE(systing_vfio_dma_unmap_ret)
  * which unmaps and unpins every region (vfio_iommu_unmap_unpin_all); a
  * group detaching from a domain (vfio_iommu_type1_detach_group) unmaps the
  * regions from that domain, every one of them when it was the domain's last
- * group. Neither passes vfio_dma_do_unmap, so without these probes a model
- * unload that simply closes its device files would leave no unmap row and
+ * group. Neither passes vfio_dma_do_unmap, so without these probes a process
+ * that simply closes its device files would leave no unmap row and
  * its iommu:unmap runs outside any window. The release pair opens a
  * [0, ~0) window and writes one unmap row flagged MEMORY_VFIO_FLAG_TEARDOWN
  * (iova 0, size ~0: "everything"); the detach pair only opens the window,
