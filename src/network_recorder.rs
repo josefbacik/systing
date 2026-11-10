@@ -1359,7 +1359,7 @@ mod socket_record_emission_tests {
         assert!(!socket_tuple_is_complete(AF4, 0, &UNSPEC, 0));
     }
 
-    /// The upgrade lifecycle (the close-storm RCA's recorder half): a
+    /// The upgrade lifecycle, on the recorder's side: a
     /// socket first seen via a pre-bind event emits a port-less record,
     /// the first complete-tuple sighting emits exactly one upgrade, and
     /// nothing after that re-emits.

@@ -328,7 +328,7 @@ fn spill_record_len(stack: &Stack) -> u64 {
 /// (stack, tgid) is appended once; at end of trace the records are streamed
 /// back for symbolization. This keeps per-unique-stack memory at ~16 bytes
 /// (the dedup hash) instead of the full address vectors, which on hosts with
-/// heavy short-lived-process churn (CI) otherwise grow to multiple GiB.
+/// heavy short-lived-process churn otherwise grow to multiple GiB.
 ///
 /// The backing file is created unlinked (tempfile) in the spill directory: the
 /// trace output directory, or the stream sink's private temporary directory
@@ -1014,12 +1014,13 @@ impl Default for BuildIdIndexBudget {
 /// Default cap on distinct files the fill walk reads per capture. One ELF
 /// note read is a few small `pread`s through a `map_files` link (tens of
 /// microseconds warm); 10,000 of them stay well inside the time cap below
-/// and cover every binary a host with thousands of containers maps.
+/// and cover every binary that a host full of containers maps.
 pub const DEFAULT_BUILD_ID_INDEX_MAX_FILES: usize = 10_000;
 /// Default cap on the fill walk's wall time per capture, in milliseconds.
-/// Two seconds is far below the whole-capture cost an unbounded walk can
-/// reach on a many-core host running thousands of short-lived containers,
-/// and above what a deduplicated walk of a busy host needs.
+/// Two seconds is far below the whole-capture cost that an
+/// unbounded walk can reach on a many-core host full of short-lived
+/// containers, and it is above what a deduplicated walk of a busy
+/// host needs.
 pub const DEFAULT_BUILD_ID_INDEX_MAX_MS: u64 = 2_000;
 
 /// What the fill walk did on this capture, for the summary line.
@@ -1183,7 +1184,7 @@ impl<'a> BuildIdIndexWalk<'a> {
     ///
     /// Each mapping is read through its `map_files` link first — namespace-
     /// immune, so containerized processes' binaries index correctly under
-    /// the privileges a full capture runs with — falling back to the
+    /// the privileges that tracing needs — falling back to the
     /// maps path, which works unprivileged for same-namespace processes. A
     /// process racing to exit mid-read is just a miss.
     fn fill_from(&mut self, maps: &ProcessMaps) -> bool {
@@ -1535,8 +1536,8 @@ pub struct StackRecorder {
     /// and inlined frames collapse into their caller. This bounds
     /// symbolization memory: blazesym retains parsed debug info per binary
     /// with no eviction, and one freshly-built `-g` binary can hold
-    /// hundreds of MiB resident, so a host running many of them (a CI node
-    /// mid-build) accumulates past any fixed budget — while the
+    /// hundreds of MiB resident, so a host running many of them (a build
+    /// machine, say) accumulates past any fixed budget — while the
     /// symbol-table path costs a few MiB per binary for identical names.
     names_only: bool,
     /// When set, symbol names longer than

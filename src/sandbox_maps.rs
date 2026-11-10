@@ -636,7 +636,7 @@ mod tests {
         assert_eq!(odd.entries[0].file_id, None);
     }
 
-    /// Maps shape observed on a live runsc systrap stub (trimmed): guest
+    /// Maps shape of a runsc systrap stub (trimmed): guest
     /// text file-backed with 4KiB pool islands at patched syscall sites,
     /// usertrap trampolines below the image, stub text above it.
     const STUB_MAPS: &str = "\

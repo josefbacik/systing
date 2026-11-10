@@ -85,9 +85,9 @@
 //! # Bounded folding
 //!
 //! The pass consumes one event stream ordered by `(ts, kind)`. The engine
-//! materializes that stream to sort it, and the sort does not spill: on a
-//! host that records tens of millions of context switches per second a
-//! 10-second capture holds hundreds of millions of stream rows, more than a
+//! materializes that stream to sort it, and the sort does not spill: the
+//! stream grows with the context-switch rate, so even a short capture of a
+//! busy many-core host can hold hundreds of millions of rows, more than a
 //! bounded process can hold. Three guards keep the fold inside a budget,
 //! each set from [`SchedAggregateParams`] and each reported in the metadata:
 //!
@@ -119,11 +119,11 @@
 //!   un-sampled window — nothing is sampled or extrapolated — and the row
 //!   says so: `meta.window_truncated` is true, `meta.window_ns` is the
 //!   window actually folded, and `meta.slice_rows_capture` is the number of
-//!   slices the requested window held. A shorter window on the hosts where a
+//!   slices the requested window held. A shorter window on a host where a
 //!   full one cannot be folded beats no row at all.
 //! - **The time budget** (`time_budget`): the event budget is a row count,
-//!   but the fold's cost per row differs by host — twice over between two
-//!   machines of one class is ordinary — so a caller with a wall-clock
+//!   but the fold's cost per row differs by host, even between machines of
+//!   the same size, so a caller with a wall-clock
 //!   deadline cannot set one row budget that fits everywhere. With a time
 //!   budget the first chunk of a multi-chunk fold doubles as a probe of this
 //!   host's rate: when the time it took, times the chunks still to fold,

@@ -10,7 +10,7 @@
 //!   (i.e. a stripped Go binary). Binaries with a symbol table keep the
 //!   richer symtab+DWARF path, and blazesym's nearest-symbol matching
 //!   against sparse cgo dynamic symbols (which produces confidently wrong
-//!   names on e.g. COS/boringcrypto kubelet builds) is bypassed entirely
+//!   names on e.g. boringcrypto kubelet builds) is bypassed entirely
 //!   when the resolver is active;
 //! * the **[`Resolve`] implementation** wiring pc lookups into blazesym's
 //!   process symbolization flow.

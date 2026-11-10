@@ -498,7 +498,7 @@ mod tests {
         rows.map(|r| r.unwrap()).collect()
     }
 
-    /// A deterministic CI-node-shaped fixture: 4 CPUs, 5 threads pinned to
+    /// A deterministic small-host fixture: 4 CPUs, 5 threads pinned to
     /// each, 300 slices per CPU, a wakeup before most slices (matched), some
     /// wakeups inside the thread's previous run (spurious, unmatched), cross-
     /// CPU wakeup targets, duplicate wakeup rows, a thread that wakes but

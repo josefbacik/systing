@@ -2297,8 +2297,8 @@ struct RecorderChannels {
     probe_rx: Receiver<probe_event>,
     network_rx: Receiver<network_event>,
     /// One receiver per `packet_ringbufs` ring, SPSC like the sched rings:
-    /// a shared channel with 64 producers was a ceiling of its own (≈1.5 M
-    /// events/s from send-side contention alone), and one consumer thread
+    /// a shared channel with 64 producers was a ceiling of its own (send-side
+    /// contention alone capped it), and one consumer thread
     /// behind it another; each ring's poller feeds its own consumer.
     packet_rxs: Vec<Receiver<packet_event>>,
     epoll_rx: Receiver<epoll_event_bpf>,
@@ -5754,10 +5754,10 @@ struct ThreadHandles {
 /// Wall-clock bracket around one step of the capture-stop transition.
 ///
 /// Prints the begin line BEFORE the step runs and the elapsed line when the
-/// step completes, so shipped host logs localize a stall to the exact
-/// operation in flight: a host that wedges mid-step leaves the unclosed
-/// begin line as its last word. Plain stdout on purpose — these lines ride
-/// the same journald path operators already read the stop sequence from.
+/// step completes, so the output localizes a stall to the exact operation
+/// in flight: a step that never returns leaves the unclosed begin line as
+/// the last word. Plain stdout on purpose — that is where the rest of the
+/// stop sequence (`Stopping...`, the missed-event counts) is printed.
 struct StopPhase {
     name: &'static str,
     start: Instant,
@@ -6175,7 +6175,7 @@ pub fn systing(
     let kernel = kernel_release_major_minor();
     let ring_plan = plan_ringbufs(num_cpus, opts.ringbuf_size_mib, opts.ringbuf_shards, kernel);
     // One startup note, unconditional: the ring layout is the first thing to
-    // read when a host drops events, and host logs are where it gets read.
+    // read when a capture drops events.
     eprintln!(
         "Ring buffers: {} rings per family x {} MiB ({} possible CPUs; kernel {}; {})",
         ring_plan.nr_rings,
@@ -6973,7 +6973,7 @@ pub fn systing(
         // BPF gate map from this (process-context) thread. BPF itself never
         // inserts into the gate map because its probes run with IRQs off,
         // where a contended hash-map bucket lock can permanently halt the
-        // vCPU on hypervisors that drop PV spinlock kicks (AWS Nitro).
+        // vCPU on hypervisors that drop PV spinlock kicks.
         // The channel senders live in the ringbuf callbacks, so this thread
         // exits once the ringbuf threads are joined and the rings dropped.
         let symbol_thread = thread::Builder::new()
@@ -7326,8 +7326,8 @@ pub fn systing(
         // the closing vmstat sample, and — only when the THP-split leg was
         // requested — each traced process's AnonHugePages. That last read
         // is one /proc/<pid>/smaps_rollup per live traced process, a
-        // page-table walk the kernel performs on every read (seconds on a
-        // host whose processes map terabytes at 4 KiB), so it belongs to
+        // page-table walk the kernel performs on every read (slow for a
+        // process with much memory mapped in 4 KiB pages), so it belongs to
         // the capture that asked the huge-page question, not to every
         // memory capture.
         if opts.memory {

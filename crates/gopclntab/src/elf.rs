@@ -9,8 +9,8 @@
 //! The table is located by section name first — `.gopclntab`, then the
 //! `.data.rel.ro.gopclntab` name some PIE links use. When neither
 //! exists, non-executable data sections are scanned for a validating
-//! pclntab header: distro external-linking PIE builds (observed on
-//! Amazon Linux 2023's containerd packages across go1.20–go1.23) merge
+//! pclntab header: distro external-linking PIE builds (for example
+//! containerd packages built with go1.20–go1.23) merge
 //! the table anonymously into `.data.rel.ro`, and the header is its only
 //! remaining identification. See [`GoPclntab::scan`].
 //!
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(elf.table.func_count(), tab.func_count());
 
         // The sectionless shape (distro external-linking PIE builds, e.g.
-        // Amazon Linux 2023 containerd): no section is named
+        // containerd packages): no section is named
         // ".gopclntab", the table sits anonymously inside a data section
         // and only its header identifies it. Simulated by renaming the
         // section — the bytes stay exactly where they were — the scan

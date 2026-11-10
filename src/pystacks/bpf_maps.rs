@@ -26,7 +26,7 @@ pub struct PystacksMaps {
     /// here once a symbol record has been resolved, which stops BPF from
     /// re-emitting that symbol. This split exists because a hash-map
     /// update from the sched_switch/perf probes (IRQs off) can deadlock
-    /// the CPU on hypervisors that drop PV spinlock kicks (AWS Nitro).
+    /// the CPU on hypervisors that drop PV spinlock kicks.
     pub symbols_fd: i32,
     pub pid_config_fd: i32,
     pub targeted_pids_fd: i32,
