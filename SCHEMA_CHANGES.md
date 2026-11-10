@@ -1197,11 +1197,11 @@ The network-packets recorder learns to sample, and says so. On a big host
 the packets tier — one `packet_event` per skb at every transmit and
 delivery hook — loses most of its events to the userspace consumer, not
 the ring: even at `--only-recorder network-packets --ringbuf-size-mib 256`
-(a 2 GiB packet family, 64 rings of 32 MiB) a busy many-core host reports
-`Missed packet events` in the millions with `Missed network events: 0` on
-the same run, and the `.duckdb` packet table is an unlabelled sample. A
-ring step only delays the overrun by seconds
-(2 GiB of ~130-byte events is ~16 s of a 1 M/s deficit); the cure is to
+(a 2 GiB packet family, 64 rings of 32 MiB) a busy many-core host could
+miss millions of packet events (`Missed packet events`)
+beside `Missed network events: 0`, and the `.duckdb`
+packet table was an unlabelled sample. A ring
+step only delays the overrun; the cure is to
 record fewer packets, and to say how many. The tables keep their columns;
 the new column is nullable.
 
@@ -1482,13 +1482,13 @@ keep their columns; the new columns are nullable.
   `op = 'unmap'` row with `flags` bit 31 set — `flags < 0` in the INTEGER
   column (not a uapi flag; the uapi `VFIO_DMA_UNMAP_FLAG_ALL` bit is set
   beside it), `iova = 0`, `size = -1` (all ones: every region), `vaddr`
-  NULL and the stack of the closing thread — so a model unload that just
+  NULL and the stack of the closing thread — so a process that just
   closes its device files shows up; a detach writes no
   row (how much it unmaps depends on whether it was the domain's last
   group) but opens the histogram window, so its `iommu:unmap` runs are
   counted in `memory_iommu` like an ioctl's. Both teardown windows stay open
-  for the whole unmap-and-unpin walk (`vfio_iommu_unmap_unpin_all` — seconds
-  to minutes for hundreds of GB pinned), so an `iommu:unmap` run by an
+  for the whole unmap-and-unpin walk (`vfio_iommu_unmap_unpin_all` — its
+  time grows with the memory pinned), so an `iommu:unmap` run by an
   interrupt on a CPU where the tearing-down task is current is counted under
   that task's window, exactly as the ioctl windows already admit: a small
   pollution of `memory_iommu` on teardown (an IRQ-attribution class the
@@ -1522,8 +1522,8 @@ keep their columns; the new columns are nullable.
 The memory recorder learns about device DMA mappings and transparent huge
 pages: how often VFIO regions are mapped and unmapped, how fragmented the
 memory behind them is, and how often THPs split or fail to be allocated on
-the host. Motivation: a model-unload regression whose suspected cause is
-4 KiB-fragmented VFIO-pinned arenas (the unmap/unpin walk has 512x the
+the host. Motivation: the time to tear down a VFIO-pinned region may depend
+on how fragmented it is (over 4 KiB pages the unmap/unpin walk has 512x the
 entries of a 2 MiB-backed one). New tables are empty unless the leg was
 asked for (`--memory-vfio`, `--memory-thp-sample-rate`); `memory_vmstat`
 is written whenever the memory recorder runs.
@@ -1557,7 +1557,7 @@ is written whenever the memory recorder runs.
   (the kprobe/kretprobe pair brackets the window), so the table is VFIO's
   by construction — the host's other IOMMU users (NIC / NVMe DMA-API
   mappings on an IOMMU-translated host) are never in it. The BPF map holds
-  131072 entries (≈23 processes with 150 GiB arenas at every size order);
+  131072 entries (one per process, operation, IOVA GiB and size order);
   runs that find it full are dropped and counted, as is an ioctl whose
   window could not be opened (more than 1024 traced tasks inside a VFIO
   ioctl at once) — systing prints `memory-vfio: N iommu map/unmap runs or
