@@ -5,10 +5,9 @@
 //! `ArrowWriter::write` — definition levels, the column encodings and the
 //! compression of every column — inline on the thread that called
 //! `add_*`. For the `network_packet` table that thread is the packet
-//! consumer: a 200,000-row flush cost it ≈140 ms during which every ring
-//! poller sat blocked on a full channel, and those flushes were 83 % of
-//! the consumer's time on a saturated host (the measurements are on the
-//! PR that introduced this module). The lane moves the whole flush: the
+//! consumer: every ring poller sat blocked on a full channel for the
+//! length of a flush, and under load those flushes were most of the
+//! consumer's time. The lane moves the whole flush: the
 //! producing thread hands the `Vec` of rows over a bounded channel and
 //! returns; the lane thread builds the arrow batch in parallel slices and
 //! fans the leaf columns out to a fixed set of column-encoder threads

@@ -1030,7 +1030,7 @@ pub struct GoLabelRecord {
 
 /// A `/proc/vmstat` counter sampled at the start and the end of the capture
 /// (the THP, compaction and direct-reclaim families), so `value_end -
-/// value_start` is the host-wide count over the capture: the fleet-general
+/// value_start` is the host-wide count over the capture: the general
 /// "how often do hugepage splits / THP fault fallbacks happen" read, with no
 /// probe attached.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

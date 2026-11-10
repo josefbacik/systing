@@ -637,7 +637,7 @@ fn current_file_rss_bytes() -> Option<u64> {
 /// and replayed one bucket at a time, so peak memory is roughly
 /// `total_live_stacks / RESPILL_BUCKETS` instead of all of them at once. 64
 /// keeps the fd cost trivial while bringing the per-bucket fraction well
-/// under the symbolizer budget on 192-core hosts.
+/// under the symbolizer budget on many-core hosts.
 const RESPILL_BUCKETS: usize = 64;
 
 /// Memory budget for the symbolization phase. blazesym retains parsed debug
@@ -656,12 +656,13 @@ fn symbolizer_memory_budget() -> u64 {
 /// Budget for the file-backed symbol cache — blazesym's mmap'd ELF/`.so`
 /// `FileCache`, measured by [`current_file_rss_bytes`]. Distinct from the
 /// anon [`symbolizer_memory_budget`] above, and the reason this fix exists:
-/// the file cache runs ~3 GiB and deterministic on the fleet (every capture
-/// symbolizes the same common-binary set), dominates the tracer's ~3.9 GiB
-/// peak, and is invisible to the anon watch — so it needs its own, tighter
+/// the file cache can run to several GiB (hosts that map the same large
+/// binaries symbolize the same set on every capture) and dominate the tracer's
+/// peak, yet it is invisible to the anon watch — so it needs its own, tighter
 /// bound. Kept well under the anon budget so the symbolization footprint
 /// leaves headroom in the cgroup for the later DuckDB build phase, which is
-/// where large captures OOM. cgroup/8 targets ~1 GiB on an 8Gi slice.
+/// where large captures OOM: an eighth of the cgroup limit, or 1 GiB
+/// without one.
 fn symbolizer_file_budget() -> u64 {
     const DEFAULT_BUDGET: u64 = 1 << 30; // 1 GiB
     crate::duckdb::detect_cgroup_memory_limit()
@@ -1016,10 +1017,9 @@ impl Default for BuildIdIndexBudget {
 /// and cover every binary a host with thousands of containers maps.
 pub const DEFAULT_BUILD_ID_INDEX_MAX_FILES: usize = 10_000;
 /// Default cap on the fill walk's wall time per capture, in milliseconds.
-/// Two seconds is an order of magnitude below the whole-capture cost the
-/// unbounded walk reached on a 192-vCPU host running thousands of
-/// short-lived containers, and above what a deduplicated walk of a busy
-/// host needs.
+/// Two seconds is far below the whole-capture cost an unbounded walk can
+/// reach on a many-core host running thousands of short-lived containers,
+/// and above what a deduplicated walk of a busy host needs.
 pub const DEFAULT_BUILD_ID_INDEX_MAX_MS: u64 = 2_000;
 
 /// What the fill walk did on this capture, for the summary line.
@@ -1183,7 +1183,7 @@ impl<'a> BuildIdIndexWalk<'a> {
     ///
     /// Each mapping is read through its `map_files` link first — namespace-
     /// immune, so containerized processes' binaries index correctly under
-    /// the privileges systing runs with in production — falling back to the
+    /// the privileges a full capture runs with — falling back to the
     /// maps path, which works unprivileged for same-namespace processes. A
     /// process racing to exit mid-read is just a miss.
     fn fill_from(&mut self, maps: &ProcessMaps) -> bool {
@@ -1897,8 +1897,8 @@ impl StackRecorder {
         // across processes and mounts, bounded in files and time, the
         // sampled processes first; nothing here runs during capture. Its
         // cost line goes to stdout beside the other per-phase cost lines,
-        // because on a host running thousands of containers the unbounded
-        // walk once cost more than the capture.
+        // because on a host with many processes an unbounded walk can
+        // cost more than the capture.
         if self.build_id_mode {
             let sampled: HashSet<i32> = interners
                 .iter()
@@ -1918,9 +1918,9 @@ impl StackRecorder {
         // tgid-hashed second-tier files for pass 2, so they stay on disk
         // instead of accumulating in memory.
         //
-        // Under heavy short-lived-process churn (CI) nearly everything is dead
-        // by now and this pass keeps peak memory flat. On long-lived-process
-        // hosts (training, inference) nearly everything is alive, and the
+        // Under heavy short-lived-process churn nearly everything is dead
+        // by now and this pass keeps peak memory flat. On hosts whose
+        // processes are long-lived nearly everything is alive, and the
         // re-spill is what keeps the address vectors out of RAM until pass 2
         // touches one bucket at a time.
         let mut respill: Vec<StackSpill> = (0..RESPILL_BUCKETS)
@@ -2562,7 +2562,7 @@ fn format_location_info(code_info: Option<&blazesym::symbolize::CodeInfo>) -> St
 /// id, so their `display_module` is itself a `[buildid:...]` placeholder.
 ///
 /// With frame labels on, a known real module is named (`<module>:unknown`
-/// once tideline stamps the leaf), matching the live-process path's
+/// once a downstream consumer stamps the leaf), matching the live-process path's
 /// module-level fallback rather than emitting a bare build-id hash the module
 /// name would have covered. When only the id is known (store miss, or a
 /// trusted id-only entry) the deferred `[buildid:...]` form carries the

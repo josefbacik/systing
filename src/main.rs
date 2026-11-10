@@ -341,7 +341,7 @@ impl From<Command> for Config {
                 .kernel_hooks
                 .parse()
                 .expect("clap admits only the values KernelHooks parses"),
-            // Testing-only; never a CLI flag (the agent's argv cannot reach it).
+            // Testing-only; never a CLI flag (no argv can reach it).
             memory_syscall_force_fallback: false,
             memory_alloc: cmd.memory_alloc,
             memory_alloc_sample_rate: cmd.memory_alloc_sample_rate,
@@ -351,7 +351,7 @@ impl From<Command> for Config {
             network_packets: cmd.network_packets,
             packet_sample_rate: cmd.packet_sample_rate,
             network_syscalls: cmd.network_syscalls,
-            // Testing-only; never a CLI flag (the agent's argv cannot reach it).
+            // Testing-only; never a CLI flag (no argv can reach it).
             network_tw_force_fallback: false,
             resolve_addresses: cmd.resolve_addresses,
             tpu_profile: cmd.tpu_profile,

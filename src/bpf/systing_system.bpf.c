@@ -76,8 +76,8 @@
  * tool_config.nr_ringbufs (min(num_cpus, NR_RINGBUFS_MAX), or the
  * --ringbuf-shards override), set by userspace before load; the outer
  * ARRAY_OF_MAPS below are sized to it and populated from userspace after
- * load. A compile-time 8 was the ceiling before: on a 192-CPU host that
- * put 24 CPUs behind one ring, and __bpf_ringbuf_reserve takes the ring's
+ * load. A compile-time 8 was the ceiling before: that put an eighth of a
+ * host's CPUs behind one ring, and __bpf_ringbuf_reserve takes the ring's
  * spinlock before it checks for space, so a full ring is also a lock every
  * producer on those CPUs spins on.
  */
@@ -956,11 +956,10 @@ struct {
  * before its enter to close that window; this tag catches any other
  * source). Untagged, a stale munmap entry was read by the thread's next
  * brk exit as the previous break: `ret - saved->addr` with `addr` the
- * unmapped address recorded page-aligned negative brk deltas of 13-46 TB
- * (the mmap region minus the PIE heap) on real hosts -- rare, a handful of
- * rows a week across thousands of hosts, each under an ordinary glibc
- * systrim stack. An exit that finds another leg's entry drops it and
- * counts MISSED_MEMORY_XLEG_EVENT. */
+ * unmapped address recorded page-aligned negative brk deltas of tens of
+ * TB (the mmap region minus the PIE heap) -- rare, and each under an
+ * ordinary glibc systrim stack. An exit that finds another leg's entry
+ * drops it and counts MISSED_MEMORY_XLEG_EVENT. */
 enum memory_syscall_leg {
 	MEMORY_SYSCALL_LEG_NONE = 0,
 	MEMORY_SYSCALL_LEG_MMAP = 1,
@@ -983,8 +982,8 @@ struct memory_syscall_args {
 	 * the REQUESTED range, not the amount actually unmapped -- the kernel
 	 * removes whatever is mapped in [addr, addr+len) and returns 0 even
 	 * where nothing is mapped -- so callers that request oversized ranges
-	 * of a sparse address space (gVisor sentries were observed requesting
-	 * far more than the whole process has mapped) recorded impossible
+	 * of a sparse address space (a gVisor sentry can request far more
+	 * than the whole process has mapped) recorded impossible
 	 * sizes. No single munmap can remove more than the process has mapped
 	 * in total; this is that upper bound (looser than the exact in-range
 	 * mapped bytes, but enough to drop the impossible values). */
@@ -1024,7 +1023,7 @@ struct {
  * 1. The VFIO DMA regions themselves (MEMORY_VFIO_MAP / MEMORY_VFIO_UNMAP
  *    events with stacks), from kprobes on the vfio_iommu_type1 ioctl
  *    handlers vfio_dma_do_map / vfio_dma_do_unmap — one event per region, so
- *    the ring sees tens to thousands of events per model load.
+ *    the event rate is that of the ioctls, not of the pages behind them.
  *
  * 2. How fragmented the memory behind those regions is. vfio_iommu_type1
  *    pins a DMA region one physically contiguous run at a time
@@ -1034,8 +1033,8 @@ struct {
  *    the iommu:map / iommu:unmap tracepoints once per call with that run's
  *    size. So the size of each tracepoint event IS the contiguity of the
  *    backing memory: a THP-backed region maps in >=2 MiB runs, a
- *    4 KiB-fragmented one in 4 KiB runs. A 146 GiB region backed by 4 KiB
- *    pages is ~38M events, far beyond any ring budget, so the tracepoints
+ *    4 KiB-fragmented one in 4 KiB runs. A region backed by 4 KiB pages
+ *    is 262,144 events per GiB, far beyond any ring budget, so the tracepoints
  *    never emit events — they count into this histogram, keyed by the
  *    mapping process, the operation and log2(size), drained by userspace
  *    at the end of the capture into memory_iommu rows — and only while the
@@ -1168,7 +1167,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	/* Bounds concurrent TRACED processes (tgids), not threads or events.
 	 * 65536 matches memory_syscall_scratch and is comfortably above the
-	 * ~20k-task ceiling observed on the busiest CI clusters; on overflow
+	 * process count of a busy host; on overflow
 	 * the rss_stat progs fall through to direct-submit so no sample is
 	 * ever dropped, only the threshold-batching optimization is lost for
 	 * the overflow tgids. */
@@ -5187,7 +5186,7 @@ int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newst
 	// SYN_SENT) fires in tcp_v4_connect() before the ephemeral port is
 	// assigned, and transitions to CLOSE observably arrive with the
 	// bound port already zeroed (every anonymous close row reads
-	// src_port=0 in production traces) — so the tuple-keyed
+	// src_port=0) — so the tuple-keyed
 	// get_or_create minted a SECOND, anonymous src_port=0 identity for
 	// terminal transitions and a socket's opens and closes landed on
 	// different flow rows. The sk-first lookup pins the whole
@@ -5466,8 +5465,8 @@ static __always_inline void memory_capture_stack(void *ctx, struct memory_event 
  * classic tracepoint/kmem/rss_stat path routes every firing through the
  * kernel's perf_trace_rss_stat glue, whose TP_fast_assign on >=6.2 calls
  * percpu_counter_sum_positive() — an O(nr_cpus) cache-line walk per event.
- * On fault-heavy nodes that glue alone has been measured at ~1% of on-CPU
- * time during a capture window. tp_btf bypasses the glue entirely and reads
+ * On a fault-heavy many-core host that glue alone is a visible share of
+ * on-CPU time during a capture window. tp_btf bypasses the glue entirely and reads
  * the counter from mm directly. The classic prog is kept as a fallback
  * (selected at load time; see systing_core.rs select_rss_stat_prog()) for
  * kernels whose BTF lacks btf_trace_rss_stat.
@@ -5504,7 +5503,7 @@ struct mm_struct___pre62 {
  * but that helper requires ARG_PTR_TO_PERCPU_BTF_ID and a value read via
  * BPF_CORE_READ arrives as SCALAR_VALUE; direct BTF-walk access preserves
  * percpu-ness only on clang-built kernels with btf_type_tag("percpu") in
- * vmlinux BTF — not portable across the fleet. The approximate read is the
+ * vmlinux BTF — not portable across kernels. The approximate read is the
  * portable choice; the threshold absorbs the noise, and the classic
  * fallback still emits exact values (from ctx->size) where tp_btf is
  * unavailable. */
@@ -5754,7 +5753,7 @@ int BPF_PROG(systing_rss_stat_exit_flush, struct task_struct *task)
 
 /* Sample 1:N mmap/munmap/brk events. The map legs were originally
  * unsampled on the assumption that map-call rates are low; allocator
- * churn breaks that (workloads unmapping ~100/s sustained), and on such
+ * churn breaks that (a workload can unmap continuously), and on such
  * hosts unsampled map events dominate the memory lane end to end:
  * per-event stack capture, ringbuf traffic, trace size, and the
  * post-capture processing whose memory footprint scales with row
@@ -6012,7 +6011,7 @@ static __always_inline int memory_munmap_exit_common(void *ctx, struct task_stru
 	/* munmap returns 0 on success, -errno on failure. A failed call
 	 * unmaps nothing and its arguments are unvalidated caller input:
 	 * emitting at enter recorded address-magnitude garbage as the
-	 * unmap size (production callers pass pointer-scale values in the
+	 * unmap size (real callers pass pointer-scale values in the
 	 * length position, which the kernel EINVALs but the recorder
 	 * published as real unmaps). Gate on success like mmap and brk.
 	 *
@@ -6114,7 +6113,7 @@ static __always_inline int memory_brk_exit_common(void *ctx, struct task_struct 
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	/* A stale entry of another leg (a munmap's unmapped address) read here
 	 * as the previous break is what recorded page-aligned negative deltas
-	 * of 13-46 TB on real hosts; the take drops it. */
+	 * of tens of TB; the take drops it. */
 	struct memory_syscall_args *saved =
 		memory_syscall_scratch_take(tgidpid, MEMORY_SYSCALL_LEG_BRK);
 	if (!saved)
@@ -6127,9 +6126,9 @@ static __always_inline int memory_brk_exit_common(void *ctx, struct task_struct 
 	 * total_vm bound skips on). There is then no previous break to diff
 	 * against, and ret - 0 would record the new break ADDRESS as the
 	 * "delta": a page-aligned value in the tens of TB on a 47-bit VA,
-	 * observed in production as a count=1 brk row of ~92 TB on a process
-	 * that exited during the capture. An unknown previous break is not a
-	 * delta of that size; emit nothing, as a failed or query brk does. */
+	 * for example on a process that exits during the capture. An unknown
+	 * previous break is not a delta of that size; emit nothing, as a
+	 * failed or query brk does. */
 	if (!old_brk)
 		return 0;
 
@@ -6137,8 +6136,8 @@ static __always_inline int memory_brk_exit_common(void *ctx, struct task_struct 
 	 * can return is -EINTR, when its mmap_write_lock_killable() fails
 	 * because a fatal signal is pending (the process is being killed). An
 	 * error carries no break: ret - old_brk would record -(old_brk + 4) as
-	 * a delta (a negative value of ~90 TB, seen in production as a
-	 * count=1 brk row with |bytes| ≡ 4 mod 4096). */
+	 * a delta (a negative value in the tens of TB, recognizable as a
+	 * brk row with |bytes| ≡ 4 mod 4096). */
 	if ((s64)ret < 0)
 		return 0;
 
@@ -6464,10 +6463,10 @@ int systing_page_fault_sw(struct bpf_perf_event_data *ctx)
  * userspace only loads and attaches these programs when kallsyms carries the
  * symbol (attach_memory_vfio_legs in systing_core.rs) and records the leg as
  * off in sysinfo.memory_vfio_leg otherwise — the other memory legs run
- * regardless. One event per DMA region (a model load is tens to thousands
- * of regions), so no sampling. The pin/unpin cost of the region is charged
- * to the calling task in the same ioctl, which is why the stacks are kept:
- * they name the runtime thread doing the mapping.
+ * regardless. One event per DMA region, orders of magnitude fewer than the
+ * pages behind them, so no sampling. The pin/unpin cost of the region is
+ * charged to the calling task in the same ioctl, which is why the stacks are
+ * kept: they name the runtime thread doing the mapping.
  */
 struct vfio_iommu_type1_dma_map_uapi {
 	u32 argsz;

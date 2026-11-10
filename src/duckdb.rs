@@ -73,11 +73,10 @@ pub(crate) fn detect_cgroup_memory_limit() -> Option<u64> {
 /// Returns `None` for the memory limit when no cgroup limit is detected.
 ///
 /// Threads are capped at one per ~512 MiB of memory budget: a parallel scan
-/// keeps roughly a row-group's worth of state live per thread, so an 18 GiB
-/// budget (a 24 GiB container at 75%) tops out around 36 threads instead of
-/// one per host CPU. Without a
-/// cgroup limit we still cap at 32 — unbounded thread counts were the
-/// observed OOM trigger.
+/// keeps roughly a row-group's worth of state live per thread, so the thread
+/// count tops out at two per GiB of budget instead of one per host CPU.
+/// Without a cgroup limit we still cap at 32 — an unbounded thread
+/// count can run the import out of memory.
 pub(crate) fn duckdb_resource_limits(mem_fraction_pct: u64, min_mib: u64) -> (Option<u64>, u64) {
     const MIB: u64 = 1024 * 1024;
 
@@ -2570,7 +2569,7 @@ mod tests {
         );
     }
 
-    /// Regression test for the production failure mode: a large trace's
+    /// Regression test for the large-trace failure mode: a large trace's
     /// stack/frame normalization must import under a bounded `memory_limit`.
     /// With the previous statement shape (lateral `WITH ORDINALITY` +
     /// `list(... ORDER BY ...)` feeding the INSERT), this exact fixture and
