@@ -8,7 +8,7 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::root::Root;
+use crate::root::{reopen_regular, Root};
 
 /// The largest perf map read: far beyond any real process's (one short
 /// line per Python function), small enough that a planted file cannot
@@ -128,7 +128,7 @@ pub fn read_in(
 
 /// The text of a file that names frames (a perf map, a code map). Anyone can
 /// write /tmp, so the file is opened without following a symlink and must be
-/// a regular file, checked on the open handle, of at most [`MAX_BYTES`]. One
+/// a regular file, checked before it is opened, of at most [`MAX_BYTES`]. One
 /// in a world-writable directory must also be owned by this user or root, as
 /// perf requires, or another user could name our frames.
 ///
@@ -149,10 +149,12 @@ pub fn read_text_in(
             (file, world_writable_dir, dump_owner)
         }
         None => {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-                .open(path)?;
+            let file = reopen_regular(
+                &std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)?,
+            )?;
             let world_writable_dir = path
                 .parent()
                 .and_then(|d| {
@@ -170,9 +172,6 @@ pub fn read_text_in(
         }
     };
     let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
-    }
     if meta.len() > MAX_BYTES {
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -223,14 +222,11 @@ fn open_beneath(root: &Root, path: &Path) -> std::io::Result<(std::fs::File, boo
         return Err(remote());
     }
     let world_writable_dir = dir.metadata()?.mode() & 0o002 != 0;
-    let file = Root::from_dir(dir)?.open_at(
-        Path::new(name),
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-    )?;
-    if crate::root::on_remote_fs(&file) {
+    let handle = Root::from_dir(dir)?.open_at(Path::new(name), libc::O_PATH | libc::O_NOFOLLOW)?;
+    if crate::root::on_remote_fs(&handle) {
         return Err(remote());
     }
-    Ok((file, world_writable_dir))
+    Ok((reopen_regular(&handle)?, world_writable_dir))
 }
 
 #[cfg(test)]
@@ -290,6 +286,22 @@ garbage line
             read(Path::new("/dev/null")).is_err(),
             "a device is not a map"
         );
+        let fifo = std::ffi::CString::new(d.path().join("fifo.map").to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(read(&d.path().join("fifo.map")).is_err(), "nor is a FIFO");
+
+        // The same beneath a root, with a relative link too.
+        std::os::unix::fs::symlink("real.map", d.path().join("rel.map")).unwrap();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        let root = Root::open(d.path()).unwrap();
+        let beneath = |path: &str| read_in(Some(&root), Path::new(path), None);
+        assert_eq!(beneath("/real.map").unwrap(), PerfMap::parse(MAP));
+        for path in ["/perf-1.map", "/rel.map", "/fifo.map", "/sub", "/"] {
+            assert!(beneath(path).is_err(), "{path}");
+        }
+        let dev = Root::open(Path::new("/dev")).unwrap();
+        assert!(read_in(Some(&dev), Path::new("/null"), None).is_err());
     }
 
     #[test]

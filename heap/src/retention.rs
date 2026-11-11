@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::root::Root;
+use crate::root::{reopen_regular, Root};
 use crate::{jemalloc, Snapshot};
 
 /// A dump file found under the prefix, identified by pid and sequence.
@@ -315,24 +315,21 @@ fn stat_at(dir: &File, name: &OsStr) -> Option<libc::stat> {
 /// bytes, with the inode of what was read.
 fn read_at(dir: &File, name: &OsStr, limit: Option<u64>) -> std::io::Result<(Vec<u8>, u64)> {
     let c = cstr(name);
-    // O_NONBLOCK: a FIFO swapped in after the stat must not hang the open.
+    // A bare handle comes first, and only a regular file is opened.
     // SAFETY: valid fd and NUL-terminated name.
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
             c.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: fd was just opened and is owned here.
-    let file = unsafe { File::from_raw_fd(fd) };
+    let file = reopen_regular(&unsafe { File::from_raw_fd(fd) })?;
     let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(std::io::Error::other("not a regular file"));
-    }
     let mut buf = Vec::new();
     match limit {
         Some(n) => (&file).take(n).read_to_end(&mut buf)?,
@@ -364,6 +361,23 @@ mod tests {
         // Another prefix that starts with ours is not ours.
         assert_eq!(pid_and_seq(b"jeprof", b"jeprof2.5.1.f.heap"), None);
         assert_eq!(pid_and_seq(b"jeprof", b"jeprof.heap"), None);
+    }
+
+    #[test]
+    fn only_a_regular_file_is_read() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("dump"), "heap_v2/1").unwrap();
+        std::os::unix::fs::symlink("dump", d.path().join("link")).unwrap();
+        // SAFETY: a NUL-terminated path.
+        let made = unsafe { libc::mkfifo(cstr(d.path().join("fifo").as_os_str()).as_ptr(), 0o600) };
+        assert_eq!(made, 0);
+        let dir = File::open(d.path()).unwrap();
+
+        let (bytes, _) = read_at(&dir, OsStr::new("dump"), Some(7)).unwrap();
+        assert_eq!(bytes, b"heap_v2");
+        for name in ["link", "fifo", "."] {
+            assert!(read_at(&dir, OsStr::new(name), None).is_err(), "{name}");
+        }
     }
 
     #[test]
