@@ -1572,6 +1572,32 @@ mod tests {
         assert!(TABLES_TOO_LONG.count() > too_long);
     }
 
+    /// The dynamic section ends at its first DT_NULL, and a dependency's name is
+    /// a file name or a short path.
+    #[test]
+    fn a_dependency_counts_before_the_first_null_entry_and_by_a_short_name() {
+        if cfg!(target_endian = "big") {
+            return;
+        }
+        let needs = |file: &[u8]| elf_facts(file).unwrap().needs_library;
+        let mut file = small_elf_padded(None, Some("libtask_context.so.1"), 1);
+        assert!(needs(&file));
+        // Its one DT_NEEDED entry (tag 1, name at 1) changes places with the
+        // DT_NULL entry behind it.
+        let entry = [1u64.to_le_bytes(), 1u64.to_le_bytes()].concat();
+        let at = file.windows(16).position(|bytes| bytes == entry).unwrap();
+        file[at..at + 16].fill(0);
+        file[at + 16..at + 32].copy_from_slice(&entry);
+        assert!(!needs(&file));
+
+        let in_folder = |folder: usize| "d".repeat(folder) + "/libtask_context.so";
+        assert!(needs(&small_elf(None, Some(&in_folder(100)))));
+        assert!(!needs(&small_elf(
+            None,
+            Some(&in_folder(NEEDED_NAME_MAX as usize))
+        )));
+    }
+
     /// Extended numbering moves a count out of the header into section 0,
     /// where it can be any size. A file that uses it, for its segments, its
     /// sections or its section names, is not looked into at all.
