@@ -161,8 +161,8 @@ sections or 64 MiB of dynamic relocation sections. A refused file's reason is
 the tool's error. These limit what one file can make the tool read; they are
 not a cap on the tool's own memory: a crafted file within them can still make
 the parser use around a hundred times its size. The file is the one the process
-has mapped, opened once through `/proc/PID/map_files`; the parse and the
-probes go through that one descriptor.
+has mapped, opened once through `/proc/PID/map_files`, if it is a regular
+file; the parse and the probes go through that one descriptor.
 
 | Interpreter | Build | Table |
 | --- | --- | --- |
