@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -1135,6 +1135,26 @@ fn build_id_index_walk_order(mut pids: Vec<i32>, sampled: &HashSet<i32>) -> Vec<
     pids.dedup();
     let (first, rest): (Vec<i32>, Vec<i32>) = pids.into_iter().partition(|p| sampled.contains(p));
     first.into_iter().chain(rest.into_iter().rev()).collect()
+}
+
+/// Whether this process may follow `/proc/<pid>/map_files` links, which takes
+/// `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE`. Decided once, from its own
+/// `/proc/self/map_files`.
+pub(crate) static MAY_FOLLOW_MAP_FILES: LazyLock<bool> =
+    LazyLock::new(|| may_follow_links_in(Path::new("/proc/self/map_files")));
+
+/// False if `dir` does not exist, or if following its first link fails with `EPERM`,
+/// as it does for a process with neither `CAP_SYS_ADMIN` nor `CAP_CHECKPOINT_RESTORE`;
+/// true for any other answer, an empty `dir` included.
+fn may_follow_links_in(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        links => links
+            .ok()
+            .and_then(|mut links| links.next()?.ok())
+            .and_then(|link| std::fs::metadata(link.path()).err())
+            .is_none_or(|e| e.raw_os_error() != Some(libc::EPERM)),
+    }
 }
 
 impl<'a> BuildIdIndexWalk<'a> {
@@ -4804,5 +4824,14 @@ mod tests {
         // so the file-backed axis reads as a positive value from our own statm.
         let v = current_file_rss_bytes().expect("statm is readable for self");
         assert!(v > 0, "file-backed RSS should be > 0 for a running process");
+    }
+
+    #[test]
+    fn test_a_proc_without_map_files_counts_as_may_not_follow() {
+        assert!(!may_follow_links_in(Path::new(
+            "/proc/self/no-such-directory"
+        )));
+        // Links that can be looked at count as "may".
+        assert!(may_follow_links_in(Path::new("/proc/self/fd")));
     }
 }

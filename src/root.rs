@@ -172,6 +172,20 @@ pub fn reopen_regular(handle: &File) -> io::Result<File> {
         .open(format!("/proc/self/fd/{}", handle.as_raw_fd()))
 }
 
+/// Open for reading the regular file that `path` leads to; a file of any other
+/// kind is refused without being opened (see [`reopen_regular`]). Every link is
+/// followed, in the tracer's own root, so this is only for a path that the tracer
+/// makes itself: `/proc/<pid>/exe` or an entry of `/proc/<pid>/map_files`, which
+/// lead to the file that the process runs or has mapped.
+pub fn follow_to_regular(path: &Path) -> io::Result<File> {
+    reopen_regular(
+        &std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(path)?,
+    )
+}
+
 /// Whether `file` is on a filesystem whose files live somewhere else: FUSE, or
 /// a network filesystem. Beneath a root the paths opened are chosen by whoever
 /// wrote the dumps; a read from such a mount would be made with the reader's
@@ -418,6 +432,32 @@ mod tests {
             (by_root.dev(), by_root.ino()),
             (by_link.dev(), by_link.ino())
         );
+    }
+
+    #[test]
+    fn a_link_of_procfs_opens_the_file_that_it_leads_to() {
+        let opened = follow_to_regular(Path::new("/proc/self/exe")).unwrap();
+        let (opened, exe) = (
+            opened.metadata().unwrap(),
+            std::fs::metadata("/proc/self/exe").unwrap(),
+        );
+        assert_eq!((opened.dev(), opened.ino()), (exe.dev(), exe.ino()));
+    }
+
+    #[test]
+    fn a_plain_path_is_opened_only_if_it_is_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), "text").unwrap();
+        let path = dir.path().join("fifo");
+        let fifo = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        assert!(follow_to_regular(&dir.path().join("file")).is_ok());
+        let refused = || assert!(follow_to_regular(&path).is_err());
+        assert_eq!(opens_seen(&path, refused), 0);
+        assert!(follow_to_regular(Path::new("/dev/null")).is_err());
+        assert!(follow_to_regular(dir.path()).is_err());
     }
 
     #[test]

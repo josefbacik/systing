@@ -5,11 +5,13 @@
 use super::offsets;
 use super::process::{self, MemoryMapping};
 use super::types::{BpfLibBinaryId, PyPidData, BPF_LIB_DEFAULT_FIELD_OFFSET};
-use crate::root::Root;
+use crate::root::{self, Root};
+use crate::stack_recorder::MAY_FOLLOW_MAP_FILES;
 use object::read::{ReadCache, ReadRef};
 use object::{Object, ObjectSymbol};
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -240,7 +242,7 @@ fn try_python_module(
 ) -> Option<PyProcessInfo> {
     // ELF facts come from the per-binary cache — forked workers of the same
     // interpreter share one parse instead of re-reading the binary per PID.
-    let elf_info = elf_py_info_of(module_path, open_in_process_root(pid, module_path)?)?;
+    let elf_info = elf_py_info_of(module_path, open_module(pid, module_path, maps, is_exe)?)?;
 
     let is_pie = elf_info.is_dynamic && is_exe;
     let is_shared = elf_info.is_dynamic && !is_exe;
@@ -381,9 +383,46 @@ fn own_gil_offsets(
     Some((own(o.debug_gil_locked)?, own(o.debug_gil_holder)?))
 }
 
-/// Open a file of process `pid` by the path that its `exe` link or its `maps`
-/// show. It is resolved beneath the process's own root, and only a regular file
-/// is opened.
+/// How many `map_files` entries of one name are tried. A library has a handful
+/// of mappings.
+const ENTRIES_TRIED: usize = 16;
+
+/// Open the file that process `pid` runs (`is_exe`) or has mapped under the name
+/// `module_path`, through its `exe` link or a `map_files` entry. Those lead to the
+/// file itself. Only a tracer that may not follow `map_files` links looks a library
+/// up by its name.
+fn open_module(
+    pid: i32,
+    module_path: &str,
+    maps: &[MemoryMapping],
+    is_exe: bool,
+) -> Option<fs::File> {
+    if is_exe {
+        return root::follow_to_regular(Path::new(&format!("/proc/{pid}/exe"))).ok();
+    }
+    if !*MAY_FOLLOW_MAP_FILES {
+        return open_in_process_root(pid, module_path);
+    }
+    let of_that_name = maps.iter().filter(|m| m.name == module_path);
+    first_present(of_that_name.map(|m| {
+        let entry = format!("/proc/{pid}/map_files/{:x}-{:x}", m.start, m.end);
+        root::follow_to_regular(Path::new(&entry))
+    }))
+}
+
+/// The first result among the first [`ENTRIES_TRIED`] of `tries` that is not a
+/// not-found error; `None` if that result is another error, or if there is none.
+/// An entry is not found once its mapping's range has changed; any other failure
+/// would meet the next mapping too.
+fn first_present<T>(tries: impl Iterator<Item = io::Result<T>>) -> Option<T> {
+    tries
+        .take(ENTRIES_TRIED)
+        .find(|tried| !matches!(tried, Err(e) if e.kind() == io::ErrorKind::NotFound))?
+        .ok()
+}
+
+/// Open a file of process `pid` by the path that its `maps` show. It is resolved
+/// beneath the process's own root, and only a regular file is opened.
 fn open_in_process_root(pid: i32, path: &str) -> Option<fs::File> {
     Root::of_process(pid)
         .and_then(|root| root.open_regular(Path::new(path), 0))
@@ -706,6 +745,70 @@ mod tests {
         // No such process, so no root to look beneath:
         // nothing is opened.
         assert!(open_in_process_root(i32::MAX, &path("python3")).is_none());
+    }
+
+    #[test]
+    fn test_the_next_entry_is_tried_only_after_one_that_is_gone() {
+        let tries_until = |failure: io::ErrorKind| {
+            let mut made = 0;
+            let failures = std::iter::repeat_with(|| {
+                made += 1;
+                Err::<(), _>(io::Error::from(failure))
+            });
+            // One more than the bound, so that a lost bound fails and does not hang.
+            let found = first_present(failures.take(ENTRIES_TRIED + 1));
+            assert!(found.is_none());
+            made
+        };
+        assert_eq!(tries_until(io::ErrorKind::NotFound), ENTRIES_TRIED);
+        assert_eq!(tries_until(io::ErrorKind::PermissionDenied), 1);
+
+        let gone = || Err(io::Error::from(io::ErrorKind::NotFound));
+        assert_eq!(first_present([gone(), Ok(1), Ok(2)].into_iter()), Some(1));
+    }
+
+    #[test]
+    fn test_a_mapping_is_found_after_entries_that_are_gone() {
+        use std::os::fd::AsRawFd;
+
+        if !*MAY_FOLLOW_MAP_FILES {
+            eprintln!("no privilege to follow map_files links: skipping the entries-gone check");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("libpython3.12.so");
+        // SAFETY: asks for a number.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        fs::write(&lib, vec![0u8; page]).unwrap();
+        let file = fs::File::open(&lib).unwrap();
+        // SAFETY: a new read-only mapping of an open file, at an address of the
+        // kernel's choosing.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(at, libc::MAP_FAILED);
+        let name = lib.to_str().unwrap();
+        // Nothing is mapped in the lowest pages, so their entries do not exist.
+        let found_after = |gone: usize| {
+            let mut maps: Vec<_> = (1..=gone).map(|p| mapping(p * 0x1000, 0, name)).collect();
+            maps.push(MemoryMapping {
+                end: at as usize + page,
+                ..mapping(at as usize, 0, name)
+            });
+            open_module(std::process::id() as i32, name, &maps, false).is_some()
+        };
+        let (within, beyond) = (found_after(ENTRIES_TRIED - 1), found_after(ENTRIES_TRIED));
+        // SAFETY: the mapping made above, which nothing else uses.
+        unsafe { libc::munmap(at, page) };
+        assert!(within);
+        assert!(!beyond);
     }
 
     fn mapping(start: usize, offset: u64, name: &str) -> MemoryMapping {
