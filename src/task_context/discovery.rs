@@ -39,15 +39,19 @@ use std::fs;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::time::{Duration, Instant};
 
-use object::elf::{FileHeader64, DT_NEEDED, PN_XNUM, PT_LOAD, SHN_XINDEX, SHT_DYNAMIC, SHT_NOBITS};
+use object::elf::{
+    FileHeader64, SectionHeader64, DT_NEEDED, DT_NULL, PN_XNUM, PT_LOAD, SHN_XINDEX, SHT_DYNAMIC,
+    SHT_NOBITS, SHT_STRTAB,
+};
 use object::read::elf::{Dyn, FileHeader, ProgramHeader, SectionHeader, SectionTable};
-use object::read::{ReadCache, ReadRef};
+use object::read::{ReadCache, ReadRef, SectionIndex};
 use object::Endianness;
 
 use super::values::{ABI_VERSION, BLOCK_HDR_SIZE, NAME_MAX, SLOTS, SLOT_SIZE, VALUE_MAX};
 // The tree's one reader of a process's map and memory lives under the Python
 // walker's module, which is always compiled (no feature gates it). If that
 // ever changes, this path must keep its reader: it has no other.
+use crate::limits::Limit;
 use crate::pystacks::process::{parse_proc_maps, MemoryMapping, ProcessMemory, ReadMemory};
 
 /// The section the library keeps its record in (`TASK_CONTEXT_INFO_SECTION`).
@@ -103,6 +107,20 @@ const ELF_CACHE_MAX: usize = 1 << 16;
 /// dynamic section of a megabyte is 65,536 entries.)
 const INFO_SECTION_MAX: u64 = 4096;
 const DYNAMIC_SECTION_MAX: u64 = 1 << 20;
+/// The most program headers, and the most section headers, a file may state
+/// for this reader to read them. A linked program has far fewer.
+const HEADERS_MAX: u16 = 1024;
+/// The longest table of section names this reader reads; it is read whole.
+/// The names of a linked program's sections fill far less.
+const SECTION_NAMES_MAX: u64 = 1 << 16;
+/// How many of a file's direct dependencies are looked up by name, and how
+/// much of each name is read: every name is a read of its own. A program with
+/// many dependencies stays far below this, and their names are file names.
+const NEEDED_MAX: usize = 1024;
+const NEEDED_NAME_MAX: u64 = 256;
+
+static TABLES_TOO_LONG: Limit =
+    Limit::new("ELF tables too long to search in full for task context");
 
 /// One process's recipe, as the BPF side takes it: the layout of
 /// `struct task_context_recipe` in `task_context_reader.bpf.h`.
@@ -228,6 +246,8 @@ pub struct DiscoveryCounters {
     pub gave_up: u64,
     /// Distinct files whose ELF facts were read.
     pub files_parsed: u64,
+    /// Exec notices still waiting when the capture stopped.
+    pub unserved: u64,
 }
 
 impl DiscoveryCounters {
@@ -243,6 +263,7 @@ impl DiscoveryCounters {
             ("map_errors", self.map_errors),
             ("gave_up", self.gave_up),
             ("files_parsed", self.files_parsed),
+            ("unserved", self.unserved),
         ];
         let mut parts: Vec<String> = pairs
             .iter()
@@ -410,35 +431,76 @@ fn needs_library<'data, R: ReadRef<'data>>(
         section.sh_type(endian) == SHT_DYNAMIC && section.sh_size(endian) > DYNAMIC_SECTION_MAX
     });
     if too_long {
+        TABLES_TOO_LONG.hit();
         return false;
     }
     let Ok(Some((entries, link))) = sections.dynamic(endian, data) else {
         return false;
     };
-    let Ok(strings) = sections.strings(endian, data, link) else {
+    let strings = sections
+        .section(link)
+        .ok()
+        .filter(|strings| strings.sh_type(endian) == SHT_STRTAB)
+        .and_then(|strings| strings.file_range(endian));
+    let Some((strings_at, strings_size)) = strings else {
         return false;
     };
-    entries.iter().any(|entry| {
-        entry.tag32(endian) == Some(DT_NEEDED)
-            && entry
-                .val32(endian)
-                .and_then(|at| strings.get(at).ok())
-                .is_some_and(|name| {
-                    // A dependency may be named with a path.
-                    let file = name.rsplit(|&byte| byte == b'/').next().unwrap_or(name);
-                    is_library_name(file)
-                })
+    // One short read.
+    let name_at = |at: u32| {
+        let from = strings_at.checked_add(at.into())?;
+        let end = strings_at.checked_add(strings_size)?;
+        let until = from.checked_add(NEEDED_NAME_MAX)?.min(end);
+        data.read_bytes_at_until(from..until, 0).ok()
+    };
+    // The section ends at its first DT_NULL for a loader, so it does here.
+    let mut needed = entries
+        .iter()
+        .take_while(|entry| entry.tag32(endian) != Some(DT_NULL))
+        .filter(|entry| entry.tag32(endian) == Some(DT_NEEDED));
+    let found = needed.by_ref().take(NEEDED_MAX).any(|entry| {
+        entry.val32(endian).and_then(name_at).is_some_and(|name| {
+            // A dependency may be named with a path.
+            let file = name.rsplit(|&byte| byte == b'/').next().unwrap_or(name);
+            is_library_name(file)
+        })
+    });
+    if !found && needed.next().is_some() {
+        TABLES_TOO_LONG.hit();
+    }
+    found
+}
+
+/// The section called `INFO_SECTION`, if the table of names (section
+/// `names_index`) is within this reader's bound. The table is read once and
+/// each header's name is compared where it starts.
+fn info_section<'data, R: ReadRef<'data>>(
+    sections: &SectionTable<'data, FileHeader64<Endianness>, R>,
+    names_index: u16,
+    endian: Endianness,
+    data: R,
+) -> Option<&'data SectionHeader64<Endianness>> {
+    let names = sections.section(SectionIndex(names_index.into())).ok()?;
+    if names.sh_size(endian) > SECTION_NAMES_MAX {
+        TABLES_TOO_LONG.hit();
+        return None;
+    }
+    let names = names.data(endian, data).ok()?;
+    sections.iter().find(|section| {
+        names
+            .get(section.sh_name(endian) as usize..)
+            .and_then(|rest| rest.strip_prefix(INFO_SECTION.as_bytes()))
+            .is_some_and(|rest| rest.first() == Some(&0))
     })
 }
 
 /// Read a file's ELF facts. `None` for anything that is not a 64-bit ELF
 /// file with a loadable segment.
 ///
-/// Only the file header, the program headers, the section header table and
-/// the two small sections of interest are read. In particular no symbol
-/// table is, so a large unstripped executable costs what a small one does.
-/// Every length followed is one this reader bounds itself: the header's own
-/// 16-bit counts, and `INFO_SECTION_MAX` / `DYNAMIC_SECTION_MAX`.
+/// Only the file header, the program headers, the section headers and their
+/// names, the two small sections of interest and the names of dependencies are
+/// read. In particular no symbol table is, so a large unstripped executable
+/// costs what a small one does. Every length and every count followed is one
+/// this reader bounds itself, by the constants above that end in `_MAX`.
 pub(crate) fn elf_facts<'data, R: ReadRef<'data>>(data: R) -> Option<ElfFacts> {
     let header = FileHeader64::<Endianness>::parse(data).ok()?;
     let endian = header.endian().ok()?;
@@ -449,6 +511,10 @@ pub(crate) fn elf_facts<'data, R: ReadRef<'data>>(data: R) -> Option<ElfFacts> {
         || header.e_shstrndx(endian) == SHN_XINDEX
         || (header.e_shnum(endian) == 0 && header.e_shoff(endian) != 0)
     {
+        return None;
+    }
+    if header.e_phnum(endian) > HEADERS_MAX || header.e_shnum(endian) > HEADERS_MAX {
+        TABLES_TOO_LONG.hit();
         return None;
     }
     let (first_load_address, first_load_offset) = header
@@ -464,7 +530,7 @@ pub(crate) fn elf_facts<'data, R: ReadRef<'data>>(data: R) -> Option<ElfFacts> {
     let mut record_address = None;
     let mut record_offset = 0;
     let mut record_refused = false;
-    if let Some((_, section)) = sections.section_by_name(endian, INFO_SECTION.as_bytes()) {
+    if let Some(section) = info_section(&sections, header.e_shstrndx(endian), endian, data) {
         // The constant fields are in the file's data image, so a section
         // that occupies no file space is not the library's; nor is one
         // that says it is longer than this reader will read.
@@ -1413,6 +1479,97 @@ mod tests {
         assert!(elf_facts(&searched[..]).unwrap().needs_library);
         let too_long = small_elf_padded(None, name, at_the_bound + 1);
         assert!(!elf_facts(&too_long[..]).unwrap().needs_library);
+    }
+
+    fn u16_in(file: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes([file[at], file[at + 1]])
+    }
+
+    fn u64_in(file: &[u8], at: usize) -> usize {
+        u64::from_le_bytes(file[at..at + 8].try_into().unwrap()) as usize
+    }
+
+    /// The length of `small_elf`'s table of section names.
+    const SMALL_ELF_NAMES: u32 = 46;
+
+    /// `file`, a `small_elf`, with `extra` more section headers, the n-th with
+    /// its name at `name_at(n)`, and `more_names` added to its section names.
+    fn with_more_sections(
+        mut file: Vec<u8>,
+        extra: u16,
+        more_names: &[u8],
+        name_at: impl Fn(u16) -> u32,
+    ) -> Vec<u8> {
+        let names_header = u64_in(&file, 40) + 64 * usize::from(u16_in(&file, 62));
+        let names_at = u64_in(&file, names_header + 24);
+        let mut names = file[names_at..names_at + SMALL_ELF_NAMES as usize].to_vec();
+        names.extend_from_slice(more_names);
+        // The section headers are the last thing in the file.
+        for n in 0..extra {
+            let kind = object::elf::SHT_PROGBITS;
+            push_section(&mut file, name_at(n), kind, 0, 0, 0, 0, 0, 0);
+        }
+        let count = u16_in(&file, 60) + extra;
+        file[60..62].copy_from_slice(&count.to_le_bytes());
+        let moved_to = file.len() as u64;
+        file[names_header + 24..names_header + 32].copy_from_slice(&moved_to.to_le_bytes());
+        file[names_header + 32..names_header + 40]
+            .copy_from_slice(&(names.len() as u64).to_le_bytes());
+        file.extend_from_slice(&names);
+        file
+    }
+
+    /// The section is found by its whole name, wherever it stands among the
+    /// headers. (These have no content, so what is found is refused.)
+    #[test]
+    fn the_info_section_is_told_by_its_whole_name_among_any_number_of_sections() {
+        if cfg!(target_endian = "big") {
+            return;
+        }
+        let plain = small_elf(None, None);
+        let extra = HEADERS_MAX - u16_in(&plain, 60);
+        let found = |file: &[u8]| elf_facts(file).unwrap().record_refused;
+        // Offset 1 of the names is "task_context_info".
+        let last = with_more_sections(plain.clone(), extra, &[], |n| u32::from(n == extra - 1));
+        assert!(found(&last));
+        let longer = with_more_sections(plain.clone(), 1, b"task_context_infos\0", |_| {
+            SMALL_ELF_NAMES
+        });
+        assert!(!found(&longer));
+        let unended =
+            with_more_sections(plain.clone(), 1, b"task_context_info", |_| SMALL_ELF_NAMES);
+        assert!(!found(&unended));
+        let outside = with_more_sections(plain, 1, &[], |_| u32::MAX);
+        assert!(!found(&outside));
+    }
+
+    #[test]
+    fn section_headers_and_their_names_are_read_only_up_to_this_readers_bounds() {
+        if cfg!(target_endian = "big") {
+            return;
+        }
+        let good = small_elf(Some(&record_in_file()), None);
+        let extra = HEADERS_MAX - u16_in(&good, 60);
+        let at_the_bound = with_more_sections(good.clone(), extra, &[], |_| 0);
+        assert!(elf_facts(&at_the_bound[..])
+            .unwrap()
+            .record_address
+            .is_some());
+        let too_long = TABLES_TOO_LONG.count();
+        assert!(elf_facts(&with_more_sections(good.clone(), extra + 1, &[], |_| 0)[..]).is_none());
+        assert!(TABLES_TOO_LONG.count() > too_long);
+
+        let mut more = vec![0u8; (SECTION_NAMES_MAX - u64::from(SMALL_ELF_NAMES)) as usize];
+        let at_the_bound = with_more_sections(good.clone(), 0, &more, |_| 0);
+        assert!(elf_facts(&at_the_bound[..])
+            .unwrap()
+            .record_address
+            .is_some());
+        more.push(0);
+        let too_long = TABLES_TOO_LONG.count();
+        let facts = elf_facts(&with_more_sections(good, 0, &more, |_| 0)[..]).unwrap();
+        assert_eq!((facts.record_address, facts.record_refused), (None, false));
+        assert!(TABLES_TOO_LONG.count() > too_long);
     }
 
     /// Extended numbering moves a count out of the header into section 0,
