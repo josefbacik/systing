@@ -47,6 +47,7 @@ use anyhow::{bail, Context, Result};
 use libbpf_rs::libbpf_sys;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 
+use crate::limits::Limit;
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::pystacks::thread_names::ThreadNames;
 use crate::record::RecordCollector;
@@ -1914,6 +1915,35 @@ pub fn iteration_count(duration: Duration, interval: Duration) -> Option<u64> {
     Some(duration.as_nanos().div_ceil(interval.as_nanos().max(1)) as u64)
 }
 
+/// Of the time of the thread that reads them, names may take one part in this
+/// many, for all processes together.
+const NAMES_SHARE: u32 = 4;
+
+/// How far the reading of names may run ahead of its share: at a capture's
+/// first snapshot every process is new.
+const NAMES_AHEAD: Duration = Duration::from_secs(1);
+
+/// Snapshots, or looks of the python-function-trace recorder, at which some
+/// process's names waited for [`NAMES_SHARE`].
+static NAMES_WAITED: Limit = Limit::new("times Python thread names had to wait");
+
+/// Keeps work that comes in pieces to one part in [`NAMES_SHARE`] of the time.
+struct Pace {
+    /// When the pieces so far will have been that share of the time gone by.
+    paid_at: Instant,
+}
+
+impl Pace {
+    fn may_go(&self, now: Instant) -> bool {
+        self.paid_at <= now + NAMES_AHEAD
+    }
+
+    /// Count a piece of work that began at `began` and took `took`.
+    fn count(&mut self, began: Instant, took: Duration) {
+        self.paid_at = self.paid_at.max(began) + took * NAMES_SHARE;
+    }
+}
+
 /// The names Python processes gave their threads, for the snapshot thread: a
 /// reader per process, opened the first time one of its threads is recorded
 /// and kept, with its open /proc/pid/mem, for as long as the snapshots see the
@@ -1929,6 +1959,13 @@ pub(crate) struct PythonThreadNames {
     /// which is what it would take for one that became something other than
     /// a Python.
     reopen_at: HashMap<u32, Instant>,
+    pace: Pace,
+    /// By tgid, the threads asked about while their process rested or names
+    /// had taken their share. A thread that sleeps is asked about only once,
+    /// so they are asked about again: see [`Self::take_put_off`].
+    put_off: HashMap<u32, HashSet<i32>>,
+    /// Whether it was the share that put any of them off.
+    waited: bool,
 }
 
 /// How long to leave a process alone after its reader lost it.
@@ -1940,6 +1977,11 @@ impl PythonThreadNames {
             psr,
             readers: HashMap::new(),
             reopen_at: HashMap::new(),
+            pace: Pace {
+                paid_at: Instant::now(),
+            },
+            put_off: HashMap::new(),
+            waited: false,
         }
     }
 
@@ -1949,6 +1991,34 @@ impl PythonThreadNames {
     /// process's word (`Thread._native_id`): one that is not a thread of its
     /// own is not its to name, and is not answered for.
     pub(crate) fn read(
+        &mut self,
+        tgid: u32,
+        changed: &HashSet<i32>,
+        seen: &HashSet<i32>,
+    ) -> HashMap<i32, String> {
+        let began = Instant::now();
+        let rests = self.readers.get(&tgid).is_some_and(ThreadNames::rests);
+        if rests || !self.pace.may_go(began) {
+            self.waited |= !rests;
+            self.put_off.entry(tgid).or_default().extend(changed);
+            return HashMap::new();
+        }
+        let names = self.read_now(tgid, changed, seen);
+        self.pace.count(began, began.elapsed());
+        names
+    }
+
+    /// The threads put off since the last call, to be asked about with the
+    /// next snapshot's, whether they have run or not.
+    pub(crate) fn take_put_off(&mut self) -> HashMap<u32, HashSet<i32>> {
+        if std::mem::take(&mut self.waited) {
+            NAMES_WAITED.hit();
+        }
+        std::mem::take(&mut self.put_off)
+    }
+
+    /// [`Self::read`], for a process that is not put off.
+    fn read_now(
         &mut self,
         tgid: u32,
         changed: &HashSet<i32>,
@@ -2094,6 +2164,14 @@ impl TaskStacksThread {
                     // iteration comes back as unchanged too, and its event
                     // runs on over the stack that was lost, until the thread
                     // next changes.
+                    if entries.is_some() {
+                        for (tgid, tids) in thread_names.take_put_off() {
+                            if let Some(seen) = seen.get(&tgid) {
+                                let again = renamers.entry(tgid).or_default();
+                                again.extend(tids.intersection(seen));
+                            }
+                        }
+                    }
                     renamers.retain(|tgid, _| !locked.contains(tgid));
                     for (tgid, changed) in renamers {
                         let names = thread_names.read(tgid, &changed, &seen[&tgid]);
@@ -2651,6 +2729,35 @@ mod tests {
             .iter()
             .map(|e| (e.utid, e.ts, e.dur, e.start_iteration, e.end_iteration))
             .collect()
+    }
+
+    #[test]
+    fn a_pace_keeps_work_to_its_share() {
+        let start = Instant::now();
+        let (piece, tick) = (Duration::from_millis(200), Duration::from_millis(100));
+        let mut pace = Pace { paid_at: start };
+        let (mut now, mut worked) = (start, Duration::ZERO);
+        while now < start + Duration::from_secs(100) {
+            if pace.may_go(now) {
+                pace.count(now, piece);
+                worked += piece;
+                now += piece;
+            } else {
+                now += tick;
+            }
+        }
+        let share = (now - start) / NAMES_SHARE;
+        assert!(worked <= share + NAMES_AHEAD && worked >= share - NAMES_AHEAD);
+
+        // Time in which nothing was done is not saved up.
+        now += Duration::from_secs(1000);
+        let mut at_a_stretch = Duration::ZERO;
+        while pace.may_go(now) {
+            pace.count(now, piece);
+            at_a_stretch += piece;
+            now += piece;
+        }
+        assert!(at_a_stretch <= NAMES_AHEAD);
     }
 
     #[test]

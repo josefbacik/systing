@@ -367,6 +367,12 @@ impl<M: ReadMemory> ThreadNames<M> {
         self.read_at(changed, seen, Instant::now(), WALK_BUDGET)
     }
 
+    /// Whether the process is still left alone after its last walk, so that
+    /// [`Self::read`] would answer nothing.
+    pub fn rests(&self) -> bool {
+        self.rest_until.is_some_and(|until| Instant::now() < until)
+    }
+
     /// Whether this reader has lost its process: a walk that no limit cut short
     /// read nothing, not even `_PyRuntime`. The open /proc/pid/mem is of the
     /// address space it was opened on, and after an exec (the pid lives on)

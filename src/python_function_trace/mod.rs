@@ -1077,7 +1077,10 @@ impl Tracer<'_, '_> {
     /// What can change inside a process while it runs: its threads' names, for the
     /// `thread` table as task stacks read them, and whether it has loaded greenlet.
     fn look_inside(&mut self, names: &mut PythonThreadNames, recorder: &SessionRecorder) {
-        let pids: Vec<u32> = self
+        // A set made anew has an order of its own, as the snapshots' map has: the
+        // names' share of the time can end before the list does, and so each
+        // process gets its turn.
+        let pids: HashSet<u32> = self
             .files
             .keys()
             .filter(|pid| !self.gone.contains_key(pid))
@@ -1096,6 +1099,9 @@ impl Tracer<'_, '_> {
                 self.warn(pid, GREENLET_WARNING.to_string());
             }
         }
+        // Each look asks about every thread, so what was put off is asked about
+        // again at the next look. This empties the list and counts the wait.
+        names.take_put_off();
     }
 }
 
