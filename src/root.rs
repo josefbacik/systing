@@ -174,9 +174,10 @@ pub fn reopen_regular(handle: &File) -> io::Result<File> {
 
 /// Open for reading the regular file that `path` leads to; a file of any other
 /// kind is refused without being opened (see [`reopen_regular`]). Every link is
-/// followed, in the tracer's own root, so this is only for a path that the tracer
-/// makes itself: `/proc/<pid>/exe` or an entry of `/proc/<pid>/map_files`, which
-/// lead to the file that the process runs or has mapped.
+/// followed, in the tracer's own root, so this is only for a path that the
+/// tracer's user gave, or that the tracer makes itself: `/proc/<pid>/exe` or an
+/// entry of `/proc/<pid>/map_files`, which lead to the file that the process
+/// runs or has mapped.
 pub fn follow_to_regular(path: &Path) -> io::Result<File> {
     reopen_regular(
         &std::fs::OpenOptions::new()

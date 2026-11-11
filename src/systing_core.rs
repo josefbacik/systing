@@ -25,6 +25,7 @@ use crate::parquet_to_perfetto;
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::ringbuf::RingBuffer;
+use crate::root::{follow_to_regular, Root};
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{
     get_clock_value, ClockSamplingConfig, MemoryFaultLeg, MemoryRecorderConfig, MemoryRecorderEnd,
@@ -3091,6 +3092,39 @@ fn resolve_library_path_for_pid(pid: u32, lib_name: &str) -> Option<String> {
     None
 }
 
+/// The file that a uprobe or a USDT probe goes into, held open until the attach
+/// call returns.
+///
+/// The file is opened once, and only if it is a regular file, and libbpf and the
+/// kernel are both given [`ProbeFile::path`], which leads to the open file
+/// itself. A path that starts with `/proc/<pid>/root/` is resolved beneath that
+/// root. A name without a slash is passed on as it is.
+struct ProbeFile(Option<fs::File>, String);
+
+impl ProbeFile {
+    fn open(path: &str) -> io::Result<ProbeFile> {
+        // A name without a slash is the user's own: libbpf looks for it in its search paths.
+        if !path.contains('/') {
+            return Ok(ProbeFile(None, path.to_string()));
+        }
+        let in_root = path
+            .strip_prefix("/proc/")
+            .and_then(|rest| rest.split_once("/root/"))
+            .filter(|(pid, _)| pid.parse::<u32>().is_ok());
+        let file = match in_root {
+            Some((pid, rest)) => Root::of_process(pid)?.open_regular(Path::new(rest), 0)?,
+            // The user's own path, or a process's `exe` link.
+            None => follow_to_regular(Path::new(path))?,
+        };
+        let by_handle = format!("/proc/self/fd/{}", file.as_raw_fd());
+        Ok(ProbeFile(Some(file), by_handle))
+    }
+
+    fn path(&self) -> &str {
+        &self.1
+    }
+}
+
 /// Convenience function to discover all Python processes by checking their main executable.
 fn discover_python_processes(debug: bool) -> Vec<u32> {
     use std::io::{BufRead, BufReader};
@@ -4995,8 +5029,10 @@ fn dedup_by_inode(raw: HashMap<String, &'static str>) -> (Vec<(String, &'static 
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
     let mut unique = Vec::new();
     for (path, reason) in raw {
-        match std::fs::metadata(&path) {
-            Ok(meta) if !seen.insert((meta.dev(), meta.ino())) => {}
+        // Opened by the same rules as at the attach: see ProbeFile.
+        let probed = ProbeFile::open(&path).ok().and_then(|file| file.0);
+        match probed.and_then(|file| file.metadata().ok()) {
+            Some(meta) if !seen.insert((meta.dev(), meta.ino())) => {}
             _ => unique.push((path, reason)),
         }
     }
@@ -5417,11 +5453,18 @@ fn attach_memory_alloc_uprobes(
 
     let mut links = Vec::new();
     for (path, _) in &alloc_paths {
+        let file = match ProbeFile::open(path) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("Warning: memory-alloc: skipping {path}: {e}");
+                continue;
+            }
+        };
         for (prog, func, ret) in probes {
             let func_name = format!("{prefix}{func}");
             match prog.attach_uprobe_with_opts(
                 -1,
-                path,
+                file.path(),
                 0,
                 UprobeOpts {
                     retprobe: *ret,
@@ -5532,16 +5575,20 @@ fn attach_probes(
                             resolved_path.as_str()
                         };
 
-                        let attach_result = skel.progs.systing_usdt.attach_usdt_with_opts(
-                            *pid as i32,
-                            usdt_path,
-                            &usdt.provider,
-                            &usdt.name,
-                            UsdtOpts {
-                                cookie: event.cookie,
-                                ..Default::default()
-                            },
-                        );
+                        let attach_result = ProbeFile::open(usdt_path)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|file| {
+                                Ok(skel.progs.systing_usdt.attach_usdt_with_opts(
+                                    *pid as i32,
+                                    file.path(),
+                                    &usdt.provider,
+                                    &usdt.name,
+                                    UsdtOpts {
+                                        cookie: event.cookie,
+                                        ..Default::default()
+                                    },
+                                )?)
+                            });
 
                         match attach_result {
                             Ok(link) => {
@@ -5594,17 +5641,21 @@ fn attach_probes(
                         resolved_path.as_str()
                     };
 
-                    let attach_result = skel.progs.systing_uprobe.attach_uprobe_with_opts(
-                        *pid as i32,
-                        uprobe_path,
-                        uprobe.offset as usize,
-                        UprobeOpts {
-                            cookie: event.cookie,
-                            retprobe: uprobe.retprobe,
-                            func_name: Some(uprobe.func_name.clone()),
-                            ..Default::default()
-                        },
-                    );
+                    let attach_result = ProbeFile::open(uprobe_path)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|file| {
+                            Ok(skel.progs.systing_uprobe.attach_uprobe_with_opts(
+                                *pid as i32,
+                                file.path(),
+                                uprobe.offset as usize,
+                                UprobeOpts {
+                                    cookie: event.cookie,
+                                    retprobe: uprobe.retprobe,
+                                    func_name: Some(uprobe.func_name.clone()),
+                                    ..Default::default()
+                                },
+                            )?)
+                        });
 
                     match attach_result {
                         Ok(link) => {
@@ -7904,6 +7955,35 @@ mod tests {
         drop(exit_tx);
         other_thread.join().unwrap();
         unsafe { libc::munmap(mapping, 4096) };
+    }
+
+    #[test]
+    fn probe_file_leads_to_the_regular_file_that_was_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("libc.so.6");
+        let own = lib.display().to_string();
+        let beneath = format!("/proc/{}/root{own}", process::id());
+        fs::write(&lib, "first").unwrap();
+
+        for path in [&own, &beneath] {
+            let file = ProbeFile::open(path).unwrap();
+            assert_eq!(fs::read_to_string(file.path()).unwrap(), "first");
+        }
+        // The file held is the one that was opened.
+        let file = ProbeFile::open(&beneath).unwrap();
+        fs::remove_file(&lib).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &lib).unwrap();
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), "first");
+        // Only a regular file is taken, by either kind of path.
+        for path in [&own, &beneath] {
+            assert!(ProbeFile::open(path).is_err(), "{path}");
+        }
+        // The two kinds of path go through different helpers.
+        fs::remove_file(&lib).unwrap();
+        std::os::unix::fs::symlink("/proc/self/exe", &lib).unwrap();
+        assert!(ProbeFile::open(&own).is_ok());
+        assert!(ProbeFile::open(&beneath).is_err());
+        assert_eq!(ProbeFile::open("libc.so.6").unwrap().path(), "libc.so.6");
     }
 
     const MIB: u32 = 1024 * 1024;
