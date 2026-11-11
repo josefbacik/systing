@@ -26,7 +26,6 @@ pub mod perfmap;
 pub mod pprof;
 pub mod pycode;
 pub mod retention;
-pub mod root;
 pub mod snoop;
 pub mod symbolize;
 
@@ -34,6 +33,7 @@ use std::path::PathBuf;
 
 pub use format::Format;
 use maps::Maps;
+pub use systing::root;
 
 /// One heap snapshot file, parsed.
 #[derive(Debug)]

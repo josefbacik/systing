@@ -59,6 +59,7 @@ pub mod pystacks;
 pub mod python_function_trace;
 pub mod record;
 pub mod ringbuf;
+pub mod root;
 pub mod sandbox_maps;
 pub mod sched;
 pub mod session_recorder;
