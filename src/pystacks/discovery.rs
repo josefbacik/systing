@@ -697,6 +697,10 @@ fn read_cstring(data: &[u8]) -> String {
 fn parse_cpython_version(s: &str) -> Option<(i32, i32, i32)> {
     // Formats: "cpython-38", "cpython-310", "cpython-311", "cpython-312", "cpython-313"
     let s = s.strip_prefix("cpython-")?;
+    // A version is ASCII digits and nothing else.
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     if s.len() == 2 {
         // e.g., "38" -> 3.8
         let major = s[..1].parse().ok()?;
@@ -820,6 +824,23 @@ mod tests {
         assert_eq!(parse_cpython_version("cpython-310"), Some((3, 10, 0)));
         assert_eq!(parse_cpython_version("cpython-313"), Some((3, 13, 0)));
         assert_eq!(parse_cpython_version("invalid"), None);
+    }
+
+    #[test]
+    fn test_parse_cpython_version_takes_ascii_digits_only() {
+        for tag in [
+            "cpython-",
+            "cpython-3",
+            "cpython-AB1",
+            "cpython-313t",
+            "cpython-3+9",
+            "cpython-3-9",
+            "cpython-+39",
+            "cpython- 39",
+            "cpython-39999999999",
+        ] {
+            assert_eq!(parse_cpython_version(tag), None, "{tag:?}");
+        }
     }
 
     #[test]
