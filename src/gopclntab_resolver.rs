@@ -21,6 +21,7 @@
 //! return unknown and render through the existing contextual labels.
 
 use std::ffi::OsString;
+use std::os::fd::AsRawFd as _;
 use std::path::Path;
 
 use blazesym::symbolize::FindSymOpts;
@@ -93,8 +94,12 @@ impl TranslateFileOffset for GoPclntabResolver {
 /// with a symbol table keep the default (richer) path. Any error along
 /// the way returns `None`, deliberately: this probe must never make
 /// symbolization worse than it was without it.
+///
+/// The probe takes regular files alone: `maps_file` is opened only if it is
+/// one ([`crate::root::follow_to_regular`]), and read through that descriptor.
 pub fn try_gopclntab_resolver(maps_file: &Path, symbolic_path: &Path) -> Option<Box<dyn Resolve>> {
-    let elf = match ElfPclntab::from_path(maps_file) {
+    let file = crate::root::follow_to_regular(maps_file).ok()?;
+    let elf = match ElfPclntab::from_path(format!("/proc/self/fd/{}", file.as_raw_fd())) {
         Ok(Some(elf)) => elf,
         Ok(None) => return None,
         Err(err) => {
@@ -132,6 +137,17 @@ mod tests {
 
     use object::Object as _;
     use object::ObjectSection as _;
+
+    #[test]
+    fn a_fifo_is_passed_over_without_being_opened() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo");
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is a NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(try_gopclntab_resolver(&path, &path).is_none());
+    }
 
     /// A stripped Go binary is claimed: a file offset inside `main.main`
     /// translates and resolves. Skips (with a notice) when no `go` binary is
