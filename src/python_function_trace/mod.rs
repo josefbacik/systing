@@ -42,6 +42,7 @@ use crate::pystacks::types::PystacksSymbolRecord;
 use crate::pystacks::{discovery, process};
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
+use crate::root::follow_to_regular;
 use crate::session_recorder::SessionRecorder;
 use crate::systing_core::{task_info, SystingEvent, SystingRecordEvent};
 use crate::target_filter::{set_target_filter, TargetFilter, TargetFilterMaps};
@@ -578,13 +579,22 @@ fn is_musl_library(path: &str) -> bool {
 /// and modification time: what was found in each, or why it was refused.
 type InterpreterCache = HashMap<(u64, u64, u64, i64, i64), Result<Option<Interpreter>, String>>;
 
+/// The file behind mapping `m` of process `pid`, and the path that it was
+/// opened by: the mapping itself (`/proc/PID/map_files/START-END`), so it is
+/// the file the process has mapped, whatever its maps line or its mount
+/// namespace says. The entry's file is opened only if it is a regular file
+/// ([`follow_to_regular`]).
+fn open_mapped_file(pid: u32, m: &process::MemoryMapping) -> Option<(PathBuf, std::fs::File)> {
+    let path = PathBuf::from(format!("/proc/{pid}/map_files/{:x}-{:x}", m.start, m.end));
+    let file = follow_to_regular(&path).ok()?;
+    Some((path, file))
+}
+
 /// The file of process `pid` that defines the interpreter, with what
 /// [`sites`] found in it: the file, open, the name the maps line gives it,
-/// made printable, and what was found in it. The file is opened once,
-/// through the mapping itself (`/proc/PID/map_files/START-END`, so it is the
-/// file the process has mapped, whatever its maps line or its mount
-/// namespace says); the cache key, the parse and the probes all go through
-/// that one descriptor, so they cannot describe different files.
+/// made printable, and what was found in it. The file is opened once
+/// ([`open_mapped_file`]); the cache key, the parse and the probes all go
+/// through that one descriptor, so they cannot describe different files.
 fn interpreter_of(
     pid: u32,
     cache: &mut InterpreterCache,
@@ -620,8 +630,7 @@ fn interpreter_of(
     // on its own too (see `sites`).
     let mut budget: u64 = 512 << 20;
     for m in candidates {
-        let path = PathBuf::from(format!("/proc/{pid}/map_files/{:x}-{:x}", m.start, m.end));
-        let Ok(file) = std::fs::File::open(&path) else {
+        let Some((path, file)) = open_mapped_file(pid, m) else {
             continue;
         };
         // Keyed by the open file, as the kernel reports it, not by what the
@@ -1068,7 +1077,10 @@ impl Tracer<'_, '_> {
     /// What can change inside a process while it runs: its threads' names, for the
     /// `thread` table as task stacks read them, and whether it has loaded greenlet.
     fn look_inside(&mut self, names: &mut PythonThreadNames, recorder: &SessionRecorder) {
-        let pids: Vec<u32> = self
+        // A set made anew has an order of its own, as the snapshots' map has: the
+        // names' share of the time can end before the list does, and so each
+        // process gets its turn.
+        let pids: HashSet<u32> = self
             .files
             .keys()
             .filter(|pid| !self.gone.contains_key(pid))
@@ -1087,6 +1099,9 @@ impl Tracer<'_, '_> {
                 self.warn(pid, GREENLET_WARNING.to_string());
             }
         }
+        // Each look asks about every thread, so what was put off is asked about
+        // again at the next look. This empties the list and counts the wait.
+        names.take_put_off();
     }
 }
 
@@ -1511,6 +1526,50 @@ fn read_counters(map: &impl MapCore) -> KernelCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One page of `file`, mapped privately for reading, as this process's map
+    /// shows it. It stays mapped until the test program ends.
+    fn map_a_page(file: &std::fs::File) -> process::MemoryMapping {
+        // SAFETY: a new private mapping at an address of the kernel's choice.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(at, libc::MAP_FAILED);
+        process::parse_proc_maps(std::process::id() as i32)
+            .into_iter()
+            .find(|m| m.start == at as usize)
+            .expect("the new mapping is in the map")
+    }
+
+    #[test]
+    fn a_mapped_file_is_opened_and_a_mapped_device_node_is_not() {
+        use std::io::Write as _;
+        if !*crate::stack_recorder::MAY_FOLLOW_MAP_FILES {
+            eprintln!("skipping: no right to follow map_files links");
+            return;
+        }
+        let me = std::process::id();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[7; 4096]).unwrap();
+        let (_, opened) =
+            open_mapped_file(me, &map_a_page(&file)).expect("a regular file is opened");
+        let id = |f: &std::fs::File| {
+            let meta = f.metadata().unwrap();
+            (meta.dev(), meta.ino())
+        };
+        assert_eq!(id(&opened), id(&file));
+
+        let device = map_a_page(&std::fs::File::open("/dev/zero").unwrap());
+        assert_eq!(device.name, "/dev/zero");
+        assert!(open_mapped_file(me, &device).is_none());
+    }
 
     #[test]
     fn maps_longer_than_the_cap_leave_greenlet_unknown() {

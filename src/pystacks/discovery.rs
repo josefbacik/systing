@@ -5,10 +5,16 @@
 use super::offsets;
 use super::process::{self, MemoryMapping};
 use super::types::{BpfLibBinaryId, PyPidData, BPF_LIB_DEFAULT_FIELD_OFFSET};
+use crate::limits::Limit;
+use crate::root::{self, Root};
+use crate::stack_recorder::MAY_FOLLOW_MAP_FILES;
 use object::read::{ReadCache, ReadRef};
 use object::{Object, ObjectSymbol};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
+use std::io;
+use std::ops::Range;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -22,42 +28,48 @@ use std::time::Instant;
 #[derive(Debug)]
 struct ElfPyInfo {
     py_runtime_addr: usize,
-    version: (i32, i32, i32),
+    /// What the file's own version tag says; `None` for a file without one.
+    version: Option<(i32, i32, i32)>,
     is_dynamic: bool,
 }
 
+impl ElfPyInfo {
+    /// The version of the runtime that a process knows as `module_path`. A file
+    /// without a tag is judged by that name, anew for each process.
+    fn version_as(&self, module_path: &str) -> Option<(i32, i32, i32)> {
+        self.version
+            .or_else(|| parse_version_from_path(module_path))
+    }
+}
+
 /// Per-binary ELF parse results keyed by (st_dev, st_ino, st_size). `None`
-/// records a binary that is not a Python runtime — rejections cost a full
+/// records a binary that is not taken as a runtime — rejections cost a full
 /// ELF parse too, so they're worth remembering. A file that fails a
-/// readability probe (see `elf_py_info`) is not cached: a transient read
-/// error (ESTALE, a /proc/pid/root path vanishing when the process exits
-/// mid-check) must not blacklist an interpreter for the rest of the session.
+/// readability probe (see `elf_py_info_of`) is not cached: a transient read
+/// error (ESTALE, EIO) must not blacklist an interpreter for the rest of the
+/// session.
 type ElfCache = HashMap<(u64, u64, u64), Option<Arc<ElfPyInfo>>>;
 
 static ELF_CACHE: LazyLock<Mutex<ElfCache>> = LazyLock::new(Default::default);
 
-/// Parse the ELF at `file_path` for Python runtime facts, going through the
-/// (st_dev, st_ino, st_size) cache. Returns `None` when the file is
-/// unreadable or is not a Python runtime.
-fn elf_py_info(file_path: &str) -> Option<Arc<ElfPyInfo>> {
-    // Open first and stat through the handle so the cache key describes the
+/// Parse the ELF `file` for Python runtime facts, going through the
+/// (st_dev, st_ino, st_size) cache. `file_path` is the path the process knows
+/// the file by, for messages. Returns `None` when the file is unreadable, too
+/// costly to check, or not a Python runtime.
+fn elf_py_info_of(file_path: &str, file: fs::File) -> Option<Arc<ElfPyInfo>> {
+    // Stat through the open handle so the cache key describes the
     // file we actually read. The inode is pinned while any process maps the
     // binary, but a cache entry can outlive every mapper; st_size in the key
     // guards against a freed (dev, ino) being reused by a different file
     // later in the session.
-    //
-    // Known limit: the version fallback in detect_python_version keys off
-    // the basename, so hardlinks to one inode under different names share
-    // whichever result was cached first.
-    let file = fs::File::open(file_path).ok()?;
     let meta = file.metadata().ok()?;
     let key = (meta.dev(), meta.ino(), meta.len());
     if let Some(cached) = ELF_CACHE.lock().unwrap().get(&key) {
         return cached.clone();
     }
     // Prove the file is readable before parsing: an I/O failure here
-    // (EISDIR, ESTALE, a /proc/pid/root path vanishing) returns without
-    // caching, so a transient error never blacklists an interpreter.
+    // (ESTALE, EIO) returns without caching, so a transient error never
+    // blacklists an interpreter.
     if !file_readable(&file) {
         return None;
     }
@@ -65,10 +77,10 @@ fn elf_py_info(file_path: &str) -> Option<Arc<ElfPyInfo>> {
     // identical results, so last-write-wins is fine.
     let parsed = parse_elf_py_info(file_path, &file);
     // A rejection is cached only if the file is still readable: an I/O
-    // error mid-parse (the file vanished under us) is indistinguishable
+    // error mid-parse (its storage failed) is indistinguishable
     // from "not a runtime" inside the parser, and must not be remembered.
     // The probe reads the first 64 bytes, so it stands in for "the file is
-    // gone or unreadable", not for an error in the middle of a file that
+    // unreadable", not for an error in the middle of a file that
     // is otherwise fine — that narrower case would be cached as a
     // rejection.
     if parsed.is_none() && !file_readable(&file) {
@@ -79,7 +91,7 @@ fn elf_py_info(file_path: &str) -> Option<Arc<ElfPyInfo>> {
 }
 
 /// Whether the ELF identification header can be read: false on any I/O
-/// error (EISDIR, ESTALE, a vanished /proc path).
+/// error (ESTALE, EIO).
 fn file_readable(file: &fs::File) -> bool {
     let mut header = [0u8; 64];
     file.read_exact_at(&mut header, 0).is_ok()
@@ -89,6 +101,80 @@ fn file_readable(file: &fs::File) -> bool {
 /// embedder pays the same symbol scans as an accept, and the log line makes
 /// the negative-cache benefit attributable.
 const SLOW_REJECT_SECS: f64 = 0.5;
+
+/// The most that the check of one file may read. Each read counts as its length
+/// plus [`READ_COST`], even one that the cache serves. `ReadCache` keeps what it
+/// has read until the check ends, so this also bounds the memory that a check
+/// holds. A CPython runtime takes a small part of it; the room is for a very
+/// large program with CPython linked in.
+const MAX_PARSE_BYTES: u64 = 512 << 20;
+
+/// A fixed charge for each read, on top of its length: about what the cache
+/// holds for a read beside its bytes.
+const READ_COST: u64 = 128;
+
+/// Files given up on at [`MAX_PARSE_BYTES`].
+static FILES_SKIPPED: Limit = Limit::new("files too costly to check for a Python runtime");
+
+/// A file read through `ReadCache` under a budget. Once a read would pass the
+/// budget, it and every later read fail. A read of known size is charged
+/// before it is made. A read whose length is known only afterwards is charged
+/// afterwards.
+struct BudgetedReader<'f> {
+    cache: ReadCache<&'f fs::File>,
+    /// `None` once a read has been refused.
+    left: Cell<Option<u64>>,
+}
+
+impl<'f> BudgetedReader<'f> {
+    fn new(file: &'f fs::File, budget: u64) -> Self {
+        Self {
+            cache: ReadCache::new(file),
+            left: Cell::new(Some(budget)),
+        }
+    }
+
+    fn charge(&self, bytes: u64) -> Result<(), ()> {
+        let left = self
+            .left
+            .get()
+            .and_then(|left| left.checked_sub(bytes.saturating_add(READ_COST)));
+        self.left.set(left);
+        left.map(|_| ()).ok_or(())
+    }
+
+    fn overdrawn(&self) -> bool {
+        self.left.get().is_none()
+    }
+
+    /// What is left of the budget: nothing once it is overdrawn.
+    fn left(&self) -> u64 {
+        self.left.get().unwrap_or(0)
+    }
+}
+
+impl<'a> ReadRef<'a> for &'a BudgetedReader<'_> {
+    fn len(self) -> Result<u64, ()> {
+        self.cache.len()
+    }
+
+    fn read_bytes_at(self, offset: u64, size: u64) -> Result<&'a [u8], ()> {
+        self.charge(size)?;
+        self.cache.read_bytes_at(offset, size)
+    }
+
+    fn read_bytes_at_until(self, range: Range<u64>, delimiter: u8) -> Result<&'a [u8], ()> {
+        /// Charged for a look that fails: `ReadCache` gives up a look after this many bytes.
+        const LONGEST_LOOK: u64 = 4096;
+        if self.overdrawn() {
+            return Err(());
+        }
+        // The length is known only after the read.
+        let found = self.cache.read_bytes_at_until(range, delimiter);
+        self.charge(found.map_or(LONGEST_LOOK, |bytes| bytes.len() as u64))?;
+        found
+    }
+}
 
 /// Parse the runtime facts out of an open ELF file.
 ///
@@ -100,11 +186,29 @@ const SLOW_REJECT_SECS: f64 = 0.5;
 /// so on a page-cache-starved host every byte it touches is a cold read
 /// that competes with the traced workload's own page faults.
 fn parse_elf_py_info(file_path: &str, file: &fs::File) -> Option<Arc<ElfPyInfo>> {
+    parse_elf_py_info_within(file_path, file, MAX_PARSE_BYTES)
+}
+
+fn parse_elf_py_info_within(
+    file_path: &str,
+    file: &fs::File,
+    budget: u64,
+) -> Option<Arc<ElfPyInfo>> {
     let start = Instant::now();
-    let reader = ReadCache::new(file);
-    let result = object::File::parse(&reader).ok().and_then(|elf| {
+    let reader = BudgetedReader::new(file, budget);
+    // Only an ELF file can hold a runtime here.
+    let is_elf = matches!(
+        object::FileKind::parse(&reader),
+        Ok(object::FileKind::Elf32 | object::FileKind::Elf64)
+    );
+    let parsed = if is_elf {
+        object::File::parse(&reader).ok()
+    } else {
+        None
+    };
+    let result = parsed.and_then(|elf| {
         let py_runtime_addr = find_symbol_address(&elf, "_PyRuntime")?;
-        let version = detect_python_version(&elf, &reader, file_path)?;
+        let version = detect_python_version(&elf, &reader);
         Some(Arc::new(ElfPyInfo {
             py_runtime_addr,
             version,
@@ -112,6 +216,25 @@ fn parse_elf_py_info(file_path: &str, file: &fs::File) -> Option<Arc<ElfPyInfo>>
         }))
     });
     let elapsed = start.elapsed().as_secs_f64();
+    let (overdrawn, costly) = (reader.overdrawn(), reader.left() < budget - budget / 8);
+    drop(reader);
+    if costly {
+        // Return freed memory to the system.
+        // SAFETY: malloc_trim is always safe to call on glibc.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+    if overdrawn {
+        FILES_SKIPPED.hit();
+        eprintln!(
+            "[pystacks] Skipped {} after {elapsed:.2}s: checking it for a Python runtime \
+             would read more than {} MiB, so it is not treated as one",
+            file_path.escape_debug(),
+            budget >> 20
+        );
+        return None;
+    }
     if result.is_some() {
         eprintln!(
             "[pystacks] Parsed Python runtime ELF {} in {elapsed:.2}s",
@@ -200,6 +323,15 @@ pub fn check_python_process(pid: i32) -> Option<PyProcessInfo> {
     None
 }
 
+/// Most `libpython*` objects of one process that are checked. A process has
+/// one, or two with the stable-ABI stub `libpython3.so`.
+const MAX_LIBPYTHON_CANDIDATES: usize = 8;
+
+/// Counts each look at a process that maps more than
+/// [`MAX_LIBPYTHON_CANDIDATES`] `libpython*` objects.
+static CANDIDATES_SKIPPED: Limit =
+    Limit::new("times a process had too many libpython files to check them all");
+
 /// The objects worth parsing for a CPython runtime, in the order to try
 /// them: the executable first (static and `--enable-shared` launcher builds
 /// alike), then each distinct `libpython*` shared object in mapping order.
@@ -211,6 +343,8 @@ pub fn check_python_process(pid: i32) -> Option<PyProcessInfo> {
 /// later-`dlopen`ed extension modules map below libpython, so a walk in
 /// mapping order would reach them before the runtime. They are left out
 /// whatever their path contains.
+///
+/// At most [`MAX_LIBPYTHON_CANDIDATES`] shared objects are listed.
 fn runtime_candidates(exe: &str, maps: &[MemoryMapping]) -> Vec<String> {
     let mut candidates = vec![exe.to_string()];
     for mapping in maps {
@@ -224,6 +358,20 @@ fn runtime_candidates(exe: &str, maps: &[MemoryMapping]) -> Vec<String> {
             .and_then(|f| f.to_str())
             .is_some_and(|f| f.to_lowercase().starts_with("libpython"));
         if is_libpython && !candidates.contains(&mapping.name) {
+            if candidates.len() > MAX_LIBPYTHON_CANDIDATES {
+                // Each look is counted, and the line is printed once.
+                static SAID: std::sync::Once = std::sync::Once::new();
+                CANDIDATES_SKIPPED.hit();
+                SAID.call_once(|| {
+                    eprintln!(
+                        "[pystacks] A process running {} maps more than \
+                         {MAX_LIBPYTHON_CANDIDATES} libpython files; only the first \
+                         {MAX_LIBPYTHON_CANDIDATES} are checked for a Python runtime",
+                        exe.escape_debug()
+                    );
+                });
+                break;
+            }
             candidates.push(mapping.name.clone());
         }
     }
@@ -239,14 +387,13 @@ fn try_python_module(
 ) -> Option<PyProcessInfo> {
     // ELF facts come from the per-binary cache — forked workers of the same
     // interpreter share one parse instead of re-reading the binary per PID.
-    let file_path = resolve_proc_path(pid, module_path);
-    let elf_info = elf_py_info(&file_path)?;
+    let elf_info = elf_py_info_of(module_path, open_module(pid, module_path, maps, is_exe)?)?;
 
     let is_pie = elf_info.is_dynamic && is_exe;
     let is_shared = elf_info.is_dynamic && !is_exe;
 
     let py_runtime_addr = elf_info.py_runtime_addr;
-    let (major, minor, micro) = elf_info.version;
+    let (major, minor, micro) = elf_info.version_as(module_path)?;
 
     // Get offset config for this version
     let offsets = offsets::for_version(major, minor)?;
@@ -357,7 +504,6 @@ fn try_python_module(
     })
 }
 
-/// Resolve a path through /proc/pid/root for containerized processes.
 /// Where the GIL's `locked` and `last_holder` are in an interpreter's state,
 /// as the process's own `_Py_DebugOffsets` has them (3.13+): `word` reads
 /// eight bytes of the process at an address, `runtime_addr` is its
@@ -382,52 +528,84 @@ fn own_gil_offsets(
     Some((own(o.debug_gil_locked)?, own(o.debug_gil_holder)?))
 }
 
-fn resolve_proc_path(pid: i32, path: &str) -> String {
-    let proc_root = format!("/proc/{pid}/root{path}");
-    if Path::new(&proc_root).exists() {
-        proc_root
-    } else {
-        path.to_string()
+/// How many `map_files` entries of one name are tried. A library has a handful
+/// of mappings.
+const ENTRIES_TRIED: usize = 16;
+
+/// Open the file that process `pid` runs (`is_exe`) or has mapped under the name
+/// `module_path`, through its `exe` link or a `map_files` entry. Those lead to the
+/// file itself. Only a tracer that may not follow `map_files` links looks a library
+/// up by its name.
+fn open_module(
+    pid: i32,
+    module_path: &str,
+    maps: &[MemoryMapping],
+    is_exe: bool,
+) -> Option<fs::File> {
+    if is_exe {
+        return root::follow_to_regular(Path::new(&format!("/proc/{pid}/exe"))).ok();
     }
+    if !*MAY_FOLLOW_MAP_FILES {
+        return open_in_process_root(pid, module_path);
+    }
+    let of_that_name = maps.iter().filter(|m| m.name == module_path);
+    first_present(of_that_name.map(|m| {
+        let entry = format!("/proc/{pid}/map_files/{:x}-{:x}", m.start, m.end);
+        root::follow_to_regular(Path::new(&entry))
+    }))
 }
 
-/// Find a symbol's address in an ELF file.
+/// The first result among the first [`ENTRIES_TRIED`] of `tries` that is not a
+/// not-found error; `None` if that result is another error, or if there is none.
+/// An entry is not found once its mapping's range has changed; any other failure
+/// would meet the next mapping too.
+fn first_present<T>(tries: impl Iterator<Item = io::Result<T>>) -> Option<T> {
+    tries
+        .take(ENTRIES_TRIED)
+        .find(|tried| !matches!(tried, Err(e) if e.kind() == io::ErrorKind::NotFound))?
+        .ok()
+}
+
+/// Open a file of process `pid` by the path that its `maps` show. It is resolved
+/// beneath the process's own root, and only a regular file is opened.
+fn open_in_process_root(pid: i32, path: &str) -> Option<fs::File> {
+    Root::of_process(pid)
+        .and_then(|root| root.open_regular(Path::new(path), 0))
+        .ok()
+}
+
+/// Whether `sym` could be one of the runtime's variables: it has a nonzero
+/// address and is not a function. Check this before the name, which costs a
+/// read from the file.
+fn is_variable<'data>(sym: &impl ObjectSymbol<'data>) -> bool {
+    sym.address() != 0 && sym.kind() != object::SymbolKind::Text
+}
+
+/// Find a variable's address in an ELF file.
 fn find_symbol_address<'data, R: ReadRef<'data>>(
     elf: &object::File<'data, R>,
     name: &str,
 ) -> Option<usize> {
     for sym in elf.symbols() {
-        if sym.name() == Ok(name) && sym.address() != 0 {
+        if is_variable(&sym) && sym.name() == Ok(name) {
             return Some(sym.address() as usize);
         }
     }
     // Try dynamic symbols
     for sym in elf.dynamic_symbols() {
-        if sym.name() == Ok(name) && sym.address() != 0 {
+        if is_variable(&sym) && sym.name() == Ok(name) {
             return Some(sym.address() as usize);
         }
     }
     None
 }
 
-/// Detect the Python version from an ELF file.
-/// Tries _PySys_ImplCacheTag first, then falls back to filename pattern
-/// (the resolved on-disk path has the same basename as the mapped module,
-/// so the pattern match is unaffected by /proc/pid/root resolution).
+/// Detect the Python version from an ELF file, by its _PySys_ImplCacheTag.
 fn detect_python_version<'data, R: ReadRef<'data>>(
     elf: &object::File<'data, R>,
     reader: R,
-    module_path: &str,
 ) -> Option<(i32, i32, i32)> {
-    // Try to find version from _PySys_ImplCacheTag symbol value
-    if let Some(version_str) = read_impl_cache_tag(elf, reader) {
-        if let Some(ver) = parse_cpython_version(&version_str) {
-            return Some(ver);
-        }
-    }
-
-    // Fallback: try to extract version from filename (e.g., python3.10, libpython3.11.so)
-    parse_version_from_path(module_path)
+    parse_cpython_version(&read_impl_cache_tag(elf, reader)?)
 }
 
 /// Try to read the _PySys_ImplCacheTag string from ELF.
@@ -452,12 +630,9 @@ fn read_impl_cache_tag<'data, R: ReadRef<'data>>(
     let sym = elf
         .symbols()
         .chain(elf.dynamic_symbols())
-        .find(|s| s.name() == Ok("_PySys_ImplCacheTag"))?;
+        .find(|s| is_variable(s) && s.name() == Ok("_PySys_ImplCacheTag"))?;
 
     let addr = sym.address();
-    if addr == 0 {
-        return None;
-    }
 
     // Up to `TAG_MAX_LEN` bytes at a virtual address, read from the file
     // range of the allocated section that holds it. Only allocated sections
@@ -522,6 +697,10 @@ fn read_cstring(data: &[u8]) -> String {
 fn parse_cpython_version(s: &str) -> Option<(i32, i32, i32)> {
     // Formats: "cpython-38", "cpython-310", "cpython-311", "cpython-312", "cpython-313"
     let s = s.strip_prefix("cpython-")?;
+    // A version is ASCII digits and nothing else.
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     if s.len() == 2 {
         // e.g., "38" -> 3.8
         let major = s[..1].parse().ok()?;
@@ -633,12 +812,35 @@ mod tests {
         assert_eq!(read(table(b"xdebugpy", 7800, 1 << 20)), None);
     }
 
+    /// [`elf_py_info_of`] on a file opened by its path in this process's own
+    /// namespace.
+    fn elf_py_info(file_path: &str) -> Option<Arc<ElfPyInfo>> {
+        elf_py_info_of(file_path, fs::File::open(file_path).ok()?)
+    }
+
     #[test]
     fn test_parse_cpython_version() {
         assert_eq!(parse_cpython_version("cpython-38"), Some((3, 8, 0)));
         assert_eq!(parse_cpython_version("cpython-310"), Some((3, 10, 0)));
         assert_eq!(parse_cpython_version("cpython-313"), Some((3, 13, 0)));
         assert_eq!(parse_cpython_version("invalid"), None);
+    }
+
+    #[test]
+    fn test_parse_cpython_version_takes_ascii_digits_only() {
+        for tag in [
+            "cpython-",
+            "cpython-3",
+            "cpython-AB1",
+            "cpython-313t",
+            "cpython-3+9",
+            "cpython-3-9",
+            "cpython-+39",
+            "cpython- 39",
+            "cpython-39999999999",
+        ] {
+            assert_eq!(parse_cpython_version(tag), None, "{tag:?}");
+        }
     }
 
     #[test]
@@ -684,6 +886,230 @@ mod tests {
     #[test]
     fn test_elf_py_info_unreadable_path() {
         assert!(elf_py_info("/nonexistent/definitely-not-a-file").is_none());
+    }
+
+    #[test]
+    fn test_open_in_process_root_opens_only_regular_files() {
+        let me = std::process::id() as i32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        fs::write(path("python3"), b"not an ELF").unwrap();
+        let fifo = std::ffi::CString::new(path("libpython3.so")).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        assert!(open_in_process_root(me, &path("python3")).is_some());
+        // A FIFO: refused without being opened.
+        assert!(open_in_process_root(me, &path("libpython3.so")).is_none());
+        assert!(open_in_process_root(me, "/dev/null").is_none());
+        // No such process, so no root to look beneath:
+        // nothing is opened.
+        assert!(open_in_process_root(i32::MAX, &path("python3")).is_none());
+    }
+
+    /// Compile `source` with the host's C compiler. False where there is none,
+    /// which in CI (`CI` set) is a failure: the caller's check would prove nothing.
+    fn cc_builds(source: &str, flags: &[&str], out: &Path) -> bool {
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let mut words = cc.split_whitespace();
+        let src = out.with_extension("c");
+        fs::write(&src, source).unwrap();
+        let built = std::process::Command::new(words.next().unwrap_or("cc"))
+            .args(words)
+            .args(flags)
+            .arg("-o")
+            .args([out, src.as_path()])
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            built || std::env::var_os("CI").is_none(),
+            "{cc} could not build {}",
+            out.display()
+        );
+        built
+    }
+
+    /// A stand-in CPython: it has `_PyRuntime` and no version tag, so its version
+    /// can only come from a file name. As a program it writes a byte and sleeps.
+    const UNTAGGED_RUNTIME: &str = "#include <unistd.h>\n\
+                                    char _PyRuntime[64];\n\
+                                    int main(void) {\n\
+                                        if (write(1, _PyRuntime, 1) != 1) return 1;\n\
+                                        sleep(120);\n\
+                                        return 0;\n\
+                                    }\n";
+
+    struct Child(std::process::Child);
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn run(program: &Path) -> Child {
+        use std::io::Read;
+
+        let mut child = std::process::Command::new(program)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // spawn() can return before the kernel has mapped the program. Its byte
+        // says that it runs.
+        let stdout = child.stdout.as_mut().unwrap();
+        stdout.read_exact(&mut [0]).unwrap();
+        Child(child)
+    }
+
+    fn version_of(pid: u32) -> Option<(i32, i32)> {
+        check_python_process(pid as i32).map(|info| (info.version_major, info.version_minor))
+    }
+
+    #[test]
+    fn test_the_next_entry_is_tried_only_after_one_that_is_gone() {
+        let tries_until = |failure: io::ErrorKind| {
+            let mut made = 0;
+            let failures = std::iter::repeat_with(|| {
+                made += 1;
+                Err::<(), _>(io::Error::from(failure))
+            });
+            // One more than the bound, so that a lost bound fails and does not hang.
+            let found = first_present(failures.take(ENTRIES_TRIED + 1));
+            assert!(found.is_none());
+            made
+        };
+        assert_eq!(tries_until(io::ErrorKind::NotFound), ENTRIES_TRIED);
+        assert_eq!(tries_until(io::ErrorKind::PermissionDenied), 1);
+
+        let gone = || Err(io::Error::from(io::ErrorKind::NotFound));
+        assert_eq!(first_present([gone(), Ok(1), Ok(2)].into_iter()), Some(1));
+    }
+
+    #[test]
+    fn test_a_mapping_is_found_after_entries_that_are_gone() {
+        use std::os::fd::AsRawFd;
+
+        if !*MAY_FOLLOW_MAP_FILES {
+            eprintln!("no privilege to follow map_files links: skipping the entries-gone check");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("libpython3.12.so");
+        // SAFETY: asks for a number.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        fs::write(&lib, vec![0u8; page]).unwrap();
+        let file = fs::File::open(&lib).unwrap();
+        // SAFETY: a new read-only mapping of an open file, at an address of the
+        // kernel's choosing.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(at, libc::MAP_FAILED);
+        let name = lib.to_str().unwrap();
+        // Nothing is mapped in the lowest pages, so their entries do not exist.
+        let found_after = |gone: usize| {
+            let mut maps: Vec<_> = (1..=gone).map(|p| mapping(p * 0x1000, 0, name)).collect();
+            maps.push(MemoryMapping {
+                end: at as usize + page,
+                ..mapping(at as usize, 0, name)
+            });
+            open_module(std::process::id() as i32, name, &maps, false).is_some()
+        };
+        let (within, beyond) = (found_after(ENTRIES_TRIED - 1), found_after(ENTRIES_TRIED));
+        // SAFETY: the mapping made above, which nothing else uses.
+        unsafe { libc::munmap(at, page) };
+        assert!(within);
+        assert!(!beyond);
+    }
+
+    #[test]
+    fn test_a_running_interpreter_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("python3.12");
+        if !cc_builds(UNTAGGED_RUNTIME, &[], &exe) {
+            eprintln!("no C compiler on this host: skipping the running-interpreter check");
+            return;
+        }
+        // The second process is served from the per-file cache.
+        let (first, second) = (run(&exe), run(&exe));
+
+        assert_eq!(version_of(first.0.id()), Some((3, 12)));
+        assert_eq!(version_of(second.0.id()), Some((3, 12)));
+    }
+
+    #[test]
+    fn test_an_interpreter_is_recognised_after_its_file_was_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("python3.12");
+        if !cc_builds(UNTAGGED_RUNTIME, &[], &exe) {
+            eprintln!("no C compiler on this host: skipping the removed-file check");
+            return;
+        }
+        let child = run(&exe);
+        fs::remove_file(&exe).unwrap();
+
+        assert_eq!(version_of(child.0.id()), Some((3, 12)));
+    }
+
+    #[test]
+    fn test_one_file_takes_its_version_from_each_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["python3.12", "python3.8", "python"];
+        if !cc_builds(UNTAGGED_RUNTIME, &[], &dir.path().join(names[0])) {
+            eprintln!("no C compiler on this host: skipping the names check");
+            return;
+        }
+        for name in &names[1..] {
+            fs::hard_link(dir.path().join(names[0]), dir.path().join(name)).unwrap();
+        }
+        let versions = names.map(|name| version_of(run(&dir.path().join(name)).0.id()));
+
+        assert_eq!(versions, [Some((3, 12)), Some((3, 8)), None]);
+    }
+
+    /// A program that maps the file `LIB` as a loader does, writes a byte and sleeps.
+    const MAPS_A_LIBRARY: &str = "#include <fcntl.h>\n\
+                                  #include <sys/mman.h>\n\
+                                  #include <sys/stat.h>\n\
+                                  #include <unistd.h>\n\
+                                  int main(void) {\n\
+                                      struct stat s;\n\
+                                      void *m;\n\
+                                      int fd = open(LIB, O_RDONLY);\n\
+                                      if (fd < 0 || fstat(fd, &s) != 0) return 1;\n\
+                                      m = mmap(0, s.st_size, PROT_READ, MAP_PRIVATE, fd, 0);\n\
+                                      if (m == MAP_FAILED) return 1;\n\
+                                      if (write(1, \"x\", 1) != 1) return 1;\n\
+                                      sleep(120);\n\
+                                      return 0;\n\
+                                  }\n";
+
+    #[test]
+    fn test_a_mapped_library_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, app) = (dir.path().join("libpython3.12.so"), dir.path().join("app"));
+        let define = format!("-DLIB=\"{}\"", lib.display());
+        if !cc_builds(UNTAGGED_RUNTIME, &["-shared", "-fPIC"], &lib)
+            || !cc_builds(MAPS_A_LIBRARY, &[&define], &app)
+        {
+            eprintln!("no C compiler on this host: skipping the mapped-library check");
+            return;
+        }
+        let child = run(&app);
+
+        assert_eq!(version_of(child.0.id()), Some((3, 12)));
+        // The name is gone. A `map_files` link still leads to the file.
+        fs::remove_file(&lib).unwrap();
+        let still = (*MAY_FOLLOW_MAP_FILES).then_some((3, 12));
+        assert_eq!(version_of(child.0.id()), still);
     }
 
     fn mapping(start: usize, offset: u64, name: &str) -> MemoryMapping {
@@ -881,7 +1307,7 @@ mod tests {
         // build carries `_PySys_ImplCacheTag` the tag read is checked
         // directly against the expected string — `(major, minor)` alone
         // would also be satisfied by the filename fallback in
-        // `detect_python_version`, so it cannot tell the two apart.
+        // `ElfPyInfo::version_as`, so it cannot tell the two apart.
         let runtimes = real_runtimes();
         if runtimes.is_empty() {
             skip_or_fail_without_runtime("real-interpreter");
@@ -893,8 +1319,8 @@ mod tests {
             let info = elf_py_info(&path)
                 .unwrap_or_else(|| panic!("{} not recognized as a runtime", rt.path.display()));
             assert_eq!(
-                (info.version.0, info.version.1),
-                (rt.major, rt.minor),
+                info.version_as(&path).map(|v| (v.0, v.1)),
+                Some((rt.major, rt.minor)),
                 "{}",
                 rt.path.display()
             );
@@ -1063,8 +1489,8 @@ mod tests {
             let info = elf_py_info(&path.to_string_lossy())
                 .unwrap_or_else(|| panic!("{} not recognized as a runtime", path.display()));
             assert_eq!(
-                (info.version.0, info.version.1),
-                (3, 99),
+                info.version,
+                Some((3, 99, 0)),
                 "{}: the version must come from the tag, not the filename",
                 path.display()
             );
@@ -1329,5 +1755,67 @@ mod tests {
             name: "/usr/lib/libpython3.13.so.1.0".to_string(),
         }];
         assert_eq!(find_module_base_address(&maps, "/nonexistent.so"), None);
+    }
+
+    #[test]
+    fn test_reads_past_the_budget_fail() {
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(&[7; 4096], 0).unwrap();
+        let reader = BudgetedReader::new(&file, 1024 + 2 * READ_COST);
+        assert_eq!((&reader).read_bytes_at(0, 1024), Ok(&[7; 1024][..]));
+        assert!(!reader.overdrawn());
+        assert!((&reader).read_bytes_at(1024, 1024).is_err());
+        assert!(reader.overdrawn());
+        assert!((&reader).read_bytes_at(0, 1).is_err());
+    }
+
+    #[test]
+    fn test_a_look_for_a_string_is_charged_for_what_it_found() {
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(b"abc\0def\0", 0).unwrap();
+        let reader = BudgetedReader::new(&file, 2 * (3 + READ_COST));
+        assert_eq!((&reader).read_bytes_at_until(0..8, 0), Ok(&b"abc"[..]));
+        assert_eq!((&reader).read_bytes_at_until(4..8, 0), Ok(&b"def"[..]));
+        assert!(!reader.overdrawn());
+        assert!((&reader).read_bytes_at_until(0..8, 0).is_err());
+        assert!(reader.overdrawn());
+    }
+
+    #[test]
+    fn test_a_file_past_the_budget_is_skipped_and_counted() {
+        let file = fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let before = FILES_SKIPPED.count();
+        // The first read is already past this budget.
+        assert!(parse_elf_py_info_within("test", &file, READ_COST).is_none());
+        assert!(FILES_SKIPPED.count() > before);
+    }
+
+    #[test]
+    fn test_real_runtimes_take_a_small_part_of_the_budget() {
+        let runtimes = real_runtimes();
+        if runtimes.is_empty() {
+            skip_or_fail_without_runtime("parse-budget");
+            return;
+        }
+        for rt in &runtimes {
+            let file = fs::File::open(&rt.path).unwrap();
+            let shown = rt.path.to_string_lossy();
+            assert!(
+                parse_elf_py_info_within(&shown, &file, MAX_PARSE_BYTES / 64).is_some(),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_runtime_candidates_are_capped() {
+        let maps: Vec<MemoryMapping> = (0..3 * MAX_LIBPYTHON_CANDIDATES)
+            .map(|i| mapping(0x1000 * (i + 1), 0, &format!("/tmp/libpython3.{i}.so")))
+            .collect();
+        let before = CANDIDATES_SKIPPED.count();
+        let candidates = runtime_candidates("/usr/bin/python3", &maps);
+        assert_eq!(candidates.len(), 1 + MAX_LIBPYTHON_CANDIDATES);
+        assert_eq!(candidates[1], "/tmp/libpython3.0.so");
+        assert!(CANDIDATES_SKIPPED.count() > before);
     }
 }

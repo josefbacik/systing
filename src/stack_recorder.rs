@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -1039,7 +1039,8 @@ pub struct BuildIdIndexStats {
     pub deduped_across_mounts: usize,
     /// Distinct files whose ELF note was read and carried a build-id.
     pub files_indexed: usize,
-    /// Distinct files read whose note was absent or unreadable.
+    /// Reads that found no note, or could not be made. A file that was left for
+    /// the next process that maps it can count again.
     pub files_without_id: usize,
     /// Which budget stopped the walk, if one did.
     pub budget_hit: Option<BuildIdIndexLimit>,
@@ -1110,16 +1111,18 @@ struct StatKey {
 }
 
 impl StatKey {
-    /// One `statx` through the mapping's namespace-immune link, falling
-    /// back to the path as mapped (which works unprivileged for
-    /// same-namespace processes). `None` when neither can be read — a
-    /// process that raced to exit — and the caller goes on to the note
-    /// read, which fails the same way and is counted.
+    /// One `statx` through the mapping's namespace-immune link. Only a tracer
+    /// that may not follow such links ([`MAY_FOLLOW_MAP_FILES`]) falls back to
+    /// the path as mapped, which works for same-namespace processes. `None`
+    /// when no stat succeeds — a process that raced to exit — and the caller
+    /// goes on to the note read, which fails the same way and is counted.
     fn read(link: &Path, display: &Path) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(link)
-            .or_else(|_| std::fs::metadata(display))
-            .ok()?;
+        let meta = match std::fs::metadata(link) {
+            Err(_) if !*MAY_FOLLOW_MAP_FILES => std::fs::metadata(display),
+            meta => meta,
+        }
+        .ok()?;
         Some(StatKey {
             path: display.to_path_buf(),
             size: meta.size(),
@@ -1135,6 +1138,40 @@ fn build_id_index_walk_order(mut pids: Vec<i32>, sampled: &HashSet<i32>) -> Vec<
     pids.dedup();
     let (first, rest): (Vec<i32>, Vec<i32>) = pids.into_iter().partition(|p| sampled.contains(p));
     first.into_iter().chain(rest.into_iter().rev()).collect()
+}
+
+/// Whether this process may follow `/proc/<pid>/map_files` links, which takes
+/// `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE`. Decided once, from its own
+/// `/proc/self/map_files`.
+pub(crate) static MAY_FOLLOW_MAP_FILES: LazyLock<bool> =
+    LazyLock::new(|| may_follow_links_in(Path::new("/proc/self/map_files")));
+
+/// False if `dir` does not exist, or if following its first link fails with `EPERM`,
+/// as it does for a process with neither `CAP_SYS_ADMIN` nor `CAP_CHECKPOINT_RESTORE`;
+/// true for any other answer, an empty `dir` included.
+fn may_follow_links_in(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        links => links
+            .ok()
+            .and_then(|mut links| links.next()?.ok())
+            .and_then(|link| std::fs::metadata(link.path()).err())
+            .is_none_or(|e| e.raw_os_error() != Some(libc::EPERM)),
+    }
+}
+
+/// The build-id note of the file at `path`, a `map_files` link or a maps path,
+/// if it is a regular file and a note can be read.
+///
+/// The file is opened only if it is a regular file
+/// ([`crate::root::follow_to_regular`]), and the note is read through that
+/// descriptor, which stays open meanwhile.
+fn read_build_id_checked(path: &Path) -> Option<std::borrow::Cow<'static, [u8]>> {
+    use std::os::fd::AsRawFd;
+    let file = crate::root::follow_to_regular(path).ok()?;
+    read_elf_build_id(&format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .ok()
+        .flatten()
 }
 
 impl<'a> BuildIdIndexWalk<'a> {
@@ -1184,9 +1221,12 @@ impl<'a> BuildIdIndexWalk<'a> {
     ///
     /// Each mapping is read through its `map_files` link first — namespace-
     /// immune, so containerized processes' binaries index correctly under
-    /// the privileges that tracing needs — falling back to the
-    /// maps path, which works unprivileged for same-namespace processes. A
-    /// process racing to exit mid-read is just a miss.
+    /// the privileges that such links need. Only a tracer that may not
+    /// follow them ([`MAY_FOLLOW_MAP_FILES`]) falls back to the maps path,
+    /// which works for same-namespace processes. Either is opened only if a
+    /// regular file is there ([`read_build_id_checked`]). A process racing to
+    /// exit mid-read is just a miss; where links are followed, its file is left
+    /// for the next process that maps it.
     fn fill_from(&mut self, maps: &ProcessMaps) -> bool {
         self.stats.processes += 1;
         for (link, display, file_id) in maps.exec_file_links_with_ids() {
@@ -1200,7 +1240,11 @@ impl<'a> BuildIdIndexWalk<'a> {
             // mapping count, and one `statx` is far cheaper than the note
             // read it saves when the file is one already read through
             // another mount — the budget bounds note reads, not stats.
-            if StatKey::read(&link, &display).is_some_and(|key| !self.seen_by_stat.insert(key)) {
+            let key = StatKey::read(&link, &display);
+            if key
+                .as_ref()
+                .is_some_and(|key| !self.seen_by_stat.insert(key.clone()))
+            {
                 self.stats.deduped += 1;
                 self.stats.deduped_across_mounts += 1;
                 continue;
@@ -1208,15 +1252,26 @@ impl<'a> BuildIdIndexWalk<'a> {
             if self.over_budget() {
                 return false;
             }
-            let (bid, resolve_path) = match read_elf_build_id(&link) {
-                Ok(Some(b)) => (b, link),
-                _ => match read_elf_build_id(&display) {
-                    Ok(Some(b)) => (b, display.clone()),
-                    _ => {
-                        self.stats.files_without_id += 1;
-                        continue;
+            let found = match read_build_id_checked(&link) {
+                Some(b) => Some((b, &link)),
+                // The link leads to the file itself; the maps path serves only
+                // where links cannot be followed.
+                None if *MAY_FOLLOW_MAP_FILES => None,
+                None => read_build_id_checked(&display).map(|b| (b, &display)),
+            };
+            let Some((bid, resolve_path)) = found else {
+                self.stats.files_without_id += 1;
+                // Nothing is left to read here, so this miss says nothing of
+                // the file, which does not count as seen.
+                if *MAY_FOLLOW_MAP_FILES && std::fs::symlink_metadata(&link).is_err() {
+                    if let Some(fid) = file_id {
+                        self.seen.remove(&fid);
                     }
-                },
+                    if let Some(key) = key {
+                        self.seen_by_stat.remove(&key);
+                    }
+                }
+                continue;
             };
             let id = note_to_id(&bid);
             let module = display
@@ -1224,7 +1279,7 @@ impl<'a> BuildIdIndexWalk<'a> {
                 .and_then(|f| f.to_str())
                 .unwrap_or("[buildid]")
                 .to_string();
-            self.store.fill_live(id, resolve_path, module);
+            self.store.fill_live(id, resolve_path.clone(), module);
             self.stats.files_indexed += 1;
         }
         true
@@ -1412,10 +1467,8 @@ fn reconstruct_build_id_addr(
 ) -> Option<u64> {
     let maps = maps?;
     for (addr, link) in maps.virt_candidates_for_file_offset(file_offset) {
-        if let Ok(Some(bid)) = read_elf_build_id(&link) {
-            if note_to_id(&bid) == *id {
-                return Some(addr);
-            }
+        if read_build_id_checked(&link).is_some_and(|bid| note_to_id(&bid) == *id) {
+            return Some(addr);
         }
     }
     for addr in maps.pool_candidates_for_offset(file_offset) {
@@ -1423,10 +1476,10 @@ fn reconstruct_build_id_addr(
             // Case 2: syscall-patch island — a file-backed neighbour carries
             // the authoritative note.
             Some(bridge) => {
-                if let Ok(Some(bid)) = read_elf_build_id(&bridge.map_files_path) {
-                    if note_to_id(&bid) == *id {
-                        return Some(addr);
-                    }
+                if read_build_id_checked(&bridge.map_files_path)
+                    .is_some_and(|bid| note_to_id(&bid) == *id)
+                {
+                    return Some(addr);
                 }
             }
             // Case 3: fully pool-backed guest text — no file neighbour, so the
@@ -2685,7 +2738,7 @@ fn dispatch_process_with_client(
 
     match entry {
         ProcessMemberType::Path(path) => {
-            let build_id = if let Some(build_id) = read_elf_build_id(&path.maps_file)? {
+            let build_id = if let Some(build_id) = read_build_id_checked(&path.maps_file) {
                 BuildId::raw(build_id)
             } else {
                 return Ok(None);
@@ -2883,30 +2936,86 @@ mod tests {
         assert_eq!(note_to_id(&[0x7; 24]), [0x7; 20], "long notes truncate");
     }
 
-    /// Two fake processes mapping the same file (one dev/inode at two
-    /// paths, as two mount namespaces would show it) and one other file. The
-    /// fixture tgids do not exist and the paths are not ELF files, so every
-    /// non-deduplicated mapping is one failed read counted in
-    /// `files_without_id`: the dedupe and budget decisions happen before the
-    /// read and are what these tests pin.
-    fn fill_fixture() -> (ProcessMaps, ProcessMaps) {
-        let a = ProcessMaps::parse(
+    /// A fake process that maps two files. The fixture tgid does not exist and
+    /// the paths are not ELF files, so each mapping is one failed read counted
+    /// in `files_without_id`: the budget decisions happen before the read and
+    /// are what these tests pin.
+    fn fill_fixture() -> ProcessMaps {
+        ProcessMaps::parse(
             -43,
             "400000-500000 r-xp 00000000 08:01 7 /usr/bin/x\n\
              700000-800000 r-xp 00000000 08:01 9 /usr/lib/y.so",
             "x",
-        );
-        let b = ProcessMaps::parse(
-            -44,
-            "400000-500000 r-xp 00000000 08:01 7 /rootfs/usr/bin/x",
-            "x",
-        );
-        (a, b)
+        )
+    }
+
+    /// A file mapped into the test's own process, so that a real `map_files`
+    /// link leads to it. A walk over [`MappedFile::maps`] then goes through the
+    /// link where the test may follow such links, as a privileged tracer may, and
+    /// by the maps path where it may not.
+    struct MappedFile {
+        addr: usize,
+    }
+
+    impl MappedFile {
+        /// One page. A `map_files` entry exists only for its mapping's exact range,
+        /// so `maps` has to end where the mapping does.
+        fn len() -> usize {
+            // SAFETY: asks for a number.
+            unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+        }
+
+        fn new(path: &Path) -> Self {
+            use std::os::fd::AsRawFd;
+            let file = File::open(path).unwrap();
+            // SAFETY: a new private, read-only mapping at an address that the
+            // kernel picks; nothing reads through it.
+            let addr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    Self::len(),
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(addr, libc::MAP_FAILED);
+            MappedFile {
+                addr: addr as usize,
+            }
+        }
+
+        /// Maps of this process that hold the mapping alone, shown as
+        /// executable, on device `dev`, with `path` as its path.
+        fn maps(&self, dev: &str, path: &Path) -> ProcessMaps {
+            let line = format!(
+                "{:x}-{:x} r-xp 00000000 {dev} 100 {}",
+                self.addr,
+                self.addr + Self::len(),
+                path.display()
+            );
+            ProcessMaps::parse(std::process::id() as i32, &line, "x")
+        }
+    }
+
+    impl Drop for MappedFile {
+        fn drop(&mut self) {
+            // SAFETY: the mapping made in `new`, to which nothing else refers.
+            unsafe { libc::munmap(self.addr as *mut libc::c_void, Self::len()) };
+        }
     }
 
     #[test]
     fn test_build_id_fill_dedupes_files_across_processes() {
-        let (a, b) = fill_fixture();
+        // One real file, really mapped: two sets of maps show the mapping with
+        // one device and inode at two paths, as two mount namespaces would.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x");
+        std::fs::write(&file, b"not an elf").unwrap();
+        let mapped = MappedFile::new(&file);
+        let a = mapped.maps("08:01", &file);
+        let b = mapped.maps("08:01", Path::new("/rootfs/usr/bin/x"));
         let mut store = BuildIdStore::new(None);
         let unbounded = BuildIdIndexBudget {
             max_files: 0,
@@ -2917,19 +3026,76 @@ mod tests {
         assert!(walk.fill_from(&b));
         let stats = walk.stats;
         assert_eq!(stats.processes, 2);
-        assert_eq!(stats.mappings, 3);
-        assert_eq!(stats.deduped, 1, "b's /rootfs/usr/bin/x is a's /usr/bin/x");
-        assert_eq!(
-            stats.files_without_id, 2,
-            "one read attempt per distinct file"
-        );
+        assert_eq!(stats.mappings, 2);
+        assert_eq!(stats.deduped, 1, "b's /rootfs/usr/bin/x is a's file");
+        assert_eq!(stats.deduped_across_mounts, 0);
+        assert_eq!(stats.files_without_id, 1, "one read for the one file");
         assert_eq!(stats.files_indexed, 0);
         assert_eq!(stats.budget_hit, None);
     }
 
     #[test]
+    fn test_build_id_read_opens_only_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(read_build_id_checked(&fifo).is_none());
+        assert!(read_build_id_checked(Path::new("/dev/null")).is_none());
+    }
+
+    /// A file whose first process is gone is read through the next one. Only a run
+    /// that may follow `map_files` links shows it: elsewhere a process's end does
+    /// not bear on the read, which goes by the maps path.
+    #[test]
+    fn test_build_id_fill_reads_a_file_again_after_a_process_that_is_gone() {
+        let exe = std::fs::read_link("/proc/self/exe").unwrap();
+        if !matches!(read_elf_build_id(&exe), Ok(Some(_))) {
+            eprintln!("skipping: test binary has no GNU build-id note");
+            return;
+        }
+        let mapped = MappedFile::new(&exe);
+        // The device and inode that `mapped.maps` shows. The tgid does not exist,
+        // and nothing lies at the path.
+        let line = "400000-500000 r-xp 00000000 08:01 100 /nonexistent/x";
+        let mut store = BuildIdStore::new(None);
+        let mut walk = BuildIdIndexWalk::new(&mut store, BuildIdIndexBudget::default());
+        assert!(walk.fill_from(&ProcessMaps::parse(-43, line, "x")));
+        assert!(walk.fill_from(&mapped.maps("08:01", &exe)));
+        assert_eq!(walk.stats.files_without_id, 1);
+        let privileged = *MAY_FOLLOW_MAP_FILES;
+        let read_again = (walk.stats.files_indexed, walk.stats.deduped);
+        assert_eq!(read_again, if privileged { (1, 0) } else { (0, 1) });
+    }
+
+    /// A tracer that may follow `map_files` links does not use the maps path. Only
+    /// a run that may follow them shows it.
+    #[test]
+    fn test_build_id_fill_falls_back_to_the_maps_path_only_without_the_privilege() {
+        let exe = std::fs::read_link("/proc/self/exe").unwrap();
+        if !matches!(read_elf_build_id(&exe), Ok(Some(_))) {
+            eprintln!("skipping: test binary has no GNU build-id note");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.bin");
+        std::os::unix::fs::symlink(&exe, &path).unwrap();
+        // The tgid does not exist, so the mapping's link cannot be read.
+        let line = format!("400000-500000 r-xp 00000000 08:01 7 {}", path.display());
+        let mut store = BuildIdStore::new(None);
+        let mut walk = BuildIdIndexWalk::new(&mut store, BuildIdIndexBudget::default());
+        assert!(walk.fill_from(&ProcessMaps::parse(-43, &line, "x")));
+        let privileged = *MAY_FOLLOW_MAP_FILES;
+        let indexed = (walk.stats.files_indexed, walk.stats.files_without_id);
+        assert_eq!(indexed, if privileged { (0, 1) } else { (1, 0) });
+        let link = Path::new("/proc/-43/map_files/400000-500000");
+        assert_eq!(StatKey::read(link, &path).is_some(), !privileged);
+    }
+
+    #[test]
     fn test_build_id_fill_stops_at_the_file_budget() {
-        let (a, _unvisited) = fill_fixture();
+        let a = fill_fixture();
         let mut store = BuildIdStore::new(None);
         let one_file = BuildIdIndexBudget {
             max_files: 1,
@@ -2937,8 +3103,7 @@ mod tests {
         };
         let mut walk = BuildIdIndexWalk::new(&mut store, one_file);
         // The first file is read; the second distinct file is over budget,
-        // and the caller stops walking on `false` (the second process is
-        // never visited).
+        // and the caller stops walking on `false`.
         assert!(!walk.fill_from(&a));
         let stats = walk.stats;
         assert_eq!(stats.files_without_id, 1);
@@ -2952,7 +3117,7 @@ mod tests {
 
     #[test]
     fn test_build_id_fill_stops_at_the_time_budget() {
-        let (a, _) = fill_fixture();
+        let a = fill_fixture();
         let mut store = BuildIdStore::new(None);
         let one_ms = BuildIdIndexBudget {
             max_files: 0,
@@ -3060,24 +3225,16 @@ mod tests {
     /// The same file seen through two mounts: each container's maps line
     /// carries its own overlay device, so the exact key differs, and the
     /// second tier (path + size + mtime through one stat) collapses them.
-    /// Built with one real file: two fake processes map it at the same
-    /// path with different devices.
+    /// Built with one real file, really mapped: two sets of maps show the
+    /// mapping at the same path with different devices.
     #[test]
     fn test_build_id_fill_dedupes_the_same_file_across_mounts() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("libc.so.6");
         std::fs::write(&file, b"not an elf").unwrap();
-        let path = file.display();
-        let a = ProcessMaps::parse(
-            -45,
-            &format!("400000-500000 r-xp 00000000 00:d4 100 {path}"),
-            "a",
-        );
-        let b = ProcessMaps::parse(
-            -46,
-            &format!("400000-500000 r-xp 00000000 00:d5 100 {path}"),
-            "b",
-        );
+        let mapped = MappedFile::new(&file);
+        let a = mapped.maps("00:d4", &file);
+        let b = mapped.maps("00:d5", &file);
         let mut store = BuildIdStore::new(None);
         let budget = BuildIdIndexBudget {
             max_files: 0,
@@ -3103,17 +3260,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("libc.so.6");
         std::fs::write(&file, b"not an elf").unwrap();
-        let path = file.display();
-        let a = ProcessMaps::parse(
-            -47,
-            &format!("400000-500000 r-xp 00000000 00:d4 100 {path}"),
-            "a",
-        );
-        let b = ProcessMaps::parse(
-            -48,
-            &format!("400000-500000 r-xp 00000000 00:d5 100 {path}"),
-            "b",
-        );
+        let mapped = MappedFile::new(&file);
+        let a = mapped.maps("00:d4", &file);
+        let b = mapped.maps("00:d5", &file);
         let mut store = BuildIdStore::new(None);
         let budget = BuildIdIndexBudget {
             max_files: 0,
@@ -4804,5 +4953,14 @@ mod tests {
         // so the file-backed axis reads as a positive value from our own statm.
         let v = current_file_rss_bytes().expect("statm is readable for self");
         assert!(v > 0, "file-backed RSS should be > 0 for a running process");
+    }
+
+    #[test]
+    fn test_a_proc_without_map_files_counts_as_may_not_follow() {
+        assert!(!may_follow_links_in(Path::new(
+            "/proc/self/no-such-directory"
+        )));
+        // Links that can be looked at count as "may".
+        assert!(may_follow_links_in(Path::new("/proc/self/fd")));
     }
 }

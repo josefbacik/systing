@@ -19,6 +19,8 @@
 use super::offsets::{self, ObjectOffsets};
 use super::process::{ProcessMemory, ReadMemory};
 use super::pyobject::PyReader;
+use crate::limits::Limit;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{Duration, Instant};
@@ -30,8 +32,8 @@ const RETRY_AFTER: Duration = Duration::from_secs(2);
 /// How long a process's names are taken as read. Finding them is a walk of
 /// `_active` and several reads for each thread in it, every thread of the
 /// process and not just the ones asked about, and a name hardly ever changes.
-/// A thread not seen before is looked up at once; a rename shows this much
-/// later at most.
+/// A thread not seen before is looked up at once, a rename this much later at
+/// most, except while the process rests after a walk ([`REST_FOR_WALK`]).
 const REFRESH_AFTER: Duration = Duration::from_secs(1);
 
 /// Most entries of `threading._active` that are followed. It has one per live
@@ -39,6 +41,71 @@ const REFRESH_AFTER: Duration = Duration::from_secs(1);
 /// in it; every entry costs several reads of its memory, on every read of its
 /// names. This many threads is as many as the task-stacks recorder tracks.
 const MAX_THREADS: usize = 1 << 16;
+
+/// Most bytes of a process's memory that one walk may read, each read counted
+/// as its length plus [`READ_COST`]. This is room for some ten thousand
+/// threads.
+const WALK_BUDGET: u64 = 32 << 20;
+
+/// Added to each read's length: a system call takes about as long as copying
+/// this many bytes and looking through them.
+const READ_COST: u64 = 256;
+
+/// No read of a walk starts later than this after the walk began.
+const WALK_TIME: Duration = Duration::from_secs(1);
+
+/// After a walk that took t, its process is left alone for this many times t,
+/// so that one process's names take a small share of the snapshot thread's time.
+const REST_FOR_WALK: u32 = 24;
+
+/// Walks that stopped at [`WALK_BUDGET`] or [`WALK_TIME`].
+static WALKS_CUT_SHORT: Limit = Limit::new("readings of Python thread names cut short");
+
+/// A process's memory under a budget and a deadline: once a read would pass
+/// either, it and every later read fail.
+struct Metered<'a, M: ReadMemory> {
+    mem: &'a M,
+    deadline: Instant,
+    /// What is left of the budget, `None` once a read has been refused.
+    left: Cell<Option<u64>>,
+    /// Whether it was the deadline that refused it.
+    late: Cell<bool>,
+    /// Whether the process's memory has answered any read.
+    answered: Cell<bool>,
+}
+
+impl<'a, M: ReadMemory> Metered<'a, M> {
+    fn new(mem: &'a M, budget: u64, deadline: Instant) -> Self {
+        Self {
+            mem,
+            deadline,
+            left: Cell::new(Some(budget)),
+            late: Cell::new(false),
+            answered: Cell::new(false),
+        }
+    }
+
+    fn cut_short(&self) -> bool {
+        self.left.get().is_none()
+    }
+}
+
+impl<M: ReadMemory> ReadMemory for Metered<'_, M> {
+    fn read_exact_at(&self, addr: usize, buf: &mut [u8]) -> bool {
+        let mut left = self
+            .left
+            .get()
+            .and_then(|left| left.checked_sub(buf.len() as u64 + READ_COST));
+        if left.is_some() && Instant::now() >= self.deadline {
+            self.late.set(true);
+            left = None;
+        }
+        self.left.set(left);
+        let read = left.is_some() && self.mem.read_exact_at(addr, buf);
+        self.answered.set(self.answered.get() || read);
+        read
+    }
+}
 
 /// What `_PyRuntime` starts with in a Python that publishes its offsets.
 pub(super) const DEBUG_OFFSETS_COOKIE: &[u8; 8] = b"xdebugpy";
@@ -215,17 +282,20 @@ pub struct ThreadNames<M: ReadMemory = ProcessMemory> {
     /// When to look for it again, after not finding it.
     retry_at: Option<Instant>,
     host_tids: HostTids,
-    /// The names as the last walk of `_active` found them, by host tid, and
-    /// when that was.
+    /// The names that the last walk of `_active` found for the threads it was
+    /// asked about, by host tid, and when that was.
     names: HashMap<i32, String>,
     walked_at: Option<Instant>,
+    /// No walk before this, even for a thread not seen before: see
+    /// [`REST_FOR_WALK`].
+    rest_until: Option<Instant>,
     /// The tids asked about so far that a walk found no thread for: one that
     /// `threading` did not start (a C library's pool, say) is never in
     /// `_active`, and is no reason to walk again. Kept from walk to walk, as
     /// the snapshots ask about different threads each time; one that gets a
     /// Thread object after all is named at the next timed walk.
     absent: HashSet<i32>,
-    /// `_PyRuntime` itself could not be read: see [`Self::is_gone`].
+    /// A walk that no limit cut short read nothing: see [`Self::is_gone`].
     gone: bool,
 }
 
@@ -267,6 +337,7 @@ impl ThreadNames {
             },
             names: HashMap::new(),
             walked_at: None,
+            rest_until: None,
             absent: HashSet::new(),
             gone: false,
         })
@@ -286,18 +357,24 @@ impl<M: ReadMemory> ThreadNames<M> {
     /// that stays blocked can be renamed by another, and one can have been
     /// asked about before its name could be read. When nothing is read there
     /// is nothing new, and nothing comes back. Nothing either when the process
-    /// has not imported `threading`, or is gone.
+    /// has not imported `threading`, is gone, or still rests after its last walk.
     ///
     /// Only `seen` are answered for, and they have to be the process's own: a
     /// name's tid is the process's word (`Thread._native_id`), checked against
     /// its tasks only for a process in a pid namespace, on the way to the
     /// host's ids.
     pub fn read(&mut self, changed: &HashSet<i32>, seen: &HashSet<i32>) -> HashMap<i32, String> {
-        self.read_at(changed, seen, Instant::now())
+        self.read_at(changed, seen, Instant::now(), WALK_BUDGET)
     }
 
-    /// Whether this reader has lost its process: not `_active` but
-    /// `_PyRuntime` itself no longer reads. The open /proc/pid/mem is of the
+    /// Whether the process is still left alone after its last walk, so that
+    /// [`Self::read`] would answer nothing.
+    pub fn rests(&self) -> bool {
+        self.rest_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Whether this reader has lost its process: a walk that no limit cut short
+    /// read nothing, not even `_PyRuntime`. The open /proc/pid/mem is of the
     /// address space it was opened on, and after an exec (the pid lives on)
     /// every read of it comes back short for good. A reader opened afresh
     /// sees the new one.
@@ -310,7 +387,11 @@ impl<M: ReadMemory> ThreadNames<M> {
         changed: &HashSet<i32>,
         seen: &HashSet<i32>,
         now: Instant,
+        budget: u64,
     ) -> HashMap<i32, String> {
+        if self.rest_until.is_some_and(|until| now < until) {
+            return HashMap::new();
+        }
         let stale = self
             .walked_at
             .is_none_or(|at| now.duration_since(at) >= REFRESH_AFTER);
@@ -318,16 +399,19 @@ impl<M: ReadMemory> ThreadNames<M> {
         if !stale && !changed.iter().any(unseen) {
             return HashMap::new();
         }
-        self.walk(seen, now);
+        let began = Instant::now();
+        self.walk(seen, now, budget);
+        self.rest_until = Some(now + began.elapsed() * (1 + REST_FOR_WALK));
         seen.iter()
             .filter_map(|tid| Some((*tid, self.names.get(tid)?.clone())))
             .collect()
     }
 
     /// Read every thread's name again, and note which of `tids` have none.
-    fn walk(&mut self, tids: &HashSet<i32>, now: Instant) {
+    fn walk(&mut self, tids: &HashSet<i32>, now: Instant, budget: u64) {
         self.host_tids.rescanned = false;
-        let py = PyReader::new(&self.mem, self.offsets);
+        let mem = Metered::new(&self.mem, budget, Instant::now() + WALK_TIME);
+        let py = PyReader::new(&mem, self.offsets);
         if self.active.is_none() {
             if self.retry_at.is_some_and(|at| now < at) {
                 return;
@@ -338,10 +422,28 @@ impl<M: ReadMemory> ThreadNames<M> {
         let names = self
             .active
             .and_then(|active| read_names(&py, active, MAX_THREADS));
+        if mem.cut_short() {
+            WALKS_CUT_SHORT.hit();
+            static SAID: std::sync::Once = std::sync::Once::new();
+            let pid = self.host_tids.pid;
+            let limit = if mem.late.get() {
+                format!("{} s", WALK_TIME.as_secs())
+            } else {
+                format!("{} MiB of reads", budget >> 20)
+            };
+            SAID.call_once(|| {
+                eprintln!(
+                    "pystacks: stopped reading the thread names of Python process {pid} at its \
+                     limit of {limit}; threads not reached have no name"
+                );
+            });
+        }
         let Some(names) = names else {
             // No dict, or not the dict it was: the process may have exec'd.
             // Look for it again, and do not answer with what is no longer so.
-            self.gone = py.ptr(self.runtime_addr).is_none();
+            py.ptr(self.runtime_addr);
+            // After an exec no read is answered, the one just made included.
+            self.gone = !mem.answered.get() && !mem.cut_short();
             self.active = None;
             self.names.clear();
             self.absent.clear();
@@ -354,6 +456,7 @@ impl<M: ReadMemory> ThreadNames<M> {
                 let host = self.host_tids.host_tid(i32::try_from(native_id).ok()?)?;
                 Some((host, name))
             })
+            .filter(|(host, _)| tids.contains(host))
             .collect();
         self.absent.retain(|tid| !self.names.contains_key(tid));
         if self.absent.len() > MAX_THREADS {
@@ -513,6 +616,7 @@ mod tests {
             },
             names: HashMap::new(),
             walked_at: None,
+            rest_until: None,
             absent: HashSet::new(),
             gone: false,
         };
@@ -521,11 +625,14 @@ mod tests {
         // all the process's threads, this long after the start.
         let ask =
             |names: &mut ThreadNames<FakeMemory>, changed: &[i32], seen: &[i32], after_ms: u64| {
+                // A rest's length goes by the real clock, these asks by a made-up one.
+                names.rest_until = None;
                 let mut got: Vec<_> = names
                     .read_at(
                         &changed.iter().copied().collect(),
                         &seen.iter().copied().collect(),
                         start + Duration::from_millis(after_ms),
+                        WALK_BUDGET,
                     )
                     .into_iter()
                     .collect();
@@ -585,6 +692,128 @@ mod tests {
             ask(&mut names, &[100], &[100, 101], 2_350),
             named(&[(100, "again"), (101, "renamed by another")])
         );
+    }
+
+    /// Memory that counts the reads made of it, and waits a set time at each.
+    struct Counted {
+        mem: FakeMemory,
+        reads: Cell<u32>,
+        delay: Duration,
+    }
+
+    impl ReadMemory for Counted {
+        fn read_exact_at(&self, addr: usize, buf: &mut [u8]) -> bool {
+            self.reads.set(self.reads.get() + 1);
+            std::thread::sleep(self.delay);
+            self.mem.read_exact_at(addr, buf)
+        }
+    }
+
+    /// A reader of a process whose `_active` lists a thread named "MainThread"
+    /// for each of `tids`.
+    fn threads_with_tids(tids: &[i64]) -> ThreadNames<Counted> {
+        let mem = FakeMemory::new();
+        let o = offsets::object_offsets_for_version(3, 13).unwrap();
+        let keys: Vec<(usize, usize)> = ["_target", "_name", "_native_id"]
+            .iter()
+            .map(|k| (mem.str(&o, k), 0))
+            .collect();
+        let tp = mem.heap_type(&o, INLINE_TYPE, 16, mem.keys(&o, 2, &keys));
+        let (name, ident) = (mem.str(&o, "MainThread"), mem.long(&o, 0x7f01));
+        let threads: Vec<(usize, usize)> = tids
+            .iter()
+            .map(|tid| {
+                let values = [0, name, mem.long(&o, *tid)];
+                (ident, mem.instance(&o, tp, 16, &values, true, 0))
+            })
+            .collect();
+        let active = mem.dict(&o, 0, &threads);
+        ThreadNames {
+            runtime_addr: mem.alloc(8),
+            mem: Counted {
+                mem,
+                reads: Cell::new(0),
+                delay: Duration::ZERO,
+            },
+            offsets: o,
+            active: Some(active),
+            retry_at: None,
+            host_tids: HostTids {
+                pid: 0,
+                nested: Some(false),
+                by_inner: HashMap::new(),
+                rescanned: false,
+            },
+            names: HashMap::new(),
+            walked_at: None,
+            rest_until: None,
+            absent: HashSet::new(),
+            gone: false,
+        }
+    }
+
+    #[test]
+    fn no_read_is_made_past_the_deadline() {
+        let mem = FakeMemory::new();
+        let addr = mem.alloc(8);
+        let in_time = Metered::new(&mem, WALK_BUDGET, Instant::now() + WALK_TIME);
+        assert!(in_time.read_exact_at(addr, &mut [0; 8]));
+        let late = Metered::new(&mem, WALK_BUDGET, Instant::now());
+        assert!(!late.read_exact_at(addr, &mut [0; 8]));
+        assert!(late.cut_short() && late.late.get());
+    }
+
+    #[test]
+    fn a_rest_is_many_times_as_long_as_its_walk() {
+        let mut names = threads_with_tids(&[100]);
+        names.mem.delay = Duration::from_millis(1);
+        let (start, tids) = (Instant::now(), HashSet::from([100]));
+        assert!(!names.read_at(&tids, &tids, start, WALK_BUDGET).is_empty());
+        let took_at_least = names.mem.delay * names.mem.reads.get();
+        assert!(names.rest_until >= Some(start + took_at_least * (1 + REST_FOR_WALK)));
+    }
+
+    #[test]
+    fn a_process_is_left_alone_while_it_rests() {
+        let mut names = threads_with_tids(&[100]);
+        let start = Instant::now();
+        let (main, both) = (HashSet::from([100]), HashSet::from([100, 101]));
+        assert!(!names.read_at(&main, &main, start, WALK_BUDGET).is_empty());
+        assert!(names.rest_until > Some(start));
+
+        // Neither the names' age nor a thread not seen before ends a rest.
+        let until = start + Duration::from_secs(5);
+        names.rest_until = Some(until);
+        let reads = names.mem.reads.get();
+        let resting = until - Duration::from_millis(1);
+        assert!(names.read_at(&both, &both, resting, WALK_BUDGET).is_empty());
+        assert_eq!(names.mem.reads.get(), reads);
+        assert!(!names.read_at(&both, &both, until, WALK_BUDGET).is_empty());
+    }
+
+    /// Nothing is mapped here in a [`FakeMemory`].
+    const UNMAPPED: usize = 0xdead_0000;
+
+    #[test]
+    fn a_walk_cut_short_is_not_taken_for_an_exec() {
+        let mut names = threads_with_tids(&[100]);
+        let tids = HashSet::from([100]);
+        assert!(names
+            .read_at(&tids, &tids, Instant::now(), READ_COST)
+            .is_empty());
+        assert!(!names.is_gone());
+    }
+
+    #[test]
+    fn a_process_that_answers_no_read_is_taken_for_gone() {
+        let mut names = threads_with_tids(&[100]);
+        names.active = Some(UNMAPPED);
+        names.runtime_addr = UNMAPPED;
+        let tids = HashSet::from([100]);
+        assert!(names
+            .read_at(&tids, &tids, Instant::now(), WALK_BUDGET)
+            .is_empty());
+        assert!(names.is_gone());
     }
 
     #[test]

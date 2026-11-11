@@ -22,7 +22,7 @@
 pub mod discovery;
 pub mod values;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -32,6 +32,7 @@ use anyhow::{Context, Result};
 use libbpf_rs::{MapCore, MapFlags, MapHandle, RingBuffer, RingBufferBuilder};
 
 use crate::parquet::{ParquetSink, StreamingParquetWriter};
+use crate::stop::{join_at_stop, STOP_JOIN_LIMIT};
 use crate::utid::UtidGenerator;
 use discovery::{all_pids, Discovery, DiscoveryCounters, Finding, Recipe};
 use values::ValuesSink;
@@ -146,6 +147,8 @@ pub struct Running {
     stats: MapHandle,
     exec_notices_unqueued: Arc<AtomicU64>,
     attached: Option<SyncSender<()>>,
+    /// Tells the discovery thread that the capture is over.
+    stopped: Arc<AtomicBool>,
 }
 
 /// What [`start`] hands back: the rings the caller polls (each with the
@@ -158,9 +161,10 @@ pub struct Started<'a> {
 /// Processes that link the library and had not published a recipe when they
 /// were last looked at, each with the time of its next look. Bounded both
 /// ways: in how many it holds and in how often each is looked at, so that a
-/// process which never publishes is not read for ever. A process is looked at
-/// when ITS time comes, never because something else happened: on a host that
-/// execs all the time, the list is not scanned once per exec.
+/// process which never publishes is not read for ever. A full list makes room
+/// for a newcomer (see `add`). A process is looked at when ITS time comes, never
+/// because something else happened: on a host that execs all the time, the list
+/// is not scanned once per exec.
 #[derive(Debug, Default)]
 struct LookAgain {
     /// (process, looks so far, when it is next looked at)
@@ -180,8 +184,11 @@ impl LookAgain {
     }
 
     /// Wait for `pid`; a process already waiting has a new image, so its
-    /// schedule starts again. Returns false, and takes nothing, when the
-    /// list is full.
+    /// schedule starts again. In a full list `pid` takes the place of the
+    /// process that has been looked at most often since its last exec (of
+    /// several, the one that came first): a program that is starting mostly
+    /// publishes within its first looks. It then returns false, and the caller
+    /// counts that process as given up.
     fn add(&mut self, pid: u32, now: Instant) -> bool {
         let entry = (pid, 0, now + Self::wait_after(0));
         if let Some(waiting) = self
@@ -192,11 +199,21 @@ impl LookAgain {
             *waiting = entry;
             return true;
         }
-        if self.waiting.len() >= Self::MAX_WAITING {
-            return false;
+        if self.waiting.len() < Self::MAX_WAITING {
+            self.waiting.push(entry);
+            return true;
         }
-        self.waiting.push(entry);
-        true
+        // The list is in the order of first coming: a new image keeps its place.
+        let most = self.waiting.iter().map(|(_, looks, _)| *looks).max();
+        if let Some(at) = self
+            .waiting
+            .iter()
+            .position(|(_, looks, _)| Some(*looks) == most)
+        {
+            self.waiting.remove(at);
+            self.waiting.push(entry);
+        }
+        false
     }
 
     /// When the next look is due, if any process is waiting.
@@ -321,12 +338,16 @@ struct DiscoveryJob {
 /// attached (from then on an exec is announced), looks at the capture's
 /// targets once more, or at every process when there are none, then serves
 /// exec notices as they come and each waiting process when its time comes.
-/// It ends when the ring that feeds it is dropped and the notices already
-/// queued are served.
+/// It ends once the ring that feeds it is dropped and its queue is empty. Once
+/// `stopped` is set no sample is taken any more, so it serves at most the notice
+/// in hand and no waiting process, counts the notices still queued, and ends;
+/// only the look in progress, or the pass over the targets or the host that it
+/// begins with, runs to its end.
 fn discovery_thread(
     job: DiscoveryJob,
     attached: Receiver<()>,
     execs: Receiver<u32>,
+    stopped: &AtomicBool,
 ) -> DiscoveryCounters {
     let DiscoveryJob {
         mut discovery,
@@ -379,6 +400,10 @@ fn discovery_thread(
         }
     }
     loop {
+        if stopped.load(Ordering::Relaxed) {
+            discovery.counters.unserved += execs.try_iter().count() as u64;
+            break;
+        }
         let wait = look_again.next_due().map_or(LOOK_AGAIN_EVERY, |due| {
             due.saturating_duration_since(Instant::now())
         });
@@ -391,7 +416,12 @@ fn discovery_thread(
             let mut found = Vec::new();
             let gave_up = look_again.tick(
                 Instant::now(),
-                |pid| discovery.look(pid),
+                |pid| {
+                    if stopped.load(Ordering::Relaxed) {
+                        return Finding::Gone;
+                    }
+                    discovery.look(pid)
+                },
                 |pid, recipe| found.push((pid, recipe)),
             );
             discovery.counters.gave_up += gave_up;
@@ -425,6 +455,7 @@ pub fn start<'a>(
         );
     }
     let exec_notices_unqueued = Arc::new(AtomicU64::new(0));
+    let stopped = Arc::new(AtomicBool::new(false));
     let Plan::Live { first, walk } = plan(&options) else {
         eprintln!(
             "task_context: the kernel's confidentiality mode is on: no process is looked at \
@@ -438,6 +469,7 @@ pub fn start<'a>(
                 stats: maps.stats,
                 exec_notices_unqueued,
                 attached: None,
+                stopped,
             },
         });
     };
@@ -501,9 +533,10 @@ pub fn start<'a>(
         planted: options.planted_recipes,
     };
     let (attached_tx, attached_rx) = sync_channel::<()>(1);
+    let stopped_for_thread = Arc::clone(&stopped);
     let discovery_handle = thread::Builder::new()
         .name("tcx_discovery".to_string())
-        .spawn(move || discovery_thread(job, attached_rx, exec_rx))
+        .spawn(move || discovery_thread(job, attached_rx, exec_rx, &stopped_for_thread))
         .context("task_context: the discovery thread")?;
 
     Ok(Started {
@@ -517,6 +550,7 @@ pub fn start<'a>(
             stats: maps.stats,
             exec_notices_unqueued,
             attached: Some(attached_tx),
+            stopped,
         },
     })
 }
@@ -549,9 +583,10 @@ impl Running {
     }
 
     /// Stop the feature. Called once the pollers of the rings [`start`]
-    /// returned have been joined and the rings dropped: that is what ends
-    /// the discovery thread and leaves this the table's only owner.
+    /// returned have been joined and the rings dropped: nothing more reaches
+    /// the discovery thread, and this is the table's only owner.
     pub fn finish(mut self) -> Result<()> {
+        self.stopped.store(true, Ordering::Relaxed);
         // A capture that never said "attached" must not leave the discovery
         // thread waiting for it while this waits for the thread.
         drop(self.attached.take());
@@ -573,9 +608,11 @@ impl Running {
         println!("task_context samples: {samples}");
 
         if let Some(discovery) = self.discovery {
-            match discovery.join() {
-                Ok(counters) => println!("task_context discovery: {}", counters.summary()),
-                Err(_) => eprintln!("task_context: the discovery thread panicked"),
+            // The thread shares nothing with what follows: it has a handle of
+            // its own on the recipes' map, and its tables.
+            let name = "task_context discovery";
+            if let Some(counters) = join_at_stop(name, discovery, STOP_JOIN_LIMIT) {
+                println!("task_context discovery: {}", counters.summary());
             }
         }
         let unqueued = self.exec_notices_unqueued.load(Ordering::Relaxed);
@@ -718,9 +755,39 @@ mod tests {
         }
         assert!(!list.add(u32::MAX, now));
         assert!(
-            list.add(0, now),
+            list.add(1, now),
             "a process already waiting is not a new entry"
         );
+        assert_eq!(list.waiting.len(), LookAgain::MAX_WAITING);
+    }
+
+    /// In a full list a newcomer takes the place of the process looked at most
+    /// often, the first of several, so one with a new image keeps its own.
+    #[test]
+    fn a_full_list_makes_room_for_a_newcomer() {
+        let start = Instant::now();
+        let mut list = LookAgain::default();
+        let waits = |list: &LookAgain, pid| list.waiting.iter().any(|(each, ..)| *each == pid);
+        for pid in 0..LookAgain::MAX_WAITING as u32 {
+            list.add(pid, start);
+        }
+        // None has been looked at yet: the first to come go.
+        assert!(!list.add(1000, start));
+        assert!(!list.add(1001, start));
+        assert!(waits(&list, 1000) && waits(&list, 1001));
+        assert!(!waits(&list, 0) && !waits(&list, 1));
+
+        // Every process but 7, which has a new image, has two looks behind it.
+        for _ in 0..2 {
+            let due = list.next_due().unwrap();
+            list.tick(due, |_| Finding::NotYet, |_, _| unreachable!());
+        }
+        list.add(7, start + ms(40));
+        for newcomer in 2001..2000 + LookAgain::MAX_WAITING as u32 {
+            assert!(!list.add(newcomer, start + ms(40)));
+            assert!(waits(&list, newcomer) && waits(&list, 7));
+        }
+        assert!(!waits(&list, 1000) && !waits(&list, 1001));
         assert_eq!(list.waiting.len(), LookAgain::MAX_WAITING);
     }
 

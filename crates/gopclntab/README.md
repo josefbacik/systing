@@ -23,9 +23,11 @@ otherwise be unreadable.
   Go ≤ 1.15 tables and big-endian are rejected as unsupported.
 - **One dependency**: the [`object`](https://crates.io/crates/object) crate (read core + ELF format only) for ELF section access.
 - **Untrusted input is the design point**: every offset is bounds-checked;
-  malformed tables produce errors or lookup misses, never panics. The test
-  suite includes truncation sweeps and corrupted-field cases, and the
-  parser is validated against binaries produced by the real Go toolchain.
+  a function's name is read up to 4 KiB, and a longer one is cut to at most
+  that, at a character boundary;
+  malformed tables produce errors, lookup misses or cut names, never panics.
+  The test suite includes truncation sweeps and corrupted-field cases, and
+  the parser is validated against binaries produced by the real Go toolchain.
 
 ## Usage
 
