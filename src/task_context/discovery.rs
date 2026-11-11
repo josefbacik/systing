@@ -37,6 +37,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{FileExt, MetadataExt};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use object::elf::{
@@ -53,6 +54,7 @@ use crate::limits::Limit;
 // walker's module, which is always compiled (no feature gates it). If that
 // ever changes, this path must keep its reader: it has no other.
 use crate::pystacks::process::{parse_proc_maps, MemoryMapping, ProcessMemory, ReadMemory};
+use crate::root::follow_to_regular;
 
 /// The section the library keeps its record in (`TASK_CONTEXT_INFO_SECTION`).
 pub(crate) const INFO_SECTION: &str = "task_context_info";
@@ -662,7 +664,8 @@ fn open_mapped_file(pid: u32, mapping: &MemoryMapping) -> Option<fs::File> {
         "/proc/{pid}/map_files/{:x}-{:x}",
         mapping.start, mapping.end
     );
-    fs::File::open(by_range).ok()
+    // Opened only if it is a regular file.
+    follow_to_regular(Path::new(&by_range)).ok()
 }
 
 /// Discovery's state: what each distinct file said, and the counters.
@@ -775,9 +778,9 @@ impl Discovery {
                 return Finding::NotYet;
             };
             let Some(library) = open_mapped_file(pid, mapping) else {
-                // The loader has gone on mapping it since the map was read. A
-                // process that is gone instead has no executable at its next
-                // look.
+                // The loader has gone on mapping it since the map was read, or the
+                // mapping is not of a regular file: look again. A process that is
+                // gone instead has no executable at its next look.
                 return Finding::NotYet;
             };
             let Some(library_facts) = self.facts_of(&library) else {
@@ -1672,6 +1675,48 @@ mod tests {
         let inode = exe.metadata().unwrap().ino();
         assert!(exe_mapping(me, &exe, &[line(inode)]).is_some());
         assert!(exe_mapping(me, &exe, &[line(inode + 1)]).is_none());
+    }
+
+    /// One page of `file`, mapped privately for reading, as this process's map
+    /// shows it. It stays mapped until the test program ends.
+    fn map_a_page(file: &fs::File) -> MemoryMapping {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a new private mapping at an address of the kernel's choice.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(at, libc::MAP_FAILED);
+        parse_proc_maps(std::process::id() as i32)
+            .into_iter()
+            .find(|mapping| mapping.start == at as usize)
+            .expect("the new mapping is in the map")
+    }
+
+    #[test]
+    fn a_mapped_file_is_opened_and_a_mapped_device_node_is_not() {
+        use std::io::Write;
+        if !*crate::stack_recorder::MAY_FOLLOW_MAP_FILES {
+            eprintln!("skipping: no right to follow map_files links");
+            return;
+        }
+        let me = std::process::id();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[7; 4096]).unwrap();
+        let opened = open_mapped_file(me, &map_a_page(&file)).expect("a regular file is opened");
+        let mut byte = [0];
+        opened.read_exact_at(&mut byte, 0).unwrap();
+        assert_eq!(byte, [7]);
+
+        let device = map_a_page(&fs::File::open("/dev/zero").unwrap());
+        assert_eq!(device.name, "/dev/zero");
+        assert!(open_mapped_file(me, &device).is_none());
     }
 
     /// Mappings of the library's file, each (start, end, offset in the file).
