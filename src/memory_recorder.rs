@@ -161,8 +161,8 @@ fn read_anon_huge_pages(pid: i32) -> Option<i64> {
 /// The most processes the end-of-capture AnonHugePages walk reads; each
 /// read is a kernel page-table walk of that process.
 pub const ANON_HUGE_WALK_MAX_TGIDS: usize = 64;
-/// The wall-time budget of the whole AnonHugePages walk; a host whose
-/// processes map terabytes at 4 KiB would otherwise hold the capture's stop
+/// The wall-time budget of the whole AnonHugePages walk; processes with
+/// much memory mapped in 4 KiB pages would otherwise hold the capture's stop
 /// for seconds.
 pub const ANON_HUGE_WALK_BUDGET: Duration = Duration::from_millis(500);
 

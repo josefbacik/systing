@@ -71,7 +71,7 @@ struct StoreSlot {
 }
 
 /// Default entry cap. A trace window sees one entry per unique binary
-/// sampled — hundreds on busy hosts — so this is generous while still
+/// sampled — typically hundreds — so this is generous while still
 /// bounding a pathological (or adversarial) unique-build-id storm.
 const DEFAULT_CAP: usize = 16384;
 

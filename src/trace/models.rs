@@ -331,8 +331,8 @@ pub struct NetworkInterfaceRecord {
     pub interface_name: String,
     pub ip_address: String,
     pub address_type: String,
-    /// Inode of the network namespace this interface/IP belongs to. Lets the
-    /// fold join a flow's `network_socket.netns_inum` to its owning netns
+    /// Inode of the network namespace this interface/IP belongs to. Lets a
+    /// consumer join a flow's `network_socket.netns_inum` to its owning netns
     /// without going through the IP (unambiguous for loopback). 0 if unknown.
     pub netns_inum: i64,
 }

@@ -1240,9 +1240,9 @@ fn import_directory(
     // statement below is its own DuckDB commit — a WAL write and an
     // fsync-class wait — and building a trace runs about forty to seventy of
     // them (the table DDL, the metadata rows, one INSERT per present table).
-    // On a host whose workload holds the disk saturated each of those waits
-    // for seconds, and a generation that takes well under a second on an idle
-    // disk stretches into minutes. One commit collapses them into a single
+    // When the disk is saturated each of those can wait for seconds, and a
+    // generation that takes well under a second on an idle disk can stretch
+    // into minutes. One commit collapses them into a single
     // durable write plus the close-time checkpoint. It also makes the import
     // atomic: a failure part-way through leaves no half-built database with
     // some tables filled and the rest missing — the transaction guard rolls
@@ -1405,8 +1405,8 @@ pub fn unknown_parquet_files(dir: &Path, paths: &ParquetPaths) -> Vec<String> {
 /// elements; the unnest+join would silently drop such rows. The streaming
 /// writer guarantees this (`stack_recorder` skips empty stacks before emit).
 /// The stack INSERT deliberately avoids two DuckDB shapes that blow through
-/// any `memory_limit` on large traces (a whole-system trace has ~1M unique
-/// stacks; the observed failure is "Out of Memory Error: failed to allocate
+/// any `memory_limit` on large traces (a whole-system trace can reach ~1M
+/// unique stacks; the failure is "Out of Memory Error: failed to allocate
 /// data" mid-import, with spill to `temp_directory` unable to help):
 ///
 /// - a lateral `FROM t, unnest(...) WITH ORDINALITY` compiles into DELIM_JOIN

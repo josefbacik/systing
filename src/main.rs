@@ -120,7 +120,7 @@ struct Command {
     /// debuginfod. Function names are unchanged for binaries that carry a
     /// symbol table; frames lose their "[file:line]" suffix and inlined
     /// frames collapse into their caller. Bounds symbolization memory on
-    /// hosts running many freshly-built debug binaries (CI), where parsed
+    /// hosts running many freshly-built debug binaries, where parsed
     /// debug info — cached per binary with no eviction — otherwise reaches
     /// GiBs.
     #[arg(long)]

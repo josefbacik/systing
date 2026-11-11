@@ -594,7 +594,7 @@ impl AnalyzeDb {
     /// MAX_QUERY_ROWS + 1` — so a query whose full result would be millions of
     /// rows never materializes them: the binding fetches the whole result set
     /// of whatever statement it executes, outside DuckDB's `memory_limit`
-    /// accounting, and an unbounded result on a large trace is what grew the
+    /// accounting, and an unbounded result on a large trace can grow the
     /// process past its cgroup limit. When the result is truncated,
     /// `total_row_count` comes from a separate `SELECT count(*) FROM (<sql>)`,
     /// which re-runs the query's pipeline once under DuckDB's memory bound

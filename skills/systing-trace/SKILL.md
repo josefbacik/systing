@@ -191,7 +191,7 @@ Once you have a `.duckdb` file, use the **`systing-analyze` MCP tools** (if avai
 - **"Operation not permitted"** → run with `sudo` (or grant `CAP_BPF`+`CAP_PERFMON`).
 - **Lost events / ring buffer full** → increase `--ringbuf-size-mib` (e.g. `64`).
 - **No stack frames resolved** → add `--enable-debuginfod` with `DEBUGINFOD_URLS` set, or install debug symbols for the target binaries.
-- **Symbolization eating memory** (CI hosts, many debug binaries) → `--symbolize-names-only`, and `--symbolize-elide-generics` for heavily generic Rust/C++.
+- **Symbolization eating memory** (many debug binaries) → `--symbolize-names-only`, and `--symbolize-elide-generics` for heavily generic Rust/C++.
 - **VM without hardware perf counters** → add `-s`/`--sw-event`.
 - **`--marker-threshold` rejected** → marker thresholds require `--continuous <seconds>`.
 - **"No TPU profiler/metrics service detected"** → the XLA runtime isn't listening on 8466/8431. Make sure a TPU workload is running. If it's in a non-host netns systing will find it automatically; with multiple listeners, pass `--tpu-service-addr` / `--tpu-metrics-addr`.

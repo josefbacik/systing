@@ -322,8 +322,8 @@ mod tests {
     fn test_varint_overflow_reproducer_does_not_panic() {
         // SIX continuation bytes drive the old code's shift to 36 —
         // `<< 36` on u32 is the exact "attempt to shift left with
-        // overflow" debug panic that torn fork/exec memory triggered in
-        // the field (a fake continuation run). The fixed read stops at
+        // overflow" debug panic that torn fork/exec memory can trigger
+        // (a fake continuation run). The fixed read stops at
         // the sixth continuation byte, saturates, and leaves the
         // remaining garbage unconsumed.
         let data = vec![0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x3F];

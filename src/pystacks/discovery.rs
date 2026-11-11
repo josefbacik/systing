@@ -207,10 +207,10 @@ pub fn check_python_process(pid: i32) -> Option<PyProcessInfo> {
 /// Nothing else is a candidate. A CPython runtime lives in the executable or
 /// in a libpython shared object; `site-packages/*.so`, `lib/python3.X/...`
 /// and every other object whose path merely contains "python" never carries
-/// `_PyRuntime`. Parsing them anyway was how discovery read gigabytes per
-/// run on ML images: later-`dlopen`ed extension modules (libtpu, jaxlib,
-/// torch) map below libpython, so they were read in full — cold, on every
-/// run — before the runtime was reached.
+/// `_PyRuntime`. Parsing them anyway costs time and finds nothing:
+/// later-`dlopen`ed extension modules map below libpython, so a walk in
+/// mapping order would reach them before the runtime. They are left out
+/// whatever their path contains.
 fn runtime_candidates(exe: &str, maps: &[MemoryMapping]) -> Vec<String> {
     let mut candidates = vec![exe.to_string()];
     for mapping in maps {
@@ -701,10 +701,10 @@ mod tests {
 
     #[test]
     fn test_runtime_candidates_exe_then_libpython_only() {
-        // An ML image as /proc/pid/maps lists it: extension modules dlopen'ed
+        // A process as /proc/pid/maps lists it: extension modules dlopen'ed
         // after start-up sit BELOW libpython, every one of them under a path
-        // containing "python". None of them may be a candidate — they were
-        // the gigabytes of cold reads per run — while the exe and each
+        // containing "python". None of them may be a candidate — parsing
+        // one finds nothing — while the exe and each
         // distinct libpython are, exe first, then in mapping order.
         let exe = "/opt/venv/bin/python3.13";
         let maps = vec![
