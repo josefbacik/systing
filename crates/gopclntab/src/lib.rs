@@ -21,7 +21,8 @@
 //!
 //! Robustness is a design requirement: the input is untrusted (arbitrary
 //! binaries found on a system), so every offset is bounds-checked and
-//! malformed tables produce an [`Error`] or a lookup miss, never a panic.
+//! malformed tables produce an [`Error`], a lookup miss or a name cut to at
+//! most [`MAX_FUNC_NAME`] bytes, never a panic.
 //!
 //! # Example
 //!
@@ -64,6 +65,10 @@ const HEADER_PREFIX_LEN: usize = 8;
 /// Most bytes taken as one function table. The largest known are a few dozen
 /// MiB.
 pub(crate) const MAX_TABLE: usize = 256 << 20;
+
+/// Most bytes taken as one function's name: a longer name is cut to at most
+/// this many bytes, at a character boundary. An ordinary name is far shorter.
+pub const MAX_FUNC_NAME: usize = 4096;
 
 /// Whether `b` starts with a plausible pclntab header: a supported magic,
 /// the two mandatory zero pad bytes, an instruction-size quantum Go
@@ -135,7 +140,7 @@ impl std::fmt::Debug for GoPclntab {
 /// A function resolved from the pclntab.
 #[derive(Debug, PartialEq)]
 pub struct GoFunc<'tab> {
-    /// The function's name.
+    /// The function's name, cut if it is longer than [`MAX_FUNC_NAME`].
     pub name: &'tab str,
     /// Virtual address of the function's entry.
     pub entry: u64,
@@ -390,6 +395,11 @@ impl GoPclntab {
     /// for cgo binaries legitimately includes the C/asm portions of text:
     /// those are not Go functions and have no entry here.
     pub fn find_func(&self, pc: u64) -> Option<GoFunc<'_>> {
+        self.find_func_cut(pc).map(|(func, _)| func)
+    }
+
+    /// [`GoPclntab::find_func`], also reporting whether the name was cut.
+    pub fn find_func_cut(&self, pc: u64) -> Option<(GoFunc<'_>, bool)> {
         if self.nfunctab == 0 {
             return None;
         }
@@ -416,14 +426,15 @@ impl GoPclntab {
         let idx = upper.checked_sub(1)?;
 
         let funcoff = usize::try_from(self.functab_word(idx * 2 + 1)?).ok()?;
-        let name = self.func_name(funcoff)?;
+        let (name, cut) = self.func_name(funcoff)?;
         let entry = self.entry_vaddr(idx)?;
         let size = self.entry_vaddr(idx + 1)?.saturating_sub(entry);
-        Some(GoFunc { name, entry, size })
+        Some((GoFunc { name, entry, size }, cut))
     }
 
-    /// Resolve a function's name from its funcdata record at `funcoff`.
-    fn func_name(&self, funcoff: usize) -> Option<&str> {
+    /// Resolve a function's name from its funcdata record at `funcoff`, and
+    /// whether it was cut.
+    fn func_name(&self, funcoff: usize) -> Option<(&str, bool)> {
         // The _func record starts with the entry (u32 offset for V118,
         // ptrsize address for V116) followed by a 4-byte name offset into
         // funcnametab.
@@ -438,8 +449,18 @@ impl GoPclntab {
         let nameoff = usize::try_from(read_uint(&self.data, nameoff_pos, 4)?).ok()?;
         let name_start = self.funcnametab.checked_add(nameoff)?;
         let rest = self.data.get(name_start..)?;
-        let len = rest.iter().position(|b| *b == 0)?;
-        std::str::from_utf8(&rest[..len]).ok()
+        let head = &rest[..rest.len().min(MAX_FUNC_NAME + 1)];
+        let end = head.iter().position(|b| *b == 0);
+        let len = match end {
+            Some(len) => len,
+            // Too long: cut at the limit, or at the start of the character
+            // that the limit falls inside.
+            None if head.len() > MAX_FUNC_NAME => (MAX_FUNC_NAME - 3..=MAX_FUNC_NAME)
+                .rev()
+                .find(|i| head[*i] & 0xC0 != 0x80)?,
+            None => return None,
+        };
+        Some((std::str::from_utf8(&head[..len]).ok()?, end.is_none()))
     }
 }
 
@@ -837,6 +858,48 @@ mod tests {
                     !(0x40_0000..0x40_0400).contains(&pc),
                     "pc {pc:#x} should resolve"
                 );
+            }
+        }
+    }
+
+    fn one_function_named(name: String) -> GoPclntab {
+        TabBuilder::v118(0x40_0000)
+            .func(0x0, name.leak())
+            .end(0x100)
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn name_up_to_the_limit_is_whole() {
+        for len in [MAX_FUNC_NAME - 1, MAX_FUNC_NAME] {
+            let tab = one_function_named("a".repeat(len));
+            let (f, cut) = tab.find_func_cut(0x40_0000).unwrap();
+            assert_eq!((f.name, cut), ("a".repeat(len).as_str(), false));
+        }
+    }
+
+    #[test]
+    fn longer_name_is_cut_at_the_limit() {
+        for len in [MAX_FUNC_NAME + 1, 3 * MAX_FUNC_NAME] {
+            let tab = one_function_named("a".repeat(len));
+            let (f, cut) = tab.find_func_cut(0x40_0080).unwrap();
+            assert_eq!((f.name, cut), ("a".repeat(MAX_FUNC_NAME).as_str(), true));
+            assert_eq!((f.entry, f.size), (0x40_0000, 0x100));
+            assert_eq!(tab.find_func(0x40_0080), Some(f));
+        }
+    }
+
+    #[test]
+    fn cut_does_not_split_a_character() {
+        // Characters of two, three and four bytes, with each possible
+        // number of their bytes before the limit.
+        for ch in ["\u{e9}", "\u{20ac}", "\u{1d11e}"] {
+            for ahead in 1..ch.len() {
+                let whole = "a".repeat(MAX_FUNC_NAME - ahead);
+                let tab = one_function_named(format!("{whole}{}", ch.repeat(8)));
+                let (f, cut) = tab.find_func_cut(0x40_0000).unwrap();
+                assert_eq!((f.name, cut), (whole.as_str(), true));
             }
         }
     }

@@ -61,8 +61,14 @@ impl Symbolize for GoPclntabResolver {
         addr: Addr,
         _opts: &FindSymOpts,
     ) -> blazesym::Result<std::result::Result<ResolvedSym<'_>, Reason>> {
-        match self.pclntab.find_func(addr) {
-            Some(func) => Ok(Ok(ResolvedSym {
+        let func = self.pclntab.find_func_cut(addr);
+        if func.as_ref().is_some_and(|(_, cut)| *cut) {
+            static NAMES_CUT: crate::limits::Limit =
+                crate::limits::Limit::new("addresses whose Go function name was cut short");
+            NAMES_CUT.hit();
+        }
+        match func {
+            Some((func, _)) => Ok(Ok(ResolvedSym {
                 name: func.name,
                 module: Some(self.module.as_os_str()),
                 addr: func.entry,
