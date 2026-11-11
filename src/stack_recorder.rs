@@ -1467,10 +1467,8 @@ fn reconstruct_build_id_addr(
 ) -> Option<u64> {
     let maps = maps?;
     for (addr, link) in maps.virt_candidates_for_file_offset(file_offset) {
-        if let Ok(Some(bid)) = read_elf_build_id(&link) {
-            if note_to_id(&bid) == *id {
-                return Some(addr);
-            }
+        if read_build_id_checked(&link).is_some_and(|bid| note_to_id(&bid) == *id) {
+            return Some(addr);
         }
     }
     for addr in maps.pool_candidates_for_offset(file_offset) {
@@ -1478,10 +1476,10 @@ fn reconstruct_build_id_addr(
             // Case 2: syscall-patch island — a file-backed neighbour carries
             // the authoritative note.
             Some(bridge) => {
-                if let Ok(Some(bid)) = read_elf_build_id(&bridge.map_files_path) {
-                    if note_to_id(&bid) == *id {
-                        return Some(addr);
-                    }
+                if read_build_id_checked(&bridge.map_files_path)
+                    .is_some_and(|bid| note_to_id(&bid) == *id)
+                {
+                    return Some(addr);
                 }
             }
             // Case 3: fully pool-backed guest text — no file neighbour, so the
@@ -2740,7 +2738,7 @@ fn dispatch_process_with_client(
 
     match entry {
         ProcessMemberType::Path(path) => {
-            let build_id = if let Some(build_id) = read_elf_build_id(&path.maps_file)? {
+            let build_id = if let Some(build_id) = read_build_id_checked(&path.maps_file) {
                 BuildId::raw(build_id)
             } else {
                 return Ok(None);
