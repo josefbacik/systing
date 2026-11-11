@@ -10,9 +10,12 @@
 /// - `pid`: OS process ID
 /// - `name`: Process name (from /proc/pid/comm or similar)
 /// - `parent_upid`: Parent process's upid (for process tree)
-/// - `cmdline`: Full command line arguments (from /proc/pid/cmdline).
+/// - `cmdline`: Command line arguments (from /proc/pid/cmdline). Of a command line
+///   past the recorder's limits only the first arguments are kept, whole ones,
+///   and `<truncated>` stands after them as the last element.
 ///   May be empty for short-lived processes that exit before cmdline can be read,
-///   or for kernel threads which have no cmdline (see `is_kernel_thread`).
+///   for kernel threads which have no cmdline (see `is_kernel_thread`), or where
+///   the limits had no room even for the first argument.
 /// - `is_kernel_thread`: Whether this process is a kernel thread (e.g., kworker,
 ///   migration, ksoftirqd). Kernel threads have no executable or cmdline.
 /// - `cgroup_id`: Numeric id of the process's cgroup in the v2 unified hierarchy

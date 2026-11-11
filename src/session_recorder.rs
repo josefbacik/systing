@@ -2,11 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::Result;
 
 use crate::events::SystingProbeRecorder;
+use crate::golang::discovery::read_capped;
+use crate::limits::Limit;
 use crate::marker_recorder::MarkerRecorder;
 use crate::memory_recorder::MemoryRecorder;
 use crate::network_recorder::NetworkRecorder;
@@ -238,6 +241,40 @@ impl SysinfoRecorder {
     }
 }
 
+/// The most of `/proc/<pid>/cmdline` that is read, and the most that one
+/// process's arguments may cost ([`cmdline_cost`]). exec takes this much for
+/// arguments and environment together under the default stack limit
+/// (`getconf ARG_MAX`). A line of many short arguments is cut below that,
+/// since each costs [`ARG_OVERHEAD`] here.
+const CMDLINE_MAX: usize = 2 << 20;
+
+/// The most that all processes' command lines together may cost. Room for some
+/// 280,000 command lines of ten arguments and 300 bytes.
+const CMDLINES_MAX: usize = 256 << 20;
+
+/// What a command line may still cost once all but the last eighth of
+/// [`CMDLINES_MAX`] is used: room for the program's path and its first arguments.
+const CMDLINE_HEAD: usize = 4 << 10;
+
+/// What an argument costs to keep beside its bytes: its `String` in the list and
+/// the allocator's smallest block.
+const ARG_OVERHEAD: usize = 64;
+
+/// Stands last in a command line that was cut, so that it is not taken for a
+/// whole one.
+const CMDLINE_CUT_MARK: &str = "<truncated>";
+
+/// Command lines of which the first arguments were kept, and not all.
+static CMDLINES_CUT: Limit = Limit::new("command lines cut short");
+
+/// Command lines of which nothing was kept.
+static CMDLINES_LEFT_OUT: Limit = Limit::new("command lines left out");
+
+/// What `args` cost to keep: their bytes, and [`ARG_OVERHEAD`] for each.
+fn cmdline_cost(args: &[String]) -> usize {
+    args.iter().map(|arg| arg.len() + ARG_OVERHEAD).sum()
+}
+
 pub struct SessionRecorder {
     pub clock_snapshot: Mutex<ClockSnapshot>,
     /// Scheduler/IRQ event recorder shards, one per `ringbufs`-family ring.
@@ -264,6 +301,9 @@ pub struct SessionRecorder {
     pub tpu_metrics_recorder: Option<Mutex<TpuMetricsRecorder>>,
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
+    /// What the command lines of `processes` have cost, to read or to keep,
+    /// whichever was more: [`CMDLINES_MAX`] at most.
+    cmdlines_cost: AtomicUsize,
     pub threads: RwLock<HashMap<u64, ThreadDescriptor>>,
     /// Maps process tgidpid -> cgroup id (the cgroup directory's kernfs node id,
     /// i.e. its inode) as observed in-kernel at event time. This lets us attribute
@@ -1064,6 +1104,7 @@ impl SessionRecorder {
             },
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
+            cmdlines_cost: AtomicUsize::new(0),
             threads: RwLock::new(HashMap::new()),
             process_cgroups: RwLock::new(HashMap::new()),
             kernel_threads: RwLock::new(HashSet::new()),
@@ -1113,17 +1154,98 @@ impl SessionRecorder {
         String::new()
     }
 
-    fn fetch_cmdline_from_proc(pid: u32) -> Vec<String> {
+    /// The most that the next command line may cost: [`CMDLINE_MAX`] until the total nears
+    /// its last eighth, [`CMDLINE_HEAD`] within that eighth, at the very end what is left.
+    fn cmdline_room(&self) -> usize {
+        let left = CMDLINES_MAX.saturating_sub(self.cmdlines_cost.load(Ordering::Relaxed));
+        let for_long_ones = left.saturating_sub(CMDLINES_MAX / 8);
+        for_long_ones.clamp(CMDLINE_HEAD, CMDLINE_MAX).min(left)
+    }
+
+    /// Process `pid`'s arguments as [`Self::read_cmdline`] gives them. No
+    /// arguments and no cost if the file cannot be opened.
+    fn fetch_cmdline_from_proc(pid: u32, most: usize) -> (Vec<String>, usize, bool) {
         let cmdline_path = Path::new("/proc").join(pid.to_string()).join("cmdline");
-        if let Ok(data) = fs::read(&cmdline_path) {
-            // cmdline is null-separated
-            data.split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).to_string())
-                .collect()
-        } else {
-            vec![]
+        match File::open(&cmdline_path) {
+            Ok(file) => Self::read_cmdline(file, most),
+            Err(_) => (vec![], 0, false),
         }
+    }
+
+    /// The arguments in the first `most` bytes of the command line `file`, as
+    /// [`Self::split_cmdline`] gives them; one byte more is read, to tell whether
+    /// there is more. After an error: no arguments and not cut, as for a process
+    /// that was gone before the file was opened, but what was read is charged.
+    fn read_cmdline(file: impl std::io::Read, most: usize) -> (Vec<String>, usize, bool) {
+        let mut data = Vec::new();
+        match read_capped(file, most as u64, &mut data) {
+            Ok(whole) => Self::split_cmdline(&data, whole, most),
+            // No limit cut this line, so it is not counted as cut.
+            Err(_) => (vec![], data.len(), false),
+        }
+    }
+
+    /// The arguments in `data`, a command line or, if not `whole`, the head of
+    /// one; what they cost; and whether they were cut, that is, whether the
+    /// process has more. They are taken from the first on while they cost `most`
+    /// at most, and never in part, since a path cut short is another file's. The
+    /// cost is no less than `data`'s length.
+    fn split_cmdline(data: &[u8], whole: bool, most: usize) -> (Vec<String>, usize, bool) {
+        // What follows a head's last NUL is the head of an argument.
+        let end = if whole {
+            data.len()
+        } else {
+            data.iter().rposition(|&b| b == 0).map_or(0, |at| at + 1)
+        };
+        let mut args = Vec::new();
+        let mut cost = 0;
+        let mut cut = !whole;
+        // cmdline is null-separated
+        for arg in data[..end].split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let arg = String::from_utf8_lossy(arg).to_string();
+            if cost + arg.len() + ARG_OVERHEAD > most {
+                cut = true;
+                break;
+            }
+            cost += arg.len() + ARG_OVERHEAD;
+            args.push(arg);
+        }
+        (args, cost.max(data.len()), cut)
+    }
+
+    /// `cmdline` as it is kept: with the mark at its end if it was `cut`, or
+    /// empty if [`CMDLINES_MAX`] has no room for its `cost`; it is then charged what
+    /// is left. What is returned stays counted until the caller gives its
+    /// [`cmdline_cost`] back.
+    fn keep_cmdline(&self, mut cmdline: Vec<String>, mut cost: usize, cut: bool) -> Vec<String> {
+        // The mark never stands alone: viewers show a process under its first
+        // argument, and under its name if it has none.
+        if cut && !cmdline.is_empty() {
+            cmdline.push(CMDLINE_CUT_MARK.to_string());
+            cost += CMDLINE_CUT_MARK.len() + ARG_OVERHEAD;
+        }
+        // The list's spare capacity is not in ARG_OVERHEAD: free it.
+        cmdline.shrink_to_fit();
+        // A line that does not fit takes what is left: it was read all the same.
+        #[allow(deprecated)] // `try_update`, its new name, needs Rust 1.95; rust-version is 1.89
+        let used = self
+            .cmdlines_cost
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some((used + cost).min(CMDLINES_MAX))
+            })
+            .unwrap();
+        let fits = used + cost <= CMDLINES_MAX;
+        if !fits {
+            cmdline = vec![];
+        }
+        if cut || !fits {
+            if cmdline.is_empty() {
+                CMDLINES_LEFT_OUT.hit();
+            } else {
+                CMDLINES_CUT.hit();
+            }
+        }
+        cmdline
     }
 
     /// Whether an executable basename is an ELF dynamic loader. Matches the
@@ -1143,8 +1265,9 @@ impl SessionRecorder {
     /// real program's basename from cmdline: skip the loader (argv[0]) and
     /// its options. An `--argv0 VALUE` option wins since that is what the
     /// program itself sees as argv[0]. Returns None when the invocation isn't
-    /// parseable (unknown option, missing option value, no program argument)
-    /// so the caller falls back to the exe basename rather than guess.
+    /// parseable (unknown option, missing option value, no program argument,
+    /// a name too long for a file's) so the caller falls back to the exe
+    /// basename rather than guess.
     fn loader_target_name(cmdline: &[String]) -> Option<String> {
         // glibc rtld options that consume the following argument (elf/rtld.c).
         const VALUE_OPTS: [&str; 7] = [
@@ -1179,6 +1302,8 @@ impl SessionRecorder {
                 let prog = argv0_override.unwrap_or(arg);
                 return Path::new(prog.as_str())
                     .file_name()
+                    // A file's name has NAME_MAX bytes at most.
+                    .filter(|name| name.len() <= libc::NAME_MAX as usize)
                     .map(|name| name.to_string_lossy().to_string());
             }
         }
@@ -1197,7 +1322,7 @@ impl SessionRecorder {
         // because thread names set via pthread_setname_np (e.g., "gc-worker-3")
         // are more informative than the binary filename.
         let name_from_proc = Self::fetch_name_from_proc(pid);
-        let cmdline = Self::fetch_cmdline_from_proc(pid);
+        let (cmdline, cost, cut) = Self::fetch_cmdline_from_proc(pid, self.cmdline_room());
 
         // Processes launched by invoking the dynamic loader directly keep the
         // loader as /proc/PID/exe for their whole lifetime, which would name
@@ -1218,6 +1343,7 @@ impl SessionRecorder {
         // Kernel threads have no /proc/pid/exe (readlink fails) and no cmdline.
         // Short-lived processes that already exited will have /proc/pid gone entirely,
         // so we only mark as kernel thread if the process dir still exists.
+        // A command line that the limits left out is not a missing one: `cut`.
         //
         // Limitations: This is a heuristic, not atomic. Zombie processes could be
         // misidentified since they also lack exe/cmdline but still have /proc/pid.
@@ -1225,6 +1351,7 @@ impl SessionRecorder {
         // but the false positive rate here is negligible in practice.
         if name_from_proc.is_empty()
             && cmdline.is_empty()
+            && !cut
             && pid != 0
             && Path::new("/proc").join(pid.to_string()).exists()
         {
@@ -1243,15 +1370,21 @@ impl SessionRecorder {
 
         // Create and store ProtoProcess
         let proto_process = ProtoProcess {
-            cmdline,
+            cmdline: self.keep_cmdline(cmdline, cost, cut),
             pid: Some(info.tgidpid as i32),
             ..ProtoProcess::default()
         };
 
-        self.processes
+        let replaced = self
+            .processes
             .write()
             .unwrap()
             .insert(info.tgidpid, proto_process);
+        if let Some(replaced) = replaced {
+            // Two threads saw the process first at the same moment.
+            self.cmdlines_cost
+                .fetch_sub(cmdline_cost(&replaced.cmdline), Ordering::Relaxed);
+        }
 
         // Record the cgroup id observed for this process. `info` may be a synthetic
         // parent built from a thread we saw (when the main thread was never observed),
@@ -2344,6 +2477,7 @@ mod tests {
             py_thread_names: Mutex::new(HashMap::new()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
+            cmdlines_cost: AtomicUsize::new(0),
             threads: RwLock::new(HashMap::new()),
             process_cgroups: RwLock::new(HashMap::new()),
             kernel_threads: RwLock::new(HashSet::new()),
@@ -2476,6 +2610,256 @@ mod tests {
             None
         );
         assert_eq!(SessionRecorder::loader_target_name(&cmdline(&[])), None);
+    }
+
+    #[test]
+    fn test_fetch_cmdline_from_proc_current_process() {
+        let (args, cost, cut) =
+            SessionRecorder::fetch_cmdline_from_proc(std::process::id(), CMDLINE_MAX);
+        assert!(!args.is_empty(), "should read current process cmdline");
+        assert_eq!(cost, cmdline_cost(&args));
+        assert!(!cut);
+    }
+
+    #[test]
+    fn test_fetch_cmdline_from_proc_nonexistent_pid() {
+        assert_eq!(
+            SessionRecorder::fetch_cmdline_from_proc(u32::MAX, CMDLINE_MAX),
+            (vec![], 0, false)
+        );
+    }
+
+    #[test]
+    fn test_fetch_cmdline_from_proc_reads_no_more_than_it_may() {
+        let pid = std::process::id();
+        // Too little for the first argument; what was read is counted.
+        assert_eq!(
+            SessionRecorder::fetch_cmdline_from_proc(pid, 3),
+            (vec![], 3, true)
+        );
+        // With nothing to spend, it still tells a command line from none.
+        assert_eq!(
+            SessionRecorder::fetch_cmdline_from_proc(pid, 0),
+            (vec![], 0, true)
+        );
+    }
+
+    #[test]
+    fn test_read_cmdline_counts_what_was_read_before_an_error() {
+        /// Gives `self.0` bytes, then fails as the file of a process that is gone.
+        struct Gone(usize);
+        impl std::io::Read for Gone {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.min(buf.len());
+                self.0 -= n;
+                buf[..n].fill(b'a');
+                match n {
+                    0 => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+                    _ => Ok(n),
+                }
+            }
+        }
+        assert_eq!(
+            SessionRecorder::read_cmdline(Gone(1000), CMDLINE_MAX),
+            (vec![], 1000, false)
+        );
+        assert_eq!(
+            SessionRecorder::read_cmdline(Gone(0), CMDLINE_MAX),
+            (vec![], 0, false)
+        );
+    }
+
+    #[test]
+    fn test_split_cmdline_whole() {
+        let args = cmdline(&["prog", "-a", "b c"]);
+        // With a NUL after each argument; with none at the end; with several in
+        // a row.
+        for data in [
+            &b"prog\0-a\0b c\0"[..],
+            b"prog\0-a\0b c",
+            b"prog\0\0-a\0b c\0\0\0",
+        ] {
+            assert_eq!(
+                SessionRecorder::split_cmdline(data, true, CMDLINE_MAX),
+                (args.clone(), cmdline_cost(&args), false)
+            );
+        }
+        assert_eq!(
+            SessionRecorder::split_cmdline(b"", true, CMDLINE_MAX),
+            (vec![], 0, false)
+        );
+    }
+
+    #[test]
+    fn test_split_cmdline_leaves_out_the_argument_the_read_cut() {
+        let split = |data| {
+            let (args, _, cut) = SessionRecorder::split_cmdline(data, false, CMDLINE_MAX);
+            (args, cut)
+        };
+        assert_eq!(
+            split(b"ld.so\0--library-path\0/lib\0/usr/bin/pyth"),
+            (cmdline(&["ld.so", "--library-path", "/lib"]), true)
+        );
+        // The read ended where an argument ends: more follow all the same.
+        assert_eq!(split(b"prog\0-a\0"), (cmdline(&["prog", "-a"]), true));
+        // Not one whole argument.
+        assert_eq!(split(b"progprogprog"), (vec![], true));
+    }
+
+    #[test]
+    fn test_split_cmdline_stops_at_what_the_line_may_cost() {
+        let data = b"a\0".repeat(100);
+        let ten = 10 * (1 + ARG_OVERHEAD);
+        let (args, cost, cut) = SessionRecorder::split_cmdline(&data, true, ten);
+        assert_eq!((args.len(), cost, cut), (10, ten, true));
+        let (args, cost, cut) = SessionRecorder::split_cmdline(&data, true, 10 * ten);
+        assert_eq!((args.len(), cost, cut), (100, 10 * ten, false));
+        // A byte that is not UTF-8 is kept as three.
+        assert_eq!(
+            SessionRecorder::split_cmdline(b"\xff\xff", true, CMDLINE_MAX),
+            (cmdline(&["\u{fffd}\u{fffd}"]), 6 + ARG_OVERHEAD, false)
+        );
+        assert_eq!(
+            SessionRecorder::split_cmdline(b"\xff\xff", true, 5 + ARG_OVERHEAD),
+            (vec![], 2, true)
+        );
+    }
+
+    #[test]
+    fn test_cmdline_room_shrinks_as_the_total_fills() {
+        let recorder = create_test_session_recorder();
+        let room_at = |used| {
+            recorder.cmdlines_cost.store(used, Ordering::Relaxed);
+            recorder.cmdline_room()
+        };
+        let last_eighth = CMDLINES_MAX - CMDLINES_MAX / 8;
+        assert_eq!(room_at(0), CMDLINE_MAX);
+        assert_eq!(room_at(last_eighth - CMDLINE_MAX), CMDLINE_MAX);
+        assert_eq!(room_at(last_eighth - CMDLINE_MAX / 2), CMDLINE_MAX / 2);
+        assert_eq!(room_at(last_eighth - 1), CMDLINE_HEAD);
+        assert_eq!(room_at(last_eighth), CMDLINE_HEAD);
+        assert_eq!(room_at(CMDLINES_MAX - CMDLINE_HEAD), CMDLINE_HEAD);
+        assert_eq!(room_at(CMDLINES_MAX - 100), 100);
+        assert_eq!(room_at(CMDLINES_MAX), 0);
+    }
+
+    #[test]
+    fn test_keep_cmdline_marks_a_cut_one() {
+        let recorder = create_test_session_recorder();
+        let args = cmdline(&["prog", "-a"]);
+        let cost = cmdline_cost(&args);
+        assert_eq!(recorder.keep_cmdline(args.clone(), cost, false), args);
+        assert_eq!(recorder.cmdlines_cost.load(Ordering::Relaxed), cost);
+        let (cut_before, left_out_before) = (CMDLINES_CUT.count(), CMDLINES_LEFT_OUT.count());
+        let marked = recorder.keep_cmdline(args, cost, true);
+        assert_eq!(marked, cmdline(&["prog", "-a", "<truncated>"]));
+        assert_eq!(
+            recorder.cmdlines_cost.load(Ordering::Relaxed),
+            cost + cmdline_cost(&marked)
+        );
+        assert!(CMDLINES_CUT.count() > cut_before);
+        // Alone, the mark would be taken for the program.
+        assert!(recorder.keep_cmdline(vec![], 4096, true).is_empty());
+        assert!(CMDLINES_LEFT_OUT.count() > left_out_before);
+    }
+
+    #[test]
+    fn test_keep_cmdline_gives_a_line_that_does_not_fit_what_is_left() {
+        let recorder = create_test_session_recorder();
+        let args = cmdline(&["prog", "-a"]);
+        let cost = cmdline_cost(&args);
+        let used = &recorder.cmdlines_cost;
+        used.store(CMDLINES_MAX - cost, Ordering::Relaxed);
+        assert_eq!(recorder.keep_cmdline(args.clone(), cost, false), args);
+        assert_eq!(used.load(Ordering::Relaxed), CMDLINES_MAX);
+
+        used.store(CMDLINES_MAX - cost + 1, Ordering::Relaxed);
+        let left_out_before = CMDLINES_LEFT_OUT.count();
+        assert!(recorder.keep_cmdline(args.clone(), cost, false).is_empty());
+        assert_eq!(used.load(Ordering::Relaxed), CMDLINES_MAX);
+        assert!(CMDLINES_LEFT_OUT.count() > left_out_before);
+
+        // The mark can be what does not fit.
+        used.store(CMDLINES_MAX - cost, Ordering::Relaxed);
+        assert!(recorder.keep_cmdline(args, cost, true).is_empty());
+        assert_eq!(used.load(Ordering::Relaxed), CMDLINES_MAX);
+    }
+
+    /// A shell that runs `script`, which prints a line when it is as the test
+    /// wants it and then waits for its standard input; that stays open until the
+    /// child is killed. spawn() alone may return while the exec still goes on.
+    fn spawn_and_await_its_line(script: &str) -> std::process::Child {
+        use std::io::Read;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let said = child.stdout.as_mut().unwrap();
+        said.read_exact(&mut [0])
+            .unwrap_or_else(|_| panic!("this ended before it printed a line: {script}"));
+        child
+    }
+
+    #[test]
+    fn test_maybe_record_task_keeps_short_cmdlines_in_the_last_eighth() {
+        let mut child = spawn_and_await_its_line("echo; read x");
+        let recorder = create_test_session_recorder();
+        recorder
+            .cmdlines_cost
+            .store(CMDLINES_MAX - CMDLINES_MAX / 8, Ordering::Relaxed);
+        recorder.maybe_record_task(&create_test_task_info(child.id(), child.id(), "sh"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let processes = recorder.processes.read().unwrap();
+        assert_eq!(
+            processes.values().next().unwrap().cmdline,
+            ["sh", "-c", "echo; read x"]
+        );
+    }
+
+    #[test]
+    fn test_maybe_record_task_leaves_out_cmdlines_past_the_total() {
+        let recorder = create_test_session_recorder();
+        let pid = std::process::id();
+        let task = create_test_task_info(pid, pid, "test");
+        recorder
+            .cmdlines_cost
+            .store(CMDLINES_MAX, Ordering::Relaxed);
+        let left_out_before = CMDLINES_LEFT_OUT.count();
+        recorder.maybe_record_task(&task);
+
+        assert!(recorder.processes.read().unwrap()[&task.tgidpid]
+            .cmdline
+            .is_empty());
+        assert_eq!(recorder.cmdlines_cost.load(Ordering::Relaxed), CMDLINES_MAX);
+        assert!(CMDLINES_LEFT_OUT.count() > left_out_before);
+        // All else of the process is recorded as ever.
+        assert_ne!(
+            recorder.process_descriptors.read().unwrap()[&task.tgidpid].process_name(),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_record_new_process_from_many_threads_counts_its_cmdline_once() {
+        let recorder = create_test_session_recorder();
+        let pid = std::process::id();
+        let task = create_test_task_info(pid, pid, "test");
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| (0..250).for_each(|_| recorder.record_new_process(&task)));
+            }
+        });
+        let processes = recorder.processes.read().unwrap();
+        let kept = &processes[&task.tgidpid].cmdline;
+        assert!(!kept.is_empty());
+        assert_eq!(
+            recorder.cmdlines_cost.load(Ordering::Relaxed),
+            cmdline_cost(kept)
+        );
     }
 
     #[test]

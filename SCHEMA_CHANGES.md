@@ -515,6 +515,23 @@ capture's end, whose value is the count. `<name>` says what was left out or
 cut, and is fixed in the source. A capture that reached none prints no such
 line and has no such track. Table shapes are unchanged.
 
+## Command lines are bounded (no schema version change)
+
+`process.cmdline` is bounded. One command line may cost 2 MiB, to read or to keep,
+an argument counting as its bytes and 64 more; 2 MiB is what exec takes for
+arguments and environment together under the default stack limit. All command
+lines of a run together may cost 256 MiB, and in the last eighth of that each
+may cost 4 KiB. Of a line past its limit the first arguments are kept, whole
+ones only, and `<truncated>` stands after them as the last element
+(`cmdline[-1] = '<truncated>'`). Where there was no room even for the first
+argument, `cmdline` is empty and unmarked, like that of a process that exited
+before it could be read. The run reports how many there were of each: `command
+lines cut short`, `command lines left out` (see above). With `--continuous` the
+256 MiB are for the whole run and not for the window that is kept, so in a long
+run on a busy host it is the newest processes that lose their command lines. A
+process that was started through the dynamic loader keeps the loader's name if
+the name in its arguments is longer than 255 bytes.
+
 ## Schema Version 32 (systing 1.29.0) — 2026-10-16
 
 The generic trace events take two new kinds, the kernel's generic perf
