@@ -161,9 +161,10 @@ pub struct Started<'a> {
 /// Processes that link the library and had not published a recipe when they
 /// were last looked at, each with the time of its next look. Bounded both
 /// ways: in how many it holds and in how often each is looked at, so that a
-/// process which never publishes is not read for ever. A process is looked at
-/// when ITS time comes, never because something else happened: on a host that
-/// execs all the time, the list is not scanned once per exec.
+/// process which never publishes is not read for ever. A full list makes room
+/// for a newcomer (see `add`). A process is looked at when ITS time comes, never
+/// because something else happened: on a host that execs all the time, the list
+/// is not scanned once per exec.
 #[derive(Debug, Default)]
 struct LookAgain {
     /// (process, looks so far, when it is next looked at)
@@ -183,8 +184,10 @@ impl LookAgain {
     }
 
     /// Wait for `pid`; a process already waiting has a new image, so its
-    /// schedule starts again. Returns false, and takes nothing, when the
-    /// list is full.
+    /// schedule starts again. In a full list `pid` takes the place of the
+    /// process that has been looked at most often, the one least likely to
+    /// publish yet (of several, the one that came first). It then returns
+    /// false, and the caller counts that process as given up.
     fn add(&mut self, pid: u32, now: Instant) -> bool {
         let entry = (pid, 0, now + Self::wait_after(0));
         if let Some(waiting) = self
@@ -195,11 +198,21 @@ impl LookAgain {
             *waiting = entry;
             return true;
         }
-        if self.waiting.len() >= Self::MAX_WAITING {
-            return false;
+        if self.waiting.len() < Self::MAX_WAITING {
+            self.waiting.push(entry);
+            return true;
         }
-        self.waiting.push(entry);
-        true
+        // The list is in the order of first coming: a new image keeps its place.
+        let most = self.waiting.iter().map(|(_, looks, _)| *looks).max();
+        if let Some(at) = self
+            .waiting
+            .iter()
+            .position(|(_, looks, _)| Some(*looks) == most)
+        {
+            self.waiting.remove(at);
+            self.waiting.push(entry);
+        }
+        false
     }
 
     /// When the next look is due, if any process is waiting.
@@ -739,9 +752,39 @@ mod tests {
         }
         assert!(!list.add(u32::MAX, now));
         assert!(
-            list.add(0, now),
+            list.add(1, now),
             "a process already waiting is not a new entry"
         );
+        assert_eq!(list.waiting.len(), LookAgain::MAX_WAITING);
+    }
+
+    /// In a full list a newcomer takes the place of the process looked at most
+    /// often, the first of several, so one with a new image keeps its own.
+    #[test]
+    fn a_full_list_makes_room_for_a_newcomer() {
+        let start = Instant::now();
+        let mut list = LookAgain::default();
+        let waits = |list: &LookAgain, pid| list.waiting.iter().any(|(each, ..)| *each == pid);
+        for pid in 0..LookAgain::MAX_WAITING as u32 {
+            list.add(pid, start);
+        }
+        // None has been looked at yet: the first to come go.
+        assert!(!list.add(1000, start));
+        assert!(!list.add(1001, start));
+        assert!(waits(&list, 1000) && waits(&list, 1001));
+        assert!(!waits(&list, 0) && !waits(&list, 1));
+
+        // Every process but 7, which has a new image, has two looks behind it.
+        for _ in 0..2 {
+            let due = list.next_due().unwrap();
+            list.tick(due, |_| Finding::NotYet, |_, _| unreachable!());
+        }
+        list.add(7, start + ms(40));
+        for newcomer in 2001..2000 + LookAgain::MAX_WAITING as u32 {
+            assert!(!list.add(newcomer, start + ms(40)));
+            assert!(waits(&list, newcomer) && waits(&list, 7));
+        }
+        assert!(!waits(&list, 1000) && !waits(&list, 1001));
         assert_eq!(list.waiting.len(), LookAgain::MAX_WAITING);
     }
 
