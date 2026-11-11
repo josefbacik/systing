@@ -267,13 +267,36 @@ fn check_stated_sizes(file: &File) -> Result<()> {
 /// its map is.
 const MAPS_MAX: u64 = 64 << 20;
 
+/// Reads the first `cap` bytes of `from` into the empty `bytes`, and says whether
+/// that is all of it. One byte past the cap is the most that is read. After an
+/// error `bytes` holds what was read before it.
+pub(crate) fn read_capped(
+    from: impl std::io::Read,
+    cap: u64,
+    bytes: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    // One byte past the cap tells a file of exactly the cap from a longer one.
+    let read = from.take(cap.saturating_add(1)).read_to_end(bytes);
+    let whole = bytes.len() as u64 <= cap;
+    bytes.truncate(cap as usize);
+    read.map(|_| whole)
+}
+
+/// The first `cap` bytes of the file at `path`, and whether that is the whole
+/// file. After an error nothing is returned: a caller that counts what it
+/// reads calls [`read_capped`].
+fn head_capped(path: &Path, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    let whole = read_capped(File::open(path)?, cap, &mut bytes)?;
+    Ok((bytes, whole))
+}
+
 /// The text of the file at `path`, refused past `cap` bytes. Bytes that are not
 /// UTF-8 cost their own place in the text, not the read.
 fn text_capped(path: &Path, cap: u64) -> Result<String> {
-    use std::io::Read as _;
-    let mut bytes = Vec::new();
-    File::open(path)?.take(cap + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > cap {
+    let (bytes, whole) = head_capped(path, cap)?;
+    if !whole {
         bail!("it is larger than {cap} bytes");
     }
     Ok(String::from_utf8(bytes)
@@ -778,6 +801,52 @@ mod tests {
             "0-1 r-xp /a\u{fffd}\n"
         );
         assert!(text_capped(file.path(), 12).is_err());
+    }
+
+    #[test]
+    fn a_head_is_read_up_to_its_cap() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"0123456789").unwrap();
+        let all = b"0123456789".to_vec();
+        assert_eq!(head_capped(file.path(), 11).unwrap(), (all.clone(), true));
+        assert_eq!(head_capped(file.path(), 10).unwrap(), (all, true));
+        assert_eq!(
+            head_capped(file.path(), 9).unwrap(),
+            (b"012345678".to_vec(), false)
+        );
+        assert_eq!(head_capped(file.path(), 0).unwrap(), (Vec::new(), false));
+        assert!(head_capped(file.path(), u64::MAX).unwrap().1);
+        assert!(head_capped(&file.path().join("missing"), 9).is_err());
+        // A file that holds more than the cap.
+        assert_eq!(
+            head_capped(Path::new("/dev/zero"), 4096).unwrap(),
+            (vec![0; 4096], false)
+        );
+    }
+
+    #[test]
+    fn what_was_read_before_an_error_is_kept() {
+        use std::io::Read;
+        /// Gives `self.0` bytes, then fails.
+        struct Fails(usize);
+        impl Read for Fails {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.min(buf.len());
+                self.0 -= n;
+                match n {
+                    0 => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+                    _ => Ok(n),
+                }
+            }
+        }
+        let mut bytes = Vec::new();
+        assert!(read_capped(Fails(1000), 4096, &mut bytes).is_err());
+        assert_eq!(bytes.len(), 1000);
+        // The cap comes before the error.
+        let mut bytes = Vec::new();
+        assert!(!read_capped(Fails(5000), 4096, &mut bytes).unwrap());
+        assert_eq!(bytes.len(), 4096);
     }
 
     #[test]
