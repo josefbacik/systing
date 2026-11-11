@@ -185,9 +185,10 @@ impl LookAgain {
 
     /// Wait for `pid`; a process already waiting has a new image, so its
     /// schedule starts again. In a full list `pid` takes the place of the
-    /// process that has been looked at most often, the one least likely to
-    /// publish yet (of several, the one that came first). It then returns
-    /// false, and the caller counts that process as given up.
+    /// process that has been looked at most often since its last exec (of
+    /// several, the one that came first): a program that is starting mostly
+    /// publishes within its first looks. It then returns false, and the caller
+    /// counts that process as given up.
     fn add(&mut self, pid: u32, now: Instant) -> bool {
         let entry = (pid, 0, now + Self::wait_after(0));
         if let Some(waiting) = self
@@ -337,9 +338,11 @@ struct DiscoveryJob {
 /// attached (from then on an exec is announced), looks at the capture's
 /// targets once more, or at every process when there are none, then serves
 /// exec notices as they come and each waiting process when its time comes.
-/// It ends once the ring that feeds it is dropped and its queue is empty, or
-/// after the look in progress when `stopped` is set: no sample is taken any more
-/// then, so the notices still queued are counted and not served.
+/// It ends once the ring that feeds it is dropped and its queue is empty. Once
+/// `stopped` is set no sample is taken any more, so it serves at most the notice
+/// in hand and no waiting process, counts the notices still queued, and ends;
+/// only the look in progress, or the pass over the targets or the host that it
+/// begins with, runs to its end.
 fn discovery_thread(
     job: DiscoveryJob,
     attached: Receiver<()>,

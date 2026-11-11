@@ -48,10 +48,10 @@ use object::read::{ReadCache, ReadRef, SectionIndex};
 use object::Endianness;
 
 use super::values::{ABI_VERSION, BLOCK_HDR_SIZE, NAME_MAX, SLOTS, SLOT_SIZE, VALUE_MAX};
+use crate::limits::Limit;
 // The tree's one reader of a process's map and memory lives under the Python
 // walker's module, which is always compiled (no feature gates it). If that
 // ever changes, this path must keep its reader: it has no other.
-use crate::limits::Limit;
 use crate::pystacks::process::{parse_proc_maps, MemoryMapping, ProcessMemory, ReadMemory};
 
 /// The section the library keeps its record in (`TASK_CONTEXT_INFO_SECTION`).
@@ -494,7 +494,8 @@ fn info_section<'data, R: ReadRef<'data>>(
 }
 
 /// Read a file's ELF facts. `None` for anything that is not a 64-bit ELF
-/// file with a loadable segment.
+/// file with a loadable segment, or that states more headers than
+/// `HEADERS_MAX`.
 ///
 /// Only the file header, the program headers, the section headers and their
 /// names, the two small sections of interest and the names of dependencies are
@@ -667,7 +668,7 @@ fn open_mapped_file(pid: u32, mapping: &MemoryMapping) -> Option<fs::File> {
 /// Discovery's state: what each distinct file said, and the counters.
 pub(crate) struct Discovery {
     /// (st_dev, st_ino, st_size) of a file -> its facts; `None` for a file
-    /// that is not a 64-bit ELF file.
+    /// that [`elf_facts`] does not take.
     files: HashMap<(u64, u64, u64), Option<ElfFacts>>,
     pub(crate) counters: DiscoveryCounters,
 }
