@@ -505,6 +505,16 @@ SELECT trace_id, task_stacks_cut_records * 1.0 / task_stacks_full_records AS cut
 FROM sysinfo WHERE task_stacks_full_records > 0;
 ```
 
+## Limits that a capture reached (no schema version change)
+
+Where the tracer gives up at a limit that is declared through `src/limits.rs`,
+the capture says so when the trace is written: for each such limit that was
+reached, one line on stdout, `Limit reached: <name>: <count>`, and one counter
+track named `Limit reached: <name>` (unit `count`) with a single sample at the
+capture's end, whose value is the count. `<name>` says what was left out or
+cut, and is fixed in the source. A capture that reached none prints no such
+line and has no such track. Table shapes are unchanged.
+
 ## Schema Version 32 (systing 1.29.0) — 2026-10-16
 
 The generic trace events take two new kinds, the kernel's generic perf

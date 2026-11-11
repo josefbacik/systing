@@ -46,6 +46,7 @@ pub mod events;
 pub mod golang;
 pub mod gopclntab_resolver;
 pub mod gvisor_guest;
+pub mod limits;
 pub mod marker_recorder;
 pub mod memory_recorder;
 pub mod network_recorder;
