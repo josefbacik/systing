@@ -1204,6 +1204,16 @@ pub(crate) fn trace_id_filter(trace_id: Option<&str>, table_alias: &str) -> Stri
     }
 }
 
+/// `network_socket` with one row per (trace_id, socket_id), to use with an alias
+/// in place of the table. A socket can have a row with an incomplete tuple and
+/// one with the complete tuple (see `NetworkSocketRecord`); the complete one is
+/// kept. Must match `socket_tuple_is_complete` in src/network_recorder.rs.
+pub(crate) const ONE_ROW_PER_SOCKET: &str = "(SELECT * FROM network_socket \
+     QUALIFY ROW_NUMBER() OVER (\
+     PARTITION BY trace_id, socket_id \
+     ORDER BY (src_port <> 0 AND NOT (dest_port = 0 AND dest_ip IN ('0.0.0.0', '::'))) DESC\
+     ) = 1)";
+
 fn get_trace_time_range(conn: &Connection, trace_id: Option<&str>) -> Result<(i64, i64, u64)> {
     // trace_id is escaped via single-quote doubling for safe SQL interpolation
     let sql = if let Some(tid) = trace_id {
@@ -1243,6 +1253,146 @@ mod tests {
     fn test_to_u64_negative() {
         assert_eq!(to_u64(-1), 0);
         assert_eq!(to_u64(i64::MIN), 0);
+    }
+
+    /// Two connections seen from both ends. Sockets 7 and 10 (the connects) and
+    /// 8 and 11 (their passive opens) each have an incomplete row and a complete
+    /// one. The incomplete row has the earlier time and is inserted first in 7
+    /// and 8, and has the later time and is inserted last in 10 and 11. Socket 9
+    /// (the listener) and trace t2's own socket 7 have one incomplete row each.
+    fn open_network_test_db(dir: &Path) -> AnalyzeDb {
+        let db_path = dir.join("network.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            crate::duckdb::create_schema(&conn).unwrap();
+            conn.execute_batch(
+                "INSERT INTO network_interface \
+                 (trace_id, namespace, interface_name, ip_address) VALUES \
+                 ('t1', 'client', 'eth0', '10.0.0.1'), \
+                 ('t1', 'server', 'eth1', '10.0.0.2'); \
+                 INSERT INTO network_socket \
+                 (trace_id, socket_id, protocol, address_family, \
+                 src_ip, src_port, dest_ip, dest_port, first_seen_ts) VALUES \
+                 ('t1', 7, 'TCP', 'IPv4', '10.0.0.1', 0, '10.0.0.2', 80, 100), \
+                 ('t1', 7, 'TCP', 'IPv4', '10.0.0.1', 40000, '10.0.0.2', 80, 200), \
+                 ('t1', 8, 'TCP', 'IPv4', '0.0.0.0', 80, '0.0.0.0', 0, 150), \
+                 ('t1', 8, 'TCP', 'IPv4', '10.0.0.2', 80, '10.0.0.1', 40000, 250), \
+                 ('t1', 9, 'TCP', 'IPv4', '0.0.0.0', 80, '0.0.0.0', 0, 50), \
+                 ('t1', 10, 'TCP', 'IPv4', '10.0.0.1', 40001, '10.0.0.2', 80, 300), \
+                 ('t1', 10, 'TCP', 'IPv4', '10.0.0.1', 0, '10.0.0.2', 80, 400), \
+                 ('t1', 11, 'TCP', 'IPv4', '10.0.0.2', 80, '10.0.0.1', 40001, 300), \
+                 ('t1', 11, 'TCP', 'IPv4', '0.0.0.0', 80, '0.0.0.0', 0, 400), \
+                 ('t2', 7, 'TCP', 'IPv4', '10.0.0.3', 0, '10.0.0.4', 443, 100); \
+                 INSERT INTO network_syscall (trace_id, socket_id, event_type, bytes) VALUES \
+                 ('t1', 7, 'sendmsg', 100), ('t1', 8, 'recvmsg', 90), \
+                 ('t1', 8, 'sendmsg', 30), ('t1', 7, 'recvmsg', 30), \
+                 ('t1', 10, 'sendmsg', 5), ('t1', 11, 'recvmsg', 3); \
+                 INSERT INTO network_packet \
+                 (trace_id, socket_id, event_type, is_retransmit) VALUES \
+                 ('t1', 7, 'TCP packet_send', false), ('t1', 7, 'TCP packet_send', true), \
+                 ('t1', 8, 'TCP packet_send', false);",
+            )
+            .unwrap();
+        }
+        AnalyzeDb::open(&db_path, true).unwrap()
+    }
+
+    #[test]
+    fn test_one_row_per_socket_keeps_the_complete_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_network_test_db(dir.path());
+
+        let result = db
+            .query(&format!(
+                "SELECT trace_id, socket_id, src_port, dest_port \
+                 FROM {ONE_ROW_PER_SOCKET} s ORDER BY trace_id, socket_id"
+            ))
+            .unwrap();
+        assert_eq!(
+            serde_json::json!(result.rows),
+            serde_json::json!([
+                ["t1", 7, 40000, 80],
+                ["t1", 8, 80, 40000],
+                ["t1", 9, 80, 0],
+                ["t1", 10, 40001, 80],
+                ["t1", 11, 80, 40001],
+                ["t2", 7, 0, 443],
+            ])
+        );
+    }
+
+    #[test]
+    fn test_network_connections_lists_a_socket_with_two_rows_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_network_test_db(dir.path());
+
+        let result = db
+            .network_connections(&NetworkConnectionsParams {
+                trace_id: None,
+                pid: None,
+                tid: None,
+                top_n: None,
+            })
+            .unwrap();
+        let mut listed = Vec::new();
+        for t in &result.traces {
+            let trace = t.trace_id.as_str();
+            for c in &t.connections {
+                let ports = (c.src_port, c.dest_port);
+                listed.push((trace, ports, c.total_bytes, c.total_tcp_packets));
+            }
+        }
+        assert_eq!(
+            listed,
+            [
+                ("t1", (40000, 80), 130, Some(2)),
+                ("t1", (80, 40000), 120, Some(1)),
+                ("t1", (40001, 80), 5, Some(0)),
+                ("t1", (80, 40001), 3, Some(0)),
+                ("t1", (80, 0), 0, Some(0)),
+                ("t2", (0, 443), 0, Some(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_network_interfaces_counts_a_socket_with_two_rows_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_network_test_db(dir.path());
+
+        let result = db
+            .network_interfaces(&NetworkInterfacesParams::default())
+            .unwrap();
+        let eth0 = &result.traces[0].interfaces[0];
+        assert_eq!(eth0.interface_name, "eth0");
+        assert_eq!((eth0.total_send_bytes, eth0.total_recv_bytes), (105, 30));
+        assert_eq!(eth0.traffic.len(), 1);
+        assert_eq!(eth0.traffic[0].socket_count, 2);
+        assert_eq!(eth0.traffic[0].total_tcp_packets, Some(2));
+        assert_eq!(eth0.traffic[0].retransmit_count, Some(1));
+    }
+
+    #[test]
+    fn test_network_socket_pairs_reads_the_complete_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_network_test_db(dir.path());
+
+        let result = db
+            .network_socket_pairs(&NetworkSocketPairsParams {
+                trace_id: None,
+                dest_port: None,
+                ip: None,
+                top_n: None,
+                exclude_loopback: false,
+            })
+            .unwrap();
+        assert_eq!(result.pairs.len(), 2);
+        let pair = &result.pairs[0];
+        assert_eq!((pair.side_a.socket_id, pair.side_b.socket_id), (7, 8));
+        assert_eq!(pair.total_bytes, 250);
+        assert_eq!(pair.side_a.interface_name, "eth0");
+        // No interface has the wildcard address of socket 8's incomplete row.
+        assert_eq!(pair.side_b.interface_name, "eth1");
     }
 
     /// Assert that an error is DuckDB refusing an operation because external

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{bail, Result};
 use serde::Serialize;
 
-use super::{to_u64, trace_id_filter, AnalyzeDb};
+use super::{to_u64, trace_id_filter, AnalyzeDb, ONE_ROW_PER_SOCKET};
 
 /// Parameters for network interfaces analysis.
 #[derive(Debug, Clone, Default)]
@@ -279,7 +279,7 @@ fn build_traffic_query(trace_id: Option<&str>) -> String {
          COALESCE(SUM(CASE WHEN ns.event_type = 'sendmsg' THEN ns.bytes ELSE 0 END), 0) as send_bytes, \
          COALESCE(SUM(CASE WHEN ns.event_type = 'recvmsg' THEN ns.bytes ELSE 0 END), 0) as recv_bytes \
          FROM network_interface ni \
-         JOIN network_socket s ON ni.ip_address = s.src_ip AND ni.trace_id = s.trace_id \
+         JOIN {ONE_ROW_PER_SOCKET} s ON ni.ip_address = s.src_ip AND ni.trace_id = s.trace_id \
          LEFT JOIN network_syscall ns ON s.socket_id = ns.socket_id AND s.trace_id = ns.trace_id \
          WHERE 1=1{filter} \
          GROUP BY ni.trace_id, ni.namespace, ni.interface_name, s.protocol, s.address_family \
@@ -295,7 +295,7 @@ fn build_retransmit_query(trace_id: Option<&str>) -> String {
          COUNT(*) as total_packets, \
          SUM(CASE WHEN np.is_retransmit THEN 1 ELSE 0 END) as retransmit_count \
          FROM network_interface ni \
-         JOIN network_socket s ON ni.ip_address = s.src_ip AND ni.trace_id = s.trace_id \
+         JOIN {ONE_ROW_PER_SOCKET} s ON ni.ip_address = s.src_ip AND ni.trace_id = s.trace_id \
          JOIN network_packet np ON s.socket_id = np.socket_id AND s.trace_id = np.trace_id \
          WHERE s.protocol = 'TCP' \
          AND np.event_type IN (\
@@ -328,9 +328,9 @@ mod tests {
     #[test]
     fn test_build_traffic_query_joins() {
         let sql = build_traffic_query(None);
-        assert!(sql.contains(
-            "JOIN network_socket s ON ni.ip_address = s.src_ip AND ni.trace_id = s.trace_id"
-        ));
+        assert!(sql.contains(&format!(
+            "JOIN {ONE_ROW_PER_SOCKET} s ON ni.ip_address = s.src_ip AND ni.trace_id = s.trace_id"
+        )));
         assert!(sql.contains(
             "LEFT JOIN network_syscall ns ON s.socket_id = ns.socket_id AND s.trace_id = ns.trace_id"
         ));
@@ -349,6 +349,7 @@ mod tests {
     #[test]
     fn test_build_retransmit_query_filters_send_side() {
         let sql = build_retransmit_query(None);
+        assert!(sql.contains(&format!("JOIN {ONE_ROW_PER_SOCKET} s ON")));
         assert!(sql.contains("s.protocol = 'TCP'"));
         assert!(sql.contains("'TCP packet_send', 'TCP packet_enqueue', 'TCP rto_timeout'"));
         assert!(!sql.contains("'packet_send'"));

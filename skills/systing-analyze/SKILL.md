@@ -179,19 +179,25 @@ ORDER BY ss.dur DESC LIMIT 20;
 ### Network
 - `network_syscall` — sendmsg/recvmsg: `ts`, `dur`, `utid`, `event_type` (`sendmsg`/`recvmsg`), `socket_id`, `bytes`, send-buffer fill (`sndbuf_used/limit/fill_pct`), recv-side (`recv_seq_start/end`, `rcv_nxt`, `bytes_available`).
 - `network_packet` — packet-level: `seq`, `length`, `tcp_flags`, `is_retransmit`, `retransmit_count`, `rto_ms`, `srtt_ms`, windows (`snd_wnd`, `rcv_wnd`, zero-window probes), qdisc (`qlen`, `qdisc_backlog`, `qdisc_latency_us`), drops (`drop_reason`, `drop_reason_str`), TCP state changes (`old_state_str`, `new_state_str`).
-- `network_socket` — socket metadata: `socket_id`, `netns_inum`, `protocol`, `address_family`, src/dest IP:port, first/last seen ts.
+- `network_socket` — socket metadata: `socket_id`, `netns_inum`, `protocol`, `address_family`, src/dest IP:port, first/last seen ts. A socket has one row, or two: one with an incomplete tuple (`src_port` 0, or `dest_port` 0 with `dest_ip` `0.0.0.0` or `::`) and one with the complete tuple.
 - `network_poll` — poll/epoll/select events per socket.
 - `network_interface` — local interface metadata (namespace, name, IPs, `netns_inum`).
 - `network_dns` — IP→hostname, only when the trace was captured with `--resolve-addresses`.
-- Join syscall/packet → socket on `socket_id` (plus `trace_id`).
+- Join syscall/packet → socket on `socket_id` (plus `trace_id`), with one row per socket, preferring the complete one:
 
 ```sql
 -- Retransmits by connection
+WITH sockets AS (
+  SELECT * FROM network_socket
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY trace_id, socket_id
+    ORDER BY (src_port <> 0 AND NOT (dest_port = 0 AND dest_ip IN ('0.0.0.0', '::'))) DESC) = 1
+)
 SELECT s.src_ip, s.src_port, s.dest_ip, s.dest_port,
        count(*) FILTER (WHERE p.is_retransmit) AS retransmits,
        count(*) AS total_packets
 FROM network_packet p
-JOIN network_socket s ON s.trace_id = p.trace_id AND s.socket_id = p.socket_id
+JOIN sockets s ON s.trace_id = p.trace_id AND s.socket_id = p.socket_id
 GROUP BY 1,2,3,4 HAVING retransmits > 0
 ORDER BY retransmits DESC;
 ```

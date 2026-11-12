@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{bail, Result};
 use serde::Serialize;
 
-use super::{to_u64, AnalyzeDb};
+use super::{to_u64, AnalyzeDb, ONE_ROW_PER_SOCKET};
 
 /// Parameters for network socket pairs analysis.
 pub struct NetworkSocketPairsParams {
@@ -388,8 +388,8 @@ fn build_pairs_query(params: &NetworkSocketPairsParams) -> String {
          b.trace_id AS trace_b, b.socket_id AS sock_b, \
          b.src_ip AS b_src_ip, b.src_port AS b_src_port, \
          b.dest_ip AS b_dest_ip, b.dest_port AS b_dest_port \
-         FROM network_socket a \
-         JOIN network_socket b ON \
+         FROM {ONE_ROW_PER_SOCKET} a \
+         JOIN {ONE_ROW_PER_SOCKET} b ON \
          a.src_ip = b.dest_ip AND a.src_port = b.dest_port AND \
          a.dest_ip = b.src_ip AND a.dest_port = b.src_port AND \
          a.protocol = b.protocol AND \
@@ -437,7 +437,7 @@ fn build_interface_query(socket_keys: &BTreeSet<(String, i64)>) -> String {
         "SELECT ns.trace_id, ns.socket_id, \
          COALESCE(ni.interface_name, 'unknown') AS interface_name, \
          COALESCE(ni.namespace, 'unknown') AS namespace \
-         FROM network_socket ns \
+         FROM {ONE_ROW_PER_SOCKET} ns \
          LEFT JOIN network_interface ni ON ns.trace_id = ni.trace_id AND ns.src_ip = ni.ip_address \
          WHERE ({filter})"
     )
@@ -457,8 +457,8 @@ mod tests {
             exclude_loopback: false,
         };
         let sql = build_pairs_query(&params);
-        assert!(sql.contains("FROM network_socket a"));
-        assert!(sql.contains("JOIN network_socket b ON"));
+        assert!(sql.contains(&format!("FROM {ONE_ROW_PER_SOCKET} a")));
+        assert!(sql.contains(&format!("JOIN {ONE_ROW_PER_SOCKET} b ON")));
         assert!(sql.contains("a.src_ip = b.dest_ip"));
         assert!(sql.contains("a.src_port = b.dest_port"));
         assert!(sql.contains("a.dest_ip = b.src_ip"));
@@ -585,7 +585,7 @@ mod tests {
         keys.insert(("t1".to_string(), 5));
 
         let sql = build_interface_query(&keys);
-        assert!(sql.contains("FROM network_socket ns"));
+        assert!(sql.contains(&format!("FROM {ONE_ROW_PER_SOCKET} ns")));
         assert!(sql.contains("LEFT JOIN network_interface ni"));
         assert!(sql.contains("ns.src_ip = ni.ip_address"));
         assert!(sql.contains("COALESCE(ni.interface_name, 'unknown')"));

@@ -90,10 +90,10 @@ Packet-level events with all TCP/UDP fields as explicit columns.
 | qdisc_latency_us | INTEGER | Yes | Qdisc residence time |
 
 **Packet Event Types:**
-- TCP: `packet_enqueue`, `packet_send`, `packet_rcv_established`, `packet_queue_rcv`, `buffer_queue`, `zero_window_probe`, `zero_window_ack`, `rto_timeout`
+- TCP: `TCP packet_enqueue`, `TCP packet_send`, `TCP packet_rcv_established`, `TCP packet_queue_rcv`, `TCP buffer_queue`, `TCP zero_window_probe`, `TCP zero_window_ack`, `TCP rto_timeout`, `TCP state_change`
 - UDP: `UDP send`, `UDP receive`, `UDP enqueue`
-- Drop: `packet_drop`, `cpu_backlog_drop`, `mem_pressure`, `tsq_throttle`
-- Qdisc: `qdisc_enqueue`, `qdisc_dequeue`, `tx_queue_stop`, `tx_queue_wake`
+- Drop: `packet drop`, `cpu backlog drop`, `memory pressure`
+- Qdisc: `qdisc_enqueue`, `qdisc_dequeue`
 
 ### `network_socket`
 
@@ -101,7 +101,7 @@ Socket metadata with the connection 4-tuple.
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
-| socket_id | BIGINT | No | Unique socket ID (PK) |
+| socket_id | BIGINT | No | Socket identifier, one per socket; a socket can have two rows (see below) |
 | protocol | VARCHAR | No | "TCP" or "UDP" |
 | address_family | VARCHAR | No | "IPv4" or "IPv6" |
 | src_ip | VARCHAR | No | Source IP address |
@@ -110,6 +110,18 @@ Socket metadata with the connection 4-tuple.
 | dest_port | INTEGER | No | Destination port |
 | first_seen_ts | BIGINT | Yes | First event timestamp |
 | last_seen_ts | BIGINT | Yes | Last event timestamp |
+
+A socket has one row, or two: one with an incomplete tuple (`src_port` 0, or `dest_port` 0 with `dest_ip` '0.0.0.0' or '::') and one with the complete tuple. Keep one row per `(trace_id, socket_id)`, the complete one if there is one, before joining: a join with both counts the socket's events twice. The queries below that read `sockets` need this in front:
+
+```sql
+WITH sockets AS (
+    SELECT * FROM network_socket
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY trace_id, socket_id
+        ORDER BY (src_port <> 0 AND NOT (dest_port = 0 AND dest_ip IN ('0.0.0.0', '::'))) DESC
+    ) = 1
+)
+```
 
 ### `network_poll`
 
@@ -155,7 +167,7 @@ SELECT sock.dest_ip, sock.dest_port, sock.protocol,
        SUM(CASE WHEN ns.event_type = 'sendmsg' THEN ns.bytes ELSE 0 END) as bytes_sent,
        SUM(CASE WHEN ns.event_type = 'recvmsg' THEN ns.bytes ELSE 0 END) as bytes_recv
 FROM network_syscall ns
-JOIN network_socket sock ON ns.socket_id = sock.socket_id
+JOIN sockets sock USING (trace_id, socket_id)
 GROUP BY sock.dest_ip, sock.dest_port, sock.protocol
 ORDER BY bytes_sent + bytes_recv DESC
 LIMIT 20;
@@ -181,7 +193,7 @@ SELECT sock.dest_ip, sock.dest_port,
        COUNT(*) as retransmit_count,
        SUM(np.length) as retransmit_bytes
 FROM network_packet np
-JOIN network_socket sock ON np.socket_id = sock.socket_id
+JOIN sockets sock USING (trace_id, socket_id)
 WHERE np.is_retransmit = true
 GROUP BY sock.dest_ip, sock.dest_port
 ORDER BY retransmit_count DESC;
@@ -194,7 +206,7 @@ SELECT np.ts / 1e9 as time_sec,
        sock.dest_ip, sock.dest_port,
        np.seq, np.length, np.rto_ms, np.retransmit_count
 FROM network_packet np
-JOIN network_socket sock ON np.socket_id = sock.socket_id
+JOIN sockets sock USING (trace_id, socket_id)
 WHERE np.is_retransmit = true
 ORDER BY np.ts
 LIMIT 100;
@@ -208,7 +220,7 @@ SELECT sock.dest_ip, sock.dest_port,
        MIN(np.ts) / 1e9 as first_probe_sec,
        MAX(np.ts) / 1e9 as last_probe_sec
 FROM network_packet np
-JOIN network_socket sock ON np.socket_id = sock.socket_id
+JOIN sockets sock USING (trace_id, socket_id)
 WHERE np.is_zero_window_probe = true
 GROUP BY sock.dest_ip, sock.dest_port
 ORDER BY probe_count DESC;
@@ -222,7 +234,7 @@ SELECT sock.dest_ip, sock.dest_port,
        MAX(ns.sndbuf_fill_pct) as max_fill_pct,
        COUNT(*) as events
 FROM network_syscall ns
-JOIN network_socket sock ON ns.socket_id = sock.socket_id
+JOIN sockets sock USING (trace_id, socket_id)
 WHERE ns.event_type = 'sendmsg' AND ns.sndbuf_fill_pct IS NOT NULL
 GROUP BY sock.dest_ip, sock.dest_port
 HAVING avg_fill_pct > 50
@@ -248,7 +260,7 @@ SELECT np.ts / 1e9 as time_sec,
        sock.dest_ip, sock.dest_port,
        np.drop_reason_str, np.length
 FROM network_packet np
-JOIN network_socket sock ON np.socket_id = sock.socket_id
+JOIN sockets sock USING (trace_id, socket_id)
 WHERE np.drop_reason IS NOT NULL
 ORDER BY np.ts;
 ```
@@ -261,8 +273,8 @@ SELECT sock.dest_ip, sock.dest_port,
        AVG(np.rto_ms) as avg_rto_ms,
        MAX(np.retransmit_count) as max_retransmits
 FROM network_packet np
-JOIN network_socket sock ON np.socket_id = sock.socket_id
-WHERE np.event_type = 'rto_timeout'
+JOIN sockets sock USING (trace_id, socket_id)
+WHERE np.event_type = 'TCP rto_timeout'
 GROUP BY sock.dest_ip, sock.dest_port
 ORDER BY rto_count DESC;
 ```
@@ -271,7 +283,7 @@ ORDER BY rto_count DESC;
 
 ```sql
 SELECT src_ip, src_port, dest_ip, dest_port
-FROM network_socket
+FROM sockets
 WHERE protocol = 'TCP' AND dest_port = 443
 ORDER BY socket_id;
 ```
@@ -280,7 +292,7 @@ ORDER BY socket_id;
 
 ```sql
 SELECT protocol, address_family, COUNT(*) as connection_count
-FROM network_socket
+FROM sockets
 GROUP BY protocol, address_family
 ORDER BY connection_count DESC;
 ```
@@ -292,7 +304,7 @@ SELECT sock.dest_ip, sock.dest_port,
        COUNT(*) as poll_count,
        COUNT(DISTINCT np.utid) as threads_polling
 FROM network_poll np
-JOIN network_socket sock ON np.socket_id = sock.socket_id
+JOIN sockets sock USING (trace_id, socket_id)
 GROUP BY sock.dest_ip, sock.dest_port
 ORDER BY poll_count DESC;
 ```
@@ -307,7 +319,7 @@ SELECT ns.ts / 1e9 as time_sec,
        ns.recv_seq_start, ns.recv_seq_end,
        ns.rcv_nxt, ns.bytes_available
 FROM network_syscall ns
-JOIN network_socket sock ON ns.socket_id = sock.socket_id
+JOIN sockets sock USING (trace_id, socket_id)
 WHERE ns.event_type = 'recvmsg'
 ORDER BY ns.ts;
 ```
@@ -320,7 +332,7 @@ SELECT sock.dest_ip, sock.dest_port,
        MAX(np.qdisc_latency_us) as max_latency_us,
        COUNT(*) as events
 FROM network_packet np
-JOIN network_socket sock ON np.socket_id = sock.socket_id
+JOIN sockets sock USING (trace_id, socket_id)
 WHERE np.event_type = 'qdisc_dequeue' AND np.qdisc_latency_us IS NOT NULL
 GROUP BY sock.dest_ip, sock.dest_port
 ORDER BY avg_latency_us DESC;
@@ -334,7 +346,7 @@ SELECT
     ni.ip_address as source_ip,
     sock.dest_ip, sock.dest_port
 FROM network_interface ni
-JOIN network_socket sock ON ni.ip_address = sock.src_ip
+JOIN sockets sock ON ni.trace_id = sock.trace_id AND ni.ip_address = sock.src_ip
 WHERE ni.namespace LIKE 'container:%';
 ```
 
@@ -345,7 +357,7 @@ SELECT COALESCE(dns.hostname, sock.dest_ip) as destination,
        sock.dest_port,
        SUM(ns.bytes) / 1048576.0 as total_mb
 FROM network_syscall ns
-JOIN network_socket sock ON ns.socket_id = sock.socket_id
+JOIN sockets sock USING (trace_id, socket_id)
 LEFT JOIN network_dns dns ON sock.dest_ip = dns.ip_address
 GROUP BY destination, sock.dest_port
 ORDER BY total_mb DESC;
@@ -372,4 +384,4 @@ High `bytes_available` values indicate the application is reading slower than da
 TCP flags are stored as pipe-separated strings: `SYN|ACK`, `FIN|ACK`, `PSH|ACK`, etc.
 
 ### Socket ID
-The socket_id is a unique identifier assigned during tracing. It's consistent within a single trace but not across traces.
+The socket_id is assigned during tracing, one per socket; a socket can have two `network_socket` rows. It's consistent within a single trace but not across traces.

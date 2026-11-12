@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Result};
 use serde::Serialize;
 
-use super::{to_u64, trace_id_filter, AnalyzeDb};
+use super::{to_u64, trace_id_filter, AnalyzeDb, ONE_ROW_PER_SOCKET};
 
 /// Parameters for network connections analysis.
 pub struct NetworkConnectionsParams {
@@ -312,7 +312,7 @@ fn build_connections_query(
          ns.src_ip, ns.src_port, ns.dest_ip, ns.dest_port, \
          {iface_select}, \
          {syscall_select} \
-         FROM network_socket ns \
+         FROM {ONE_ROW_PER_SOCKET} ns \
          {iface_join} \
          {syscall_join} \
          WHERE 1=1{trace_filter}{pid_tid_where} \
@@ -335,7 +335,7 @@ fn build_retransmit_query(trace_id: Option<&str>, socket_ids: &[i64]) -> String 
          COUNT(*) AS total_packets, \
          SUM(CASE WHEN np.is_retransmit THEN 1 ELSE 0 END) AS retransmit_count \
          FROM network_packet np \
-         JOIN network_socket ns \
+         JOIN {ONE_ROW_PER_SOCKET} ns \
          ON np.trace_id = ns.trace_id AND np.socket_id = ns.socket_id \
          WHERE ns.protocol = 'TCP' \
          AND np.event_type IN (\
@@ -352,7 +352,9 @@ mod tests {
     #[test]
     fn test_build_connections_query_no_filters() {
         let sql = build_connections_query(None, None, None, Some(50), true, true);
-        assert!(sql.contains("FROM network_socket ns"));
+        assert!(sql.contains(&format!("FROM {ONE_ROW_PER_SOCKET} ns")));
+        // ONE_ROW_PER_SOCKET has a QUALIFY of its own.
+        let sql = sql.replace(ONE_ROW_PER_SOCKET, "network_socket");
         assert!(sql.contains("LEFT JOIN network_interface ni"));
         assert!(sql.contains("LEFT JOIN network_syscall nsc"));
         assert!(sql.contains("WHERE 1=1"));
@@ -419,6 +421,8 @@ mod tests {
     #[test]
     fn test_build_connections_query_no_limit() {
         let sql = build_connections_query(None, None, None, None, true, true);
+        // ONE_ROW_PER_SOCKET has a QUALIFY of its own.
+        let sql = sql.replace(ONE_ROW_PER_SOCKET, "network_socket");
         assert!(!sql.contains("QUALIFY"));
         assert!(!sql.contains("ROW_NUMBER"));
         assert!(sql.contains("ORDER BY ns.trace_id"));
@@ -428,6 +432,7 @@ mod tests {
     fn test_build_retransmit_query_basic() {
         let socket_ids = vec![100i64, 200i64];
         let sql = build_retransmit_query(None, &socket_ids);
+        assert!(sql.contains(&format!("JOIN {ONE_ROW_PER_SOCKET} ns")));
         assert!(sql.contains("ns.protocol = 'TCP'"));
         assert!(sql.contains("'TCP packet_send', 'TCP packet_enqueue', 'TCP rto_timeout'"));
         assert!(sql.contains("SUM(CASE WHEN np.is_retransmit THEN 1 ELSE 0 END)"));

@@ -400,10 +400,10 @@ pub struct NetworkSyscallRecord {
 /// Replaces instant + instant_args for network events. Single table for all packet
 /// event types with nullable fields (Parquet handles sparse columns efficiently).
 ///
-/// Event types: packet_enqueue, packet_send, packet_rcv_established, packet_queue_rcv,
-/// buffer_queue, zero_window_probe, zero_window_ack, rto_timeout, udp_send, udp_receive,
-/// udp_enqueue, packet_drop, cpu_backlog_drop, mem_pressure, tsq_throttle, qdisc_enqueue,
-/// qdisc_dequeue, tx_queue_stop, tx_queue_wake
+/// Event types: TCP packet_enqueue, TCP packet_send, TCP packet_rcv_established,
+/// TCP packet_queue_rcv, TCP buffer_queue, TCP zero_window_probe, TCP zero_window_ack,
+/// TCP rto_timeout, TCP state_change, UDP send, UDP receive, UDP enqueue, packet drop,
+/// cpu backlog drop, memory pressure, qdisc_enqueue, qdisc_dequeue
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetworkPacketRecord {
     pub id: i64,
@@ -464,7 +464,7 @@ pub struct NetworkPacketRecord {
 /// Replaces socket_connection with a cleaner schema (no track_id needed).
 /// Socket info extracted directly from BPF events for true streaming.
 ///
-/// Normally one record per socket per capture. A socket whose identity
+/// One record per socket per capture, or two. A socket whose identity
 /// was created by an event that fires before the kernel has filled in
 /// the tuple emits its first record with the degraded tuple and ONE
 /// upgraded record with the complete tuple when a later event carries
@@ -480,7 +480,7 @@ pub struct NetworkPacketRecord {
 /// record.
 ///
 /// # Fields
-/// - `socket_id`: Unique socket ID (primary key)
+/// - `socket_id`: Socket ID, one per socket (a socket can have two records)
 /// - `protocol`: "TCP" or "UDP"
 /// - `address_family`: "IPv4" or "IPv6"
 /// - `src_ip`: Source IP address
