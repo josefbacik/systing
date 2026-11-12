@@ -80,15 +80,31 @@ bool pystacks_propagate_fork(pid_t parent_pid, pid_t child_pid);
  */
 void pystacks_clear_pid(pid_t pid);
 
+/*
+ * Scratch slots per CPU. A walk holds one slot of pystacks_state_heap and of
+ * pystacks_msg_heap from the claim to the release in pystacks_read_stacks().
+ * Walks overlap and end in any order, so each slot has a busy word: the CPU
+ * sampler can land on a walk, and a program that can run with preemption on (a
+ * uprobe, USDT, fentry or fexit program; from Linux 7.2 one on a syscall
+ * tracepoint too) can be scheduled out in mid-walk. Four, because the kernel
+ * lets one thread at a time into a tracepoint or trampoline program on a CPU:
+ * the mmap, munmap and brk exits can hold three, which leaves one for whatever
+ * runs meanwhile. A walk that finds none free reads nothing. An object in which
+ * one program at a time uses the scratch sets 1 and takes slot 0 with no claim.
+ */
+#ifndef PYSTACKS_SCRATCH_SLOTS
+#define PYSTACKS_SCRATCH_SLOTS 4
+#endif
+
 struct pystacks_msg_heap_map {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 1);
+  __uint(max_entries, PYSTACKS_SCRATCH_SLOTS);
   __type(key, u32);
   __type(value, struct pystacks_message);
 };
 
 extern struct pystacks_msg_heap_map pystacks_msg_heap SEC(".maps");
 
-struct pystacks_message* pystacks_get_msg(void);
+struct pystacks_message* pystacks_get_msg(const uint32_t* slot);
 
 #endif

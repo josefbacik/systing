@@ -43,6 +43,8 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+/* One scratch slot: one program at a time on a CPU uses it, see pyft_busy. */
+#define PYSTACKS_SCRATCH_SLOTS 1
 #include "pystacks.bpf.c"
 
 #include "systing_shared.bpf.h"
@@ -215,7 +217,7 @@ static __always_inline void pyft_count(u32 idx)
  */
 static __noinline u64 pyft_intern(void *frame, void *code, pid_t tgid)
 {
-	struct sample_state_t *state = get_state();
+	struct sample_state_t *state = get_state(0);
 	PyPidData *pid_data = bpf_map_lookup_elem(&pystacks_pid_config, &tgid);
 	void *rb = pyft_ring();
 

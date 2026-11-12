@@ -149,7 +149,9 @@ static __always_inline long find_vma_unless_busy(struct task_struct *task,
  * selects the sleepable bodies of its task and read helpers (which it pulls in
  * as .c files itself, for the same reason). One unit, so nothing here crosses
  * a link: its __hidden functions, its maps and `zero` are simply in scope.
+ * One scratch slot: one thread reads the iterator.
  */
+#define PYSTACKS_SCRATCH_SLOTS 1
 #include "pystacks.bpf.c"
 
 #include "systing_shared.bpf.h"
@@ -616,7 +618,7 @@ __noinline int task_stacks_read_python(pid_t tid)
 	tgid = task->tgid;
 	if (profile_pid_task(tgid, task))
 		ret = pystacks_read_stacks_task(
-			(struct pt_regs *)bpf_task_pt_regs(task), tgid, task);
+			(struct pt_regs *)bpf_task_pt_regs(task), tgid, task, 0);
 	put_task(task);
 	if (ret <= 0)
 		return 0;

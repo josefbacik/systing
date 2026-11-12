@@ -3293,6 +3293,150 @@ fn test_pystacks_python314() {
     run_pystacks_version_test(PYTHON_314_VERSION);
 }
 
+/// Every mmap and munmap row keeps the frames that belong to it, though
+/// threads are scheduled out in mid-walk. Each worker says who it
+/// is twice, in its function names and in the length of its mappings. To make
+/// walks overlap, the workers share one CPU, map from the bottom of a deep
+/// stack, and lose the CPU thousands of times a second to a real-time thread.
+/// The trampoline hooks can be preempted wherever the kernel preempts kernel
+/// code (not with preempt=none or voluntary); the default hooks from Linux 7.2.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_pystacks_memory_rows_keep_their_frames() {
+    const WORKERS: i64 = 6;
+    /// Worker `n` maps `FIRST_PAGES + n` pages: lengths nothing else asks for.
+    const FIRST_PAGES: i64 = 101;
+
+    let Some(cpu) = spare_cpu() else {
+        eprintln!("skipping: needs two CPUs, one for the workers and one for the recorder");
+        return;
+    };
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let python = pyenv_python(PYTHON_313_VERSION);
+
+    let waker = spawn_python_workload(
+        &python,
+        dir.path(),
+        "waker.py",
+        &format!("import os\nos.sched_setaffinity(0, {{{cpu}}})"),
+        "time.sleep(0.0002)",
+    );
+    let param = libc::sched_param { sched_priority: 1 };
+    // SAFETY: `param` outlives the call, which only reads it.
+    if unsafe { libc::sched_setscheduler(waker.pid as i32, libc::SCHED_FIFO, &param) } != 0 {
+        eprintln!(
+            "skipping: cannot make the waker real-time ({})",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let workers: Vec<PythonWorkload> = (0..WORKERS)
+        .map(|n| {
+            let defs = format!(
+                "import mmap, os\n\
+                 os.sched_setaffinity(0, {{{cpu}}})\n\
+                 def systing_own_{n}_leaf():\n\
+                 \x20   for _ in range(200):\n\
+                 \x20       mmap.mmap(-1, {length}).close()\n\
+                 def systing_own_{n}_rec(depth):\n\
+                 \x20   if depth:\n\
+                 \x20       systing_own_{n}_rec(depth - 1)\n\
+                 \x20   else:\n\
+                 \x20       systing_own_{n}_leaf()\n",
+                length = 4096 * (FIRST_PAGES + n),
+            );
+            spawn_python_workload(
+                &python,
+                dir.path(),
+                &format!("own_{n}.py"),
+                &defs,
+                &format!("systing_own_{n}_rec(60)"),
+            )
+        })
+        .collect();
+
+    let config = Config {
+        duration: 5,
+        parquet_only: true,
+        collect_pystacks: true,
+        memory: true,
+        kernel_hooks: KernelHooks::Trampoline,
+        pid: workers.iter().map(|worker| worker.pid).collect(),
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+    systing(config, None).expect("systing recording failed");
+    drop(workers);
+    drop(waker);
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "memory_rows")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    let (own, foreign, seen): (i64, i64, i64) = conn
+        .query_row(
+            &format!(
+                "WITH named AS (
+                     SELECT s.id AS stack_id,
+                            CAST(regexp_extract(f.name, 'systing_own_([0-9]+)_', 1) AS BIGINT)
+                                AS worker
+                     FROM (SELECT id, unnest(frame_ids) AS frame_id FROM stack) s
+                     JOIN frame f ON f.id = s.frame_id
+                     WHERE regexp_matches(f.name, 'systing_own_[0-9]+_')
+                 ), calls AS (
+                     SELECT stack_id, size // 4096 - {FIRST_PAGES} AS worker
+                     FROM memory_map
+                     WHERE size % 4096 = 0
+                 )
+                 SELECT COUNT(*) FILTER (WHERE n.worker = c.worker),
+                        COUNT(*) FILTER (WHERE n.worker <> c.worker),
+                        COUNT(DISTINCT c.worker)
+                 FROM calls c
+                 JOIN named n USING (stack_id)
+                 WHERE c.worker BETWEEN 0 AND {WORKERS} - 1"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("Failed to query the workers' memory_map rows");
+    // A skipped run mostly means that a thread was scheduled out inside a
+    // program, which is how walks come to overlap.
+    let last_of = |track: &str| -> Option<f64> {
+        conn.query_row(
+            "SELECT MAX(c.value)
+             FROM counter c
+             JOIN counter_track t ON c.track_id = t.id
+             WHERE t.name = ?",
+            [track],
+            |row| row.get(0),
+        )
+        .expect("Failed to query a missed-events track")
+    };
+    let skipped = last_of("Missed kernel-skipped events");
+    let refused = last_of("Missed python-stack events");
+    eprintln!(
+        "{own} frames in the right rows, {foreign} in the wrong ones, {seen} workers; \
+         runs skipped by the kernel: {skipped:?}, walks without a scratch slot: {refused:?}"
+    );
+    if skipped == Some(0.0) {
+        eprintln!(
+            "the kernel skipped no run, so walks may not have overlapped: this proves little"
+        );
+    }
+
+    assert_eq!(
+        seen, WORKERS,
+        "not every worker has rows with Python frames"
+    );
+    assert!(own > 10_000, "too few frames to tell: {own}");
+    assert_eq!(foreign, 0, "memory_map rows show the wrong Python frames");
+    assert!(
+        refused.is_some(),
+        "no track of walks without a scratch slot"
+    );
+}
+
 // =============================================================================
 // Pystacks dynamic process discovery
 //

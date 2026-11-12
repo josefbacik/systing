@@ -879,8 +879,14 @@ pub const MISSED_EVENT_CLASS_LABELS: &[(u32, &str)] = &[
     // ran without its exit; see memory_syscall_leg in the BPF source).
     (9, "memory-xleg"),
     (10, "python function"),
+    (MISSED_CLASS_PYTHON_STACK, "python-stack"),
     (MISSED_CLASS_KERNEL_SKIPPED, "kernel-skipped"),
 ];
+
+/// Not a class of the `missed_events` map, and not a lost event: records that
+/// went out without their thread's Python frames, because other walks held
+/// every scratch slot of the CPU (`pystacks_no_scratch` in pystacks.bpf.c).
+pub const MISSED_CLASS_PYTHON_STACK: u32 = 100;
 
 /// Not a class of the `missed_events` map: runs of this capture's programs that
 /// the kernel skipped, so none of our code ran to count them (see

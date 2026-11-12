@@ -30,6 +30,7 @@ use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{
     get_clock_value, ClockSamplingConfig, MemoryFaultLeg, MemoryRecorderConfig, MemoryRecorderEnd,
     MissedEvent, NetworkRecorderConfig, SessionRecorder, SysInfoEvent, MISSED_CLASS_KERNEL_SKIPPED,
+    MISSED_CLASS_PYTHON_STACK,
 };
 use crate::stack_recorder::StackRecorder;
 
@@ -4043,7 +4044,11 @@ fn configure_bpf_skeleton(
             if name == "ringbuf_pysym_events" {
                 map.set_max_entries(page_size)
                     .with_context(|| format!("Failed to shrink '{name}'"))?;
-            } else if name == "pystacks_symbols" || name == "pystacks_emitted_cache" {
+            } else if name == "pystacks_symbols"
+                || name == "pystacks_emitted_cache"
+                || name == "pystacks_state_heap"
+                || name == "pystacks_msg_heap"
+            {
                 map.set_max_entries(1)
                     .with_context(|| format!("Failed to shrink '{name}'"))?;
             }
@@ -6100,6 +6105,13 @@ fn run_tracing_loop(
             dump_missed_events(&skel.maps.missed_events, 9)
         );
     }
+    if opts.collect_pystacks {
+        // Not lost events: records without their thread's Python frames.
+        println!(
+            "Missed python-stack events: {}",
+            sum_percpu_counter(&skel.maps.pystacks_no_scratch)
+        );
+    }
     {
         // Runs, not events: a call's enter and its exit each count.
         let skipped: Option<Vec<(String, u64)>> = skel
@@ -7165,6 +7177,13 @@ pub fn systing(
                 // time-localized like a loss burst.
                 classes.push(9);
             }
+            let no_scratch_map = if collect_pystacks {
+                Some(libbpf_rs::MapHandle::try_from(
+                    &skel.maps.pystacks_no_scratch,
+                )?)
+            } else {
+                None
+            };
             let programs = skel
                 .object()
                 .progs()
@@ -7184,6 +7203,13 @@ pub fn systing(
                             for &class in &classes {
                                 let count = dump_missed_events(&missed_map, class);
                                 rec.record_event(MissedEvent { ts, class, count });
+                            }
+                            if let Some(map) = &no_scratch_map {
+                                rec.record_event(MissedEvent {
+                                    ts,
+                                    class: MISSED_CLASS_PYTHON_STACK,
+                                    count: sum_percpu_counter(map),
+                                });
                             }
                             let skipped: Option<u64> = programs
                                 .iter()
