@@ -293,8 +293,16 @@ static __always_inline void read_shadow_frame_data(
  * independently and no shared counter or map insert is needed from probe
  * context. User space recomputes it (hash_symbol() in symbols.rs) and refuses
  * a record that does not match, so change both together.
+ *
+ * A global function, so that the verifier walks the loop once for a program.
+ * Inlined, it was walked again at every frame of the stack walk: about two
+ * thirds of all that the verifier walked in a program with the walker.
  */
-static symbol_id_t hash_symbol(const struct pystacks_symbol* const sym) {
+__noinline symbol_id_t hash_symbol(const struct pystacks_symbol* const sym) {
+  if (!sym) {
+    return 1; /* never: a global function's pointer counts as nullable */
+  }
+
   _Static_assert(
       sizeof(struct pystacks_symbol) % sizeof(uint64_t) == 0,
       "pystacks_symbol must be a multiple of 8 bytes for the word hash");

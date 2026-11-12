@@ -465,10 +465,10 @@ static __always_inline s32 task_syscall_nr(struct task_struct *task, u32 state)
  *    The verifier checks a global function once, on its own, with unknown
  *    arguments; at a call to one it checks the arguments and moves on. A
  *    static function it walks again on every path into every call. The
- *    Python walk costs ~410K of the 1M-instruction budget however it is
+ *    Python walk costs ~130K of the 1M-instruction budget however it is
  *    called, so it has to be walked exactly once: inlined into the iterator
  *    program, one branch ahead of it doubles it.
- *  - A global function takes scalars. It cannot be handed the iterator's
+ *  - A leg takes scalars. It cannot be handed the iterator's
  *    trusted task pointer (before __arg_trusted, 6.8), so each takes the tid
  *    and re-acquires the thread with get_task(), releasing it with
  *    put_task(): in a sleepable build those are bpf_task_from_pid() and
