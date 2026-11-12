@@ -3959,6 +3959,11 @@ fn configure_bpf_skeleton(
             // records every packet as before.
             rodata.tool_config.packet_sample_rate = opts.packet_sample_rate;
         }
+        if opts.network_syscalls || opts.network_packets {
+            // Their hooks look socket ids up by the full tuple; see the
+            // field's comment in systing_system.bpf.c.
+            rodata.tool_config.network_tuple_lookups = 1;
+        }
 
         // Rings per family and the wakeup threshold (half a ring, so
         // consumers batch) come from the plan; see plan_ringbufs.

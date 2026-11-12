@@ -160,6 +160,13 @@ const volatile struct {
 	u32 packet_sample_rate; /* network-packets: keep 1 in N PACKETS of the
 				 * data-path event types (0 or 1 = every packet).
 				 * See packet_sample_keep(). */
+	u32 network_tuple_lookups; /* network-syscalls or network-packets is on.
+				    * Their hooks look socket ids up by the full
+				    * tuple, so the state hook gives a connecting
+				    * socket's id a key with its bound tuple.
+				    * Rodata: with only the state-change recorder
+				    * on, the verifier prunes that arm, so it adds
+				    * no such keys. */
 } tool_config = {};
 
 enum event_type {
@@ -1316,6 +1323,37 @@ static __always_inline u64 get_or_create_socket_id(
 	}
 
 	return socket_id;
+}
+
+// Give a connecting socket's id a second key, with its bound tuple, so that
+// look-ups by the full tuple find the id that was minted at the connect start.
+// Hooks that run after the close, when the port is released again, find it by
+// the connect start's port-less key. Nothing is written unless that key holds
+// this id.
+static __always_inline void add_bound_tuple_key(
+	struct sock *sk,
+	u8 *src_addr,
+	u16 src_port,
+	u8 *dest_addr,
+	u16 dest_port,
+	u64 socket_id)
+{
+	struct socket_identity_key identity_key = {0};
+	struct socket_metadata metadata;
+	struct socket_metadata *start;
+
+	identity_key.sk_ptr = (u64)sk;
+	__builtin_memcpy(identity_key.src_addr, src_addr, 16);
+	__builtin_memcpy(identity_key.dest_addr, dest_addr, 16);
+	identity_key.dest_port = dest_port;
+	start = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
+	if (!start || start->socket_id != socket_id)
+		return;
+
+	metadata = *start;
+	metadata.src_port = src_port;
+	identity_key.src_port = src_port;
+	bpf_map_update_elem(&socket_metadata_map, &identity_key, &metadata, BPF_ANY);
 }
 
 // Lookup socket ID for an existing socket with full 4-tuple
@@ -5208,6 +5246,15 @@ int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newst
 			src_addr, src_port, dest_addr, dest_port, tgidpid);
 	if (socket_id == 0)
 		return 0;
+
+	// The attempt goes on (ESTABLISHED, or SYN_RECV in a simultaneous
+	// open) and its local port is bound by now. Unless the socket was
+	// bound first, hooks that look ids up by the full tuple would miss
+	// this id: send, receive and poll would mint a second one.
+	if (tool_config.network_tuple_lookups &&
+	    oldstate == TCP_SYN_SENT && newstate != TCP_CLOSE)
+		add_bound_tuple_key((struct sock *)sk, src_addr, src_port,
+				    dest_addr, dest_port, socket_id);
 
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
