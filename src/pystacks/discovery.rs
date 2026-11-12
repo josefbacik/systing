@@ -9,7 +9,7 @@ use crate::limits::Limit;
 use crate::root::{self, Root};
 use crate::stack_recorder::MAY_FOLLOW_MAP_FILES;
 use object::read::{ReadCache, ReadRef};
-use object::{Object, ObjectSymbol};
+use object::{Object, ObjectSegment, ObjectSymbol, SegmentFlags};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
@@ -34,6 +34,57 @@ struct ElfPyInfo {
     /// What the file's own version tag says; `None` for a file without one.
     version: Option<(i32, i32, i32)>,
     is_dynamic: bool,
+    exec_segments: Vec<ExecSegment>,
+}
+
+/// One executable loadable segment (a `PT_LOAD` program header with `PF_X`):
+/// `file_size` bytes at `file_offset` of the file are loaded at `vaddr`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExecSegment {
+    file_offset: u64,
+    file_size: u64,
+    vaddr: u64,
+}
+
+/// How many executable segments of a file are kept. A runtime has one, or
+/// two after a post-link optimizer; the bound keeps a file that states
+/// thousands from growing the cache.
+const MAX_EXEC_SEGMENTS: usize = 8;
+
+fn exec_segments<'data, R: ReadRef<'data>>(elf: &object::File<'data, R>) -> Vec<ExecSegment> {
+    elf.segments()
+        .filter(|segment| {
+            matches!(segment.flags(), SegmentFlags::Elf { p_flags } if p_flags & object::elf::PF_X != 0)
+        })
+        .take(MAX_EXEC_SEGMENTS)
+        .map(|segment| {
+            let (file_offset, file_size) = segment.file_range();
+            ExecSegment {
+                file_offset,
+                file_size,
+                vaddr: segment.address(),
+            }
+        })
+        .collect()
+}
+
+/// The virtual address at which the byte at `offset` of the file is loaded,
+/// by the first of `segments` that holds it. A segment whose addresses
+/// overflow holds nothing. The kernel rounds a mapping's offset down to a
+/// page, so a segment holds every offset from its own, rounded down likewise.
+fn file_offset_to_vaddr(segments: &[ExecSegment], offset: u64, page_size: u64) -> Option<u64> {
+    segments.iter().find_map(|segment| {
+        let first = segment.file_offset - segment.file_offset % page_size;
+        let end = segment.file_offset.checked_add(segment.file_size)?;
+        if !(first..end).contains(&offset) {
+            return None;
+        }
+        if offset >= segment.file_offset {
+            segment.vaddr.checked_add(offset - segment.file_offset)
+        } else {
+            segment.vaddr.checked_sub(segment.file_offset - offset)
+        }
+    })
 }
 
 impl ElfPyInfo {
@@ -248,6 +299,7 @@ fn parse_elf_py_info_within(
             code_type_addr: find_symbol_address(&elf, "PyCode_Type").unwrap_or(0),
             version,
             is_dynamic: elf.kind() == object::ObjectKind::Dynamic,
+            exec_segments: exec_segments(&elf),
         }))
     });
     let elapsed = start.elapsed().as_secs_f64();
@@ -418,7 +470,8 @@ fn try_python_module(
     let offsets = offsets::for_version(major, minor)?;
 
     // Find base load address from maps
-    let base_addr = find_module_base_address(maps, module_path).unwrap_or(0);
+    let base_addr =
+        find_module_base_address(maps, module_path, &elf_info.exec_segments).unwrap_or(0);
 
     // Build binary ID — prefer the executable mapping for consistency with
     // base address computation, fall back to any mapping for this module.
@@ -631,14 +684,15 @@ fn exe_code_type_addr(pid: i32, maps: &[MemoryMapping]) -> Option<usize> {
     let reader = BudgetedReader::new(&file, MAX_PARSE_BYTES);
     let found = parse_elf(&reader).and_then(|elf| {
         let addr = find_symbol_address(&elf, "PyCode_Type")?;
-        Some((addr, elf.kind() == object::ObjectKind::Dynamic))
+        let is_dynamic = elf.kind() == object::ObjectKind::Dynamic;
+        Some((addr, is_dynamic, exec_segments(&elf)))
     });
     if over_budget(reader, &exe, MAX_PARSE_BYTES, start.elapsed().as_secs_f64()) {
         return None;
     }
-    let (addr, is_dynamic) = found?;
+    let (addr, is_dynamic, exec_segments) = found?;
     if is_dynamic {
-        Some(find_module_base_address(maps, &exe)? + addr)
+        Some(find_module_base_address(maps, &exe, &exec_segments)? + addr)
     } else {
         Some(addr)
     }
@@ -813,16 +867,24 @@ fn parse_version_from_path(path: &str) -> Option<(i32, i32, i32)> {
 /// for the same file, we can't simply pick the first one.
 ///
 /// Instead, we compute the base from the executable (r-xp) mapping:
-///   base = exec_mapping.start - exec_mapping.offset
-/// This is reliable because there is exactly one executable mapping per
-/// loaded module, and its file offset tells us where vaddr 0 would be.
-fn find_module_base_address(maps: &[MemoryMapping], module_path: &str) -> Option<usize> {
+///   base = exec_mapping.start - (vaddr of the byte at exec_mapping.offset)
+/// `exec_segments` gives that vaddr, which LLD's default layout puts a page
+/// above the offset. Where no segment holds the offset, the two count as equal.
+fn find_module_base_address(
+    maps: &[MemoryMapping],
+    module_path: &str,
+    exec_segments: &[ExecSegment],
+) -> Option<usize> {
     // Prefer computing base from the executable mapping
     if let Some(exec_map) = maps
         .iter()
         .find(|m| m.name == module_path && m.perms.contains('x'))
     {
-        return exec_map.start.checked_sub(exec_map.offset as usize);
+        // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let vaddr = file_offset_to_vaddr(exec_segments, exec_map.offset, page_size)
+            .unwrap_or(exec_map.offset);
+        return exec_map.start.checked_sub(usize::try_from(vaddr).ok()?);
     }
 
     // Fallback: use the last offset=0 mapping (the dynamic linker creates
@@ -1769,7 +1831,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0"),
+            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0", &[]),
             Some(0x7f0000000000)
         );
     }
@@ -1826,7 +1888,7 @@ mod tests {
         ];
         // Should compute base from exec mapping: 0x7cfdaf4a0000 - 0x7f000 = 0x7cfdaf421000
         assert_eq!(
-            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0"),
+            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0", &[]),
             Some(0x7cfdaf421000)
         );
     }
@@ -1858,7 +1920,7 @@ mod tests {
         ];
         // Should use the last offset=0 mapping
         assert_eq!(
-            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0"),
+            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0", &[]),
             Some(0x7f0000200000)
         );
     }
@@ -1875,7 +1937,144 @@ mod tests {
             inode: 12345,
             name: "/usr/lib/libpython3.13.so.1.0".to_string(),
         }];
-        assert_eq!(find_module_base_address(&maps, "/nonexistent.so"), None);
+        assert_eq!(
+            find_module_base_address(&maps, "/nonexistent.so", &[]),
+            None
+        );
+    }
+
+    fn exec_segment(file_offset: u64, file_size: u64, vaddr: u64) -> ExecSegment {
+        ExecSegment {
+            file_offset,
+            file_size,
+            vaddr,
+        }
+    }
+
+    #[test]
+    fn test_find_module_base_address_by_the_program_headers() {
+        const EXE: &str = "/opt/python/bin/python3.13";
+        const BASE: usize = 0x5555_5555_4000;
+        for (what, start, offset, segments, want) in [
+            (
+                "LLD's default layout: the vaddr is a page above the offset",
+                BASE + 0xc0_1000,
+                0xc0_0000,
+                vec![exec_segment(0xc0_0000, 0x20_0000, 0xc0_1000)],
+                Some(BASE),
+            ),
+            (
+                "GNU ld's layout: the vaddr equals the offset",
+                BASE + 0x10_0000,
+                0x10_0000,
+                vec![exec_segment(0x10_0000, 0x30_0000, 0x10_0000)],
+                Some(BASE),
+            ),
+            (
+                "the mapping is of the second of two executable segments",
+                BASE + 0x80_0000,
+                0x50_0000,
+                vec![
+                    exec_segment(0x10_0000, 0x30_0000, 0x10_1000),
+                    exec_segment(0x50_0000, 0x20_0000, 0x80_0000),
+                ],
+                Some(BASE),
+            ),
+            (
+                "no segment holds the mapping's offset",
+                BASE + 0x10_0000,
+                0x10_0000,
+                vec![exec_segment(0x40_0000, 0x1000, 0x50_0000)],
+                Some(BASE),
+            ),
+            (
+                "the file states a vaddr above the mapping's start",
+                0x1000,
+                0,
+                vec![exec_segment(0, 0x1000, 0x7000_0000_0000)],
+                None,
+            ),
+        ] {
+            let maps = vec![MemoryMapping {
+                perms: "r-xp".to_string(),
+                ..mapping(start, offset, EXE)
+            }];
+            assert_eq!(
+                find_module_base_address(&maps, EXE, &segments),
+                want,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_file_offset_to_vaddr() {
+        let segments = [
+            exec_segment(0xc0_0000, 0x2000, 0xc0_1000),
+            // Neither offset nor vaddr on a page boundary: the mapping's
+            // offset is the segment's, rounded down.
+            exec_segment(0x70_0e40, 0x1000, 0x70_2e40),
+            // Overlaps the first; where they overlap, the first wins.
+            exec_segment(0xc0_1000, 0x3000, 0x90_0000),
+            exec_segment(0x80_0000, 0x1000, u64::MAX - 0x7ff),
+            exec_segment(u64::MAX - 0xfff, 0x2000, 0),
+            // A vaddr below what rounding down takes off.
+            exec_segment(0xa0_0e40, 0x1000, 0x10),
+        ];
+        for (offset, want) in [
+            (0xbf_f000, None),
+            (0xc0_0000, Some(0xc0_1000)),
+            (0xc0_1fff, Some(0xc0_2fff)),
+            (0xc0_2000, Some(0x90_1000)),
+            (0xc0_3fff, Some(0x90_2fff)),
+            (0xc0_4000, None),
+            (0x70_0000, Some(0x70_2000)),
+            (0x70_0e40, Some(0x70_2e40)),
+            (0x70_1e3f, Some(0x70_3e3f)),
+            (0x70_1e40, None),
+            (0x80_07ff, Some(u64::MAX)),
+            (0x80_0800, None),
+            (u64::MAX, None),
+            (0xa0_0000, None),
+        ] {
+            assert_eq!(
+                file_offset_to_vaddr(&segments, offset, 0x1000),
+                want,
+                "offset {offset:#x}"
+            );
+        }
+        assert_eq!(file_offset_to_vaddr(&[], 0, 0x1000), None);
+        // With pages of 64 KiB the same segment's mapping starts further down.
+        let segments = [exec_segment(0x1_f000, 0x1000, 0x2_f000)];
+        assert_eq!(file_offset_to_vaddr(&segments, 0x1_0000, 0x1000), None);
+        assert_eq!(
+            file_offset_to_vaddr(&segments, 0x1_0000, 0x1_0000),
+            Some(0x2_0000)
+        );
+    }
+
+    #[no_mangle]
+    static SYSTING_TEST_LOAD_ADDRESS_MARKER: u8 = 1;
+
+    #[test]
+    fn test_find_module_base_address_of_this_test_binary() {
+        let exe = fs::read_link("/proc/self/exe").unwrap();
+        let exe = exe.to_str().unwrap();
+        let file = fs::File::open(exe).unwrap();
+        let reader = ReadCache::new(&file);
+        let elf = object::File::parse(&reader).unwrap();
+        // Only a position-independent file has a load address to find. Where rustc
+        // links with LLD, this one is laid out with its vaddr above its offset.
+        if elf.kind() != object::ObjectKind::Dynamic {
+            return;
+        }
+        let maps = process::parse_proc_maps(std::process::id() as i32);
+        let base = find_module_base_address(&maps, exe, &exec_segments(&elf)).unwrap();
+        let in_the_file = find_symbol_address(&elf, "SYSTING_TEST_LOAD_ADDRESS_MARKER").unwrap();
+        assert_eq!(
+            base + in_the_file,
+            &SYSTING_TEST_LOAD_ADDRESS_MARKER as *const u8 as usize
+        );
     }
 
     #[test]
