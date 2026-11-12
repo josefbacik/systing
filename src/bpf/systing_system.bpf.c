@@ -1325,10 +1325,35 @@ static __always_inline u64 get_or_create_socket_id(
 	return socket_id;
 }
 
+// Forget what is stored under this socket pointer: the identity keyed by the
+// pointer and this tuple, and the pointer's entry in sk_socket_id_map, which the
+// sk-first look-up would find. Either can be an earlier socket's in the same
+// memory. The next get_or_create_socket_id() mints a fresh id.
+static __always_inline void forget_socket_id(
+	struct sock *sk,
+	u8 *src_addr,
+	u16 src_port,
+	u8 *dest_addr,
+	u16 dest_port)
+{
+	struct socket_identity_key identity_key = {0};
+	u64 sk_ptr = (u64)sk;
+
+	identity_key.sk_ptr = sk_ptr;
+	__builtin_memcpy(identity_key.src_addr, src_addr, 16);
+	identity_key.src_port = src_port;
+	__builtin_memcpy(identity_key.dest_addr, dest_addr, 16);
+	identity_key.dest_port = dest_port;
+
+	bpf_map_delete_elem(&socket_metadata_map, &identity_key);
+	bpf_map_delete_elem(&sk_socket_id_map, &sk_ptr);
+}
+
 // Give a connecting socket's id a second key, with its bound tuple, so that
 // look-ups by the full tuple find the id that was minted at the connect start.
 // Hooks that run after the close, when the port is released again, find it by
-// the connect start's port-less key. Nothing is written unless that key holds
+// the connect start's port-less key, which the next connect through this memory
+// to the same destination replaces. Nothing is written unless that key holds
 // this id.
 static __always_inline void add_bound_tuple_key(
 	struct sock *sk,
@@ -5287,6 +5312,19 @@ int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newst
 	// Note: tgidpid may not be the socket owner in softirq/timer
 	// context, but get_or_create_socket_id does not use it for
 	// identification.
+	//
+	// A connect starts a new connection. The kernel hands a freed socket's
+	// memory to later sockets, and this transition fires before an unbound
+	// socket's local port is chosen, so a later connect to the same
+	// destination would find an earlier connection's key (port-less,
+	// unless the socket was bound first): its open would land on the old
+	// id and its outcome on a new one. Forget that key first, so that
+	// get_or_create below mints a fresh id and seeds sk_socket_id_map, and
+	// the attempt's state changes are on one id.
+	if (oldstate == TCP_CLOSE && newstate == TCP_SYN_SENT)
+		forget_socket_id((struct sock *)sk, src_addr, src_port,
+				 dest_addr, dest_port);
+
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	u64 sk_key = (u64)sk;
 	u64 socket_id = 0;

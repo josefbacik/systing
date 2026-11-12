@@ -1746,11 +1746,10 @@ fn test_e2e_network_suite() {
     // keep generating connections throughout the entire recording window.
     // We sleep 200ms between rounds to keep traffic volume reasonable.
     use std::sync::atomic::Ordering;
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
+    let addr = listener.local_addr().unwrap();
     let traffic = stoppable_workload(move |stop| {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
-        let addr = listener.local_addr().unwrap();
-
         while !stop.load(Ordering::Relaxed) {
             // Make a single TCP connection per iteration
             if let Ok(_stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
@@ -1961,6 +1960,8 @@ fn test_e2e_network_suite() {
              TCP connections should produce SYN_SENT/SYN_RECV -> ESTABLISHED transitions."
         );
 
+        assert_one_socket_id_per_connect(&conn, addr.port());
+
         // Check that TIME_WAIT transitions are captured (via tcp_time_wait kprobe rewrite)
         let time_wait_count: i64 = conn
             .query_row(
@@ -2034,6 +2035,132 @@ fn test_e2e_network_suite() {
     }
 
     eprintln!("\n  All network suite checks passed");
+}
+
+/// The ids of the sockets that one thread connected to 127.0.0.1 and `port`, one
+/// after the other: each holds exactly one connect's start. Ids first seen before
+/// the first recorded start belong to connects that began before the capture.
+fn assert_one_socket_id_per_connect(conn: &duckdb::Connection, port: u16) {
+    let (ids, bad): (i64, i64) = conn
+        .query_row(
+            "WITH event AS ( \
+                 SELECT socket_id, ts, \
+                        old_state_str = 'CLOSE' AND new_state_str = 'SYN_SENT' AS is_start \
+                 FROM network_packet \
+                 UNION ALL SELECT socket_id, ts, false FROM network_syscall \
+                 UNION ALL SELECT socket_id, ts, false FROM network_poll), \
+             client AS ( \
+                 SELECT * FROM event WHERE socket_id IN \
+                 (SELECT socket_id FROM network_socket \
+                  WHERE dest_ip = '127.0.0.1' AND dest_port = ?)), \
+             id AS ( \
+                 SELECT COUNT(*) FILTER (is_start) AS starts FROM client GROUP BY socket_id \
+                 HAVING MIN(ts) >= (SELECT MIN(ts) FROM client WHERE is_start)) \
+             SELECT COUNT(*), COUNT(*) FILTER (starts <> 1) FROM id",
+            [port],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to query the connects' socket ids");
+    eprintln!("    {ids} socket ids of connects to port {port}");
+    assert!(ids > 0, "[network] no connect to port {port} recorded");
+    assert_eq!(
+        bad, 0,
+        "[network] {bad} of {ids} socket ids do not hold exactly one connect's start"
+    );
+}
+
+/// One connection, one socket id, with the packets recorder on: its start, its
+/// SYN, its sends and receives, and, for a connect whose SYN gets no answer,
+/// the SYN's timeout. The second listener's accept queue holds two connections,
+/// which nobody accepts, so it drops every later SYN.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_network_one_socket_id_per_connect() {
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let duckdb_path = dir.path().join("trace.duckdb");
+    let config = Config {
+        duration: NETWORK_SUITE_DURATION_SECS + 2,
+        network: true,
+        network_packets: true,
+        output_dir: dir.path().to_path_buf(),
+        output: duckdb_path.clone(),
+        ..Config::default()
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
+    let addr = listener.local_addr().unwrap();
+    let silent = TcpListener::bind("127.0.0.1:0").expect("Failed to bind silent listener");
+    let silent_addr = silent.local_addr().unwrap();
+    // SAFETY: a valid listening socket; this only makes its accept queue shorter.
+    assert_eq!(unsafe { libc::listen(silent.as_raw_fd(), 1) }, 0);
+    let _queued =
+        [(); 2].map(|()| TcpStream::connect(silent_addr).expect("Failed to fill the accept queue"));
+
+    let traffic = stoppable_workload(move |stop| {
+        while !stop.load(Ordering::Relaxed) {
+            {
+                let mut client = TcpStream::connect(addr).expect("Failed to connect");
+                let (mut server, _) = listener.accept().expect("Failed to accept");
+                let mut buf = [0u8; 4];
+                client.write_all(b"ping").unwrap();
+                server.read_exact(&mut buf).unwrap();
+                server.write_all(b"pong").unwrap();
+                client.read_exact(&mut buf).unwrap();
+            }
+            thread::sleep(Duration::from_millis(100));
+            // Polls the socket while its SYN, which times out after one
+            // second, gets no answer.
+            TcpStream::connect_timeout(&silent_addr, Duration::from_millis(1200))
+                .expect_err("the silent listener answered");
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    eprintln!("Recording trace (network + packets, connects with and without an answer)...");
+    let recorded = systing(config, None);
+    traffic.stop();
+    recorded.expect("systing recording failed");
+
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    let syn = "event_type = 'TCP packet_enqueue' AND tcp_flags LIKE 'SYN%'";
+    for (port, table, condition) in [
+        (addr.port(), "network_packet", syn),
+        (addr.port(), "network_syscall", "event_type = 'sendmsg'"),
+        (addr.port(), "network_syscall", "event_type = 'recvmsg'"),
+        (silent_addr.port(), "network_packet", syn),
+        (
+            silent_addr.port(),
+            "network_packet",
+            "event_type = 'TCP rto_timeout'",
+        ),
+    ] {
+        let rows: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} WHERE {condition} \
+                     AND socket_id IN (SELECT socket_id FROM network_socket \
+                     WHERE dest_ip = '127.0.0.1' AND dest_port = {port}) \
+                     AND socket_id IN (SELECT socket_id FROM network_packet \
+                     WHERE old_state_str = 'CLOSE' AND new_state_str = 'SYN_SENT')"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("Failed to query the connects' rows");
+        eprintln!("    port {port}: {rows} rows in {table} with {condition}");
+        assert!(
+            rows > 0,
+            "no row in {table} with {condition} on a connect's id"
+        );
+    }
+    assert_one_socket_id_per_connect(&conn, addr.port());
+    assert_one_socket_id_per_connect(&conn, silent_addr.port());
 }
 
 /// One capture with the packets recorder on and `packet_sample_rate = 4`

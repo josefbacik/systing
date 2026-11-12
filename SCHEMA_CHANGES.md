@@ -484,6 +484,20 @@ All NULL when the recorder was not asked for, and in traces from before schema 3
   were not traced, with why, and what could make the trace wrong for those that
   were, a line each. NULL where there is nothing to say.
 
+## One socket id per connect (no schema version change)
+
+An outbound TCP connection has one `socket_id`, from its connect's start to its
+close. Until now its open could be recorded under the id of an earlier
+connection to the same destination, and its outcome, traffic and close under a
+second id of its own. A connect that fails has an id of its own too, so a count
+of ids or of `network_socket` rows per destination rises to one per attempt.
+With `network-packets` a connecting socket's SYNs are recorded under its id, and
+with that or `network-syscalls` their timeouts; most of these were left out. A
+connect often has two `network_socket` rows, one without the local port and the
+complete one: keep one per `(trace_id, socket_id)`, the complete one if there is
+one. Table shapes are unchanged. Older traces keep their ids;
+`_traces.recorder_version` says which systing recorded a trace.
+
 ## Schema Version 33 (systing 1.30.0) — 2026-10-28
 
 The task-stacks recorder's walks leave counts in the trace. A record cut short
