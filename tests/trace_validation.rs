@@ -7443,6 +7443,296 @@ with open({expected:?}, "w") as f:
     }
 }
 
+/// A Python process with one thread parked for good and two, the main thread
+/// among them, that forever call 30 levels deep through eight functions and
+/// return. One of the two runs while the other waits for the GIL.
+fn spawn_python_that_calls_and_returns(version: &str, dir: &std::path::Path) -> PythonWorkload {
+    let defs = r#"
+import threading
+payload = tuple(range(1000, 1024))
+for k in range(8):
+    exec(f"def hop_{k}(i, d, t):\n" + "".join(f"    v{n} = t\n" for n in range(3 * k)) +
+         "    return d and HOPS[(i + d * (i % 5 + 1)) % 8](i, d - 1, t)\n")
+HOPS = [globals()[f"hop_{k}"] for k in range(8)]
+def spin():
+    i = 0
+    while True:
+        i += 1
+        HOPS[i % 8](i, 30, payload)
+def parked():
+    threading.Event().wait()
+threading.Thread(target=parked, daemon=True).start()
+threading.Thread(target=spin, daemon=True).start()
+i = 0
+"#;
+    spawn_python_workload(
+        pyenv_python(version),
+        dir,
+        "calls_and_returns.py",
+        defs,
+        "i += 1\nHOPS[i % 8](i, 30, payload)",
+    )
+}
+
+/// Captures the Python frames of `pid` every 10 ms for 3 s into `dir`, and returns
+/// a function that counts rows: of `stack` (id, frame_names, root first), or of
+/// `frame` (f, one row per frame of a distinct stack). `None`, with a `skipping:`
+/// line, where a capture reads no Python frames.
+fn count_in_python_task_stacks(dir: &TempDir, pid: u32) -> Option<impl Fn(&str) -> i64> {
+    use systing::task_stacks_recorder::TaskStackFrames;
+
+    let config = Config {
+        duration: 3,
+        pid: vec![pid],
+        pystacks_pids: vec![pid],
+        output_dir: dir.path().to_path_buf(),
+        no_sched: true,
+        no_irq: true,
+        no_cpu_stack_traces: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        collect_pystacks: true,
+        task_stacks_frames: Some(TaskStackFrames::Python),
+        task_stacks: true,
+        task_stacks_interval_ms: 10,
+        parquet_only: true,
+        ..Config::default()
+    };
+    systing(config, None).expect("systing recording failed");
+    match task_stacks_remote_reads(dir).as_deref() {
+        Some("on") => {}
+        Some("off:kernel-release") => {
+            eprintln!("skipping: on this kernel a capture reads no Python frames");
+            return None;
+        }
+        other => panic!("sysinfo.task_stacks_remote_reads = {other:?}"),
+    }
+    let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+    conn.execute_batch(&format!(
+        "CREATE VIEW stack AS SELECT id, frame_names FROM read_parquet('{}'); \
+         CREATE VIEW frame AS SELECT unnest(frame_names) AS f FROM stack",
+        dir.path().join("stack.parquet").display()
+    ))
+    .expect("Failed to read the stacks");
+    Some(move |from_where: &str| {
+        conn.query_row(&format!("SELECT count(*) FROM {from_where}"), [], |row| {
+            row.get(0)
+        })
+        .expect("Failed to count")
+    })
+}
+
+/// Every frame of a thread that calls and returns during the walk has one of the
+/// program's names or says that it has none.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_names_of_a_running_thread() {
+    for version in [PYTHON_312_VERSION, PYTHON_313_VERSION] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let workload = spawn_python_that_calls_and_returns(version, dir.path());
+        let count = count_in_python_task_stacks(&dir, workload.pid);
+        drop(workload);
+        let Some(count) = count else { return };
+
+        eprintln!(
+            "[running thread, {version}] {} stacks, {} frames, {} of them hop_*, {} \"<unknown python>\"",
+            count("stack"),
+            count("frame"),
+            count("frame WHERE starts_with(f, 'hop_')"),
+            count("frame WHERE starts_with(f, '<unknown python>')")
+        );
+        assert_eq!(
+            count(
+                "frame WHERE NOT regexp_full_match(f, \
+                 'hop_[0-7] \\(python\\) \\[<string>(:[0-9]+)?\\]\
+                 |(<module>|spin|parked) \\(python\\) \\[calls_and_returns\\.py(:[0-9]+)?\\]\
+                 |threading:[A-Za-z_.]+ \\(python\\) \\[threading\\.py(:[0-9]+)?\\]\
+                 |(\\[Frame Error\\]|<unknown python>) \\(python\\) \\[unknown(:[0-9]+)?\\]')"
+            ),
+            0,
+            "frames that are not the program's, \"[Frame Error]\" or \"<unknown python>\""
+        );
+        assert_eq!(
+            count(
+                "stack WHERE \
+                 len(list_filter(frame_names, f -> starts_with(f, '[Frame Error]'))) > 1"
+            ),
+            0,
+            "stacks with more than one \"[Frame Error]\""
+        );
+        // The parked thread is read whole, with its names.
+        assert!(
+            count(
+                "stack WHERE starts_with(frame_names[1], 'threading:Thread._bootstrap ') \
+                 AND list_contains(list_transform(frame_names, f -> split_part(f, ' ', 1)), 'parked') \
+                 AND len(list_filter(frame_names, f -> f[1] IN ('[', '<'))) = 0"
+            ) > 0,
+            "the parked thread's stack is not there, whole and with its names"
+        );
+        assert!(
+            count("frame WHERE starts_with(f, 'hop_')") > 0,
+            "none of the functions that the two threads call has its name"
+        );
+    }
+}
+
+/// A thread that makes no system call has its names: its frames' code objects pass
+/// the check before and after the names are read. Once it runs Python, and once
+/// SIGSTOP holds it where it ran.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_keeps_the_names_of_a_busy_thread() {
+    for (version, stop) in [
+        (PYTHON_312_VERSION, false),
+        (PYTHON_312_VERSION, true),
+        (PYTHON_313_VERSION, false),
+        (PYTHON_313_VERSION, true),
+    ] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let workload = spawn_python_workload(
+            pyenv_python(version),
+            dir.path(),
+            "busy.py",
+            "def spin_here():\n    for _ in range(100000):\n        pass\n",
+            "spin_here()",
+        );
+        if stop {
+            // The marker is there before the program has left open().
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // SAFETY: a signal to a child of this test, which dropping it kills.
+            let stopped = unsafe { libc::kill(workload.pid as i32, libc::SIGSTOP) };
+            assert_eq!(stopped, 0, "Failed to stop the workload");
+        }
+        let count = count_in_python_task_stacks(&dir, workload.pid);
+        drop(workload);
+        let Some(count) = count else { return };
+
+        assert!(
+            count("frame WHERE starts_with(f, '<module> ')") > 0,
+            "{version}, stopped: {stop}: the thread's outermost frame has no name"
+        );
+        // A stopped thread can stand in <module>, between two calls.
+        assert!(
+            stop || count("frame WHERE starts_with(f, 'spin_here ')") > 0,
+            "{version}: the function that the thread runs has no name"
+        );
+        assert_eq!(
+            count(
+                "frame WHERE NOT regexp_full_match(f, \
+                 '(<module>|spin_here) \\(python\\) \\[busy\\.py(:[0-9]+)?\\]\
+                 |(\\[Frame Error\\]|<unknown python>) \\(python\\) \\[unknown(:[0-9]+)?\\]')"
+            ),
+            0,
+            "{version}, stopped: {stop}: frames that are not the program's, \
+             \"[Frame Error]\" or \"<unknown python>\""
+        );
+    }
+}
+
+/// Functions whose file name lies at the end of readable memory have their names.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_keeps_a_file_name_at_the_end_of_readable_memory() {
+    let defs = r#"
+import bisect, threading
+def readable_behind(strings):
+    spans = []
+    for line in open("/proc/self/maps"):
+        span, perms = line.split()[:2]
+        if "r" in perms:
+            start, end = (int(x, 16) for x in span.split("-"))
+            if spans and spans[-1][1] == start:
+                spans[-1][1] = end
+            else:
+                spans.append([start, end])
+    starts = [start for start, _ in spans]
+    # The text of a compact ASCII str begins 40 bytes into the object.
+    return [(spans[bisect.bisect_right(starts, id(s) + 40) - 1][1] - id(s) - 40, s) for s in strings]
+forever = threading.Event()
+kept, edge = [], None
+for n in range(60):
+    threading.Thread(target=forever.wait, daemon=True).start()
+    kept.append([f"edge_{n}_{i:06}_{'x' * 20}.py" for i in range(40000)])
+    edge = min(readable_behind(kept[-1]))
+    if edge[0] < 200:
+        break
+def no_edge_found():
+    forever.wait()
+def leaf():
+    forever.wait()
+source = "".join(f"def edgy_{d}():\n    {f'edgy_{d + 1}' if d < 19 else 'leaf'}()\n" for d in range(20))
+exec(compile(source, edge[1], "exec"))
+threading.Thread(target=edgy_0 if edge[0] < 200 else no_edge_found, daemon=True).start()
+"#;
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let workload = spawn_python_workload(
+        pyenv_python(PYTHON_313_VERSION),
+        dir.path(),
+        "edge.py",
+        defs,
+        "time.sleep(0.05)",
+    );
+    let count = count_in_python_task_stacks(&dir, workload.pid);
+    drop(workload);
+    let Some(count) = count else { return };
+    if count("frame WHERE starts_with(f, 'no_edge_found ')") > 0 {
+        eprintln!("skipping: no string came to lie at the end of readable memory");
+        return;
+    }
+
+    // Not all 20: a name can be held back for other reasons.
+    let named = count("(SELECT DISTINCT f FROM frame WHERE starts_with(f, 'edgy_'))");
+    assert!(
+        named >= 15,
+        "only {named} of the 20 functions have their names"
+    );
+}
+
+/// The frames around a Python `__init__` are all there, with their names. The frame
+/// that a specialized call of a class pushes below it has a code object that
+/// CPython defines statically, and on 3.14 a tagged code pointer.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_frames_around_an_init() {
+    // The call site has to be warm to be specialized. The last call stays in.
+    let defs = r#"
+class Widget:
+    def __init__(self, stay):
+        if stay:
+            with open(sys.argv[1], "w") as f:
+                f.write("ready")
+            while True:
+                time.sleep(0.1)
+def outer():
+    for i in range(20000):
+        Widget(i == 19999)
+"#;
+    for version in [PYTHON_313_VERSION, PYTHON_314_VERSION] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let workload = spawn_python_workload(
+            pyenv_python(version),
+            dir.path(),
+            "in_init.py",
+            defs,
+            "outer()",
+        );
+        let count = count_in_python_task_stacks(&dir, workload.pid);
+        drop(workload);
+        let Some(count) = count else { return };
+
+        assert!(
+            count(
+                "stack WHERE starts_with(frame_names[1], '<module> ') \
+                 AND starts_with(frame_names[2], 'outer ') \
+                 AND starts_with(frame_names[-1], 'Widget.__init__ ') \
+                 AND len(list_filter(frame_names, f -> \
+                     f[1] = '[' OR starts_with(f, '<unknown python>'))) = 0"
+            ) > 0,
+            "{version}: no stack from <module> to Widget.__init__ has all its names"
+        );
+    }
+}
+
 /// The task-stacks recorder with pystacks: `--collect-pystacks` merges each
 /// thread's Python frames with its native and kernel frames, and
 /// `--task-stacks-frames python` records the Python frames alone. Either way

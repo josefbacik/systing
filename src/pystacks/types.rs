@@ -242,6 +242,7 @@ pub struct PyPidData {
     pub tls_key_addr: usize,
     pub gil_locked_addr: usize,
     pub gil_last_holder_addr: usize,
+    pub code_type_addr: usize,
 }
 
 /// BPF binary ID for binary-level caching.
@@ -280,8 +281,8 @@ const _: () = {
     // PystacksSymbolRecord: u64(8) + PystacksSymbol(440) + PystacksLineTable(24) = 472
     assert!(std::mem::size_of::<PystacksSymbolRecord>() == 472);
 
-    // PyPidData: OffsetConfig(424) + bool(1) + padding(7) + 5*usize(40) = 472
-    assert!(std::mem::size_of::<PyPidData>() == 472);
+    // PyPidData: OffsetConfig(424) + bool(1) + padding(7) + 6*usize(48) = 480
+    assert!(std::mem::size_of::<PyPidData>() == 480);
 
     // BpfLibBinaryId: u64 + u64 = 16
     assert!(std::mem::size_of::<BpfLibBinaryId>() == 16);

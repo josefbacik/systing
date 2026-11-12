@@ -21,6 +21,7 @@ typedef struct {
   uintptr_t tls_key_addr; // virtual address of autoTLSkey for pthreads TLS
   uintptr_t gil_locked_addr; // virtual address of gil_locked
   uintptr_t gil_last_holder_addr; // virtual address of gil_last_holder
+  uintptr_t code_type_addr; // virtual address of PyCode_Type, 0 if not known
 } PyPidData;
 
 #endif

@@ -187,10 +187,20 @@ struct sample_state_t {
   uint64_t cur_cpu;
   void* frame_ptr;
   bool sync_use_shadow_frame;
-  /* The frame just visited by pystacks_get_frame_data was a CPython 3.12+
-   * entry frame (see PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER): nothing was read
-   * from it and no symbol is to be emitted for it. */
+  /* The frame just visited by pystacks_get_frame_data was a CPython 3.12+ entry
+   * frame (see PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER): nothing was read from it
+   * and no symbol is to be emitted for it. */
   bool frame_skipped;
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+  /* Whether the symbol just read may be sent, and whether the frame's code
+   * object had more than one reference before its names were read: see
+   * pystacks_get_frame_data(). */
+  bool send_symbol;
+  bool shared_before;
+  uintptr_t code_type_addr;
+  /* Words of the process, read for a check and not kept. */
+  uint64_t words[2];
+#endif
   char long_file_name[BPF_LIB_FILE_NAME_TRYGET];
   struct pystacks_symbol sym;
   struct pystacks_line_table linetable;
@@ -363,6 +373,12 @@ static symbol_id_t get_py_symbol_id(struct sample_state_t* const state) {
   if (bpf_map_lookup_elem(&pystacks_symbols, &id))
     return id;
 
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+  /* The name and file reach user space in this record alone. The frame keeps
+   * this id, and can show the name if another walk sends it. */
+  if (!state->send_symbol)
+    return id;
+#endif
   emit_symbol_record(id, &state->sym, &state->linetable);
   return id;
 }
@@ -586,6 +602,11 @@ static __always_inline void get_names(
   // if there is a failure when reading qualname which will result in a negative
   // qualname_len
   if (!use_shadow_frame && qualname_len <= 1) {
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+    // The iterator takes no class name: this block is the probes' alone. In a
+    // task stack a method shows without its class on 3.10 and older, which have
+    // no qualified name.
+    //
     // Figure out if we want to parse class name, basically checking the name of
     // the first argument,
     //   ((PyTupleObject*)$frame->f_code->co_varnames)->ob_item[0]
@@ -611,7 +632,8 @@ static __always_inline void get_names(
     bool first_cls = *(int32_t*)ob_item == *(int32_t*)cls_str;
 
     // Read class name from $frame->f_localsplus[0]->ob_type->tp_name.
-    if ((first_self || first_cls) && cur_frame) {
+    if ((first_self || first_cls) && cur_frame &&
+        offsets->PyCodeObject_varnames != BPF_LIB_DEFAULT_FIELD_OFFSET) {
       void* ptr;
       bpf_probe_read_user_task(
           &ptr,
@@ -629,6 +651,7 @@ static __always_inline void get_names(
           symbol->qualname.value, BPF_LIB_PYSTACKS_CLASS_NAME_LEN, ptr, task);
       symbol->qualname.value[BPF_LIB_PYSTACKS_CLASS_NAME_LEN] = '\0';
     }
+#endif
     // read PyCodeObject's name into symbol
     void* name_ptr;
     bpf_probe_read_user_task(
@@ -715,6 +738,9 @@ static __always_inline void* get_code_ptr(
           sizeof(void*),
           (char*)frame_ptr + offsets->PyInterpreterFrame_code,
           task);
+      /* 3.14 keeps the executable as a tagged reference, and sets the tag for
+       * an immortal code object. No object's address has those two bits. */
+      code_ptr = (void*)((uintptr_t)code_ptr & ~(uintptr_t)3);
     } else {
       result = bpf_probe_read_user_task(
           &code_ptr,
@@ -728,6 +754,34 @@ static __always_inline void* get_code_ptr(
   }
   return code_ptr;
 }
+
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+/*
+ * Whether code_ptr looks like a live code object. The type must be
+ * PyCode_Type, which cannot be subclassed. The first word must be a reference
+ * count and not an address: not 0, and no bit from 32 to 47 (3.14 keeps flags
+ * above those).
+ *
+ * If the type's address is not known, everything passes, and no name is sent.
+ */
+static __always_inline bool is_code_object(
+    struct sample_state_t* const state,
+    void* code_ptr,
+    struct task_struct* task) {
+  if (!state->code_type_addr) {
+    return true;
+  }
+  /* ob_refcnt, ob_type */
+  return bpf_probe_read_user_task(
+             state->words,
+             2 * sizeof(state->words[0]),
+             code_ptr + state->offsets.PyObject_type - sizeof(state->words[0]),
+             task) == 0 &&
+      state->words[1] == state->code_type_addr &&
+      (uint32_t)state->words[0] != 0 &&
+      (state->words[0] & 0x0000ffff00000000ULL) == 0;
+}
+#endif
 
 static __always_inline bool is_ending_frame(struct pystacks_symbol* sym) {
   return bpf_map_lookup_elem(&pystacks_ending_frames, sym) != NULL ||
@@ -812,7 +866,41 @@ __noinline bool pystacks_get_frame_data(int pid) {
     void* code_ptr =
         get_code_ptr(state->frame_ptr, offsets, use_shadow_frame, task);
 
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+    if (state->frame_ptr &&
+        (!code_ptr || !is_code_object(state, code_ptr, task))) {
+      /* Give one "[Frame Error]" and end the walk: the next call finds no
+       * frame. */
+      get_names(state, state->frame_ptr, NULL, use_shadow_frame, task);
+      state->send_symbol = true;
+      state->frame_ptr = NULL;
+      put_task(task);
+      return true;
+    }
+    state->shared_before = (uint32_t)state->words[0] != 1;
+#endif
     get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+    /* With no code object the symbol is the constant "[Frame Error]".
+     * A name whose read faulted is not sent. Nor is a name from an object
+     * that could not be checked. A symbol that user space has needs no
+     * sending. */
+    state->send_symbol = !code_ptr;
+    if (code_ptr && !state->sym.fault_pid && state->code_type_addr) {
+      const symbol_id_t id = hash_symbol(&state->sym);
+      /* Whether to send the record, now that the names have been read. All of
+       * these must hold:
+       * - user space does not have the symbol yet;
+       * - the count was more than 1 before the names were read;
+       * - the check passes again;
+       * - the count is more than 1 now.
+       * A frame whose record is not sent keeps its id, and can show the name if
+       * another walk sends it. */
+      state->send_symbol = !bpf_map_lookup_elem(&pystacks_symbols, &id) &&
+          state->shared_before && is_code_object(state, code_ptr, task) &&
+          (uint32_t)state->words[0] != 1;
+    }
+#endif
   }
 
   int ret_code = 0;
@@ -1274,6 +1362,9 @@ __hidden int pystacks_read_stacks_task(
   BPF_LIB_GET_STATE();
 
   state->offsets = pid_data->offsets;
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+  state->code_type_addr = pid_data->code_type_addr;
+#endif
   state->cur_cpu = bpf_get_smp_processor_id();
 
   // The global PyThreadState of the thread holding the GIL, where the

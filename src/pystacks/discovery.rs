@@ -28,6 +28,9 @@ use std::time::Instant;
 #[derive(Debug)]
 struct ElfPyInfo {
     py_runtime_addr: usize,
+    /// `PyCode_Type`, the type of every code object; 0 if the file has no such
+    /// symbol.
+    code_type_addr: usize,
     /// What the file's own version tag says; `None` for a file without one.
     version: Option<(i32, i32, i32)>,
     is_dynamic: bool,
@@ -176,6 +179,47 @@ impl<'a> ReadRef<'a> for &'a BudgetedReader<'_> {
     }
 }
 
+/// The file behind `reader`, parsed, if it is an ELF file.
+fn parse_elf<'a, 'f>(
+    reader: &'a BudgetedReader<'f>,
+) -> Option<object::File<'a, &'a BudgetedReader<'f>>> {
+    let is_elf = matches!(
+        object::FileKind::parse(reader),
+        Ok(object::FileKind::Elf32 | object::FileKind::Elf64)
+    );
+    if is_elf {
+        object::File::parse(reader).ok()
+    } else {
+        None
+    }
+}
+
+/// Ends the check of a file, which took `elapsed` seconds: frees `reader`'s memory and,
+/// if the file needed more than `budget`, counts it in the limit report and says so on
+/// stderr. Returns whether the file needed more than `budget`.
+fn over_budget(reader: BudgetedReader<'_>, file_path: &str, budget: u64, elapsed: f64) -> bool {
+    let (overdrawn, costly) = (reader.overdrawn(), reader.left() < budget - budget / 8);
+    drop(reader);
+    if costly {
+        // Return freed memory to the system.
+        // SAFETY: malloc_trim is always safe to call on glibc.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+    if overdrawn {
+        FILES_SKIPPED.hit();
+        eprintln!(
+            "[pystacks] Skipped {} after {elapsed:.2}s: looking into it for Python would read \
+             more than {} MiB. A process that needs this file will have no Python stacks, or \
+             stacks that end at their first frame",
+            file_path.escape_debug(),
+            budget >> 20
+        );
+    }
+    overdrawn
+}
+
 /// Parse the runtime facts out of an open ELF file.
 ///
 /// The file is read on demand through `object`'s `ReadCache` rather than
@@ -196,43 +240,18 @@ fn parse_elf_py_info_within(
 ) -> Option<Arc<ElfPyInfo>> {
     let start = Instant::now();
     let reader = BudgetedReader::new(file, budget);
-    // Only an ELF file can hold a runtime here.
-    let is_elf = matches!(
-        object::FileKind::parse(&reader),
-        Ok(object::FileKind::Elf32 | object::FileKind::Elf64)
-    );
-    let parsed = if is_elf {
-        object::File::parse(&reader).ok()
-    } else {
-        None
-    };
-    let result = parsed.and_then(|elf| {
+    let result = parse_elf(&reader).and_then(|elf| {
         let py_runtime_addr = find_symbol_address(&elf, "_PyRuntime")?;
         let version = detect_python_version(&elf, &reader);
         Some(Arc::new(ElfPyInfo {
             py_runtime_addr,
+            code_type_addr: find_symbol_address(&elf, "PyCode_Type").unwrap_or(0),
             version,
             is_dynamic: elf.kind() == object::ObjectKind::Dynamic,
         }))
     });
     let elapsed = start.elapsed().as_secs_f64();
-    let (overdrawn, costly) = (reader.overdrawn(), reader.left() < budget - budget / 8);
-    drop(reader);
-    if costly {
-        // Return freed memory to the system.
-        // SAFETY: malloc_trim is always safe to call on glibc.
-        unsafe {
-            libc::malloc_trim(0);
-        }
-    }
-    if overdrawn {
-        FILES_SKIPPED.hit();
-        eprintln!(
-            "[pystacks] Skipped {} after {elapsed:.2}s: checking it for a Python runtime \
-             would read more than {} MiB, so it is not treated as one",
-            file_path.escape_debug(),
-            budget >> 20
-        );
+    if over_budget(reader, file_path, budget, elapsed) {
         return None;
     }
     if result.is_some() {
@@ -437,6 +456,33 @@ fn try_python_module(
 
     pid_data.py_runtime_addr = effective_runtime_addr;
 
+    // PyCode_Type, the copy that the process uses. An executable that refers to the
+    // type gets a copy of its own (a copy relocation), and a library's is then
+    // never made ready. So if a library's copy is not ready, try the
+    // executable's first, as the dynamic linker does.
+    const PY_TYPE_OBJECT_TP_FLAGS: usize = 168; // 3.8 to 3.14
+    const PY_TPFLAGS_READY: usize = 1 << 12;
+    let ready = |addr: &usize| {
+        let mut flags = [0u8; 8];
+        process::read_process_memory(pid, addr + PY_TYPE_OBJECT_TP_FLAGS, &mut flags).ok()
+            == Some(flags.len())
+            && usize::from_ne_bytes(flags) & PY_TPFLAGS_READY != 0
+    };
+    let own = Some(elf_info.code_type_addr)
+        .filter(|&addr| addr != 0)
+        .map(|addr| effective_runtime_addr - py_runtime_addr + addr);
+    pid_data.code_type_addr = own
+        .filter(|addr| is_exe || ready(addr))
+        .or_else(|| (!is_exe).then(|| exe_code_type_addr(pid, maps))?)
+        .or(own)
+        .unwrap_or(0);
+    if pid_data.code_type_addr == 0 {
+        eprintln!(
+            "[pystacks] No PyCode_Type found for process {pid}: task stacks will show its \
+             Python frames as \"<unknown python>\""
+        );
+    }
+
     // Compute derived addresses from _PyRuntime for Python >= 3.7
     if major == 3 && minor >= 7 {
         if pid_data.offsets.tls_key_offset != BPF_LIB_DEFAULT_FIELD_OFFSET {
@@ -572,6 +618,30 @@ fn open_in_process_root(pid: i32, path: &str) -> Option<fs::File> {
     Root::of_process(pid)
         .and_then(|root| root.open_regular(Path::new(path), 0))
         .ok()
+}
+
+/// `PyCode_Type` in the process, as its executable defines it, if it does. The
+/// file is opened and read as in the check for a runtime: through the process's
+/// `exe` link, and under [`MAX_PARSE_BYTES`].
+fn exe_code_type_addr(pid: i32, maps: &[MemoryMapping]) -> Option<usize> {
+    let exe = process::read_exe_path(pid)?;
+    let exe = exe.to_string_lossy();
+    let file = open_module(pid, &exe, maps, true)?;
+    let start = Instant::now();
+    let reader = BudgetedReader::new(&file, MAX_PARSE_BYTES);
+    let found = parse_elf(&reader).and_then(|elf| {
+        let addr = find_symbol_address(&elf, "PyCode_Type")?;
+        Some((addr, elf.kind() == object::ObjectKind::Dynamic))
+    });
+    if over_budget(reader, &exe, MAX_PARSE_BYTES, start.elapsed().as_secs_f64()) {
+        return None;
+    }
+    let (addr, is_dynamic) = found?;
+    if is_dynamic {
+        Some(find_module_base_address(maps, &exe)? + addr)
+    } else {
+        Some(addr)
+    }
 }
 
 /// Whether `sym` could be one of the runtime's variables: it has a nonzero
@@ -1075,6 +1145,46 @@ mod tests {
         assert_eq!(versions, [Some((3, 12)), Some((3, 8)), None]);
     }
 
+    /// A program with a `PyCode_Type` of its own. It writes a byte, then the
+    /// variable's address, and sleeps.
+    const HAS_A_CODE_TYPE: &str = "#include <unistd.h>\n\
+                                   char PyCode_Type[64];\n\
+                                   int main(void) {\n\
+                                       void *at = PyCode_Type;\n\
+                                       if (write(1, PyCode_Type, 1) != 1) return 1;\n\
+                                       if (write(1, &at, sizeof at) != sizeof at) return 1;\n\
+                                       sleep(120);\n\
+                                       return 0;\n\
+                                   }\n";
+
+    #[test]
+    fn test_an_executables_own_code_type_is_found() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("app");
+        // Once at a fixed address, and once position-independent.
+        for flags in [&["-no-pie"][..], &["-fPIE", "-pie"][..]] {
+            if !cc_builds(HAS_A_CODE_TYPE, flags, &exe) {
+                eprintln!("no C compiler on this host: skipping the PyCode_Type check");
+                return;
+            }
+            let mut child = run(&exe);
+            let mut at = [0u8; size_of::<usize>()];
+            let stdout = child.0.stdout.as_mut().unwrap();
+            stdout.read_exact(&mut at).unwrap();
+            // Now only the process's exe link leads to the file.
+            fs::remove_file(&exe).unwrap();
+            let pid = child.0.id() as i32;
+
+            assert_eq!(
+                exe_code_type_addr(pid, &process::parse_proc_maps(pid)),
+                Some(usize::from_ne_bytes(at)),
+                "{flags:?}"
+            );
+        }
+    }
+
     /// A program that maps the file `LIB` as a loader does, writes a byte and sleeps.
     const MAPS_A_LIBRARY: &str = "#include <fcntl.h>\n\
                                   #include <sys/mman.h>\n\
@@ -1442,7 +1552,8 @@ mod tests {
             format!(
                 "const char _PySys_ImplCacheTag[] = \"{TAG}\";\n\
                  char _PyRuntime[64];\n\
-                 int systing_fixture_keep(void) {{ return _PyRuntime[0]; }}\n"
+                 char PyCode_Type[64];\n\
+                 int systing_fixture_keep(void) {{ return _PyRuntime[0] + PyCode_Type[0]; }}\n"
             ),
         )
         .unwrap();
@@ -1496,6 +1607,13 @@ mod tests {
             );
             assert_eq!(info.is_dynamic, expect_dynamic, "{}", path.display());
             assert_ne!(info.py_runtime_addr, 0, "{}", path.display());
+            // The shared object has a PyCode_Type, the executable has none.
+            assert_eq!(
+                info.code_type_addr != 0,
+                expect_dynamic,
+                "{}",
+                path.display()
+            );
             checked += 1;
         }
         assert!(checked >= 1);
@@ -1537,21 +1655,23 @@ mod tests {
             .args([
                 "-c",
                 "import ssl, sqlite3, ctypes, decimal, hashlib, zlib, bz2, lzma, json, socket, select, struct, time\n\
-                 print('ready', flush=True)\n\
+                 print('ready', id(type(compile('', '', 'exec'))), flush=True)\n\
                  time.sleep(120)",
             ])
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn python");
         let pid = child.id() as i32;
-        {
+        let code_type_addr: usize = {
             use std::io::BufRead;
             let mut line = String::new();
             std::io::BufReader::new(child.stdout.take().unwrap())
                 .read_line(&mut line)
                 .unwrap();
-            assert_eq!(line.trim(), "ready");
-        }
+            let id = line.trim().strip_prefix("ready ").expect("ready line");
+            id.parse()
+                .expect("the address of the type of a code object")
+        };
 
         let maps = process::parse_proc_maps(pid);
         let exe = process::read_exe_path(pid)
@@ -1591,6 +1711,7 @@ mod tests {
         let _ = child.wait();
 
         let info = info.expect("live pyenv interpreter not discovered");
+        assert_eq!(info.pid_data.code_type_addr, code_type_addr);
         assert_eq!(info.pid, pid);
         assert_eq!(info.version_major, 3);
         eprintln!(
