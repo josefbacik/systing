@@ -4513,8 +4513,8 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 	bpf_probe_read_kernel(&icsk_retransmits, sizeof(icsk_retransmits), &icsk->icsk_retransmits);
 	bpf_probe_read_kernel(&icsk_backoff, sizeof(icsk_backoff), &icsk->icsk_backoff);
 
-	// Store RTO as raw jiffies - conversion to microseconds happens in userspace
-	// where we can read the system's actual HZ value from /proc/sys/kernel/sched_clock_tick_rate
+	// Store RTO in jiffies; user space converts it to
+	// milliseconds with the kernel's HZ.
 	event->rto_jiffies = icsk_rto;
 
 	// Add 1 to retransmit_count because we fire BEFORE the kernel increments it

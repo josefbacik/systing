@@ -445,6 +445,14 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Jiffies in `network_packet` (no schema version change)
+
+`network_packet.rto_ms` and `icsk_timeout` were converted from jiffies at 100 per
+second instead of the kernel's CONFIG_HZ, so they read 2.5 times too high at
+CONFIG_HZ=250 and ten times too high at 1000. New traces have the right unit.
+Older traces keep their values; `_traces.recorder_version` says which systing
+recorded a trace.
+
 ## Schema Version 34 (systing 1.31.0) — 2026-11-02
 
 The Python function trace is a recorder of a capture

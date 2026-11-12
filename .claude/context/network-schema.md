@@ -75,7 +75,7 @@ Packet-level events with all TCP/UDP fields as explicit columns.
 | window_clamp | INTEGER | Yes | Max window |
 | rcv_wscale | SMALLINT | Yes | Receive window scale |
 | icsk_pending | SMALLINT | Yes | Timer type pending |
-| icsk_timeout | BIGINT | Yes | Timer timeout (jiffies) |
+| icsk_timeout | BIGINT | Yes | Timer's absolute expiry in microseconds (from jiffies, not the time left) |
 | drop_reason | INTEGER | Yes | SKB_DROP_REASON_* code |
 | drop_reason_str | VARCHAR | Yes | Human-readable drop reason |
 | drop_location | BIGINT | Yes | Kernel address of drop |

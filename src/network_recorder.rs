@@ -22,19 +22,37 @@ pub type SocketId = u64;
 
 use std::sync::OnceLock;
 
-/// Cached system HZ value (clock ticks per second).
+/// Cached kernel HZ value (jiffies per second, CONFIG_HZ).
 /// This is constant for the lifetime of the process.
 static SYSTEM_HZ: OnceLock<u64> = OnceLock::new();
 
-/// Get the system HZ value, caching it on first call.
+/// HZ from the length of one jiffy. The kernel rounds that length to whole
+/// nanoseconds (3,333,333 at HZ=300), so this takes the nearest whole rate.
+/// `None` for a rate that no kernel builds with: include/linux/jiffies.h
+/// accepts 12 to 12287.
+fn hz_from_jiffy(jiffy: libc::timespec) -> Option<u64> {
+    if jiffy.tv_sec != 0 || jiffy.tv_nsec <= 0 {
+        return None;
+    }
+    let ns = jiffy.tv_nsec as u64;
+    Some((1_000_000_000 + ns / 2) / ns).filter(|hz| (12..12288).contains(hz))
+}
+
+/// Get the kernel's HZ (CONFIG_HZ), caching it on first call. The kernel reports
+/// the length of one jiffy as the resolution of CLOCK_MONOTONIC_COARSE.
+/// `sysconf(_SC_CLK_TCK)` is USER_HZ instead: 100 whatever CONFIG_HZ is.
+/// The value is 100 if the call fails or gives no valid rate.
 fn system_hz() -> u64 {
     *SYSTEM_HZ.get_or_init(|| {
-        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-        if hz > 0 {
-            hz
-        } else {
-            100
+        let mut jiffy = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid timespec to fill.
+        if unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC_COARSE, &mut jiffy) } != 0 {
+            return 100;
         }
+        hz_from_jiffy(jiffy).unwrap_or(100)
     })
 }
 
@@ -1292,6 +1310,38 @@ mod tests {
         assert_eq!(tcp_state_name(12), "NEW_SYN_RECV");
         assert_eq!(tcp_state_name(13), "UNKNOWN");
         assert_eq!(tcp_state_name(255), "UNKNOWN");
+    }
+
+    #[test]
+    fn hz_from_jiffy_takes_a_jiffy_and_nothing_else() {
+        let hz = |tv_sec, tv_nsec| hz_from_jiffy(libc::timespec { tv_sec, tv_nsec });
+        // The rates of kernel/Kconfig.hz.
+        assert_eq!(hz(0, 10_000_000), Some(100));
+        assert_eq!(hz(0, 4_000_000), Some(250));
+        assert_eq!(hz(0, 3_333_333), Some(300));
+        assert_eq!(hz(0, 1_000_000), Some(1000));
+        // The two ends of the range, and the rate just past each.
+        assert_eq!(hz(0, 83_333_333), Some(12));
+        assert_eq!(hz(0, 90_909_091), None);
+        assert_eq!(hz(0, 81_387), Some(12287));
+        assert_eq!(hz(0, 81_380), None);
+        // Not a jiffy: zero, negative, 1 ns (a high-resolution clock), one second.
+        assert_eq!(hz(0, 0), None);
+        assert_eq!(hz(0, -1), None);
+        assert_eq!(hz(0, 1), None);
+        assert_eq!(hz(1, 0), None);
+    }
+
+    #[test]
+    fn system_hz_is_the_running_kernels_config_hz() {
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        let path = format!("/boot/config-{}", release.trim());
+        let Ok(config) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: {path} unreadable");
+            return;
+        };
+        let hz = config.lines().find_map(|l| l.strip_prefix("CONFIG_HZ="));
+        assert_eq!(hz, Some(system_hz().to_string().as_str()));
     }
 }
 
