@@ -188,8 +188,9 @@ struct sample_state_t {
   void* frame_ptr;
   bool sync_use_shadow_frame;
   /* The frame just visited by pystacks_get_frame_data was a CPython 3.12+ entry
-   * frame (see PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER): nothing was read from it
-   * and no symbol is to be emitted for it. */
+   * frame (see PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER) or, in the sleepable
+   * build, a frame that has returned (see PYSTACKS_EMPTY_SLOT): it has no
+   * names, and no symbol is to be emitted for it. */
   bool frame_skipped;
 #ifdef STROBELIGHT_SLEEPABLE_BPF
   /* Whether the symbol just read may be sent, and whether the frame's code
@@ -766,6 +767,18 @@ static __always_inline void get_names(
   read_names(state, cur_frame, code_ptr, use_shadow_frame, task, false);
 }
 
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+/*
+ * What get_code_ptr() gives for a frame whose slot for its code object is
+ * empty. From 3.14 the slot is a tagged reference, and an empty one
+ * (PyStackRef_NULL) is the tag alone: CPython's _PyFrame_SafeGetCode() gives no
+ * code object for such a frame.
+ *
+ * A slot that cannot be read gives NULL.
+ */
+#define PYSTACKS_EMPTY_SLOT ((void*)1)
+#endif
+
 // Get the PyCodeObject from the frame pointer
 static __always_inline void* get_code_ptr(
     void* frame_ptr,
@@ -813,6 +826,12 @@ static __always_inline void* get_code_ptr(
           sizeof(void*),
           (char*)frame_ptr + offsets->PyInterpreterFrame_code,
           task);
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+      if (result == 0 && offsets->PyVersion_minor >= 14 &&
+          code_ptr == PYSTACKS_EMPTY_SLOT) {
+        return code_ptr;
+      }
+#endif
       /* 3.14 keeps the executable as a tagged reference, and sets the tag for
        * an immortal code object. No object's address has those two bits. */
       code_ptr = (void*)((uintptr_t)code_ptr & ~(uintptr_t)3);
@@ -956,7 +975,17 @@ __noinline bool pystacks_get_frame_data(int pid) {
         get_code_ptr(state->frame_ptr, offsets, use_shadow_frame, task);
 
 #ifdef STROBELIGHT_SLEEPABLE_BPF
-    if (state->frame_ptr &&
+    if (code_ptr == PYSTACKS_EMPTY_SLOT) {
+      /* From 3.14 on the frame has returned, so it is no part of the stack any
+       * more. Step over it, as over an entry frame. A thread's frame keeps its
+       * link to its caller, which faces the check like every frame; a
+       * generator's has none, and the walk ends. The caller's loop bounds the
+       * frames that a walk visits. On older versions the word is no address. */
+      code_ptr = NULL;
+      state->frame_skipped =
+          offsets->PyVersion_major == 3 && offsets->PyVersion_minor >= 14;
+    }
+    if (!state->frame_skipped && state->frame_ptr &&
         (!code_ptr || !is_code_object(state, code_ptr, task))) {
       /* Give one "[Frame Error]" and end the walk: the next call finds no
        * frame. */
@@ -966,8 +995,10 @@ __noinline bool pystacks_get_frame_data(int pid) {
       put_task(task);
       return true;
     }
-    state->shared_before = (uint32_t)state->words[0] != 1;
-    get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+    if (!state->frame_skipped) {
+      state->shared_before = (uint32_t)state->words[0] != 1;
+      get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+    }
 #else
     read_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task, true);
     if (state->end_walk) {
@@ -1195,7 +1226,9 @@ __hidden int walk_and_load_py_stack(
    * chain at most every other visited frame is stepped over and twice the
    * symbol budget covers the walk; entry frames do follow one another when a
    * finalizer re-enters the interpreter while a frame is being popped, and
-   * such a chain, rare and shallow, may end short of its symbol budget. An
+   * such a chain, rare and shallow, may end short of its symbol budget. So may
+   * a walk that steps over many frames that have returned (see
+   * PYSTACKS_EMPTY_SLOT). An
    * entry frame is counted where it is stepped over, in
    * pystacks_get_frame_data, and spends nothing here.
    */

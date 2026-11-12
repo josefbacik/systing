@@ -7770,6 +7770,47 @@ threading.Thread(target=edgy_0 if edge[0] < 200 else no_edge_found, daemon=True)
     );
 }
 
+/// On 3.14 a walk goes on past a frame that has returned.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_walk_past_a_frame_that_has_returned_on_3_14() {
+    let defs = "def leaf():\n    pass\n\
+                def middle():\n    leaf()\n\
+                def outer():\n    for _ in range(1000):\n        middle()\n";
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let workload = spawn_python_workload(
+        pyenv_python(PYTHON_314_VERSION),
+        dir.path(),
+        "calls.py",
+        defs,
+        "outer()",
+    );
+    let count = count_in_python_task_stacks(&dir, workload.pid);
+    drop(workload);
+    if count.is_none() {
+        return;
+    }
+
+    // Frames stand root first, so a walk that was cut short has its "[Frame Error]"
+    // in the first place.
+    let events = dir.path().join("task_stack_event.parquet");
+    let cut_short = task_stack_events_where(
+        &events,
+        &format!(
+            "stack_id IN (SELECT id FROM read_parquet('{}') \
+             WHERE starts_with(frame_names[1], '[Frame Error]'))",
+            dir.path().join("stack.parquet").display()
+        ),
+    );
+    let all = task_stack_events_where(&events, "stack_id IS NOT NULL");
+    eprintln!("[returned frames, 3.14] {cut_short} of {all} events have a stack cut short");
+    assert!(all > 100, "only {all} events have a stack");
+    assert!(
+        cut_short * 10 < all,
+        "{cut_short} of {all} events have a stack that was cut short"
+    );
+}
+
 /// The frames around a Python `__init__` are all there, with their names. The frame
 /// that a specialized call of a class pushes below it has a code object that
 /// CPython defines statically, and on 3.14 a tagged code pointer.

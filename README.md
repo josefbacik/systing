@@ -407,7 +407,9 @@ frame whose name was not kept can show it if another walk of the capture kept
 it, and otherwise shows `<unknown python>`. On Python 3.10 and older a method
 shows without its class. A walk that meets a frame with no code object ends
 there: the stack keeps its innermost frames, and one `[Frame Error]` stands in
-for the rest. The
+for the rest. A record that is cut short at a busy memory-map lock can end in
+that mark too. From Python 3.14 on the walk steps over a frame that has returned
+meanwhile, so a running thread's stack can lack a frame between two others. The
 unchanged-thread skip and the CPU-time deltas hold for twice the threads the
 host had when the capture started, and at least 65,536; a thread past that is
 still recorded, and walked again at every snapshot. `--collect-build-id` does
