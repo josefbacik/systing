@@ -1378,6 +1378,50 @@ static __always_inline u64 lookup_socket_id(
 	return existing ? existing->socket_id : 0;
 }
 
+// The id of a socket that is still connecting; 0 otherwise. In SYN_SENT, unless
+// the socket was bound first, the id has no key but the connect start's, without
+// the local port: a look-up by the tuple misses, and get_or_create_socket_id()
+// would mint a second id and take over the pointer's entry, so that the
+// attempt's outcome would land on another id than its open. An entry under a
+// pointer can be an earlier socket's in the same memory, so it counts only if
+// the connect start's key holds the same id.
+static __always_inline u64 connecting_socket_id(
+	struct sock *sk,
+	u8 *src_addr,
+	u8 *dest_addr,
+	u16 dest_port)
+{
+	u64 sk_ptr = (u64)sk;
+	u64 socket_id;
+	u64 *sid;
+
+	if (BPF_CORE_READ(sk, __sk_common.skc_state) != TCP_SYN_SENT)
+		return 0;
+	sid = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!sid)
+		return 0;
+	socket_id = *sid;
+	if (lookup_socket_id(sk, src_addr, 0, dest_addr, dest_port) != socket_id)
+		return 0;
+	return socket_id;
+}
+
+// Lookup socket ID for a TCP socket that may still be connecting
+// Returns 0 if not found
+static __always_inline u64 lookup_tcp_socket_id(
+	struct sock *sk,
+	u8 *src_addr,
+	u16 src_port,
+	u8 *dest_addr,
+	u16 dest_port)
+{
+	u64 socket_id = lookup_socket_id(sk, src_addr, src_port, dest_addr, dest_port);
+
+	if (socket_id)
+		return socket_id;
+	return connecting_socket_id(sk, src_addr, dest_addr, dest_port);
+}
+
 // Lookup socket_id from a file descriptor by walking the task's fd table
 // Returns 0 if fd is not a socket or socket_id is not found
 //
@@ -3235,11 +3279,15 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 	// Store socket pointer for reading buffer state on exit
 	info.sk_ptr = (u64)sk;
 
-	// Get or create socket ID for this socket with full 4-tuple
+	// Socket ID: by pointer while connecting, else by the 4-tuple
 	if (sk && info.dest_port != 0) {
-		info.socket_id = get_or_create_socket_id(sk, protocol, info.af,
-							  info.src_addr, info.src_port,
-							  info.dest_addr, info.dest_port, tgidpid);
+		if (protocol == NETWORK_TCP)
+			info.socket_id = connecting_socket_id(sk, info.src_addr,
+							      info.dest_addr, info.dest_port);
+		if (info.socket_id == 0)
+			info.socket_id = get_or_create_socket_id(sk, protocol, info.af,
+								  info.src_addr, info.src_port,
+								  info.dest_addr, info.dest_port, tgidpid);
 	}
 
 	bpf_map_update_elem(&pending_network_sends, &tgidpid, &info, BPF_ANY);
@@ -3366,11 +3414,14 @@ static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
 		read_socket_src_info(sk, &info.af, info.src_addr, &info.src_port);
 		read_socket_dest_info(sk, &info.af, info.peer_addr, &info.peer_port);
 
-		// Get or create socket ID for this socket with full 4-tuple
+		// Socket ID: by pointer while connecting, else by the 4-tuple
 		if (info.peer_port != 0) {
-			info.socket_id = get_or_create_socket_id(sk, NETWORK_TCP, info.af,
-								  info.src_addr, info.src_port,
-								  info.peer_addr, info.peer_port, tgidpid);
+			info.socket_id = connecting_socket_id(sk, info.src_addr,
+							      info.peer_addr, info.peer_port);
+			if (info.socket_id == 0)
+				info.socket_id = get_or_create_socket_id(sk, NETWORK_TCP, info.af,
+									  info.src_addr, info.src_port,
+									  info.peer_addr, info.peer_port, tgidpid);
 		}
 
 		// Capture TCP receive sequence info at entry
@@ -3861,8 +3912,8 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	event->is_retransmit = (sacked & TCPCB_RETRANS) ? 1 : 0;
 
 	// Look up socket ID for this socket with full 4-tuple
-	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
-					     event->dest_addr, event->dest_port);
+	event->socket_id = lookup_tcp_socket_id(sk, event->src_addr, event->src_port,
+						 event->dest_addr, event->dest_port);
 	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	// Read send buffer state from socket
@@ -3939,8 +3990,8 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 	event->is_retransmit = 0;  // TCPCB_RETRANS not available at this probe point
 
 	// Look up socket ID for this socket with full 4-tuple
-	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
-					     event->dest_addr, event->dest_port);
+	event->socket_id = lookup_tcp_socket_id(sk, event->src_addr, event->src_port,
+						 event->dest_addr, event->dest_port);
 	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	// Read send buffer state from socket
@@ -4580,8 +4631,8 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 	event->sndbuf_limit = sndbuf > 0 ? (u32)sndbuf : 0;
 
 	// Get socket ID for correlation
-	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
-					     event->dest_addr, event->dest_port);
+	event->socket_id = lookup_tcp_socket_id(sk, event->src_addr, event->src_port,
+						 event->dest_addr, event->dest_port);
 	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	// Read persist timer state
@@ -4662,7 +4713,9 @@ int BPF_KPROBE(tcp_poll_entry, struct file *file, struct socket *sock, poll_tabl
 	if (dest_port == 0)
 		return 0;
 
-	u64 socket_id = get_or_create_socket_id(sk, NETWORK_TCP, af, src_addr, src_port, dest_addr, dest_port, tgidpid);
+	u64 socket_id = connecting_socket_id(sk, src_addr, dest_addr, dest_port);
+	if (socket_id == 0)
+		socket_id = get_or_create_socket_id(sk, NETWORK_TCP, af, src_addr, src_port, dest_addr, dest_port, tgidpid);
 	if (socket_id == 0)
 		return 0;
 
