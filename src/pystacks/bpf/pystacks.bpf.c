@@ -501,6 +501,14 @@ static __always_inline void* checked_code_ptr(
 }
 #endif
 
+/* The id of the process whose names read_names() reads. Call it where the id is
+ * stored: a local at the top of read_names() is kept across every read, which
+ * can cost its caller's frame a stack slot (see src/bpf_stack_budget.rs). */
+static __always_inline pid_t names_tgid(struct task_struct* task) {
+  return task ? BPF_CORE_READ(task, tgid)
+              : (pid_t)(bpf_get_current_pid_tgid() >> 32);
+}
+
 /*
  * With check_code, which only a probe's walk passes, the names are read only
  * through a code object that checked_code_ptr() lets through. The check is made
@@ -516,8 +524,6 @@ static __always_inline void read_names(
     struct task_struct* task,
     const bool check_code) {
   const OffsetConfig* const offsets = &state->offsets;
-  const pid_t pid = task ? BPF_CORE_READ(task, tgid)
-                         : (pid_t)(bpf_get_current_pid_tgid() >> 32);
   struct pystacks_symbol* const symbol = &state->sym;
   struct pystacks_line_table* const linetable = &state->linetable;
 
@@ -576,7 +582,7 @@ static __always_inline void read_names(
           code_ptr + offsets->PyCodeObject_firstlineno,
           task);
       linetable->first_line = first_line;
-      linetable->pid = pid;
+      linetable->pid = names_tgid(task);
 
       int32_t lasti = -1;
       if (offsets->PyVersion_major == 3 && offsets->PyVersion_minor < 11) {
@@ -652,7 +658,7 @@ static __always_inline void read_names(
           task);
       symbol->qualname.value[BPF_LIB_PYSTACKS_CLASS_NAME_LEN] = '\0';
       if (qualname_len == -EFAULT) {
-        symbol->fault_pid = pid;
+        symbol->fault_pid = names_tgid(task);
         symbol->qualname.fault_addr =
             (uintptr_t)(qualname_ptr + offsets->String_data);
       }
@@ -753,7 +759,7 @@ static __always_inline void read_names(
       bpf_probe_read_kernel_str(
           &symbol->filename.value, sizeof(symbol->filename.value), src);
     } else if (len == -EFAULT) {
-      symbol->fault_pid = pid;
+      symbol->fault_pid = names_tgid(task);
       symbol->filename.fault_addr =
           (uintptr_t)(filename_ptr + offsets->String_data);
     }
