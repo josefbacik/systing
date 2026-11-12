@@ -274,6 +274,12 @@ pub fn read_gctx(mem: &dyn Memory, key: u64, gaddr: u64) -> Option<(u64, Vec<u64
         buf.resize(total, 0);
         mem.read_exact(gaddr.checked_add(have as u64)?, &mut buf[have..total])
             .ok()?;
+        // What the first read brought from `key` on, `bt` and the first frames,
+        // must still be there after the second.
+        let first = gctx::BT_VEC..have;
+        if mem.bytes(key, first.len()).ok()? != buf[first] {
+            return None;
+        }
     }
     let root = u64_at(&buf, gctx::TCTXS_ROOT);
     let addrs = (0..len).map(|i| u64_at(&buf, gctx::VEC + i * 8)).collect();
@@ -609,6 +615,62 @@ mod tests {
         h.gctx(0x10000, &frames, 0x100000);
         let p = walk(&h.finish(), HEADER).unwrap();
         assert_eq!(p.stacks[0].addrs, frames);
+    }
+
+    /// Serves a record out of one memory until its outer frames are read, and
+    /// out of another from that read on.
+    struct Changed {
+        before: FakeMem,
+        after: FakeMem,
+        record: std::ops::Range<u64>,
+        /// Where the frames begin that the first read does not bring.
+        outer: u64,
+        changed: Cell<bool>,
+    }
+
+    impl Memory for Changed {
+        fn read_some(&self, addr: u64, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.record.contains(&addr) {
+                return self.before.read_some(addr, buf);
+            }
+            if addr >= self.outer {
+                self.changed.set(true);
+            }
+            if self.changed.get() {
+                self.after.read_some(addr, buf)
+            } else {
+                self.before.read_some(addr, buf)
+            }
+        }
+    }
+
+    #[test]
+    fn a_record_whose_first_frames_change_before_its_second_read_is_skipped() {
+        let old: Vec<u64> = (1..=100).map(|i| 0x7000_0000 + i).collect();
+        let new: Vec<u64> = (1..=100).map(|i| 0x7100_0000 + i).collect();
+        let size = gctx::VEC + old.len() * 8;
+        // The second memory: the record of another stack of the same length, then
+        // bytes that are no record.
+        let mut record = Heap::new();
+        record.gctx(0x10000, &new, 0x100000);
+        let mut no_record = FakeMem::default();
+        no_record.put(0x10000, vec![0x5a; size]);
+        for (after, stacks) in [(record.mem, vec![new]), (no_record, vec![])] {
+            let mut h = Heap::new();
+            // Without a live thread record the stack is dropped in any case.
+            h.tctx(0x100000, 0x10000, 0, 0, NOMINAL, (1, 100));
+            h.gctx(0x10000, &old, 0x100000);
+            let mem = Changed {
+                before: h.finish(),
+                after,
+                record: 0x10000..0x10000 + size as u64,
+                outer: 0x10000 + (gctx::VEC + FIRST_FRAMES * 8) as u64,
+                changed: Cell::new(false),
+            };
+            let p = walk(&mem, HEADER).unwrap();
+            let read: Vec<Vec<u64>> = p.stacks.into_iter().map(|s| s.addrs).collect();
+            assert_eq!(read, stacks);
+        }
     }
 
     /// Serves the table header differently the second time it is read, as if
