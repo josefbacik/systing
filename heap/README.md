@@ -336,7 +336,7 @@ One row per snapshot read with `--snoop`. None for a dump.
 | `walks_redone` | Walks done again, because the table changed or records were skipped |
 | `unsteady` | The table was changing during every walk, so stacks may be missing |
 | `backtraces_read`, `backtraces_skipped` | Backtrace records read, and those skipped because they were not, or no longer, jemalloc's. Read counts every backtrace, including one with nothing live, which has no `heap_sample` row. |
-| `thread_records_read`, `thread_records_skipped` | The same for the per-thread counters. A skipped record's counts are missing from its stack. |
+| `thread_records_read`, `thread_records_skipped` | The same for the per-thread counters. A skipped record's counts are missing from its stack. Read includes records from before a `prof.reset`, whose counts are left out, as a dump leaves them out. |
 | `links_checked`, `links_out_of_order` | Thread records compared for the order jemalloc keeps them in, and those out of it |
 | `counters_checked`, `counters_off` | Thread records whose counters were compared, and those that cannot be jemalloc's |
 | `reads`, `bytes_read`, `duration_ms` | What the read cost |

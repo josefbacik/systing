@@ -21,8 +21,8 @@
 //!
 //! This depends on jemalloc's private data structures, which its authors are
 //! free to change; a jemalloc this does not recognise is refused, not
-//! guessed at. It is kept in this module, and nothing else in the crate knows
-//! how it works.
+//! guessed at, with one exception (see [`layout`]). It is kept in this module,
+//! and nothing else in the crate knows how it works.
 
 pub mod elf;
 pub mod layout;
@@ -447,6 +447,9 @@ fn refuse_unusable(profile: &walk::Profile) -> Result<()> {
         );
     }
     if profile.stacks.is_empty() {
+        if profile.stats.tctx_expired > 0 {
+            bail!("the process has no live sampled allocations since its last prof.reset yet");
+        }
         bail!("the process has no live sampled allocations to report yet");
     }
     // A layout that differs somewhere the shape checks do not look shows as
@@ -623,6 +626,12 @@ impl Report {
                 self.stats.retries, self.stats.gctx_skipped, self.stats.tctx_skipped
             ));
         }
+        if self.stats.tctx_expired > 0 {
+            out.push_str(&format!(
+                "; {} thread counters from before a prof.reset left out",
+                self.stats.tctx_expired
+            ));
+        }
         if self.stats.unsteady {
             out.push_str(
                 "; the profile table was being changed during every read (jemalloc \
@@ -678,6 +687,15 @@ mod tests {
         }))
         .unwrap_err();
         assert!(e.to_string().contains("no live sampled allocations"), "{e}");
+        // Nothing but what a reset left out: says so.
+        let e = refuse_unusable(&profile(walk::Stats {
+            gctx_read: 3,
+            tctx_read: 3,
+            tctx_expired: 3,
+            ..Default::default()
+        }))
+        .unwrap_err();
+        assert!(e.to_string().contains("prof.reset"), "{e}");
     }
 
     #[test]
