@@ -2968,6 +2968,88 @@ def level1():
     );
 }
 
+/// Records on-CPU stacks of `pid`, with Python frames, for `duration` seconds in
+/// `dir`. Returns a function that counts rows of the view `python_stack`: one row
+/// per distinct stack, with `names` its Python function names, root first.
+fn count_in_sampled_python_stacks(dir: &TempDir, pid: u32, duration: u64) -> impl Fn(&str) -> i64 {
+    let config = Config {
+        duration,
+        pid: vec![pid],
+        pystacks_pids: vec![pid],
+        output_dir: dir.path().to_path_buf(),
+        sample_freq: 1999,
+        no_sched: true,
+        no_irq: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        collect_pystacks: true,
+        parquet_only: true,
+        ..Config::default()
+    };
+    systing(config, None).expect("systing recording failed");
+    let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+    conn.execute_batch(&format!(
+        "CREATE VIEW python_stack AS SELECT * FROM (SELECT list_transform( \
+             list_filter(frame_names, f -> contains(f, ' (python) [')), \
+             f -> f[:strpos(f, ' (python) [') - 1]) AS names \
+         FROM read_parquet('{}')) WHERE len(names) > 0",
+        dir.path().join("stack.parquet").display()
+    ))
+    .expect("Failed to read the stacks");
+    move |from_where: &str| {
+        conn.query_row(&format!("SELECT count(*) FROM {from_where}"), [], |row| {
+            row.get(0)
+        })
+        .expect("Failed to count")
+    }
+}
+
+/// A sample's walk goes on past a frame whose code object cannot be read: the
+/// frame shows as "[Frame Error]" and its callers are all there.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_pystacks_walk_goes_on_past_a_code_object_that_cannot_be_read() {
+    let defs = r#"
+import ctypes, gc, mmap
+gc.disable()
+libc = ctypes.CDLL(None)
+libc.mallopt(-3, 65536)  # M_MMAP_THRESHOLD
+def leaf():
+    page = id(middle.__code__) & ~(mmap.PAGESIZE - 1)
+    assert id(middle.__code__) - page == 16, "the code object shares its first page"
+    assert libc.mprotect(ctypes.c_void_p(page), mmap.PAGESIZE, 0) == 0
+    with open(sys.argv[1], "w") as f:
+        f.write("ready")
+    while True:
+        pass
+exec("def middle():\n" + "    x = 1\n" * 50000 + "    leaf()\n")
+def outer():
+    middle()
+"#;
+    for version in [PYTHON_312_VERSION, PYTHON_313_VERSION] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let workload = spawn_python_workload(
+            pyenv_python(version),
+            dir.path(),
+            "unreadable_code.py",
+            defs,
+            "outer()",
+        );
+        let count = count_in_sampled_python_stacks(&dir, workload.pid, 3);
+        drop(workload);
+
+        assert!(
+            count("python_stack WHERE names = ['<module>', 'outer', '[Frame Error]', 'leaf']") > 0,
+            "[{version}] no stack with the callers of the frame that cannot be read"
+        );
+        assert_eq!(
+            count("python_stack WHERE names[1] != '<module>'"),
+            0,
+            "[{version}] stacks that do not reach <module>"
+        );
+    }
+}
+
 // =============================================================================
 // Per-version pystacks tests
 //

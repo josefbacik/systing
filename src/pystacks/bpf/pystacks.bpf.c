@@ -197,9 +197,16 @@ struct sample_state_t {
    * pystacks_get_frame_data(). */
   bool send_symbol;
   bool shared_before;
+#endif
   uintptr_t code_type_addr;
   /* Words of the process, read for a check and not kept. */
   uint64_t words[2];
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+  /* The frame that pystacks_get_frame_data() was last called at, and whether
+   * it found that the walk must end there. They must last from one call to the
+   * next. */
+  void* this_frame;
+  bool end_walk;
 #endif
   char long_file_name[BPF_LIB_FILE_NAME_TRYGET];
   struct pystacks_symbol sym;
@@ -446,12 +453,65 @@ static __always_inline void* get_gen_ptr(
   return gen_ptr;
 }
 
-static __always_inline void get_names(
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+/*
+ * What a probe's walk may read a frame's names through: code_ptr, or NULL.
+ *
+ * The test is is_code_object()'s: the type must be PyCode_Type, and the first
+ * word a reference count and not an address.
+ *
+ * If the type's address is not known, everything passes. So does NULL, through
+ * which no name is read: get_code_ptr() gives it for a word of 0 and for a word
+ * that could not be read alike.
+ *
+ * Where the object cannot be read, no name is read, and the walk goes on to the
+ * caller.
+ *
+ * At a word that fails what can be asked of an object's address (it lies in
+ * user space and is a multiple of 8), as at an object that fails the test, the
+ * walk ends: end_walk is set.
+ */
+static __always_inline void* checked_code_ptr(
+    struct sample_state_t* const state,
+    void* code_ptr,
+    struct task_struct* task) {
+  if (!code_ptr || !state->code_type_addr) {
+    return code_ptr;
+  }
+  /* ob_refcnt, ob_type */
+  if (bpf_probe_read_user_task(
+          state->words,
+          2 * sizeof(state->words[0]),
+          code_ptr + state->offsets.PyObject_type - sizeof(state->words[0]),
+          task) != 0) {
+    state->end_walk = !IS_VALID_USER_SPACE_ADDRESS(code_ptr) ||
+        ((uintptr_t)code_ptr & 7);
+    return NULL;
+  }
+  if (state->words[1] == state->code_type_addr &&
+      (uint32_t)state->words[0] != 0 &&
+      (state->words[0] & 0x0000ffff00000000ULL) == 0) {
+    return code_ptr;
+  }
+  state->end_walk = true;
+  return NULL;
+}
+#endif
+
+/*
+ * With check_code, which only a probe's walk passes, the names are read only
+ * through a code object that checked_code_ptr() lets through. The check is made
+ * in here, where code_ptr is held for the reads that follow in any case. Made
+ * by the caller, it takes the caller's frame past 64 bytes, which kernels up to
+ * 6.8 count as 32 more: see src/bpf_stack_budget.rs.
+ */
+static __always_inline void read_names(
     struct sample_state_t* const state,
     void* cur_frame,
     void* code_ptr,
     bool use_shadow_frame,
-    struct task_struct* task) {
+    struct task_struct* task,
+    const bool check_code) {
   const OffsetConfig* const offsets = &state->offsets;
   const pid_t pid = task ? BPF_CORE_READ(task, tgid)
                          : (pid_t)(bpf_get_current_pid_tgid() >> 32);
@@ -465,6 +525,12 @@ static __always_inline void get_names(
   memset_zero(symbol, sizeof(struct pystacks_symbol));
   memset_zero(linetable, sizeof(struct pystacks_line_table));
   state->lasti = -1;
+
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+  if (check_code) {
+    code_ptr = checked_code_ptr(state, code_ptr, task);
+  }
+#endif
 
   if (!code_ptr) {
     // if we end up here, this means that reading of `PyCodeObject` for this
@@ -691,6 +757,15 @@ static __always_inline void get_names(
   }
 }
 
+static __always_inline void get_names(
+    struct sample_state_t* const state,
+    void* cur_frame,
+    void* code_ptr,
+    bool use_shadow_frame,
+    struct task_struct* task) {
+  read_names(state, cur_frame, code_ptr, use_shadow_frame, task, false);
+}
+
 // Get the PyCodeObject from the frame pointer
 static __always_inline void* get_code_ptr(
     void* frame_ptr,
@@ -847,6 +922,20 @@ __noinline bool pystacks_get_frame_data(int pid) {
    * it unsigned is safe on both.
    */
   state->frame_skipped = false;
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+  /* The walk ends where checked_code_ptr() said so, and at a frame that gives
+   * itself as its caller.
+   *
+   * The call after the one that found the reason ends the walk, here and not in
+   * the caller's loop, which the verifier walks turn by turn. So this_frame and
+   * end_walk last from one call to the next, and walk_and_load_py_stack()
+   * resets them at the start of a walk. */
+  if (state->end_walk || state->frame_ptr == state->this_frame) {
+    state->frame_ptr = NULL;
+  }
+  state->this_frame = state->frame_ptr;
+  state->end_walk = false;
+#endif
   if (!use_shadow_frame && offsets->PyVersion_major >= 3 &&
       offsets->PyVersion_minor >= 12 &&
       offsets->PyFrameObject_owner != BPF_LIB_DEFAULT_FIELD_OFFSET) {
@@ -878,8 +967,15 @@ __noinline bool pystacks_get_frame_data(int pid) {
       return true;
     }
     state->shared_before = (uint32_t)state->words[0] != 1;
-#endif
     get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+#else
+    read_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task, true);
+    if (state->end_walk) {
+      /* The symbol is "[Frame Error]". The next call ends the walk. */
+      put_task(task);
+      return true;
+    }
+#endif
 #ifdef STROBELIGHT_SLEEPABLE_BPF
     /* With no code object the symbol is the constant "[Frame Error]".
      * A name whose read faulted is not sent. Nor is a name from an object
@@ -1085,6 +1181,11 @@ __hidden int walk_and_load_py_stack(
 
   bool last_frame_read = false;
   int pid = task ? BPF_CORE_READ(task, pid) : 0;
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+  /* The state outlives a walk. */
+  state->this_frame = NULL;
+  state->end_walk = false;
+#endif
 
   /*
    * Bound the walk on emitted symbols rather than on visited frames, so a
@@ -1362,9 +1463,7 @@ __hidden int pystacks_read_stacks_task(
   BPF_LIB_GET_STATE();
 
   state->offsets = pid_data->offsets;
-#ifdef STROBELIGHT_SLEEPABLE_BPF
   state->code_type_addr = pid_data->code_type_addr;
-#endif
   state->cur_cpu = bpf_get_smp_processor_id();
 
   // The global PyThreadState of the thread holding the GIL, where the
