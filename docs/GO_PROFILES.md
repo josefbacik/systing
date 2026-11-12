@@ -36,7 +36,10 @@ with its values (in pprof's order and units) and its frames, leaf first;
 `profile.proto`, as `/debug/pprof/<profile>` serves it), which `go tool pprof`
 and any other pprof tool read. A goroutine profile written so also has a
 `state` label on each stack: the wait reason, or the state of a goroutine
-that is not waiting.
+that is not waiting. A heap profile has a sample for each object size that a
+stack allocates, as Go's own file has, though without Go's `bytes` label. One
+over the limit on frames (see Limits) is first added up to one sample for each
+stack of addresses.
 Reading memory needs the program's own user or `CAP_SYS_PTRACE`, as for
 `--snoop` of jemalloc.
 
@@ -168,6 +171,10 @@ version's numbers, and so are release candidates and experiment builds
   decides how much it allocates. At the cap it aborts; the target is not
   touched. It also refuses a profile of more than 2^22 frames, each stack
   counted as eight more and every 64 bytes of a frame's names as one more.
+  A heap profile over that is first added up, so that each stack of addresses
+  has one sample and the header has `"added_up_by_stack": true`, and is refused
+  only if it is still over. From such a file `systing-heap` has its `est_*`
+  columns right, but sampled counts can be off for a stack of several sizes.
 - On a Go program or profile, `systing-heap` has no overall limit on memory
   or time. Where that input isn't trusted, run it under a cgroup memory limit
   and `timeout`.
