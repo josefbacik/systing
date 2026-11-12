@@ -198,6 +198,8 @@ struct sample_state_t {
    * pystacks_get_frame_data(). */
   bool send_symbol;
   bool shared_before;
+  /* code_version() of the frame's code object before its names were read. */
+  uint32_t version_before;
 #endif
   uintptr_t code_type_addr;
   /* Words of the process, read for a check and not kept. */
@@ -875,6 +877,38 @@ static __always_inline bool is_code_object(
       (uint32_t)state->words[0] != 0 &&
       (state->words[0] & 0x0000ffff00000000ULL) == 0;
 }
+
+/*
+ * Whether code objects have a version number that code_version() can read. The
+ * field, co_version, came with 3.12. It has no offset in OffsetConfig: in 3.12
+ * to 3.14 it follows co_firstlineno and five more ints.
+ */
+static __always_inline bool has_code_version(
+    const OffsetConfig* const offsets) {
+  return offsets->PyVersion_major == 3 && offsets->PyVersion_minor >= 12 &&
+      offsets->PyVersion_minor <= 14 &&
+      offsets->PyCodeObject_firstlineno != BPF_LIB_DEFAULT_FIELD_OFFSET;
+}
+
+/*
+ * The version number of a code object, co_version: the 32 bits that follow
+ * co_firstlineno and five more ints (see has_code_version()).
+ *
+ * 0 if it cannot be read. 0 also for a code object with no number, such as one
+ * that CPython defines statically, which is immortal.
+ */
+static __always_inline uint32_t code_version(
+    struct sample_state_t* const state,
+    void* code_ptr,
+    struct task_struct* task) {
+  state->words[0] = 0;
+  bpf_probe_read_user_task(
+      state->words,
+      sizeof(uint32_t),
+      code_ptr + state->offsets.PyCodeObject_firstlineno + 6 * sizeof(int32_t),
+      task);
+  return (uint32_t)state->words[0];
+}
 #endif
 
 static __always_inline bool is_ending_frame(struct pystacks_symbol* sym) {
@@ -997,6 +1031,9 @@ __noinline bool pystacks_get_frame_data(int pid) {
     }
     if (!state->frame_skipped) {
       state->shared_before = (uint32_t)state->words[0] != 1;
+      if (code_ptr && has_code_version(offsets)) {
+        state->version_before = code_version(state, code_ptr, task);
+      }
       get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
     }
 #else
@@ -1020,12 +1057,19 @@ __noinline bool pystacks_get_frame_data(int pid) {
        * - user space does not have the symbol yet;
        * - the count was more than 1 before the names were read;
        * - the check passes again;
-       * - the count is more than 1 now.
+       * - the count is more than 1 now;
+       * - where code objects have a version number (has_code_version()), it is
+       *   not 0 and is the one from before the names were read. An immortal
+       *   code object, whose count's low 32 bits read as negative, needs no
+       *   number.
        * A frame whose record is not sent keeps its id, and can show the name if
        * another walk sends it. */
       state->send_symbol = !bpf_map_lookup_elem(&pystacks_symbols, &id) &&
           state->shared_before && is_code_object(state, code_ptr, task) &&
-          (uint32_t)state->words[0] != 1;
+          (uint32_t)state->words[0] != 1 &&
+          ((int32_t)state->words[0] < 0 || !has_code_version(offsets) ||
+           (state->version_before != 0 &&
+            code_version(state, code_ptr, task) == state->version_before));
     }
 #endif
   }

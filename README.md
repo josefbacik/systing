@@ -402,14 +402,16 @@ What to keep in mind: a row's `ts` is the start of its iteration's walk, which
 reaches a given thread up to one walk later. The stack of a thread that stays
 blocked is exact; a running thread's is read while it runs and is a best effort.
 A Python function's name and file are kept only if what the frame gives as its
-code object looks like a live code object both before and after they are read. A
-frame whose name was not kept can show it if another walk of the capture kept
-it, and otherwise shows `<unknown python>`. On Python 3.10 and older a method
-shows without its class. A walk that meets a frame with no code object ends
-there: the stack keeps its innermost frames, and one `[Frame Error]` stands in
-for the rest. A record that is cut short at a busy memory-map lock can end in
-that mark too. From Python 3.14 on the walk steps over a frame that has returned
-meanwhile, so a running thread's stack can lack a frame between two others. The
+code object looks like a live code object both before and after they are read.
+On Python 3.12 to 3.14 the code object's version number must also be the same
+both times. A frame whose name was not kept can show it if another walk of the
+capture kept it, and otherwise shows `<unknown python>`. On Python 3.10 and
+older a method shows without its class. A walk that meets a frame with no code
+object ends there: the stack keeps its innermost frames, and one `[Frame Error]`
+stands in for the rest. A record that is cut short at a busy memory-map lock can
+end in that mark too. From Python 3.14 on the walk steps over a frame that has
+returned meanwhile, so a running thread's stack can lack a frame between two
+others. The
 unchanged-thread skip and the CPU-time deltas hold for twice the threads the
 host had when the capture started, and at least 65,536; a thread past that is
 still recorded, and walked again at every snapshot. `--collect-build-id` does
