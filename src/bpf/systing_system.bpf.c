@@ -160,6 +160,13 @@ const volatile struct {
 	u32 packet_sample_rate; /* network-packets: keep 1 in N PACKETS of the
 				 * data-path event types (0 or 1 = every packet).
 				 * See packet_sample_keep(). */
+	u32 network_tuple_lookups; /* network-syscalls or network-packets is on.
+				    * Their hooks look socket ids up by the full
+				    * tuple, so the state hook gives a connecting
+				    * socket's id a key with its bound tuple.
+				    * Rodata: with only the state-change recorder
+				    * on, the verifier prunes that arm, so it adds
+				    * no such keys. */
 } tool_config = {};
 
 enum event_type {
@@ -1318,6 +1325,62 @@ static __always_inline u64 get_or_create_socket_id(
 	return socket_id;
 }
 
+// Forget what is stored under this socket pointer: the identity keyed by the
+// pointer and this tuple, and the pointer's entry in sk_socket_id_map, which the
+// sk-first look-up would find. Either can be an earlier socket's in the same
+// memory. The next get_or_create_socket_id() mints a fresh id.
+static __always_inline void forget_socket_id(
+	struct sock *sk,
+	u8 *src_addr,
+	u16 src_port,
+	u8 *dest_addr,
+	u16 dest_port)
+{
+	struct socket_identity_key identity_key = {0};
+	u64 sk_ptr = (u64)sk;
+
+	identity_key.sk_ptr = sk_ptr;
+	__builtin_memcpy(identity_key.src_addr, src_addr, 16);
+	identity_key.src_port = src_port;
+	__builtin_memcpy(identity_key.dest_addr, dest_addr, 16);
+	identity_key.dest_port = dest_port;
+
+	bpf_map_delete_elem(&socket_metadata_map, &identity_key);
+	bpf_map_delete_elem(&sk_socket_id_map, &sk_ptr);
+}
+
+// Give a connecting socket's id a second key, with its bound tuple, so that
+// look-ups by the full tuple find the id that was minted at the connect start.
+// Hooks that run after the close, when the port is released again, find it by
+// the connect start's port-less key, which the next connect through this memory
+// to the same destination replaces. Nothing is written unless that key holds
+// this id.
+static __always_inline void add_bound_tuple_key(
+	struct sock *sk,
+	u8 *src_addr,
+	u16 src_port,
+	u8 *dest_addr,
+	u16 dest_port,
+	u64 socket_id)
+{
+	struct socket_identity_key identity_key = {0};
+	struct socket_metadata metadata;
+	struct socket_metadata *start;
+
+	identity_key.sk_ptr = (u64)sk;
+	__builtin_memcpy(identity_key.src_addr, src_addr, 16);
+	__builtin_memcpy(identity_key.dest_addr, dest_addr, 16);
+	identity_key.dest_port = dest_port;
+	start = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
+	if (!start || start->socket_id != socket_id)
+		return;
+
+	metadata = *start;
+	metadata.src_port = src_port;
+	identity_key.src_port = src_port;
+	bpf_map_update_elem(&socket_metadata_map, &identity_key, &metadata, BPF_ANY);
+}
+
 // Lookup socket ID for an existing socket with full 4-tuple
 // Returns 0 if not found
 static __always_inline u64 lookup_socket_id(
@@ -1338,6 +1401,50 @@ static __always_inline u64 lookup_socket_id(
 
 	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
 	return existing ? existing->socket_id : 0;
+}
+
+// The id of a socket that is still connecting; 0 otherwise. In SYN_SENT, unless
+// the socket was bound first, the id has no key but the connect start's, without
+// the local port: a look-up by the tuple misses, and get_or_create_socket_id()
+// would mint a second id and take over the pointer's entry, so that the
+// attempt's outcome would land on another id than its open. An entry under a
+// pointer can be an earlier socket's in the same memory, so it counts only if
+// the connect start's key holds the same id.
+static __always_inline u64 connecting_socket_id(
+	struct sock *sk,
+	u8 *src_addr,
+	u8 *dest_addr,
+	u16 dest_port)
+{
+	u64 sk_ptr = (u64)sk;
+	u64 socket_id;
+	u64 *sid;
+
+	if (BPF_CORE_READ(sk, __sk_common.skc_state) != TCP_SYN_SENT)
+		return 0;
+	sid = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!sid)
+		return 0;
+	socket_id = *sid;
+	if (lookup_socket_id(sk, src_addr, 0, dest_addr, dest_port) != socket_id)
+		return 0;
+	return socket_id;
+}
+
+// Lookup socket ID for a TCP socket that may still be connecting
+// Returns 0 if not found
+static __always_inline u64 lookup_tcp_socket_id(
+	struct sock *sk,
+	u8 *src_addr,
+	u16 src_port,
+	u8 *dest_addr,
+	u16 dest_port)
+{
+	u64 socket_id = lookup_socket_id(sk, src_addr, src_port, dest_addr, dest_port);
+
+	if (socket_id)
+		return socket_id;
+	return connecting_socket_id(sk, src_addr, dest_addr, dest_port);
 }
 
 // Lookup socket_id from a file descriptor by walking the task's fd table
@@ -3197,11 +3304,15 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 	// Store socket pointer for reading buffer state on exit
 	info.sk_ptr = (u64)sk;
 
-	// Get or create socket ID for this socket with full 4-tuple
+	// Socket ID: by pointer while connecting, else by the 4-tuple
 	if (sk && info.dest_port != 0) {
-		info.socket_id = get_or_create_socket_id(sk, protocol, info.af,
-							  info.src_addr, info.src_port,
-							  info.dest_addr, info.dest_port, tgidpid);
+		if (protocol == NETWORK_TCP)
+			info.socket_id = connecting_socket_id(sk, info.src_addr,
+							      info.dest_addr, info.dest_port);
+		if (info.socket_id == 0)
+			info.socket_id = get_or_create_socket_id(sk, protocol, info.af,
+								  info.src_addr, info.src_port,
+								  info.dest_addr, info.dest_port, tgidpid);
 	}
 
 	bpf_map_update_elem(&pending_network_sends, &tgidpid, &info, BPF_ANY);
@@ -3328,11 +3439,14 @@ static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
 		read_socket_src_info(sk, &info.af, info.src_addr, &info.src_port);
 		read_socket_dest_info(sk, &info.af, info.peer_addr, &info.peer_port);
 
-		// Get or create socket ID for this socket with full 4-tuple
+		// Socket ID: by pointer while connecting, else by the 4-tuple
 		if (info.peer_port != 0) {
-			info.socket_id = get_or_create_socket_id(sk, NETWORK_TCP, info.af,
-								  info.src_addr, info.src_port,
-								  info.peer_addr, info.peer_port, tgidpid);
+			info.socket_id = connecting_socket_id(sk, info.src_addr,
+							      info.peer_addr, info.peer_port);
+			if (info.socket_id == 0)
+				info.socket_id = get_or_create_socket_id(sk, NETWORK_TCP, info.af,
+									  info.src_addr, info.src_port,
+									  info.peer_addr, info.peer_port, tgidpid);
 		}
 
 		// Capture TCP receive sequence info at entry
@@ -3823,8 +3937,8 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	event->is_retransmit = (sacked & TCPCB_RETRANS) ? 1 : 0;
 
 	// Look up socket ID for this socket with full 4-tuple
-	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
-					     event->dest_addr, event->dest_port);
+	event->socket_id = lookup_tcp_socket_id(sk, event->src_addr, event->src_port,
+						 event->dest_addr, event->dest_port);
 	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	// Read send buffer state from socket
@@ -3901,8 +4015,8 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 	event->is_retransmit = 0;  // TCPCB_RETRANS not available at this probe point
 
 	// Look up socket ID for this socket with full 4-tuple
-	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
-					     event->dest_addr, event->dest_port);
+	event->socket_id = lookup_tcp_socket_id(sk, event->src_addr, event->src_port,
+						 event->dest_addr, event->dest_port);
 	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	// Read send buffer state from socket
@@ -4513,8 +4627,8 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 	bpf_probe_read_kernel(&icsk_retransmits, sizeof(icsk_retransmits), &icsk->icsk_retransmits);
 	bpf_probe_read_kernel(&icsk_backoff, sizeof(icsk_backoff), &icsk->icsk_backoff);
 
-	// Store RTO as raw jiffies - conversion to microseconds happens in userspace
-	// where we can read the system's actual HZ value from /proc/sys/kernel/sched_clock_tick_rate
+	// Store RTO in jiffies; user space converts it to
+	// milliseconds with the kernel's HZ.
 	event->rto_jiffies = icsk_rto;
 
 	// Add 1 to retransmit_count because we fire BEFORE the kernel increments it
@@ -4542,8 +4656,8 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 	event->sndbuf_limit = sndbuf > 0 ? (u32)sndbuf : 0;
 
 	// Get socket ID for correlation
-	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
-					     event->dest_addr, event->dest_port);
+	event->socket_id = lookup_tcp_socket_id(sk, event->src_addr, event->src_port,
+						 event->dest_addr, event->dest_port);
 	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	// Read persist timer state
@@ -4624,7 +4738,9 @@ int BPF_KPROBE(tcp_poll_entry, struct file *file, struct socket *sock, poll_tabl
 	if (dest_port == 0)
 		return 0;
 
-	u64 socket_id = get_or_create_socket_id(sk, NETWORK_TCP, af, src_addr, src_port, dest_addr, dest_port, tgidpid);
+	u64 socket_id = connecting_socket_id(sk, src_addr, dest_addr, dest_port);
+	if (socket_id == 0)
+		socket_id = get_or_create_socket_id(sk, NETWORK_TCP, af, src_addr, src_port, dest_addr, dest_port, tgidpid);
 	if (socket_id == 0)
 		return 0;
 
@@ -5196,6 +5312,19 @@ int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newst
 	// Note: tgidpid may not be the socket owner in softirq/timer
 	// context, but get_or_create_socket_id does not use it for
 	// identification.
+	//
+	// A connect starts a new connection. The kernel hands a freed socket's
+	// memory to later sockets, and this transition fires before an unbound
+	// socket's local port is chosen, so a later connect to the same
+	// destination would find an earlier connection's key (port-less,
+	// unless the socket was bound first): its open would land on the old
+	// id and its outcome on a new one. Forget that key first, so that
+	// get_or_create below mints a fresh id and seeds sk_socket_id_map, and
+	// the attempt's state changes are on one id.
+	if (oldstate == TCP_CLOSE && newstate == TCP_SYN_SENT)
+		forget_socket_id((struct sock *)sk, src_addr, src_port,
+				 dest_addr, dest_port);
+
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	u64 sk_key = (u64)sk;
 	u64 socket_id = 0;
@@ -5208,6 +5337,15 @@ int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newst
 			src_addr, src_port, dest_addr, dest_port, tgidpid);
 	if (socket_id == 0)
 		return 0;
+
+	// The attempt goes on (ESTABLISHED, or SYN_RECV in a simultaneous
+	// open) and its local port is bound by now. Unless the socket was
+	// bound first, hooks that look ids up by the full tuple would miss
+	// this id: send, receive and poll would mint a second one.
+	if (tool_config.network_tuple_lookups &&
+	    oldstate == TCP_SYN_SENT && newstate != TCP_CLOSE)
+		add_bound_tuple_key((struct sock *)sk, src_addr, src_port,
+				    dest_addr, dest_port, socket_id);
 
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);

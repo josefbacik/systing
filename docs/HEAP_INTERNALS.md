@@ -316,6 +316,7 @@ jemalloc's locks are not taken, so the profile changes while it is read.
 | The table was swapped for another | It is read again |
 | jemalloc is rebuilding the table | The entries found are compared with the table's own count. A read that keeps disagreeing is used anyway and marked `unsteady`. |
 | An entry was being moved between cells, or a subtree was hidden during a rotation | **Not detected.** A record missed this way raises no skip. |
+| A `prof.reset` came during the read | **Not detected.** Threads looked at before it are counted, and threads looked at after it are left out. |
 | A tree has more than 65,536 records | Cut there, and counted as a skipped record |
 
 How each read went is printed, and stored in `heap_live_read`. A Perfetto trace has no place for it.
@@ -351,7 +352,7 @@ The estimates do not depend on the sampling period, so a period the tool could n
 | Topic | Detail |
 |---|---|
 | Sample period | From the library's symbols. Failing that, from the `MALLOC_CONF` the process started with. Failing that, jemalloc's default. The summary says which. A wrong value changes only the label. |
-| `prof.reset` | After a reset to another period, jemalloc's unbiased counters can be off or wrap. A stack whose counter wrapped gets the estimate its raw counts give. A large share of those refuses the run. Counters of threads that a reset marked expired may be counted. Not tested. |
+| `prof.reset` | What was sampled before a reset is left out, as a dump leaves it out, and the summary says how many thread counters that was. Where the tool does not recognise a thread's `prof_tdata_t` (it knows jemalloc 5.3.0's and 5.3.1's), the thread counts as not expired and its counters stay in. After a reset to another period such counters can be off or wrap. A stack whose counter wrapped gets the estimate its raw counts give. A large share of those refuses the run. |
 | Paused sampling | Not checked |
 | Python frames | Need `--perf-map-dir`. There is no dump to look beside. |
 | A young or idle heap | Nothing has been sampled, and the tool says so |
@@ -402,7 +403,7 @@ Everything below ran on **x86-64 Linux with glibc**.
 | Snapshot files | Ubuntu's `libjemalloc2` 5.3.0 |
 | The socket | CPython 3.12, 3.13 and 3.14 with `libjemalloc2` 5.3.0; CPython 3.14.7 with jemalloc 5.3.1; a native C program; the responder-only library; the environment switch, with `1` and `fork`; asked by the same user and by root; **asked by root from outside a service that has its own pid and mount namespaces**, where it is pid 1 and its socket is in a `/run` the host cannot see |
 | `--ask python` | CPython 3.14.6 with `libjemalloc2` 5.3.0 (CI); CPython 3.14.7 with jemalloc 5.3.1; **as root against a service of another user**, with that user trying to write, remove, replace and rename the script and its folders |
-| `--snoop` | `libjemalloc2` 5.3.0 (stripped), jemalloc 5.3.0 built from source, and the `dev` branch, with `prof_accum` and `prof_unbias` each on and off |
+| `--snoop` | `libjemalloc2` 5.3.0 (stripped), jemalloc 5.3.0 built from source, and the `dev` branch, with `prof_accum` and `prof_unbias` each on and off; after a `prof.reset`, `libjemalloc2` 5.3.0 and jemalloc 5.3.1 |
 | `--check` | Every command it prints is run through a shell, against a service that has everything and whose socket folder is named with a space, `;` and `$` |
 | `backtrace="python"` | CPython 3.12, 3.13 and 3.14 |
 | Every backtrace | A thread's table of thread-local variables made to grow inside a sampled `realloc()`, on glibc 2.39: in a native program, in each of 32 threads, in Python, and in a Python whose libpython is a shared library that reads its thread state through the loader |

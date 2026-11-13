@@ -2191,6 +2191,8 @@ impl ParquetToPerfettoConverter {
         if socket_path.exists() {
             let batches = read_parquet_file(&socket_path)?;
 
+            let mut rows: Vec<(i64, bool, String)> = Vec::new();
+
             for batch in &batches {
                 let socket_ids = batch
                     .column_by_name("socket_id")
@@ -2225,23 +2227,37 @@ impl ParquetToPerfettoConverter {
                     let dest_ip = dest_ips.value(i);
                     let dest_port = dest_ports.value(i);
 
-                    // Create track for this socket
-                    let track_uuid = self.alloc_uuid();
-                    socket_to_uuid.insert(socket_id, track_uuid);
-
                     let track_name = format!(
                         "Socket {socket_id}:{protocol}:{src_ip}:{src_port}->{dest_ip}:{dest_port}"
                     );
-
-                    let mut track_desc = TrackDescriptor::default();
-                    track_desc.set_uuid(track_uuid);
-                    track_desc.set_name(track_name);
-                    track_desc.set_parent_uuid(root_uuid);
-
-                    let mut track_packet = TracePacket::default();
-                    track_packet.set_track_descriptor(track_desc);
-                    writer.write_packet(&track_packet)?;
+                    // Must match socket_tuple_is_complete in src/network_recorder.rs.
+                    let complete =
+                        src_port != 0 && !(dest_port == 0 && matches!(dest_ip, "0.0.0.0" | "::"));
+                    rows.push((socket_id, complete, track_name));
                 }
+            }
+
+            // A socket can have a row with an incomplete tuple and one with the
+            // complete tuple (see `NetworkSocketRecord`). Its events go on one
+            // track, so the incomplete row gets none.
+            let has_complete: HashSet<i64> = rows.iter().filter(|r| r.1).map(|r| r.0).collect();
+            for (socket_id, complete, track_name) in rows {
+                if !complete && has_complete.contains(&socket_id) {
+                    continue;
+                }
+
+                // Create track for this socket
+                let track_uuid = self.alloc_uuid();
+                socket_to_uuid.insert(socket_id, track_uuid);
+
+                let mut track_desc = TrackDescriptor::default();
+                track_desc.set_uuid(track_uuid);
+                track_desc.set_name(track_name);
+                track_desc.set_parent_uuid(root_uuid);
+
+                let mut track_packet = TracePacket::default();
+                track_packet.set_track_descriptor(track_desc);
+                writer.write_packet(&track_packet)?;
             }
         }
 
@@ -3747,6 +3763,18 @@ mod tests {
         dest_ip: &str,
         dest_port: i32,
     ) -> Result<()> {
+        create_test_network_sockets_parquet(
+            dir,
+            &[(socket_id, protocol, src_ip, src_port, dest_ip, dest_port)],
+        )
+    }
+
+    /// Helper to create network_socket.parquet with several rows, each
+    /// (socket_id, protocol, src_ip, src_port, dest_ip, dest_port)
+    fn create_test_network_sockets_parquet(
+        dir: &Path,
+        rows: &[(i64, &str, &str, i32, &str, i32)],
+    ) -> Result<()> {
         let path = dir.join("network_socket.parquet");
         let schema = Arc::new(Schema::new(vec![
             Field::new("socket_id", DataType::Int64, false),
@@ -3760,15 +3788,15 @@ mod tests {
             Field::new("last_seen_ts", DataType::Int64, true),
         ]));
 
-        let socket_ids = Int64Array::from(vec![socket_id]);
-        let protocols: StringArray = vec![Some(protocol)].into_iter().collect();
-        let address_families: StringArray = vec![Some("IPv4")].into_iter().collect();
-        let src_ips: StringArray = vec![Some(src_ip)].into_iter().collect();
-        let src_ports = Int32Array::from(vec![src_port]);
-        let dest_ips: StringArray = vec![Some(dest_ip)].into_iter().collect();
-        let dest_ports = Int32Array::from(vec![dest_port]);
-        let first_seen: Int64Array = vec![Some(1000000i64)].into_iter().collect();
-        let last_seen: Int64Array = vec![Some(2000000i64)].into_iter().collect();
+        let socket_ids = Int64Array::from_iter_values(rows.iter().map(|r| r.0));
+        let protocols: StringArray = rows.iter().map(|r| Some(r.1)).collect();
+        let address_families: StringArray = rows.iter().map(|_| Some("IPv4")).collect();
+        let src_ips: StringArray = rows.iter().map(|r| Some(r.2)).collect();
+        let src_ports = Int32Array::from_iter_values(rows.iter().map(|r| r.3));
+        let dest_ips: StringArray = rows.iter().map(|r| Some(r.4)).collect();
+        let dest_ports = Int32Array::from_iter_values(rows.iter().map(|r| r.5));
+        let first_seen: Int64Array = rows.iter().map(|_| Some(1000000i64)).collect();
+        let last_seen: Int64Array = rows.iter().map(|_| Some(2000000i64)).collect();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -4136,6 +4164,56 @@ mod tests {
             Type::TYPE_INSTANT,
             "Packet event should be TYPE_INSTANT"
         );
+    }
+
+    #[test]
+    fn test_network_data_conversion_writes_one_track_per_socket() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+
+        // Socket 42 has a row without a source port, socket 43 one without a
+        // peer, and each a complete row; 43's complete row comes first.
+        // Socket 44, a listener, has one row.
+        create_test_network_sockets_parquet(
+            dir.path(),
+            &[
+                (42, "TCP", "10.0.0.1", 0, "10.0.0.2", 80),
+                (42, "TCP", "10.0.0.1", 40000, "10.0.0.2", 80),
+                (43, "TCP", "10.0.0.2", 80, "10.0.0.1", 40000),
+                (44, "TCP", "0.0.0.0", 80, "0.0.0.0", 0),
+                (43, "TCP", "0.0.0.0", 80, "0.0.0.0", 0),
+            ],
+        )
+        .unwrap();
+        create_test_network_packet_parquet(dir.path(), 42, 1000000, "TCP packet_enqueue", 1500)
+            .unwrap();
+
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+        converter
+            .write_network_data(dir.path(), &mut writer)
+            .unwrap();
+
+        let tracks: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_track_descriptor())
+            .map(|p| p.track_descriptor())
+            .collect();
+        let names: Vec<_> = tracks.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "Network Packets",
+                "Socket 42:TCP:10.0.0.1:40000->10.0.0.2:80",
+                "Socket 43:TCP:10.0.0.2:80->10.0.0.1:40000",
+                "Socket 44:TCP:0.0.0.0:80->0.0.0.0:0",
+            ]
+        );
+
+        let event = writer.packets.iter().find(|p| p.has_track_event());
+        assert_eq!(event.unwrap().track_event().track_uuid(), tracks[1].uuid());
     }
 
     #[test]

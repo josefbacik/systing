@@ -1746,11 +1746,10 @@ fn test_e2e_network_suite() {
     // keep generating connections throughout the entire recording window.
     // We sleep 200ms between rounds to keep traffic volume reasonable.
     use std::sync::atomic::Ordering;
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
+    let addr = listener.local_addr().unwrap();
     let traffic = stoppable_workload(move |stop| {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
-        let addr = listener.local_addr().unwrap();
-
         while !stop.load(Ordering::Relaxed) {
             // Make a single TCP connection per iteration
             if let Ok(_stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
@@ -1961,6 +1960,8 @@ fn test_e2e_network_suite() {
              TCP connections should produce SYN_SENT/SYN_RECV -> ESTABLISHED transitions."
         );
 
+        assert_one_socket_id_per_connect(&conn, addr.port());
+
         // Check that TIME_WAIT transitions are captured (via tcp_time_wait kprobe rewrite)
         let time_wait_count: i64 = conn
             .query_row(
@@ -2034,6 +2035,132 @@ fn test_e2e_network_suite() {
     }
 
     eprintln!("\n  All network suite checks passed");
+}
+
+/// The ids of the sockets that one thread connected to 127.0.0.1 and `port`, one
+/// after the other: each holds exactly one connect's start. Ids first seen before
+/// the first recorded start belong to connects that began before the capture.
+fn assert_one_socket_id_per_connect(conn: &duckdb::Connection, port: u16) {
+    let (ids, bad): (i64, i64) = conn
+        .query_row(
+            "WITH event AS ( \
+                 SELECT socket_id, ts, \
+                        old_state_str = 'CLOSE' AND new_state_str = 'SYN_SENT' AS is_start \
+                 FROM network_packet \
+                 UNION ALL SELECT socket_id, ts, false FROM network_syscall \
+                 UNION ALL SELECT socket_id, ts, false FROM network_poll), \
+             client AS ( \
+                 SELECT * FROM event WHERE socket_id IN \
+                 (SELECT socket_id FROM network_socket \
+                  WHERE dest_ip = '127.0.0.1' AND dest_port = ?)), \
+             id AS ( \
+                 SELECT COUNT(*) FILTER (is_start) AS starts FROM client GROUP BY socket_id \
+                 HAVING MIN(ts) >= (SELECT MIN(ts) FROM client WHERE is_start)) \
+             SELECT COUNT(*), COUNT(*) FILTER (starts <> 1) FROM id",
+            [port],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to query the connects' socket ids");
+    eprintln!("    {ids} socket ids of connects to port {port}");
+    assert!(ids > 0, "[network] no connect to port {port} recorded");
+    assert_eq!(
+        bad, 0,
+        "[network] {bad} of {ids} socket ids do not hold exactly one connect's start"
+    );
+}
+
+/// One connection, one socket id, with the packets recorder on: its start, its
+/// SYN, its sends and receives, and, for a connect whose SYN gets no answer,
+/// the SYN's timeout. The second listener's accept queue holds two connections,
+/// which nobody accepts, so it drops every later SYN.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_network_one_socket_id_per_connect() {
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let duckdb_path = dir.path().join("trace.duckdb");
+    let config = Config {
+        duration: NETWORK_SUITE_DURATION_SECS + 2,
+        network: true,
+        network_packets: true,
+        output_dir: dir.path().to_path_buf(),
+        output: duckdb_path.clone(),
+        ..Config::default()
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
+    let addr = listener.local_addr().unwrap();
+    let silent = TcpListener::bind("127.0.0.1:0").expect("Failed to bind silent listener");
+    let silent_addr = silent.local_addr().unwrap();
+    // SAFETY: a valid listening socket; this only makes its accept queue shorter.
+    assert_eq!(unsafe { libc::listen(silent.as_raw_fd(), 1) }, 0);
+    let _queued =
+        [(); 2].map(|()| TcpStream::connect(silent_addr).expect("Failed to fill the accept queue"));
+
+    let traffic = stoppable_workload(move |stop| {
+        while !stop.load(Ordering::Relaxed) {
+            {
+                let mut client = TcpStream::connect(addr).expect("Failed to connect");
+                let (mut server, _) = listener.accept().expect("Failed to accept");
+                let mut buf = [0u8; 4];
+                client.write_all(b"ping").unwrap();
+                server.read_exact(&mut buf).unwrap();
+                server.write_all(b"pong").unwrap();
+                client.read_exact(&mut buf).unwrap();
+            }
+            thread::sleep(Duration::from_millis(100));
+            // Polls the socket while its SYN, which times out after one
+            // second, gets no answer.
+            TcpStream::connect_timeout(&silent_addr, Duration::from_millis(1200))
+                .expect_err("the silent listener answered");
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    eprintln!("Recording trace (network + packets, connects with and without an answer)...");
+    let recorded = systing(config, None);
+    traffic.stop();
+    recorded.expect("systing recording failed");
+
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    let syn = "event_type = 'TCP packet_enqueue' AND tcp_flags LIKE 'SYN%'";
+    for (port, table, condition) in [
+        (addr.port(), "network_packet", syn),
+        (addr.port(), "network_syscall", "event_type = 'sendmsg'"),
+        (addr.port(), "network_syscall", "event_type = 'recvmsg'"),
+        (silent_addr.port(), "network_packet", syn),
+        (
+            silent_addr.port(),
+            "network_packet",
+            "event_type = 'TCP rto_timeout'",
+        ),
+    ] {
+        let rows: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} WHERE {condition} \
+                     AND socket_id IN (SELECT socket_id FROM network_socket \
+                     WHERE dest_ip = '127.0.0.1' AND dest_port = {port}) \
+                     AND socket_id IN (SELECT socket_id FROM network_packet \
+                     WHERE old_state_str = 'CLOSE' AND new_state_str = 'SYN_SENT')"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("Failed to query the connects' rows");
+        eprintln!("    port {port}: {rows} rows in {table} with {condition}");
+        assert!(
+            rows > 0,
+            "no row in {table} with {condition} on a connect's id"
+        );
+    }
+    assert_one_socket_id_per_connect(&conn, addr.port());
+    assert_one_socket_id_per_connect(&conn, silent_addr.port());
 }
 
 /// One capture with the packets recorder on and `packet_sample_rate = 4`
@@ -2968,6 +3095,88 @@ def level1():
     );
 }
 
+/// Records on-CPU stacks of `pid`, with Python frames, for `duration` seconds in
+/// `dir`. Returns a function that counts rows of the view `python_stack`: one row
+/// per distinct stack, with `names` its Python function names, root first.
+fn count_in_sampled_python_stacks(dir: &TempDir, pid: u32, duration: u64) -> impl Fn(&str) -> i64 {
+    let config = Config {
+        duration,
+        pid: vec![pid],
+        pystacks_pids: vec![pid],
+        output_dir: dir.path().to_path_buf(),
+        sample_freq: 1999,
+        no_sched: true,
+        no_irq: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        collect_pystacks: true,
+        parquet_only: true,
+        ..Config::default()
+    };
+    systing(config, None).expect("systing recording failed");
+    let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+    conn.execute_batch(&format!(
+        "CREATE VIEW python_stack AS SELECT * FROM (SELECT list_transform( \
+             list_filter(frame_names, f -> contains(f, ' (python) [')), \
+             f -> f[:strpos(f, ' (python) [') - 1]) AS names \
+         FROM read_parquet('{}')) WHERE len(names) > 0",
+        dir.path().join("stack.parquet").display()
+    ))
+    .expect("Failed to read the stacks");
+    move |from_where: &str| {
+        conn.query_row(&format!("SELECT count(*) FROM {from_where}"), [], |row| {
+            row.get(0)
+        })
+        .expect("Failed to count")
+    }
+}
+
+/// A sample's walk goes on past a frame whose code object cannot be read: the
+/// frame shows as "[Frame Error]" and its callers are all there.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_pystacks_walk_goes_on_past_a_code_object_that_cannot_be_read() {
+    let defs = r#"
+import ctypes, gc, mmap
+gc.disable()
+libc = ctypes.CDLL(None)
+libc.mallopt(-3, 65536)  # M_MMAP_THRESHOLD
+def leaf():
+    page = id(middle.__code__) & ~(mmap.PAGESIZE - 1)
+    assert id(middle.__code__) - page == 16, "the code object shares its first page"
+    assert libc.mprotect(ctypes.c_void_p(page), mmap.PAGESIZE, 0) == 0
+    with open(sys.argv[1], "w") as f:
+        f.write("ready")
+    while True:
+        pass
+exec("def middle():\n" + "    x = 1\n" * 50000 + "    leaf()\n")
+def outer():
+    middle()
+"#;
+    for version in [PYTHON_312_VERSION, PYTHON_313_VERSION] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let workload = spawn_python_workload(
+            pyenv_python(version),
+            dir.path(),
+            "unreadable_code.py",
+            defs,
+            "outer()",
+        );
+        let count = count_in_sampled_python_stacks(&dir, workload.pid, 3);
+        drop(workload);
+
+        assert!(
+            count("python_stack WHERE names = ['<module>', 'outer', '[Frame Error]', 'leaf']") > 0,
+            "[{version}] no stack with the callers of the frame that cannot be read"
+        );
+        assert_eq!(
+            count("python_stack WHERE names[1] != '<module>'"),
+            0,
+            "[{version}] stacks that do not reach <module>"
+        );
+    }
+}
+
 // =============================================================================
 // Per-version pystacks tests
 //
@@ -3082,6 +3291,150 @@ fn test_pystacks_python313() {
 #[ignore]
 fn test_pystacks_python314() {
     run_pystacks_version_test(PYTHON_314_VERSION);
+}
+
+/// Every mmap and munmap row keeps the frames that belong to it, though
+/// threads are scheduled out in mid-walk. Each worker says who it
+/// is twice, in its function names and in the length of its mappings. To make
+/// walks overlap, the workers share one CPU, map from the bottom of a deep
+/// stack, and lose the CPU thousands of times a second to a real-time thread.
+/// The trampoline hooks can be preempted wherever the kernel preempts kernel
+/// code (not with preempt=none or voluntary); the default hooks from Linux 7.2.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_pystacks_memory_rows_keep_their_frames() {
+    const WORKERS: i64 = 6;
+    /// Worker `n` maps `FIRST_PAGES + n` pages: lengths nothing else asks for.
+    const FIRST_PAGES: i64 = 101;
+
+    let Some(cpu) = spare_cpu() else {
+        eprintln!("skipping: needs two CPUs, one for the workers and one for the recorder");
+        return;
+    };
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let python = pyenv_python(PYTHON_313_VERSION);
+
+    let waker = spawn_python_workload(
+        &python,
+        dir.path(),
+        "waker.py",
+        &format!("import os\nos.sched_setaffinity(0, {{{cpu}}})"),
+        "time.sleep(0.0002)",
+    );
+    let param = libc::sched_param { sched_priority: 1 };
+    // SAFETY: `param` outlives the call, which only reads it.
+    if unsafe { libc::sched_setscheduler(waker.pid as i32, libc::SCHED_FIFO, &param) } != 0 {
+        eprintln!(
+            "skipping: cannot make the waker real-time ({})",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let workers: Vec<PythonWorkload> = (0..WORKERS)
+        .map(|n| {
+            let defs = format!(
+                "import mmap, os\n\
+                 os.sched_setaffinity(0, {{{cpu}}})\n\
+                 def systing_own_{n}_leaf():\n\
+                 \x20   for _ in range(200):\n\
+                 \x20       mmap.mmap(-1, {length}).close()\n\
+                 def systing_own_{n}_rec(depth):\n\
+                 \x20   if depth:\n\
+                 \x20       systing_own_{n}_rec(depth - 1)\n\
+                 \x20   else:\n\
+                 \x20       systing_own_{n}_leaf()\n",
+                length = 4096 * (FIRST_PAGES + n),
+            );
+            spawn_python_workload(
+                &python,
+                dir.path(),
+                &format!("own_{n}.py"),
+                &defs,
+                &format!("systing_own_{n}_rec(60)"),
+            )
+        })
+        .collect();
+
+    let config = Config {
+        duration: 5,
+        parquet_only: true,
+        collect_pystacks: true,
+        memory: true,
+        kernel_hooks: KernelHooks::Trampoline,
+        pid: workers.iter().map(|worker| worker.pid).collect(),
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+    systing(config, None).expect("systing recording failed");
+    drop(workers);
+    drop(waker);
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "memory_rows")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    let (own, foreign, seen): (i64, i64, i64) = conn
+        .query_row(
+            &format!(
+                "WITH named AS (
+                     SELECT s.id AS stack_id,
+                            CAST(regexp_extract(f.name, 'systing_own_([0-9]+)_', 1) AS BIGINT)
+                                AS worker
+                     FROM (SELECT id, unnest(frame_ids) AS frame_id FROM stack) s
+                     JOIN frame f ON f.id = s.frame_id
+                     WHERE regexp_matches(f.name, 'systing_own_[0-9]+_')
+                 ), calls AS (
+                     SELECT stack_id, size // 4096 - {FIRST_PAGES} AS worker
+                     FROM memory_map
+                     WHERE size % 4096 = 0
+                 )
+                 SELECT COUNT(*) FILTER (WHERE n.worker = c.worker),
+                        COUNT(*) FILTER (WHERE n.worker <> c.worker),
+                        COUNT(DISTINCT c.worker)
+                 FROM calls c
+                 JOIN named n USING (stack_id)
+                 WHERE c.worker BETWEEN 0 AND {WORKERS} - 1"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("Failed to query the workers' memory_map rows");
+    // A skipped run mostly means that a thread was scheduled out inside a
+    // program, which is how walks come to overlap.
+    let last_of = |track: &str| -> Option<f64> {
+        conn.query_row(
+            "SELECT MAX(c.value)
+             FROM counter c
+             JOIN counter_track t ON c.track_id = t.id
+             WHERE t.name = ?",
+            [track],
+            |row| row.get(0),
+        )
+        .expect("Failed to query a missed-events track")
+    };
+    let skipped = last_of("Missed kernel-skipped events");
+    let refused = last_of("Missed python-stack events");
+    eprintln!(
+        "{own} frames in the right rows, {foreign} in the wrong ones, {seen} workers; \
+         runs skipped by the kernel: {skipped:?}, walks without a scratch slot: {refused:?}"
+    );
+    if skipped == Some(0.0) {
+        eprintln!(
+            "the kernel skipped no run, so walks may not have overlapped: this proves little"
+        );
+    }
+
+    assert_eq!(
+        seen, WORKERS,
+        "not every worker has rows with Python frames"
+    );
+    assert!(own > 10_000, "too few frames to tell: {own}");
+    assert_eq!(foreign, 0, "memory_map rows show the wrong Python frames");
+    assert!(
+        refused.is_some(),
+        "no track of walks without a scratch slot"
+    );
 }
 
 // =============================================================================
@@ -7439,6 +7792,337 @@ with open({expected:?}, "w") as f:
         assert!(
             names.read(&tids, &tids).is_empty(),
             "[{version}] second read"
+        );
+    }
+}
+
+/// A Python process with one thread parked for good and two, the main thread
+/// among them, that forever call 30 levels deep through eight functions and
+/// return. One of the two runs while the other waits for the GIL.
+fn spawn_python_that_calls_and_returns(version: &str, dir: &std::path::Path) -> PythonWorkload {
+    let defs = r#"
+import threading
+payload = tuple(range(1000, 1024))
+for k in range(8):
+    exec(f"def hop_{k}(i, d, t):\n" + "".join(f"    v{n} = t\n" for n in range(3 * k)) +
+         "    return d and HOPS[(i + d * (i % 5 + 1)) % 8](i, d - 1, t)\n")
+HOPS = [globals()[f"hop_{k}"] for k in range(8)]
+def spin():
+    i = 0
+    while True:
+        i += 1
+        HOPS[i % 8](i, 30, payload)
+def parked():
+    threading.Event().wait()
+threading.Thread(target=parked, daemon=True).start()
+threading.Thread(target=spin, daemon=True).start()
+i = 0
+"#;
+    spawn_python_workload(
+        pyenv_python(version),
+        dir,
+        "calls_and_returns.py",
+        defs,
+        "i += 1\nHOPS[i % 8](i, 30, payload)",
+    )
+}
+
+/// Captures the Python frames of `pid` every 10 ms for 3 s into `dir`, and returns
+/// a function that counts rows: of `stack` (id, frame_names, root first), or of
+/// `frame` (f, one row per frame of a distinct stack). `None`, with a `skipping:`
+/// line, where a capture reads no Python frames.
+fn count_in_python_task_stacks(dir: &TempDir, pid: u32) -> Option<impl Fn(&str) -> i64> {
+    use systing::task_stacks_recorder::TaskStackFrames;
+
+    let config = Config {
+        duration: 3,
+        pid: vec![pid],
+        pystacks_pids: vec![pid],
+        output_dir: dir.path().to_path_buf(),
+        no_sched: true,
+        no_irq: true,
+        no_cpu_stack_traces: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        collect_pystacks: true,
+        task_stacks_frames: Some(TaskStackFrames::Python),
+        task_stacks: true,
+        task_stacks_interval_ms: 10,
+        parquet_only: true,
+        ..Config::default()
+    };
+    systing(config, None).expect("systing recording failed");
+    match task_stacks_remote_reads(dir).as_deref() {
+        Some("on") => {}
+        Some("off:kernel-release") => {
+            eprintln!("skipping: on this kernel a capture reads no Python frames");
+            return None;
+        }
+        other => panic!("sysinfo.task_stacks_remote_reads = {other:?}"),
+    }
+    let conn = duckdb::Connection::open_in_memory().expect("Failed to open DuckDB");
+    conn.execute_batch(&format!(
+        "CREATE VIEW stack AS SELECT id, frame_names FROM read_parquet('{}'); \
+         CREATE VIEW frame AS SELECT unnest(frame_names) AS f FROM stack",
+        dir.path().join("stack.parquet").display()
+    ))
+    .expect("Failed to read the stacks");
+    Some(move |from_where: &str| {
+        conn.query_row(&format!("SELECT count(*) FROM {from_where}"), [], |row| {
+            row.get(0)
+        })
+        .expect("Failed to count")
+    })
+}
+
+/// Every frame of a thread that calls and returns during the walk has one of the
+/// program's names or says that it has none.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_names_of_a_running_thread() {
+    for version in [PYTHON_312_VERSION, PYTHON_313_VERSION] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let workload = spawn_python_that_calls_and_returns(version, dir.path());
+        let count = count_in_python_task_stacks(&dir, workload.pid);
+        drop(workload);
+        let Some(count) = count else { return };
+
+        eprintln!(
+            "[running thread, {version}] {} stacks, {} frames, {} of them hop_*, {} \"<unknown python>\"",
+            count("stack"),
+            count("frame"),
+            count("frame WHERE starts_with(f, 'hop_')"),
+            count("frame WHERE starts_with(f, '<unknown python>')")
+        );
+        assert_eq!(
+            count(
+                "frame WHERE NOT regexp_full_match(f, \
+                 'hop_[0-7] \\(python\\) \\[<string>(:[0-9]+)?\\]\
+                 |(<module>|spin|parked) \\(python\\) \\[calls_and_returns\\.py(:[0-9]+)?\\]\
+                 |threading:[A-Za-z_.]+ \\(python\\) \\[threading\\.py(:[0-9]+)?\\]\
+                 |(\\[Frame Error\\]|<unknown python>) \\(python\\) \\[unknown(:[0-9]+)?\\]')"
+            ),
+            0,
+            "frames that are not the program's, \"[Frame Error]\" or \"<unknown python>\""
+        );
+        assert_eq!(
+            count(
+                "stack WHERE \
+                 len(list_filter(frame_names, f -> starts_with(f, '[Frame Error]'))) > 1"
+            ),
+            0,
+            "stacks with more than one \"[Frame Error]\""
+        );
+        // The parked thread is read whole, with its names.
+        assert!(
+            count(
+                "stack WHERE starts_with(frame_names[1], 'threading:Thread._bootstrap ') \
+                 AND list_contains(list_transform(frame_names, f -> split_part(f, ' ', 1)), 'parked') \
+                 AND len(list_filter(frame_names, f -> f[1] IN ('[', '<'))) = 0"
+            ) > 0,
+            "the parked thread's stack is not there, whole and with its names"
+        );
+        assert!(
+            count("frame WHERE starts_with(f, 'hop_')") > 0,
+            "none of the functions that the two threads call has its name"
+        );
+    }
+}
+
+/// A thread that makes no system call has its names: its frames' code objects pass
+/// the check before and after the names are read. Once it runs Python, and once
+/// SIGSTOP holds it where it ran.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_keeps_the_names_of_a_busy_thread() {
+    for (version, stop) in [
+        (PYTHON_312_VERSION, false),
+        (PYTHON_312_VERSION, true),
+        (PYTHON_313_VERSION, false),
+        (PYTHON_313_VERSION, true),
+    ] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let workload = spawn_python_workload(
+            pyenv_python(version),
+            dir.path(),
+            "busy.py",
+            "def spin_here():\n    for _ in range(100000):\n        pass\n",
+            "spin_here()",
+        );
+        if stop {
+            // The marker is there before the program has left open().
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // SAFETY: a signal to a child of this test, which dropping it kills.
+            let stopped = unsafe { libc::kill(workload.pid as i32, libc::SIGSTOP) };
+            assert_eq!(stopped, 0, "Failed to stop the workload");
+        }
+        let count = count_in_python_task_stacks(&dir, workload.pid);
+        drop(workload);
+        let Some(count) = count else { return };
+
+        assert!(
+            count("frame WHERE starts_with(f, '<module> ')") > 0,
+            "{version}, stopped: {stop}: the thread's outermost frame has no name"
+        );
+        // A stopped thread can stand in <module>, between two calls.
+        assert!(
+            stop || count("frame WHERE starts_with(f, 'spin_here ')") > 0,
+            "{version}: the function that the thread runs has no name"
+        );
+        assert_eq!(
+            count(
+                "frame WHERE NOT regexp_full_match(f, \
+                 '(<module>|spin_here) \\(python\\) \\[busy\\.py(:[0-9]+)?\\]\
+                 |(\\[Frame Error\\]|<unknown python>) \\(python\\) \\[unknown(:[0-9]+)?\\]')"
+            ),
+            0,
+            "{version}, stopped: {stop}: frames that are not the program's, \
+             \"[Frame Error]\" or \"<unknown python>\""
+        );
+    }
+}
+
+/// Functions whose file name lies at the end of readable memory have their names.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_keeps_a_file_name_at_the_end_of_readable_memory() {
+    let defs = r#"
+import bisect, threading
+def readable_behind(strings):
+    spans = []
+    for line in open("/proc/self/maps"):
+        span, perms = line.split()[:2]
+        if "r" in perms:
+            start, end = (int(x, 16) for x in span.split("-"))
+            if spans and spans[-1][1] == start:
+                spans[-1][1] = end
+            else:
+                spans.append([start, end])
+    starts = [start for start, _ in spans]
+    # The text of a compact ASCII str begins 40 bytes into the object.
+    return [(spans[bisect.bisect_right(starts, id(s) + 40) - 1][1] - id(s) - 40, s) for s in strings]
+forever = threading.Event()
+kept, edge = [], None
+for n in range(60):
+    threading.Thread(target=forever.wait, daemon=True).start()
+    kept.append([f"edge_{n}_{i:06}_{'x' * 20}.py" for i in range(40000)])
+    edge = min(readable_behind(kept[-1]))
+    if edge[0] < 200:
+        break
+def no_edge_found():
+    forever.wait()
+def leaf():
+    forever.wait()
+source = "".join(f"def edgy_{d}():\n    {f'edgy_{d + 1}' if d < 19 else 'leaf'}()\n" for d in range(20))
+exec(compile(source, edge[1], "exec"))
+threading.Thread(target=edgy_0 if edge[0] < 200 else no_edge_found, daemon=True).start()
+"#;
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let workload = spawn_python_workload(
+        pyenv_python(PYTHON_313_VERSION),
+        dir.path(),
+        "edge.py",
+        defs,
+        "time.sleep(0.05)",
+    );
+    let count = count_in_python_task_stacks(&dir, workload.pid);
+    drop(workload);
+    let Some(count) = count else { return };
+    if count("frame WHERE starts_with(f, 'no_edge_found ')") > 0 {
+        eprintln!("skipping: no string came to lie at the end of readable memory");
+        return;
+    }
+
+    // Not all 20: a name can be held back for other reasons.
+    let named = count("(SELECT DISTINCT f FROM frame WHERE starts_with(f, 'edgy_'))");
+    assert!(
+        named >= 15,
+        "only {named} of the 20 functions have their names"
+    );
+}
+
+/// On 3.14 a walk goes on past a frame that has returned.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_walk_past_a_frame_that_has_returned_on_3_14() {
+    let defs = "def leaf():\n    pass\n\
+                def middle():\n    leaf()\n\
+                def outer():\n    for _ in range(1000):\n        middle()\n";
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let workload = spawn_python_workload(
+        pyenv_python(PYTHON_314_VERSION),
+        dir.path(),
+        "calls.py",
+        defs,
+        "outer()",
+    );
+    let count = count_in_python_task_stacks(&dir, workload.pid);
+    drop(workload);
+    if count.is_none() {
+        return;
+    }
+
+    // Frames stand root first, so a walk that was cut short has its "[Frame Error]"
+    // in the first place.
+    let events = dir.path().join("task_stack_event.parquet");
+    let cut_short = task_stack_events_where(
+        &events,
+        &format!(
+            "stack_id IN (SELECT id FROM read_parquet('{}') \
+             WHERE starts_with(frame_names[1], '[Frame Error]'))",
+            dir.path().join("stack.parquet").display()
+        ),
+    );
+    let all = task_stack_events_where(&events, "stack_id IS NOT NULL");
+    eprintln!("[returned frames, 3.14] {cut_short} of {all} events have a stack cut short");
+    assert!(all > 100, "only {all} events have a stack");
+    assert!(
+        cut_short * 10 < all,
+        "{cut_short} of {all} events have a stack that was cut short"
+    );
+}
+
+/// The frames around a Python `__init__` are all there, with their names. The frame
+/// that a specialized call of a class pushes below it has a code object that
+/// CPython defines statically, and on 3.14 a tagged code pointer.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_frames_around_an_init() {
+    // The call site has to be warm to be specialized. The last call stays in.
+    let defs = r#"
+class Widget:
+    def __init__(self, stay):
+        if stay:
+            with open(sys.argv[1], "w") as f:
+                f.write("ready")
+            while True:
+                time.sleep(0.1)
+def outer():
+    for i in range(20000):
+        Widget(i == 19999)
+"#;
+    for version in [PYTHON_313_VERSION, PYTHON_314_VERSION] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let workload = spawn_python_workload(
+            pyenv_python(version),
+            dir.path(),
+            "in_init.py",
+            defs,
+            "outer()",
+        );
+        let count = count_in_python_task_stacks(&dir, workload.pid);
+        drop(workload);
+        let Some(count) = count else { return };
+
+        assert!(
+            count(
+                "stack WHERE starts_with(frame_names[1], '<module> ') \
+                 AND starts_with(frame_names[2], 'outer ') \
+                 AND starts_with(frame_names[-1], 'Widget.__init__ ') \
+                 AND len(list_filter(frame_names, f -> \
+                     f[1] = '[' OR starts_with(f, '<unknown python>'))) = 0"
+            ) > 0,
+            "{version}: no stack from <module> to Widget.__init__ has all its names"
         );
     }
 }

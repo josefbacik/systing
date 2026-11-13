@@ -35,7 +35,18 @@ __hidden inline long bpf_probe_read_user_str_task(
 #ifdef STROBELIGHT_SLEEPABLE_BPF
   int ret = bpf_copy_from_user_task(dst, size, unsafe_ptr, task, 0);
   if (ret) {
-    return ret;
+    /* Where the read of all of size fails, read again as far as the page goes:
+     * up to the next 4096 boundary. Every page ends on one, and size is too
+     * small to cross two. The failed read has zeroed dst, so the string still
+     * ends. */
+    u32 room = 4096 - ((uintptr_t)unsafe_ptr & 4095);
+    if (room >= size) {
+      return ret;
+    }
+    ret = bpf_copy_from_user_task(dst, room, unsafe_ptr, task, 0);
+    if (ret) {
+      return ret;
+    }
   }
   return bpf_probe_read_kernel_str(dst, size, dst);
 #else // STROBELIGHT_SLEEPABLE_BPF

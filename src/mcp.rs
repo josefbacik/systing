@@ -923,7 +923,11 @@ network activity, and performance counters. Traces are stored in DuckDB database
 - network_syscall: Network send/recv syscalls with bytes and buffer metrics.
 - network_packet: Packet-level events (TCP/UDP) with sequence numbers, \
   retransmits, RTT, drops.
-- network_socket: Socket metadata (protocol, src/dest IP:port).
+- network_socket: Socket metadata (protocol, src/dest IP:port). A socket can \
+  have two rows, one with an incomplete tuple (src_port 0, or dest_port 0 with \
+  dest_ip '0.0.0.0' or '::') and one with the complete tuple. Keep one row per \
+  (trace_id, socket_id), preferring the complete one, before joining on those \
+  columns.
 
 # Important conventions
 - All timestamps (ts) are in nanoseconds since an arbitrary epoch.

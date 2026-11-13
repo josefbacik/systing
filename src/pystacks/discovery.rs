@@ -9,7 +9,7 @@ use crate::limits::Limit;
 use crate::root::{self, Root};
 use crate::stack_recorder::MAY_FOLLOW_MAP_FILES;
 use object::read::{ReadCache, ReadRef};
-use object::{Object, ObjectSymbol};
+use object::{Object, ObjectSegment, ObjectSymbol, SegmentFlags};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
@@ -28,9 +28,63 @@ use std::time::Instant;
 #[derive(Debug)]
 struct ElfPyInfo {
     py_runtime_addr: usize,
+    /// `PyCode_Type`, the type of every code object; 0 if the file has no such
+    /// symbol.
+    code_type_addr: usize,
     /// What the file's own version tag says; `None` for a file without one.
     version: Option<(i32, i32, i32)>,
     is_dynamic: bool,
+    exec_segments: Vec<ExecSegment>,
+}
+
+/// One executable loadable segment (a `PT_LOAD` program header with `PF_X`):
+/// `file_size` bytes at `file_offset` of the file are loaded at `vaddr`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExecSegment {
+    file_offset: u64,
+    file_size: u64,
+    vaddr: u64,
+}
+
+/// How many executable segments of a file are kept. A runtime has one, or
+/// two after a post-link optimizer; the bound keeps a file that states
+/// thousands from growing the cache.
+const MAX_EXEC_SEGMENTS: usize = 8;
+
+fn exec_segments<'data, R: ReadRef<'data>>(elf: &object::File<'data, R>) -> Vec<ExecSegment> {
+    elf.segments()
+        .filter(|segment| {
+            matches!(segment.flags(), SegmentFlags::Elf { p_flags } if p_flags & object::elf::PF_X != 0)
+        })
+        .take(MAX_EXEC_SEGMENTS)
+        .map(|segment| {
+            let (file_offset, file_size) = segment.file_range();
+            ExecSegment {
+                file_offset,
+                file_size,
+                vaddr: segment.address(),
+            }
+        })
+        .collect()
+}
+
+/// The virtual address at which the byte at `offset` of the file is loaded,
+/// by the first of `segments` that holds it. A segment whose addresses
+/// overflow holds nothing. The kernel rounds a mapping's offset down to a
+/// page, so a segment holds every offset from its own, rounded down likewise.
+fn file_offset_to_vaddr(segments: &[ExecSegment], offset: u64, page_size: u64) -> Option<u64> {
+    segments.iter().find_map(|segment| {
+        let first = segment.file_offset - segment.file_offset % page_size;
+        let end = segment.file_offset.checked_add(segment.file_size)?;
+        if !(first..end).contains(&offset) {
+            return None;
+        }
+        if offset >= segment.file_offset {
+            segment.vaddr.checked_add(offset - segment.file_offset)
+        } else {
+            segment.vaddr.checked_sub(segment.file_offset - offset)
+        }
+    })
 }
 
 impl ElfPyInfo {
@@ -176,6 +230,47 @@ impl<'a> ReadRef<'a> for &'a BudgetedReader<'_> {
     }
 }
 
+/// The file behind `reader`, parsed, if it is an ELF file.
+fn parse_elf<'a, 'f>(
+    reader: &'a BudgetedReader<'f>,
+) -> Option<object::File<'a, &'a BudgetedReader<'f>>> {
+    let is_elf = matches!(
+        object::FileKind::parse(reader),
+        Ok(object::FileKind::Elf32 | object::FileKind::Elf64)
+    );
+    if is_elf {
+        object::File::parse(reader).ok()
+    } else {
+        None
+    }
+}
+
+/// Ends the check of a file, which took `elapsed` seconds: frees `reader`'s memory and,
+/// if the file needed more than `budget`, counts it in the limit report and says so on
+/// stderr. Returns whether the file needed more than `budget`.
+fn over_budget(reader: BudgetedReader<'_>, file_path: &str, budget: u64, elapsed: f64) -> bool {
+    let (overdrawn, costly) = (reader.overdrawn(), reader.left() < budget - budget / 8);
+    drop(reader);
+    if costly {
+        // Return freed memory to the system.
+        // SAFETY: malloc_trim is always safe to call on glibc.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+    if overdrawn {
+        FILES_SKIPPED.hit();
+        eprintln!(
+            "[pystacks] Skipped {} after {elapsed:.2}s: looking into it for Python would read \
+             more than {} MiB. A process that needs this file will have no Python stacks, or \
+             stacks that end at their first frame",
+            file_path.escape_debug(),
+            budget >> 20
+        );
+    }
+    overdrawn
+}
+
 /// Parse the runtime facts out of an open ELF file.
 ///
 /// The file is read on demand through `object`'s `ReadCache` rather than
@@ -196,43 +291,19 @@ fn parse_elf_py_info_within(
 ) -> Option<Arc<ElfPyInfo>> {
     let start = Instant::now();
     let reader = BudgetedReader::new(file, budget);
-    // Only an ELF file can hold a runtime here.
-    let is_elf = matches!(
-        object::FileKind::parse(&reader),
-        Ok(object::FileKind::Elf32 | object::FileKind::Elf64)
-    );
-    let parsed = if is_elf {
-        object::File::parse(&reader).ok()
-    } else {
-        None
-    };
-    let result = parsed.and_then(|elf| {
+    let result = parse_elf(&reader).and_then(|elf| {
         let py_runtime_addr = find_symbol_address(&elf, "_PyRuntime")?;
         let version = detect_python_version(&elf, &reader);
         Some(Arc::new(ElfPyInfo {
             py_runtime_addr,
+            code_type_addr: find_symbol_address(&elf, "PyCode_Type").unwrap_or(0),
             version,
             is_dynamic: elf.kind() == object::ObjectKind::Dynamic,
+            exec_segments: exec_segments(&elf),
         }))
     });
     let elapsed = start.elapsed().as_secs_f64();
-    let (overdrawn, costly) = (reader.overdrawn(), reader.left() < budget - budget / 8);
-    drop(reader);
-    if costly {
-        // Return freed memory to the system.
-        // SAFETY: malloc_trim is always safe to call on glibc.
-        unsafe {
-            libc::malloc_trim(0);
-        }
-    }
-    if overdrawn {
-        FILES_SKIPPED.hit();
-        eprintln!(
-            "[pystacks] Skipped {} after {elapsed:.2}s: checking it for a Python runtime \
-             would read more than {} MiB, so it is not treated as one",
-            file_path.escape_debug(),
-            budget >> 20
-        );
+    if over_budget(reader, file_path, budget, elapsed) {
         return None;
     }
     if result.is_some() {
@@ -399,7 +470,8 @@ fn try_python_module(
     let offsets = offsets::for_version(major, minor)?;
 
     // Find base load address from maps
-    let base_addr = find_module_base_address(maps, module_path).unwrap_or(0);
+    let base_addr =
+        find_module_base_address(maps, module_path, &elf_info.exec_segments).unwrap_or(0);
 
     // Build binary ID — prefer the executable mapping for consistency with
     // base address computation, fall back to any mapping for this module.
@@ -436,6 +508,33 @@ fn try_python_module(
     };
 
     pid_data.py_runtime_addr = effective_runtime_addr;
+
+    // PyCode_Type, the copy that the process uses. An executable that refers to the
+    // type gets a copy of its own (a copy relocation), and a library's is then
+    // never made ready. So if a library's copy is not ready, try the
+    // executable's first, as the dynamic linker does.
+    const PY_TYPE_OBJECT_TP_FLAGS: usize = 168; // 3.8 to 3.14
+    const PY_TPFLAGS_READY: usize = 1 << 12;
+    let ready = |addr: &usize| {
+        let mut flags = [0u8; 8];
+        process::read_process_memory(pid, addr + PY_TYPE_OBJECT_TP_FLAGS, &mut flags).ok()
+            == Some(flags.len())
+            && usize::from_ne_bytes(flags) & PY_TPFLAGS_READY != 0
+    };
+    let own = Some(elf_info.code_type_addr)
+        .filter(|&addr| addr != 0)
+        .map(|addr| effective_runtime_addr - py_runtime_addr + addr);
+    pid_data.code_type_addr = own
+        .filter(|addr| is_exe || ready(addr))
+        .or_else(|| (!is_exe).then(|| exe_code_type_addr(pid, maps))?)
+        .or(own)
+        .unwrap_or(0);
+    if pid_data.code_type_addr == 0 {
+        eprintln!(
+            "[pystacks] No PyCode_Type found for process {pid}: task stacks will show its \
+             Python frames as \"<unknown python>\""
+        );
+    }
 
     // Compute derived addresses from _PyRuntime for Python >= 3.7
     if major == 3 && minor >= 7 {
@@ -572,6 +671,31 @@ fn open_in_process_root(pid: i32, path: &str) -> Option<fs::File> {
     Root::of_process(pid)
         .and_then(|root| root.open_regular(Path::new(path), 0))
         .ok()
+}
+
+/// `PyCode_Type` in the process, as its executable defines it, if it does. The
+/// file is opened and read as in the check for a runtime: through the process's
+/// `exe` link, and under [`MAX_PARSE_BYTES`].
+fn exe_code_type_addr(pid: i32, maps: &[MemoryMapping]) -> Option<usize> {
+    let exe = process::read_exe_path(pid)?;
+    let exe = exe.to_string_lossy();
+    let file = open_module(pid, &exe, maps, true)?;
+    let start = Instant::now();
+    let reader = BudgetedReader::new(&file, MAX_PARSE_BYTES);
+    let found = parse_elf(&reader).and_then(|elf| {
+        let addr = find_symbol_address(&elf, "PyCode_Type")?;
+        let is_dynamic = elf.kind() == object::ObjectKind::Dynamic;
+        Some((addr, is_dynamic, exec_segments(&elf)))
+    });
+    if over_budget(reader, &exe, MAX_PARSE_BYTES, start.elapsed().as_secs_f64()) {
+        return None;
+    }
+    let (addr, is_dynamic, exec_segments) = found?;
+    if is_dynamic {
+        Some(find_module_base_address(maps, &exe, &exec_segments)? + addr)
+    } else {
+        Some(addr)
+    }
 }
 
 /// Whether `sym` could be one of the runtime's variables: it has a nonzero
@@ -743,16 +867,24 @@ fn parse_version_from_path(path: &str) -> Option<(i32, i32, i32)> {
 /// for the same file, we can't simply pick the first one.
 ///
 /// Instead, we compute the base from the executable (r-xp) mapping:
-///   base = exec_mapping.start - exec_mapping.offset
-/// This is reliable because there is exactly one executable mapping per
-/// loaded module, and its file offset tells us where vaddr 0 would be.
-fn find_module_base_address(maps: &[MemoryMapping], module_path: &str) -> Option<usize> {
+///   base = exec_mapping.start - (vaddr of the byte at exec_mapping.offset)
+/// `exec_segments` gives that vaddr, which LLD's default layout puts a page
+/// above the offset. Where no segment holds the offset, the two count as equal.
+fn find_module_base_address(
+    maps: &[MemoryMapping],
+    module_path: &str,
+    exec_segments: &[ExecSegment],
+) -> Option<usize> {
     // Prefer computing base from the executable mapping
     if let Some(exec_map) = maps
         .iter()
         .find(|m| m.name == module_path && m.perms.contains('x'))
     {
-        return exec_map.start.checked_sub(exec_map.offset as usize);
+        // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let vaddr = file_offset_to_vaddr(exec_segments, exec_map.offset, page_size)
+            .unwrap_or(exec_map.offset);
+        return exec_map.start.checked_sub(usize::try_from(vaddr).ok()?);
     }
 
     // Fallback: use the last offset=0 mapping (the dynamic linker creates
@@ -1073,6 +1205,46 @@ mod tests {
         let versions = names.map(|name| version_of(run(&dir.path().join(name)).0.id()));
 
         assert_eq!(versions, [Some((3, 12)), Some((3, 8)), None]);
+    }
+
+    /// A program with a `PyCode_Type` of its own. It writes a byte, then the
+    /// variable's address, and sleeps.
+    const HAS_A_CODE_TYPE: &str = "#include <unistd.h>\n\
+                                   char PyCode_Type[64];\n\
+                                   int main(void) {\n\
+                                       void *at = PyCode_Type;\n\
+                                       if (write(1, PyCode_Type, 1) != 1) return 1;\n\
+                                       if (write(1, &at, sizeof at) != sizeof at) return 1;\n\
+                                       sleep(120);\n\
+                                       return 0;\n\
+                                   }\n";
+
+    #[test]
+    fn test_an_executables_own_code_type_is_found() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("app");
+        // Once at a fixed address, and once position-independent.
+        for flags in [&["-no-pie"][..], &["-fPIE", "-pie"][..]] {
+            if !cc_builds(HAS_A_CODE_TYPE, flags, &exe) {
+                eprintln!("no C compiler on this host: skipping the PyCode_Type check");
+                return;
+            }
+            let mut child = run(&exe);
+            let mut at = [0u8; size_of::<usize>()];
+            let stdout = child.0.stdout.as_mut().unwrap();
+            stdout.read_exact(&mut at).unwrap();
+            // Now only the process's exe link leads to the file.
+            fs::remove_file(&exe).unwrap();
+            let pid = child.0.id() as i32;
+
+            assert_eq!(
+                exe_code_type_addr(pid, &process::parse_proc_maps(pid)),
+                Some(usize::from_ne_bytes(at)),
+                "{flags:?}"
+            );
+        }
     }
 
     /// A program that maps the file `LIB` as a loader does, writes a byte and sleeps.
@@ -1442,7 +1614,8 @@ mod tests {
             format!(
                 "const char _PySys_ImplCacheTag[] = \"{TAG}\";\n\
                  char _PyRuntime[64];\n\
-                 int systing_fixture_keep(void) {{ return _PyRuntime[0]; }}\n"
+                 char PyCode_Type[64];\n\
+                 int systing_fixture_keep(void) {{ return _PyRuntime[0] + PyCode_Type[0]; }}\n"
             ),
         )
         .unwrap();
@@ -1496,6 +1669,13 @@ mod tests {
             );
             assert_eq!(info.is_dynamic, expect_dynamic, "{}", path.display());
             assert_ne!(info.py_runtime_addr, 0, "{}", path.display());
+            // The shared object has a PyCode_Type, the executable has none.
+            assert_eq!(
+                info.code_type_addr != 0,
+                expect_dynamic,
+                "{}",
+                path.display()
+            );
             checked += 1;
         }
         assert!(checked >= 1);
@@ -1537,21 +1717,23 @@ mod tests {
             .args([
                 "-c",
                 "import ssl, sqlite3, ctypes, decimal, hashlib, zlib, bz2, lzma, json, socket, select, struct, time\n\
-                 print('ready', flush=True)\n\
+                 print('ready', id(type(compile('', '', 'exec'))), flush=True)\n\
                  time.sleep(120)",
             ])
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn python");
         let pid = child.id() as i32;
-        {
+        let code_type_addr: usize = {
             use std::io::BufRead;
             let mut line = String::new();
             std::io::BufReader::new(child.stdout.take().unwrap())
                 .read_line(&mut line)
                 .unwrap();
-            assert_eq!(line.trim(), "ready");
-        }
+            let id = line.trim().strip_prefix("ready ").expect("ready line");
+            id.parse()
+                .expect("the address of the type of a code object")
+        };
 
         let maps = process::parse_proc_maps(pid);
         let exe = process::read_exe_path(pid)
@@ -1591,6 +1773,7 @@ mod tests {
         let _ = child.wait();
 
         let info = info.expect("live pyenv interpreter not discovered");
+        assert_eq!(info.pid_data.code_type_addr, code_type_addr);
         assert_eq!(info.pid, pid);
         assert_eq!(info.version_major, 3);
         eprintln!(
@@ -1648,7 +1831,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0"),
+            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0", &[]),
             Some(0x7f0000000000)
         );
     }
@@ -1705,7 +1888,7 @@ mod tests {
         ];
         // Should compute base from exec mapping: 0x7cfdaf4a0000 - 0x7f000 = 0x7cfdaf421000
         assert_eq!(
-            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0"),
+            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0", &[]),
             Some(0x7cfdaf421000)
         );
     }
@@ -1737,7 +1920,7 @@ mod tests {
         ];
         // Should use the last offset=0 mapping
         assert_eq!(
-            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0"),
+            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0", &[]),
             Some(0x7f0000200000)
         );
     }
@@ -1754,7 +1937,144 @@ mod tests {
             inode: 12345,
             name: "/usr/lib/libpython3.13.so.1.0".to_string(),
         }];
-        assert_eq!(find_module_base_address(&maps, "/nonexistent.so"), None);
+        assert_eq!(
+            find_module_base_address(&maps, "/nonexistent.so", &[]),
+            None
+        );
+    }
+
+    fn exec_segment(file_offset: u64, file_size: u64, vaddr: u64) -> ExecSegment {
+        ExecSegment {
+            file_offset,
+            file_size,
+            vaddr,
+        }
+    }
+
+    #[test]
+    fn test_find_module_base_address_by_the_program_headers() {
+        const EXE: &str = "/opt/python/bin/python3.13";
+        const BASE: usize = 0x5555_5555_4000;
+        for (what, start, offset, segments, want) in [
+            (
+                "LLD's default layout: the vaddr is a page above the offset",
+                BASE + 0xc0_1000,
+                0xc0_0000,
+                vec![exec_segment(0xc0_0000, 0x20_0000, 0xc0_1000)],
+                Some(BASE),
+            ),
+            (
+                "GNU ld's layout: the vaddr equals the offset",
+                BASE + 0x10_0000,
+                0x10_0000,
+                vec![exec_segment(0x10_0000, 0x30_0000, 0x10_0000)],
+                Some(BASE),
+            ),
+            (
+                "the mapping is of the second of two executable segments",
+                BASE + 0x80_0000,
+                0x50_0000,
+                vec![
+                    exec_segment(0x10_0000, 0x30_0000, 0x10_1000),
+                    exec_segment(0x50_0000, 0x20_0000, 0x80_0000),
+                ],
+                Some(BASE),
+            ),
+            (
+                "no segment holds the mapping's offset",
+                BASE + 0x10_0000,
+                0x10_0000,
+                vec![exec_segment(0x40_0000, 0x1000, 0x50_0000)],
+                Some(BASE),
+            ),
+            (
+                "the file states a vaddr above the mapping's start",
+                0x1000,
+                0,
+                vec![exec_segment(0, 0x1000, 0x7000_0000_0000)],
+                None,
+            ),
+        ] {
+            let maps = vec![MemoryMapping {
+                perms: "r-xp".to_string(),
+                ..mapping(start, offset, EXE)
+            }];
+            assert_eq!(
+                find_module_base_address(&maps, EXE, &segments),
+                want,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_file_offset_to_vaddr() {
+        let segments = [
+            exec_segment(0xc0_0000, 0x2000, 0xc0_1000),
+            // Neither offset nor vaddr on a page boundary: the mapping's
+            // offset is the segment's, rounded down.
+            exec_segment(0x70_0e40, 0x1000, 0x70_2e40),
+            // Overlaps the first; where they overlap, the first wins.
+            exec_segment(0xc0_1000, 0x3000, 0x90_0000),
+            exec_segment(0x80_0000, 0x1000, u64::MAX - 0x7ff),
+            exec_segment(u64::MAX - 0xfff, 0x2000, 0),
+            // A vaddr below what rounding down takes off.
+            exec_segment(0xa0_0e40, 0x1000, 0x10),
+        ];
+        for (offset, want) in [
+            (0xbf_f000, None),
+            (0xc0_0000, Some(0xc0_1000)),
+            (0xc0_1fff, Some(0xc0_2fff)),
+            (0xc0_2000, Some(0x90_1000)),
+            (0xc0_3fff, Some(0x90_2fff)),
+            (0xc0_4000, None),
+            (0x70_0000, Some(0x70_2000)),
+            (0x70_0e40, Some(0x70_2e40)),
+            (0x70_1e3f, Some(0x70_3e3f)),
+            (0x70_1e40, None),
+            (0x80_07ff, Some(u64::MAX)),
+            (0x80_0800, None),
+            (u64::MAX, None),
+            (0xa0_0000, None),
+        ] {
+            assert_eq!(
+                file_offset_to_vaddr(&segments, offset, 0x1000),
+                want,
+                "offset {offset:#x}"
+            );
+        }
+        assert_eq!(file_offset_to_vaddr(&[], 0, 0x1000), None);
+        // With pages of 64 KiB the same segment's mapping starts further down.
+        let segments = [exec_segment(0x1_f000, 0x1000, 0x2_f000)];
+        assert_eq!(file_offset_to_vaddr(&segments, 0x1_0000, 0x1000), None);
+        assert_eq!(
+            file_offset_to_vaddr(&segments, 0x1_0000, 0x1_0000),
+            Some(0x2_0000)
+        );
+    }
+
+    #[no_mangle]
+    static SYSTING_TEST_LOAD_ADDRESS_MARKER: u8 = 1;
+
+    #[test]
+    fn test_find_module_base_address_of_this_test_binary() {
+        let exe = fs::read_link("/proc/self/exe").unwrap();
+        let exe = exe.to_str().unwrap();
+        let file = fs::File::open(exe).unwrap();
+        let reader = ReadCache::new(&file);
+        let elf = object::File::parse(&reader).unwrap();
+        // Only a position-independent file has a load address to find. Where rustc
+        // links with LLD, this one is laid out with its vaddr above its offset.
+        if elf.kind() != object::ObjectKind::Dynamic {
+            return;
+        }
+        let maps = process::parse_proc_maps(std::process::id() as i32);
+        let base = find_module_base_address(&maps, exe, &exec_segments(&elf)).unwrap();
+        let in_the_file = find_symbol_address(&elf, "SYSTING_TEST_LOAD_ADDRESS_MARKER").unwrap();
+        assert_eq!(
+            base + in_the_file,
+            &SYSTING_TEST_LOAD_ADDRESS_MARKER as *const u8 as usize
+        );
     }
 
     #[test]

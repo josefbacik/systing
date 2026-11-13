@@ -151,7 +151,7 @@ This will display all available recorders and their default states:
 The three `network*` recorders are tiers of the same subsystem, ordered by event
 volume — see Network Traffic Recording below for when to use each.
 
-Python stack symbolization is not a recorder; enable it with `--collect-pystacks`, which resolves Python frames in whichever stacks the active recorders collect. In a stack, the Python frames stand where the interpreter ran them among the native frames: each run of Python frames takes the place of the `_PyEval_EvalFrameDefault` frame it executed in, so C called from Python, and Python called back from C, read in order. When the two cannot be paired up (a native stack that lost an interpreter loop frame, because the frame-pointer unwinder skips the caller of a function built without frame pointers, or Python 3.11 re-entered from C, which leaves no marker of where) the Python frames come first as one block, followed by the native ones. That is decided stack by stack, so one Python function can appear under both shapes in a trace. The interpreter's own entry frames (3.12's `<interpreter trampoline>`) are not shown.
+Python stack symbolization is not a recorder; enable it with `--collect-pystacks`, which resolves Python frames in whichever stacks the active recorders collect. In a stack, the Python frames stand where the interpreter ran them among the native frames: each run of Python frames takes the place of the `_PyEval_EvalFrameDefault` frame it executed in, so C called from Python, and Python called back from C, read in order. When the two cannot be paired up (a native stack that lost an interpreter loop frame, because the frame-pointer unwinder skips the caller of a function built without frame pointers, or Python 3.11 re-entered from C, which leaves no marker of where) the Python frames come first as one block, followed by the native ones. That is decided stack by stack, so one Python function can appear under both shapes in a trace. The interpreter's own entry frames (3.12's `<interpreter trampoline>`) are not shown. A frame whose code object cannot be read shows as `[Frame Error]`. A frame that gives something other than a code object ends the walk, and one `[Frame Error]` stands in for the rest.
 
 `--collect-build-id` captures user stacks as (build-id, file offset) pairs
 instead of raw addresses, so frames of processes that exit before end-of-trace
@@ -399,8 +399,19 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
   A leaf's slice ends, and begins again, where that changes.
 
 What to keep in mind: a row's `ts` is the start of its iteration's walk, which
-reaches a given thread up to one walk later. A blocked thread's stack is exact;
-a running thread's is read while it runs and is a best effort. The
+reaches a given thread up to one walk later. The stack of a thread that stays
+blocked is exact; a running thread's is read while it runs and is a best effort.
+A Python function's name and file are kept only if what the frame gives as its
+code object looks like a live code object both before and after they are read.
+On Python 3.12 to 3.14 the code object's version number must also be the same
+both times. A frame whose name was not kept can show it if another walk of the
+capture kept it, and otherwise shows `<unknown python>`. On Python 3.10 and
+older a method shows without its class. A walk that meets a frame with no code
+object ends there: the stack keeps its innermost frames, and one `[Frame Error]`
+stands in for the rest. A record that is cut short at a busy memory-map lock can
+end in that mark too. From Python 3.14 on the walk steps over a frame that has
+returned meanwhile, so a running thread's stack can lack a frame between two
+others. The
 unchanged-thread skip and the CPU-time deltas hold for twice the threads the
 host had when the capture started, and at least 65,536; a thread past that is
 still recorded, and walked again at every snapshot. `--collect-build-id` does

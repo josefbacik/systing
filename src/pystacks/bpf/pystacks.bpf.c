@@ -71,8 +71,8 @@ struct {
 #define BPF_LIB_CO_STATICALLY_COMPILED 0x4000000
 
 /*
- * LOCKING RULE FOR THIS FILE: pystacks runs from probe contexts where IRQs
- * are hard-off (sched_switch fires under the runqueue lock; the perf-event
+ * LOCKING RULE FOR THIS FILE: some contexts that pystacks runs from have IRQs
+ * hard-off (sched_switch fires under the runqueue lock; the perf-event
  * sampler runs in NMI context). bpf_map_update_elem on a HASH map takes a
  * per-bucket raw spinlock; on a large guest under contention those waiters
  * fall into the paravirt qspinlock slow path, where kvm_wait executes HLT
@@ -187,14 +187,39 @@ struct sample_state_t {
   uint64_t cur_cpu;
   void* frame_ptr;
   bool sync_use_shadow_frame;
-  /* The frame just visited by pystacks_get_frame_data was a CPython 3.12+
-   * entry frame (see PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER): nothing was read
-   * from it and no symbol is to be emitted for it. */
+  /* The frame just visited by pystacks_get_frame_data was a CPython 3.12+ entry
+   * frame (see PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER) or, in the sleepable
+   * build, a frame that has returned (see PYSTACKS_EMPTY_SLOT): it has no
+   * names, and no symbol is to be emitted for it. */
   bool frame_skipped;
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+  /* Whether the symbol just read may be sent, and whether the frame's code
+   * object had more than one reference before its names were read: see
+   * pystacks_get_frame_data(). */
+  bool send_symbol;
+  bool shared_before;
+  /* code_version() of the frame's code object before its names were read. */
+  uint32_t version_before;
+#endif
+  uintptr_t code_type_addr;
+  /* Words of the process, read for a check and not kept. */
+  uint64_t words[2];
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+  /* The frame that pystacks_get_frame_data() was last called at, and whether
+   * it found that the walk must end there. They must last from one call to the
+   * next. */
+  void* this_frame;
+  bool end_walk;
+#endif
   char long_file_name[BPF_LIB_FILE_NAME_TRYGET];
   struct pystacks_symbol sym;
   struct pystacks_line_table linetable;
   int32_t lasti;
+  /* Which slot this is, and whether a walk holds it. The number is kept here
+   * because a walk has no stack to spare for a copy (bpf_stack_budget.rs):
+   * &state->slot serves as the message map's key. */
+  uint32_t slot;
+  uint32_t busy;
 };
 
 /*
@@ -217,20 +242,53 @@ struct sample_state_t {
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 1);
+  __uint(max_entries, PYSTACKS_SCRATCH_SLOTS);
   __type(key, u32);
   __type(value, struct sample_state_t);
 } pystacks_state_heap SEC(".maps");
 
-static __always_inline struct sample_state_t* get_state() {
-  return bpf_map_lookup_elem(&pystacks_state_heap, &zero);
+static __always_inline struct sample_state_t* get_state(uint32_t slot) {
+  return bpf_map_lookup_elem(&pystacks_state_heap, &slot);
 }
 
-#define BPF_LIB_GET_STATE()                   \
-  struct sample_state_t* state = get_state(); \
-  if (!state) {                               \
-    return 0; /* should never happen */       \
+#define BPF_LIB_GET_STATE(slot)                   \
+  struct sample_state_t* state = get_state(slot); \
+  if (!state) {                                   \
+    return 0; /* should never happen */           \
   }
+
+/* Walks that found every scratch slot of their CPU held, and read nothing. */
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, uint64_t);
+} pystacks_no_scratch SEC(".maps");
+
+/*
+ * Takes a free scratch slot of this CPU and returns its number. With every
+ * slot held, counts that and returns PYSTACKS_SCRATCH_SLOTS, which no lookup
+ * finds.
+ */
+__noinline int pystacks_claim_scratch(void) {
+  for (uint32_t slot = 0; slot < PYSTACKS_SCRATCH_SLOTS; slot++) {
+    struct sample_state_t* state = get_state(slot);
+    if (state && !__sync_val_compare_and_swap(&state->busy, 0, 1)) {
+      state->slot = slot;
+      return slot;
+    }
+  }
+
+  uint64_t* refused = bpf_map_lookup_elem(&pystacks_no_scratch, &zero);
+  if (refused) {
+    __sync_fetch_and_add(refused, 1);
+  }
+  return PYSTACKS_SCRATCH_SLOTS;
+}
+
+static __always_inline void release_scratch(struct sample_state_t* state) {
+  __sync_lock_test_and_set(&state->busy, 0);
+}
 
 static __always_inline void read_shadow_frame_data(
     void* shadow_frame,
@@ -273,8 +331,16 @@ static __always_inline void read_shadow_frame_data(
  * independently and no shared counter or map insert is needed from probe
  * context. User space recomputes it (hash_symbol() in symbols.rs) and refuses
  * a record that does not match, so change both together.
+ *
+ * A global function, so that the verifier walks the loop once for a program.
+ * Inlined, it was walked again at every frame of the stack walk: about two
+ * thirds of all that the verifier walked in a program with the walker.
  */
-static symbol_id_t hash_symbol(const struct pystacks_symbol* const sym) {
+__noinline symbol_id_t hash_symbol(const struct pystacks_symbol* const sym) {
+  if (!sym) {
+    return 1; /* never: a global function's pointer counts as nullable */
+  }
+
   _Static_assert(
       sizeof(struct pystacks_symbol) % sizeof(uint64_t) == 0,
       "pystacks_symbol must be a multiple of 8 bytes for the word hash");
@@ -363,6 +429,12 @@ static symbol_id_t get_py_symbol_id(struct sample_state_t* const state) {
   if (bpf_map_lookup_elem(&pystacks_symbols, &id))
     return id;
 
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+  /* The name and file reach user space in this record alone. The frame keeps
+   * this id, and can show the name if another walk sends it. */
+  if (!state->send_symbol)
+    return id;
+#endif
   emit_symbol_record(id, &state->sym, &state->linetable);
   return id;
 }
@@ -430,15 +502,74 @@ static __always_inline void* get_gen_ptr(
   return gen_ptr;
 }
 
-static __always_inline void get_names(
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+/*
+ * What a probe's walk may read a frame's names through: code_ptr, or NULL.
+ *
+ * The test is is_code_object()'s: the type must be PyCode_Type, and the first
+ * word a reference count and not an address.
+ *
+ * If the type's address is not known, everything passes. So does NULL, through
+ * which no name is read: get_code_ptr() gives it for a word of 0 and for a word
+ * that could not be read alike.
+ *
+ * Where the object cannot be read, no name is read, and the walk goes on to the
+ * caller.
+ *
+ * At a word that fails what can be asked of an object's address (it lies in
+ * user space and is a multiple of 8), as at an object that fails the test, the
+ * walk ends: end_walk is set.
+ */
+static __always_inline void* checked_code_ptr(
+    struct sample_state_t* const state,
+    void* code_ptr,
+    struct task_struct* task) {
+  if (!code_ptr || !state->code_type_addr) {
+    return code_ptr;
+  }
+  /* ob_refcnt, ob_type */
+  if (bpf_probe_read_user_task(
+          state->words,
+          2 * sizeof(state->words[0]),
+          code_ptr + state->offsets.PyObject_type - sizeof(state->words[0]),
+          task) != 0) {
+    state->end_walk = !IS_VALID_USER_SPACE_ADDRESS(code_ptr) ||
+        ((uintptr_t)code_ptr & 7);
+    return NULL;
+  }
+  if (state->words[1] == state->code_type_addr &&
+      (uint32_t)state->words[0] != 0 &&
+      (state->words[0] & 0x0000ffff00000000ULL) == 0) {
+    return code_ptr;
+  }
+  state->end_walk = true;
+  return NULL;
+}
+#endif
+
+/* The id of the process whose names read_names() reads. Call it where the id is
+ * stored: a local at the top of read_names() is kept across every read, which
+ * can cost its caller's frame a stack slot (see src/bpf_stack_budget.rs). */
+static __always_inline pid_t names_tgid(struct task_struct* task) {
+  return task ? BPF_CORE_READ(task, tgid)
+              : (pid_t)(bpf_get_current_pid_tgid() >> 32);
+}
+
+/*
+ * With check_code, which only a probe's walk passes, the names are read only
+ * through a code object that checked_code_ptr() lets through. The check is made
+ * in here, where code_ptr is held for the reads that follow in any case. Made
+ * by the caller, it takes the caller's frame past 64 bytes, which kernels up to
+ * 6.8 count as 32 more: see src/bpf_stack_budget.rs.
+ */
+static __always_inline void read_names(
     struct sample_state_t* const state,
     void* cur_frame,
     void* code_ptr,
     bool use_shadow_frame,
-    struct task_struct* task) {
+    struct task_struct* task,
+    const bool check_code) {
   const OffsetConfig* const offsets = &state->offsets;
-  const pid_t pid = task ? BPF_CORE_READ(task, tgid)
-                         : (pid_t)(bpf_get_current_pid_tgid() >> 32);
   struct pystacks_symbol* const symbol = &state->sym;
   struct pystacks_line_table* const linetable = &state->linetable;
 
@@ -449,6 +580,12 @@ static __always_inline void get_names(
   memset_zero(symbol, sizeof(struct pystacks_symbol));
   memset_zero(linetable, sizeof(struct pystacks_line_table));
   state->lasti = -1;
+
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+  if (check_code) {
+    code_ptr = checked_code_ptr(state, code_ptr, task);
+  }
+#endif
 
   if (!code_ptr) {
     // if we end up here, this means that reading of `PyCodeObject` for this
@@ -491,7 +628,7 @@ static __always_inline void get_names(
           code_ptr + offsets->PyCodeObject_firstlineno,
           task);
       linetable->first_line = first_line;
-      linetable->pid = pid;
+      linetable->pid = names_tgid(task);
 
       int32_t lasti = -1;
       if (offsets->PyVersion_major == 3 && offsets->PyVersion_minor < 11) {
@@ -567,7 +704,7 @@ static __always_inline void get_names(
           task);
       symbol->qualname.value[BPF_LIB_PYSTACKS_CLASS_NAME_LEN] = '\0';
       if (qualname_len == -EFAULT) {
-        symbol->fault_pid = pid;
+        symbol->fault_pid = names_tgid(task);
         symbol->qualname.fault_addr =
             (uintptr_t)(qualname_ptr + offsets->String_data);
       }
@@ -586,6 +723,11 @@ static __always_inline void get_names(
   // if there is a failure when reading qualname which will result in a negative
   // qualname_len
   if (!use_shadow_frame && qualname_len <= 1) {
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+    // The iterator takes no class name: this block is the probes' alone. In a
+    // task stack a method shows without its class on 3.10 and older, which have
+    // no qualified name.
+    //
     // Figure out if we want to parse class name, basically checking the name of
     // the first argument,
     //   ((PyTupleObject*)$frame->f_code->co_varnames)->ob_item[0]
@@ -611,7 +753,8 @@ static __always_inline void get_names(
     bool first_cls = *(int32_t*)ob_item == *(int32_t*)cls_str;
 
     // Read class name from $frame->f_localsplus[0]->ob_type->tp_name.
-    if ((first_self || first_cls) && cur_frame) {
+    if ((first_self || first_cls) && cur_frame &&
+        offsets->PyCodeObject_varnames != BPF_LIB_DEFAULT_FIELD_OFFSET) {
       void* ptr;
       bpf_probe_read_user_task(
           &ptr,
@@ -629,6 +772,7 @@ static __always_inline void get_names(
           symbol->qualname.value, BPF_LIB_PYSTACKS_CLASS_NAME_LEN, ptr, task);
       symbol->qualname.value[BPF_LIB_PYSTACKS_CLASS_NAME_LEN] = '\0';
     }
+#endif
     // read PyCodeObject's name into symbol
     void* name_ptr;
     bpf_probe_read_user_task(
@@ -661,12 +805,33 @@ static __always_inline void get_names(
       bpf_probe_read_kernel_str(
           &symbol->filename.value, sizeof(symbol->filename.value), src);
     } else if (len == -EFAULT) {
-      symbol->fault_pid = pid;
+      symbol->fault_pid = names_tgid(task);
       symbol->filename.fault_addr =
           (uintptr_t)(filename_ptr + offsets->String_data);
     }
   }
 }
+
+static __always_inline void get_names(
+    struct sample_state_t* const state,
+    void* cur_frame,
+    void* code_ptr,
+    bool use_shadow_frame,
+    struct task_struct* task) {
+  read_names(state, cur_frame, code_ptr, use_shadow_frame, task, false);
+}
+
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+/*
+ * What get_code_ptr() gives for a frame whose slot for its code object is
+ * empty. From 3.14 the slot is a tagged reference, and an empty one
+ * (PyStackRef_NULL) is the tag alone: CPython's _PyFrame_SafeGetCode() gives no
+ * code object for such a frame.
+ *
+ * A slot that cannot be read gives NULL.
+ */
+#define PYSTACKS_EMPTY_SLOT ((void*)1)
+#endif
 
 // Get the PyCodeObject from the frame pointer
 static __always_inline void* get_code_ptr(
@@ -715,6 +880,15 @@ static __always_inline void* get_code_ptr(
           sizeof(void*),
           (char*)frame_ptr + offsets->PyInterpreterFrame_code,
           task);
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+      if (result == 0 && offsets->PyVersion_minor >= 14 &&
+          code_ptr == PYSTACKS_EMPTY_SLOT) {
+        return code_ptr;
+      }
+#endif
+      /* 3.14 keeps the executable as a tagged reference, and sets the tag for
+       * an immortal code object. No object's address has those two bits. */
+      code_ptr = (void*)((uintptr_t)code_ptr & ~(uintptr_t)3);
     } else {
       result = bpf_probe_read_user_task(
           &code_ptr,
@@ -728,6 +902,66 @@ static __always_inline void* get_code_ptr(
   }
   return code_ptr;
 }
+
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+/*
+ * Whether code_ptr looks like a live code object. The type must be
+ * PyCode_Type, which cannot be subclassed. The first word must be a reference
+ * count and not an address: not 0, and no bit from 32 to 47 (3.14 keeps flags
+ * above those).
+ *
+ * If the type's address is not known, everything passes, and no name is sent.
+ */
+static __always_inline bool is_code_object(
+    struct sample_state_t* const state,
+    void* code_ptr,
+    struct task_struct* task) {
+  if (!state->code_type_addr) {
+    return true;
+  }
+  /* ob_refcnt, ob_type */
+  return bpf_probe_read_user_task(
+             state->words,
+             2 * sizeof(state->words[0]),
+             code_ptr + state->offsets.PyObject_type - sizeof(state->words[0]),
+             task) == 0 &&
+      state->words[1] == state->code_type_addr &&
+      (uint32_t)state->words[0] != 0 &&
+      (state->words[0] & 0x0000ffff00000000ULL) == 0;
+}
+
+/*
+ * Whether code objects have a version number that code_version() can read. The
+ * field, co_version, came with 3.12. It has no offset in OffsetConfig: in 3.12
+ * to 3.14 it follows co_firstlineno and five more ints.
+ */
+static __always_inline bool has_code_version(
+    const OffsetConfig* const offsets) {
+  return offsets->PyVersion_major == 3 && offsets->PyVersion_minor >= 12 &&
+      offsets->PyVersion_minor <= 14 &&
+      offsets->PyCodeObject_firstlineno != BPF_LIB_DEFAULT_FIELD_OFFSET;
+}
+
+/*
+ * The version number of a code object, co_version: the 32 bits that follow
+ * co_firstlineno and five more ints (see has_code_version()).
+ *
+ * 0 if it cannot be read. 0 also for a code object with no number, such as one
+ * that CPython defines statically, which is immortal.
+ */
+static __always_inline uint32_t code_version(
+    struct sample_state_t* const state,
+    void* code_ptr,
+    struct task_struct* task) {
+  state->words[0] = 0;
+  bpf_probe_read_user_task(
+      state->words,
+      sizeof(uint32_t),
+      code_ptr + state->offsets.PyCodeObject_firstlineno + 6 * sizeof(int32_t),
+      task);
+  return (uint32_t)state->words[0];
+}
+#endif
 
 static __always_inline bool is_ending_frame(struct pystacks_symbol* sym) {
   return bpf_map_lookup_elem(&pystacks_ending_frames, sym) != NULL ||
@@ -751,8 +985,8 @@ static __always_inline bool is_ending_frame(struct pystacks_symbol* sym) {
  * the verifier rejects). A stack_len of zero wraps to the largest value and
  * fails the same check.
  */
-static __always_inline void note_entry_frame(void) {
-  struct pystacks_message* py_msg = pystacks_get_msg();
+static __always_inline void note_entry_frame(const uint32_t* slot) {
+  struct pystacks_message* py_msg = pystacks_get_msg(slot);
   if (!py_msg) {
     return; /* should never happen */
   }
@@ -768,8 +1002,13 @@ static __always_inline void note_entry_frame(void) {
  * Read current PyFrameObject filename/name and update
  * stack_info->frame_ptr with pointer to next PyFrameObject
  */
-__noinline bool pystacks_get_frame_data(int pid) {
-  BPF_LIB_GET_STATE();
+__noinline bool pystacks_get_frame_data(int pid, uint32_t slot) {
+  /* Only the sleepable build's get_task() reads pid. Keep it alive in every
+   * build: for an argument that is never read the compiler sets no register
+   * at the call, and the verifier wants a scalar there. */
+  barrier_var(pid);
+
+  BPF_LIB_GET_STATE(slot);
 
   if (state == NULL) {
     return false;
@@ -793,6 +1032,20 @@ __noinline bool pystacks_get_frame_data(int pid) {
    * it unsigned is safe on both.
    */
   state->frame_skipped = false;
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+  /* The walk ends where checked_code_ptr() said so, and at a frame that gives
+   * itself as its caller.
+   *
+   * The call after the one that found the reason ends the walk, here and not in
+   * the caller's loop, which the verifier walks turn by turn. So this_frame and
+   * end_walk last from one call to the next, and walk_and_load_py_stack()
+   * resets them at the start of a walk. */
+  if (state->end_walk || state->frame_ptr == state->this_frame) {
+    state->frame_ptr = NULL;
+  }
+  state->this_frame = state->frame_ptr;
+  state->end_walk = false;
+#endif
   if (!use_shadow_frame && offsets->PyVersion_major >= 3 &&
       offsets->PyVersion_minor >= 12 &&
       offsets->PyFrameObject_owner != BPF_LIB_DEFAULT_FIELD_OFFSET) {
@@ -804,7 +1057,7 @@ __noinline bool pystacks_get_frame_data(int pid) {
             task) == 0 &&
         owner >= PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER) {
       state->frame_skipped = true;
-      note_entry_frame();
+      note_entry_frame(&state->slot);
     }
   }
 
@@ -812,7 +1065,70 @@ __noinline bool pystacks_get_frame_data(int pid) {
     void* code_ptr =
         get_code_ptr(state->frame_ptr, offsets, use_shadow_frame, task);
 
-    get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+    if (code_ptr == PYSTACKS_EMPTY_SLOT) {
+      /* From 3.14 on the frame has returned, so it is no part of the stack any
+       * more. Step over it, as over an entry frame. A thread's frame keeps its
+       * link to its caller, which faces the check like every frame; a
+       * generator's has none, and the walk ends. The caller's loop bounds the
+       * frames that a walk visits. On older versions the word is no address. */
+      code_ptr = NULL;
+      state->frame_skipped =
+          offsets->PyVersion_major == 3 && offsets->PyVersion_minor >= 14;
+    }
+    if (!state->frame_skipped && state->frame_ptr &&
+        (!code_ptr || !is_code_object(state, code_ptr, task))) {
+      /* Give one "[Frame Error]" and end the walk: the next call finds no
+       * frame. */
+      get_names(state, state->frame_ptr, NULL, use_shadow_frame, task);
+      state->send_symbol = true;
+      state->frame_ptr = NULL;
+      put_task(task);
+      return true;
+    }
+    if (!state->frame_skipped) {
+      state->shared_before = (uint32_t)state->words[0] != 1;
+      if (code_ptr && has_code_version(offsets)) {
+        state->version_before = code_version(state, code_ptr, task);
+      }
+      get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+    }
+#else
+    read_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task, true);
+    if (state->end_walk) {
+      /* The symbol is "[Frame Error]". The next call ends the walk. */
+      put_task(task);
+      return true;
+    }
+#endif
+#ifdef STROBELIGHT_SLEEPABLE_BPF
+    /* With no code object the symbol is the constant "[Frame Error]".
+     * A name whose read faulted is not sent. Nor is a name from an object
+     * that could not be checked. A symbol that user space has needs no
+     * sending. */
+    state->send_symbol = !code_ptr;
+    if (code_ptr && !state->sym.fault_pid && state->code_type_addr) {
+      const symbol_id_t id = hash_symbol(&state->sym);
+      /* Whether to send the record, now that the names have been read. All of
+       * these must hold:
+       * - user space does not have the symbol yet;
+       * - the count was more than 1 before the names were read;
+       * - the check passes again;
+       * - the count is more than 1 now;
+       * - where code objects have a version number (has_code_version()), it is
+       *   not 0 and is the one from before the names were read. An immortal
+       *   code object, whose count's low 32 bits read as negative, needs no
+       *   number.
+       * A frame whose record is not sent keeps its id, and can show the name if
+       * another walk sends it. */
+      state->send_symbol = !bpf_map_lookup_elem(&pystacks_symbols, &id) &&
+          state->shared_before && is_code_object(state, code_ptr, task) &&
+          (uint32_t)state->words[0] != 1 &&
+          ((int32_t)state->words[0] < 0 || !has_code_version(offsets) ||
+           (state->version_before != 0 &&
+            code_version(state, code_ptr, task) == state->version_before));
+    }
+#endif
   }
 
   int ret_code = 0;
@@ -840,9 +1156,9 @@ __noinline bool pystacks_get_frame_data(int pid) {
   return ret_code == 0;
 }
 
-static __noinline uint64_t
-add_symbol_to_buffer(struct pystacks_message* const py_msg) {
-  struct sample_state_t* const state = get_state();
+static __noinline uint64_t add_symbol_to_buffer(
+    struct pystacks_message* const py_msg,
+    struct sample_state_t* const state) {
   if (!state || !py_msg) {
     return 0; /* should never happen */
   }
@@ -884,12 +1200,8 @@ add_symbol_to_buffer(struct pystacks_message* const py_msg) {
 static __always_inline void read_leaf_frame(
     struct pt_regs* ctx,
     struct pystacks_message* const py_msg,
-    struct task_struct* task) {
-  struct sample_state_t* const state = get_state();
-  if (!state) {
-    return; /* should never happen */
-  }
-
+    struct task_struct* task,
+    struct sample_state_t* const state) {
   const OffsetConfig* const offsets = &state->offsets;
   void* pt1 = (void*)PT_REGS_PARM1(ctx);
   void* pt2 = (void*)PT_REGS_PARM2(ctx);
@@ -930,7 +1242,7 @@ static __always_inline void read_leaf_frame(
         false /* this is not a shadow frame */,
         task);
 
-    add_symbol_to_buffer(py_msg);
+    add_symbol_to_buffer(py_msg, state);
   }
 }
 #endif
@@ -971,13 +1283,12 @@ static int set_py_stack_status(
 
 __hidden int walk_and_load_py_stack(
     struct pt_regs* ctx,
-    struct task_struct* task) {
-  struct pystacks_message* py_msg = pystacks_get_msg();
+    struct task_struct* task,
+    struct sample_state_t* state) {
+  struct pystacks_message* py_msg = pystacks_get_msg(&state->slot);
   if (!py_msg) {
     return -PYSTACKS_ERROR; /* should never happen */
   }
-
-  BPF_LIB_GET_STATE();
 
   uint64_t i = 0;
   const uint32_t stack_max_len = pystacks_prog_cfg.stack_max_len;
@@ -990,13 +1301,18 @@ __hidden int walk_and_load_py_stack(
      * function that's being executed, so this work-around is necessary (see
      * comment in `read_leaf_frame` definition).
      */
-    read_leaf_frame(ctx, py_msg, task);
+    read_leaf_frame(ctx, py_msg, task, state);
     ++i;
   }
 #endif
 
   bool last_frame_read = false;
   int pid = task ? BPF_CORE_READ(task, pid) : 0;
+#ifndef STROBELIGHT_SLEEPABLE_BPF
+  /* The state outlives a walk. */
+  state->this_frame = NULL;
+  state->end_walk = false;
+#endif
 
   /*
    * Bound the walk on emitted symbols rather than on visited frames, so a
@@ -1006,15 +1322,17 @@ __hidden int walk_and_load_py_stack(
    * chain at most every other visited frame is stepped over and twice the
    * symbol budget covers the walk; entry frames do follow one another when a
    * finalizer re-enters the interpreter while a frame is being popped, and
-   * such a chain, rare and shallow, may end short of its symbol budget. An
+   * such a chain, rare and shallow, may end short of its symbol budget. So may
+   * a walk that steps over many frames that have returned (see
+   * PYSTACKS_EMPTY_SLOT). An
    * entry frame is counted where it is stepped over, in
    * pystacks_get_frame_data, and spends nothing here.
    */
   for (; i < 2 * BPF_LIB_MAX_STACK_DEPTH && py_msg->stack_len < stack_max_len &&
-       (last_frame_read = pystacks_get_frame_data(pid));
+       (last_frame_read = pystacks_get_frame_data(pid, state->slot));
        ++i) {
     if (!state->frame_skipped) {
-      add_symbol_to_buffer(py_msg);
+      add_symbol_to_buffer(py_msg, state);
     }
   }
 
@@ -1245,7 +1563,8 @@ static int get_thread_state_match(
 __hidden int pystacks_read_stacks_task(
     struct pt_regs* ctx,
     pid_t pid,
-    struct task_struct* task) {
+    struct task_struct* task,
+    uint32_t slot) {
   if (!ctx) {
     return -PYSTACKS_PROG_NOT_SUPPORTED;
   }
@@ -1271,9 +1590,10 @@ __hidden int pystacks_read_stacks_task(
     return -PYSTACKS_NON_PY_PROCESS;
   }
 
-  BPF_LIB_GET_STATE();
+  BPF_LIB_GET_STATE(slot);
 
   state->offsets = pid_data->offsets;
+  state->code_type_addr = pid_data->code_type_addr;
   state->cur_cpu = bpf_get_smp_processor_id();
 
   // The global PyThreadState of the thread holding the GIL, where the
@@ -1293,7 +1613,7 @@ __hidden int pystacks_read_stacks_task(
   // pointers do not witness glibc's layout (pthread_helpers.bpf.c).
   void* tls_base = get_glibc_pthread_descriptor(cur_task);
 
-  struct pystacks_message* py_msg = pystacks_get_msg();
+  struct pystacks_message* py_msg = pystacks_get_msg(&state->slot);
   if (!py_msg) {
     return -PYSTACKS_ERROR; /* should never happen */
   }
@@ -1358,7 +1678,7 @@ __hidden int pystacks_read_stacks_task(
     return py_msg->header.len;
   }
 
-  int py_stack_size = walk_and_load_py_stack(ctx, task);
+  int py_stack_size = walk_and_load_py_stack(ctx, task, state);
 
   py_msg->probe_time_ns = bpf_ktime_get_ns() - sample_ts;
 
@@ -1368,12 +1688,12 @@ __hidden int pystacks_read_stacks_task(
 // global wrapper for verification
 // main function is to get and put the task around pystacks_read_stacks_task
 // call
-int pystacks_read_stacks_global(struct pt_regs* ctx, pid_t pid) {
+int pystacks_read_stacks_global(struct pt_regs* ctx, pid_t pid, uint32_t slot) {
   struct task_struct* task;
   if (get_task(pid, &task))
     return 0;
 
-  int ret = pystacks_read_stacks_task(ctx, pid, task);
+  int ret = pystacks_read_stacks_task(ctx, pid, task, slot);
 
   put_task(task);
 
@@ -1399,12 +1719,19 @@ __hidden int pystacks_read_stacks(
     return 0;
   }
 
-  struct pystacks_message* py_msg = pystacks_get_msg();
+  struct sample_state_t* state = get_state(pystacks_claim_scratch());
+  if (!state) {
+    // no slot is free (counted there). Not an error, zero bytes written
+    return 0;
+  }
+
+  struct pystacks_message* py_msg = pystacks_get_msg(&state->slot);
   if (!py_msg) {
+    release_scratch(state);
     return -PYSTACKS_ERROR; /* should never happen */
   }
 
-  int py_stack_size = pystacks_read_stacks_global(ctx, pid);
+  int py_stack_size = pystacks_read_stacks_global(ctx, pid, state->slot);
 
   if (py_stack_size == (int)offsetof(struct pystacks_message, buffer)) {
     /* The walker ran and emitted no frame (no thread state behind the TLS
@@ -1414,22 +1741,23 @@ __hidden int pystacks_read_stacks(
      * buffer as the sampler initialised it. */
     bpf_probe_read_kernel(
         py_msg_buffer, offsetof(struct pystacks_message, buffer), py_msg);
-    return py_stack_size;
-  }
-
-  if (py_stack_size > 0 && (uint32_t)py_stack_size <= sizeof(*py_msg_buffer)) {
+  } else if (
+      py_stack_size > 0 && (uint32_t)py_stack_size <= sizeof(*py_msg_buffer)) {
     /* Use bpf_probe_read_kernel with the fixed struct size to satisfy the
      * BPF verifier. The verifier needs a compile-time constant or tightly
      * bounded value for the size parameter. */
     bpf_probe_read_kernel(py_msg_buffer, sizeof(*py_msg_buffer), py_msg);
-    return py_stack_size;
+  } else {
+    py_stack_size = 0;
   }
 
-  return 0;
+  release_scratch(state);
+
+  return py_stack_size;
 }
 
-struct pystacks_message* pystacks_get_msg(void) {
-  return bpf_map_lookup_elem(&pystacks_msg_heap, &zero);
+struct pystacks_message* pystacks_get_msg(const uint32_t* slot) {
+  return bpf_map_lookup_elem(&pystacks_msg_heap, slot);
 }
 
 /* See pystacks.bpf.h for the rationale.

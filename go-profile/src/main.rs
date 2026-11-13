@@ -17,6 +17,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
+use systing::golang::profiles::HeapRecord;
 use systing::golang::{pprof, GoProcess, ReadStats};
 
 #[derive(Parser)]
@@ -103,6 +104,43 @@ fn within_budget(stack_costs: impl Iterator<Item = usize>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The stack and scaled values of each heap bucket, in the order read. The
+/// runtime keeps a bucket for each object size that a stack allocates, and a
+/// sample here has no size. So if they are over the budget: one row for each
+/// stack, sorted, its buckets added up. An error if that is still over.
+fn heap_rows(
+    records: Vec<HeapRecord>,
+    rate: i64,
+    cost_of: impl Fn(&[u64]) -> usize,
+) -> Result<Vec<(Vec<u64>, [i64; 4])>> {
+    // Each bucket is scaled first: Go's scale depends on the object size.
+    let mut rows: Vec<_> = records
+        .into_iter()
+        .map(|r| {
+            let values = r.scaled(rate).map(|v| v as i64);
+            (r.pcs, values)
+        })
+        .collect();
+    if within_budget(rows.iter().map(|(pcs, _)| cost_of(pcs))).is_ok() {
+        return Ok(rows);
+    }
+    // There can be millions of buckets, so this works in place, and a
+    // bucket's memory is freed once it is added.
+    rows.sort_unstable();
+    rows.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            for (sum, v) in kept.1.iter_mut().zip(later.1) {
+                *sum = sum.saturating_add(v);
+            }
+        }
+        same
+    });
+    rows.shrink_to_fit();
+    within_budget(rows.iter().map(|(pcs, _)| cost_of(pcs)))?;
+    Ok(rows)
 }
 
 /// The soft limit to set for a cap of `mib` MiB, under the soft and hard
@@ -206,16 +244,16 @@ fn snoop(pid: u32, kind: Kind, each: bool, out: Option<&Path>) -> Result<()> {
     let (profile, default_type) = match kind {
         Kind::Heap => {
             let heap = go.heap(&mut stats)?;
-            within_budget(heap.records.iter().map(|r| cost_of(&r.pcs)))?;
+            let buckets = heap.records.len();
+            let rows = heap_rows(heap.records, heap.rate, cost_of)?;
             header["profile"] = json!("heap");
             header["period"] = json!(heap.rate);
-            let samples = heap
-                .records
-                .iter()
-                .map(|r| {
-                    let values = r.scaled(heap.rate).map(|v| v as i64).to_vec();
-                    sample(values, frames(&r.pcs), Vec::new())
-                })
+            if rows.len() < buckets {
+                header["added_up_by_stack"] = json!(true);
+            }
+            let samples = rows
+                .into_iter()
+                .map(|(pcs, values)| sample(values.to_vec(), frames(&pcs), Vec::new()))
                 .collect();
             let profile = pprof::Profile {
                 sample_types: types(&[
@@ -456,6 +494,92 @@ mod tests {
         assert_eq!([0, 63, 64, 6400].map(frame_cost), [1, 1, 2, 101]);
         assert!(within_budget(stacks(1000, 1024 * frame_cost(63))).is_ok());
         assert!(within_budget(stacks(1000, 1024 * frame_cost(6400))).is_err());
+    }
+
+    const RATE: i64 = 512 << 10;
+
+    /// A heap bucket: `allocs` objects of `size` bytes sampled on a stack, of
+    /// which `live` are still there.
+    fn bucket(pcs: &[u64], size: u64, allocs: u64, live: u64) -> HeapRecord {
+        HeapRecord {
+            pcs: pcs.to_vec(),
+            alloc_objects: allocs,
+            alloc_bytes: allocs * size,
+            live_objects: live,
+            live_bytes: live * size,
+        }
+    }
+
+    /// One stack at three object sizes, beside a stack that it starts with and
+    /// one that differs in the last frame, and what pprof writes for each.
+    fn five_buckets() -> (Vec<HeapRecord>, Vec<[i64; 4]>) {
+        let table = vec![
+            bucket(&[1, 2, 3], 16, 100, 40),
+            bucket(&[1, 2, 4], 16, 5, 1),
+            bucket(&[1, 2, 3], 4096, 149, 0),
+            bucket(&[1, 2], 16, 7, 7),
+            bucket(&[1, 2, 3], 1 << 20, 3, 3),
+        ];
+        let written = |r: &HeapRecord| r.scaled(RATE).map(|v| v as i64);
+        let w = table.iter().map(written).collect();
+        (table, w)
+    }
+
+    #[test]
+    fn buckets_within_the_budget_stay_as_they_were_read() {
+        let (table, w) = five_buckets();
+        let stacks: Vec<Vec<u64>> = table.iter().map(|r| r.pcs.clone()).collect();
+        let rows = heap_rows(table, RATE, |pcs| pcs.len()).unwrap();
+        assert_eq!(rows, stacks.into_iter().zip(w).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn buckets_over_the_budget_are_added_up_by_stack() {
+        // At a quarter of the budget a stack, five are over it and three fit.
+        let (table, w) = five_buckets();
+        let sum = std::array::from_fn(|i| w[0][i] + w[2][i] + w[4][i]);
+        assert_eq!(
+            heap_rows(table, RATE, |_| MAX_NAMED_FRAMES / 4).unwrap(),
+            [
+                (vec![1, 2], w[3]),
+                (vec![1, 2, 3], sum),
+                (vec![1, 2, 4], w[1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn stacks_over_the_budget_are_refused() {
+        // At half of the budget a stack, the three stacks are over it too.
+        let (table, _) = five_buckets();
+        assert!(heap_rows(table, RATE, |_| MAX_NAMED_FRAMES / 2).is_err());
+    }
+
+    #[test]
+    fn a_sum_stops_at_the_largest_value() {
+        // At rate 1 the counts are written as they are. At three quarters of
+        // the budget a stack, two buckets are over it and one stack fits.
+        let most = bucket(&[1], 1, i64::MAX as u64, i64::MAX as u64);
+        let table = vec![most, bucket(&[1], 2, 1, 1)];
+        let rows = heap_rows(table, 1, |_| MAX_NAMED_FRAMES / 4 * 3).unwrap();
+        assert_eq!(rows, [(vec![1], [i64::MAX; 4])]);
+    }
+
+    #[test]
+    fn twin_buckets_add_up_and_different_stacks_do_not() {
+        // Two buckets alike in all their values still add up.
+        let twin = || bucket(&[1], 16, 100, 40);
+        let sum = twin().scaled(RATE).map(|v| 2 * v as i64);
+        let rows = heap_rows(vec![twin(), twin()], RATE, |_| MAX_NAMED_FRAMES / 4 * 3).unwrap();
+        assert_eq!(rows, [(vec![1], sum)]);
+        // Stacks that all differ have nothing to add up, so they are refused.
+        let table = vec![twin(), bucket(&[2], 16, 100, 40)];
+        assert!(heap_rows(table, RATE, |_| MAX_NAMED_FRAMES / 4 * 3).is_err());
+    }
+
+    #[test]
+    fn an_empty_profile_has_no_rows() {
+        assert!(heap_rows(Vec::new(), RATE, |_| 1).unwrap().is_empty());
     }
 
     #[test]

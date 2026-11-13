@@ -149,7 +149,9 @@ static __always_inline long find_vma_unless_busy(struct task_struct *task,
  * selects the sleepable bodies of its task and read helpers (which it pulls in
  * as .c files itself, for the same reason). One unit, so nothing here crosses
  * a link: its __hidden functions, its maps and `zero` are simply in scope.
+ * One scratch slot: one thread reads the iterator.
  */
+#define PYSTACKS_SCRATCH_SLOTS 1
 #include "pystacks.bpf.c"
 
 #include "systing_shared.bpf.h"
@@ -465,10 +467,10 @@ static __always_inline s32 task_syscall_nr(struct task_struct *task, u32 state)
  *    The verifier checks a global function once, on its own, with unknown
  *    arguments; at a call to one it checks the arguments and moves on. A
  *    static function it walks again on every path into every call. The
- *    Python walk costs ~410K of the 1M-instruction budget however it is
+ *    Python walk costs ~130K of the 1M-instruction budget however it is
  *    called, so it has to be walked exactly once: inlined into the iterator
  *    program, one branch ahead of it doubles it.
- *  - A global function takes scalars. It cannot be handed the iterator's
+ *  - A leg takes scalars. It cannot be handed the iterator's
  *    trusted task pointer (before __arg_trusted, 6.8), so each takes the tid
  *    and re-acquires the thread with get_task(), releasing it with
  *    put_task(): in a sleepable build those are bpf_task_from_pid() and
@@ -616,7 +618,7 @@ __noinline int task_stacks_read_python(pid_t tid)
 	tgid = task->tgid;
 	if (profile_pid_task(tgid, task))
 		ret = pystacks_read_stacks_task(
-			(struct pt_regs *)bpf_task_pt_regs(task), tgid, task);
+			(struct pt_regs *)bpf_task_pt_regs(task), tgid, task, 0);
 	put_task(task);
 	if (ret <= 0)
 		return 0;

@@ -10,6 +10,7 @@
 //!
 //! A jemalloc laid out otherwise (another major version, a debug build of the
 //! counters `CKH_COUNT`, a patched fork) fails those checks and is refused.
+//! `prof_tdata_t` is the exception: see [`tdata`].
 
 use super::mem::Memory;
 
@@ -41,6 +42,8 @@ pub mod gctx {
 
 /// `prof_tctx_t`: one thread's counters for one backtrace.
 pub mod tctx {
+    /// Address of the thread's `prof_tdata_t`.
+    pub const TDATA: usize = 0;
     /// The three fields the tree is ordered by (`prof_tctx_comp`), in order.
     pub const THR_UID: usize = 8;
     pub const THR_DISCRIM: usize = 16;
@@ -57,6 +60,21 @@ pub mod tctx {
     /// `prof_tctx_state_t` has four values, 0 to 3; anything else is not a
     /// `prof_tctx_t`.
     pub const STATE_MAX: u32 = 3;
+}
+
+/// `prof_tdata_t`: what jemalloc keeps for one thread that allocates. A thread
+/// gets a new one after `prof.reset`, which marks the old one expired. One that
+/// fits neither layout below is not refused: it counts as not expired. These
+/// offsets were read off DWARF on x86-64 only.
+pub mod tdata {
+    /// A `prof_tctx_t` holds copies of these two, at the same offsets.
+    pub const THR_UID: usize = 8;
+    pub const THR_DISCRIM: usize = 16;
+    /// Where `bt2tctx` (a `ckh_t`) and `expired` (a `bool`) are. Here the two
+    /// versions differ: jemalloc 5.3.0 first, then 5.3.1.
+    pub const BT2TCTX_AND_EXPIRED: [(usize, usize); 2] = [(64, 33), (48, 118)];
+    /// Enough of it to hold everything above.
+    pub const READ: usize = 120;
 }
 
 /// `prof_cnt_t`: eight counters.

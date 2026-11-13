@@ -26,10 +26,10 @@
 //! Counters are read as the process updates them, so a stack's numbers can be
 //! from slightly different moments, as a live `mallctl` read of them would be.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 
-use super::layout::{gctx, tctx, Ckh, Counts, CNT_SIZE};
+use super::layout::{ckh, gctx, tctx, tdata, Ckh, Counts, CNT_SIZE};
 use super::mem::Memory;
 
 /// The most frames read for one stack. jemalloc keeps 128 by default; `dev`
@@ -68,8 +68,11 @@ pub struct Stats {
     pub gctx_skipped: u64,
     /// `tctx` skipped for the same reason.
     pub tctx_skipped: u64,
-    /// `tctx` read and counted.
+    /// `tctx` read.
     pub tctx_read: u64,
+    /// Of those, the ones whose counts are left out, because `prof.reset` came
+    /// after them.
+    pub tctx_expired: u64,
     /// Parent and child thread records compared for the tree's order, and
     /// those out of it (see [`read_tctxs`]).
     pub order_checked: u64,
@@ -145,7 +148,7 @@ fn walk_limited(mem: &dyn Memory, bt2gctx: u64, limits: Limits) -> io::Result<Pr
             }
         };
         let mut stats = Stats::default();
-        let mut stacks = read_stacks(mem, &entries, &mut stats, limits)?;
+        let mut stacks = read_stacks(mem, &head, &entries, &mut stats, limits)?;
         let after = Ckh::read(mem, bt2gctx)?;
         // The table was swapped for another meanwhile.
         if (after.tab, after.lg_cur_buckets) != (head.tab, head.lg_cur_buckets) {
@@ -201,10 +204,15 @@ fn walk_limited(mem: &dyn Memory, bt2gctx: u64, limits: Limits) -> io::Result<Pr
 
 fn read_stacks(
     mem: &dyn Memory,
+    head: &Ckh,
     entries: &[(u64, u64)],
     stats: &mut Stats,
     limits: Limits,
 ) -> io::Result<Vec<Stack>> {
+    let mut expired = Expired {
+        fns: (head.hash, head.keycomp),
+        known: HashMap::new(),
+    };
     let mut seen = HashSet::new();
     let mut stacks = Vec::new();
     let mut frames = 0u64;
@@ -219,7 +227,7 @@ fn read_stacks(
         };
         stats.gctx_read += 1;
         let mut counts = Counts::default();
-        for c in read_tctxs(mem, gaddr, root, stats) {
+        for c in read_tctxs(mem, gaddr, root, &mut expired, stats) {
             counts.add(&c);
         }
         if counts.is_reported() {
@@ -274,10 +282,45 @@ pub fn read_gctx(mem: &dyn Memory, key: u64, gaddr: u64) -> Option<(u64, Vec<u64
         buf.resize(total, 0);
         mem.read_exact(gaddr.checked_add(have as u64)?, &mut buf[have..total])
             .ok()?;
+        // What the first read brought from `key` on, `bt` and the first frames,
+        // must still be there after the second.
+        let first = gctx::BT_VEC..have;
+        if mem.bytes(key, first.len()).ok()? != buf[first] {
+            return None;
+        }
     }
     let root = u64_at(&buf, gctx::TCTXS_ROOT);
     let addrs = (0..len).map(|i| u64_at(&buf, gctx::VEC + i * 8)).collect();
     Some((root, addrs))
+}
+
+/// Which threads' `prof_tdata_t` are marked expired, each looked at once.
+struct Expired {
+    /// The hash and comparison functions of `bt2gctx`. jemalloc gives the same
+    /// two to the `bt2tctx` of every `prof_tdata_t`.
+    fns: (u64, u64),
+    known: HashMap<u64, bool>,
+}
+
+impl Expired {
+    /// Whether the `prof_tdata_t` of the `tctx` in `b` is marked expired. One
+    /// that cannot be read, or is not recognised, counts as not expired.
+    fn holds(&mut self, mem: &dyn Memory, b: &[u8]) -> bool {
+        let addr = u64_at(b, tctx::TDATA);
+        if let Some(&known) = self.known.get(&addr) {
+            return known;
+        }
+        let ids = tdata::THR_UID..tdata::THR_DISCRIM + 8;
+        let expired = mem.bytes(addr, tdata::READ).is_ok_and(|t| {
+            t[ids.clone()] == b[ids]
+                && tdata::BT2TCTX_AND_EXPIRED.iter().any(|&(table, flag)| {
+                    let table = Ckh::parse(&t[table..table + ckh::SIZE]);
+                    table.plausible() && (table.hash, table.keycomp) == self.fns && t[flag] == 1
+                })
+        });
+        self.known.insert(addr, expired);
+        expired
+    }
 }
 
 /// The key jemalloc orders a `gctx`'s tree of thread records by
@@ -293,7 +336,13 @@ type TctxKey = (u64, u64, u64);
 /// offsets), and that a record's unbiased counters are at least its raw ones
 /// (each sampled object adds at least 8 to the shifted count and at least its
 /// size to the unbiased bytes, `prof_unbias_map_init`).
-fn read_tctxs(mem: &dyn Memory, gaddr: u64, root: u64, stats: &mut Stats) -> Vec<Counts> {
+fn read_tctxs(
+    mem: &dyn Memory,
+    gaddr: u64,
+    root: u64,
+    expired: &mut Expired,
+    stats: &mut Stats,
+) -> Vec<Counts> {
     let mut out = Vec::new();
     // Each address to visit, with its parent's key and which side it hangs on.
     let mut todo: Vec<(u64, Option<(TctxKey, bool)>)> = vec![(root, None)];
@@ -355,6 +404,13 @@ fn read_tctxs(mem: &dyn Memory, gaddr: u64, root: u64, stats: &mut Stats) -> Vec
         // 5.3.0 links a record into the tree only once it is nominal.)
         if state == tctx::STATE_INITIALIZING {
             stats.tctx_skipped += 1;
+            continue;
+        }
+        // prof_tdata_merge_iter() leaves a thread's records out of a dump once
+        // `prof.reset` has marked its `prof_tdata_t` expired, and so does this.
+        if expired.holds(mem, &b) {
+            stats.tctx_read += 1;
+            stats.tctx_expired += 1;
             continue;
         }
         let c = Counts::parse(&b[tctx::CNTS..tctx::CNTS + CNT_SIZE]);
@@ -483,6 +539,24 @@ mod tests {
             self.mem.put(at, b);
         }
 
+        /// The `prof_tdata_t` of thread `uid`, as jemalloc 5.3.0 (`version` 0) or
+        /// 5.3.1 (`version` 1) lays it out, for the `tctx` at each of `records`.
+        fn tdata(&mut self, at: u64, uid: u64, version: usize, expired: bool, records: &[u64]) {
+            let (table, flag) = [(64, 33), (48, 118)][version];
+            let mut b = vec![0u8; 256];
+            put_u64(&mut b, tdata::THR_UID, uid);
+            // An empty table. Its two functions are 0, as those in `finish` are.
+            b[table + ckh::LG_MIN_BUCKETS] = 1;
+            b[table + ckh::LG_CUR_BUCKETS] = 1;
+            put_u64(&mut b, table + ckh::TAB, 0x9000);
+            b[flag] = expired as u8;
+            self.mem.put(at, b);
+            for (i, &record) in records.iter().enumerate() {
+                self.mem.poke_u64(record + tctx::TDATA as u64, at);
+                self.key(record, (uid, 0, i as u64));
+            }
+        }
+
         /// A `gctx` for `frames`, whose tree starts at `root`; entered in the
         /// table.
         fn gctx(&mut self, at: u64, frames: &[u64], root: u64) {
@@ -559,6 +633,53 @@ mod tests {
     }
 
     #[test]
+    fn records_from_before_a_reset_are_left_out_as_a_dump_leaves_them_out() {
+        for version in [0, 1] {
+            let mut h = Heap::new();
+            // Two threads hold objects from one stack, and the first thread
+            // alone holds objects from another.
+            h.tctx(0x100000, 0x10000, 0, 0x100400, NOMINAL, (3, 300));
+            h.tctx(0x100400, 0x10000, 0, 0, NOMINAL, (1, 100));
+            h.gctx(0x10000, &[0xa1], 0x100000);
+            h.tctx(0x100800, 0x10400, 0, 0, NOMINAL, (5, 500));
+            h.gctx(0x10400, &[0xb1], 0x100800);
+            // `prof.reset` came after the first thread's allocations.
+            h.tdata(0x200000, 1, version, true, &[0x100000, 0x100800]);
+            h.tdata(0x200400, 2, version, false, &[0x100400]);
+            let p = walk(&h.finish(), HEADER).unwrap();
+            assert_eq!(p.stacks.len(), 1, "{version}");
+            assert_eq!(p.stacks[0].addrs, [0xa1], "{version}");
+            assert_eq!(p.stacks[0].counts.cur_objs, 1, "{version}");
+            assert_eq!((p.stats.tctx_read, p.stats.tctx_expired), (3, 2));
+            assert_eq!(p.stats.counters_checked, 1, "{version}");
+        }
+    }
+
+    #[test]
+    fn thread_data_that_is_not_recognised_counts_as_not_expired() {
+        // Each has the flag set at both versions' offsets.
+        let spoil: [fn(&mut FakeMem); 3] = [
+            // Another thread's: the record's copy of `thr_uid` differs.
+            |m| m.poke_u64(0x200000 + tdata::THR_UID as u64, 7),
+            // No table at either version's offset.
+            |m| m.poke(0x200000 + 40, &[0; 72]),
+            // A table with other functions than `bt2gctx` has.
+            |m| m.poke_u64(0x200000 + 64 + ckh::HASH as u64, 0x1234),
+        ];
+        for (i, spoil) in spoil.iter().enumerate() {
+            let mut h = Heap::new();
+            h.tctx(0x100000, 0x10000, 0, 0, NOMINAL, (3, 300));
+            h.gctx(0x10000, &[0xa1], 0x100000);
+            h.tdata(0x200000, 1, 0, true, &[0x100000]);
+            h.mem.poke(0x200000 + 118, &[1]);
+            spoil(&mut h.mem);
+            let p = walk(&h.finish(), HEADER).unwrap();
+            assert_eq!(p.stacks.len(), 1, "{i}");
+            assert_eq!(p.stats.tctx_expired, 0, "{i}");
+        }
+    }
+
+    #[test]
     fn memory_that_is_not_what_it_was_is_skipped_not_believed() {
         let mut h = Heap::new();
         h.tctx(0x100000, 0x10000, 0, 0, NOMINAL, (2, 200));
@@ -609,6 +730,62 @@ mod tests {
         h.gctx(0x10000, &frames, 0x100000);
         let p = walk(&h.finish(), HEADER).unwrap();
         assert_eq!(p.stacks[0].addrs, frames);
+    }
+
+    /// Serves a record out of one memory until its outer frames are read, and
+    /// out of another from that read on.
+    struct Changed {
+        before: FakeMem,
+        after: FakeMem,
+        record: std::ops::Range<u64>,
+        /// Where the frames begin that the first read does not bring.
+        outer: u64,
+        changed: Cell<bool>,
+    }
+
+    impl Memory for Changed {
+        fn read_some(&self, addr: u64, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.record.contains(&addr) {
+                return self.before.read_some(addr, buf);
+            }
+            if addr >= self.outer {
+                self.changed.set(true);
+            }
+            if self.changed.get() {
+                self.after.read_some(addr, buf)
+            } else {
+                self.before.read_some(addr, buf)
+            }
+        }
+    }
+
+    #[test]
+    fn a_record_whose_first_frames_change_before_its_second_read_is_skipped() {
+        let old: Vec<u64> = (1..=100).map(|i| 0x7000_0000 + i).collect();
+        let new: Vec<u64> = (1..=100).map(|i| 0x7100_0000 + i).collect();
+        let size = gctx::VEC + old.len() * 8;
+        // The second memory: the record of another stack of the same length, then
+        // bytes that are no record.
+        let mut record = Heap::new();
+        record.gctx(0x10000, &new, 0x100000);
+        let mut no_record = FakeMem::default();
+        no_record.put(0x10000, vec![0x5a; size]);
+        for (after, stacks) in [(record.mem, vec![new]), (no_record, vec![])] {
+            let mut h = Heap::new();
+            // Without a live thread record the stack is dropped in any case.
+            h.tctx(0x100000, 0x10000, 0, 0, NOMINAL, (1, 100));
+            h.gctx(0x10000, &old, 0x100000);
+            let mem = Changed {
+                before: h.finish(),
+                after,
+                record: 0x10000..0x10000 + size as u64,
+                outer: 0x10000 + (gctx::VEC + FIRST_FRAMES * 8) as u64,
+                changed: Cell::new(false),
+            };
+            let p = walk(&mem, HEADER).unwrap();
+            let read: Vec<Vec<u64>> = p.stacks.into_iter().map(|s| s.addrs).collect();
+            assert_eq!(read, stacks);
+        }
     }
 
     /// Serves the table header differently the second time it is read, as if

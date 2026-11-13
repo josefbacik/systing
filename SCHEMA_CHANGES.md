@@ -445,6 +445,14 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Jiffies in `network_packet` (no schema version change)
+
+`network_packet.rto_ms` and `icsk_timeout` were converted from jiffies at 100 per
+second instead of the kernel's CONFIG_HZ, so they read 2.5 times too high at
+CONFIG_HZ=250 and ten times too high at 1000. New traces have the right unit.
+Older traces keep their values; `_traces.recorder_version` says which systing
+recorded a trace.
+
 ## Schema Version 34 (systing 1.31.0) — 2026-11-02
 
 The Python function trace is a recorder of a capture
@@ -475,6 +483,20 @@ All NULL when the recorder was not asked for, and in traces from before schema 3
 - `sysinfo.python_function_notes` (VARCHAR): the processes that were a Python and
   were not traced, with why, and what could make the trace wrong for those that
   were, a line each. NULL where there is nothing to say.
+
+## One socket id per connect (no schema version change)
+
+An outbound TCP connection has one `socket_id`, from its connect's start to its
+close. Until now its open could be recorded under the id of an earlier
+connection to the same destination, and its outcome, traffic and close under a
+second id of its own. A connect that fails has an id of its own too, so a count
+of ids or of `network_socket` rows per destination rises to one per attempt.
+With `network-packets` a connecting socket's SYNs are recorded under its id, and
+with that or `network-syscalls` their timeouts; most of these were left out. A
+connect often has two `network_socket` rows, one without the local port and the
+complete one: keep one per `(trace_id, socket_id)`, the complete one if there is
+one. Table shapes are unchanged. Older traces keep their ids;
+`_traces.recorder_version` says which systing recorded a trace.
 
 ## Schema Version 33 (systing 1.30.0) — 2026-10-28
 

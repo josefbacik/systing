@@ -1,9 +1,10 @@
 // The program tests/snoop.rs reads the heap of.
 //
-//   snoop_target <dump-file | ->
+//   snoop_target <dump-file | -> [reset]
 //
 // It allocates from call paths the test looks for by name, and from a few
 // hundred anonymous ones on two threads, keeping some and freeing the rest.
+// With "reset" it then resets the profile, and allocates from one more path.
 // With a file name it then asks jemalloc for an ordinary dump of that heap, to
 // compare against. It prints READY, and parks until it is told to stop.
 //
@@ -33,6 +34,8 @@ NOINLINE void *snoop_test_big(size_t n) { return malloc(n); }
 NOINLINE void *snoop_test_small(size_t n) { return malloc(n); }
 // Allocated and freed at once: holds nothing, so is not in a profile.
 NOINLINE void snoop_test_freed(size_t n) { free(malloc(n)); }
+// 64 buffers of 64 KiB kept, allocated after the profile was reset.
+NOINLINE void *snoop_test_after_reset(size_t n) { return malloc(n); }
 
 // Two functions per level, picked by the bits of `path`: 2^DEPTH distinct
 // stacks reach the same malloc.
@@ -79,7 +82,7 @@ int main(int argc, char **argv) {
 	steps[5][0] = step_5_0; steps[5][1] = step_5_1;
 
 	// `held` above is the workers' own; these are the ones kept for good.
-	static void *keep[256 + 3000];
+	static void *keep[256 + 3000 + 64];
 	pthread_t th[2];
 	for (long i = 0; i < 2; i++) pthread_create(&th[i], NULL, worker, (void *)(i + 1));
 	for (int i = 0; i < 2; i++) pthread_join(th[i], NULL);
@@ -88,9 +91,17 @@ int main(int argc, char **argv) {
 	for (int i = 0; i < 3000; i++) keep[256 + i] = snoop_test_small(100 + (i % 7) * 300);
 	for (int i = 0; i < 2000; i++) snoop_test_freed(4096);
 
+	// Resolved at run time: whichever jemalloc is LD_PRELOADed answers.
+	int (*ctl)(const char *, void *, size_t *, void *, size_t) = dlsym(RTLD_DEFAULT, "mallctl");
+	if (argc > 2 && strcmp(argv[2], "reset") == 0) {
+		if (!ctl || ctl("prof.reset", NULL, NULL, NULL, 0) != 0) {
+			(void)!write(2, "prof.reset failed\n", 18);
+			return 1;
+		}
+		for (int i = 0; i < 64; i++) keep[256 + 3000 + i] = snoop_test_after_reset(65536);
+	}
+
 	if (argc > 1 && strcmp(argv[1], "-") != 0) {
-		// Resolved at run time: whichever jemalloc is LD_PRELOADed answers.
-		int (*ctl)(const char *, void *, size_t *, void *, size_t) = dlsym(RTLD_DEFAULT, "mallctl");
 		const char *file = argv[1];
 		if (!ctl || ctl("prof.dump", NULL, NULL, &file, sizeof file) != 0) {
 			(void)!write(2, "prof.dump failed\n", 17);

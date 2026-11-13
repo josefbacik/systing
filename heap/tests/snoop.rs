@@ -61,8 +61,17 @@ struct Target {
 
 impl Target {
     fn start(bin: &Path, lib: Option<&Path>, malloc_conf: Option<&str>, dump: &str) -> Target {
+        Target::start_with(bin, lib, malloc_conf, &[dump])
+    }
+
+    fn start_with(
+        bin: &Path,
+        lib: Option<&Path>,
+        malloc_conf: Option<&str>,
+        args: &[&str],
+    ) -> Target {
         let mut cmd = Command::new(bin);
-        cmd.arg(dump)
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -264,6 +273,38 @@ fn the_counts_are_the_ones_a_dump_of_the_same_heap_has() {
             );
             // The same memory map, for symbolization.
             assert_eq!(snooped.maps.exe_name(), dumped.maps.exe_name());
+            target.stop();
+        }
+    }
+}
+
+/// After `prof.reset` a dump leaves out what was sampled before it, though the
+/// objects are still live, and a read from memory leaves out the same.
+#[test]
+fn what_was_sampled_before_a_reset_is_left_out_as_a_dump_leaves_it_out() {
+    for lib in libs() {
+        for conf in [
+            "prof:true,lg_prof_sample:12,prof_accum:false,prof_unbias:false",
+            "prof:true,lg_prof_sample:12,prof_accum:true,prof_unbias:false",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let Some(bin) = build_target(dir.path()) else {
+                return;
+            };
+            let dump = dir.path().join("reference.heap");
+            let args = [dump.to_str().unwrap(), "reset"];
+            let target = Target::start_with(&bin, Some(&lib), Some(conf), &args);
+
+            let dumped = jemalloc::read(&dump).unwrap();
+            let process = snoop::Process::open(target.pid()).unwrap();
+            let (snooped, report) = snoop::read(&process, &process.root().unwrap()).unwrap();
+
+            let ctx = format!("{lib:?} with {conf}: {report:?}");
+            // The 64 buffers of 64 KiB, all sampled at a 4 KiB period.
+            let live: u64 = dumped.samples.iter().map(|s| s.live_bytes).sum();
+            assert!((4_194_304..4_300_000).contains(&live), "{ctx}: {live}");
+            assert_eq!(rows(&snooped.samples), rows(&dumped.samples), "{ctx}");
+            assert!(report.stats.tctx_expired > 40, "{ctx}");
             target.stop();
         }
     }

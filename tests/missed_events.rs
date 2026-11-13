@@ -30,12 +30,13 @@ const ALWAYS_ON_TRACKS: [&str; 5] = [
 ];
 
 /// Classes whose subsystems are off in this run's config: no tracks allowed.
-const DISABLED_TRACKS: [&str; 5] = [
+const DISABLED_TRACKS: [&str; 6] = [
     "Missed network events",
     "Missed packet events",
     "Missed poll events",
     "Missed marker events",
     "Missed memory events",
+    "Missed python-stack events",
 ];
 
 #[test]
