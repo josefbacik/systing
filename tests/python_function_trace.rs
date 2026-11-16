@@ -491,7 +491,11 @@ fn a_traced_command_is_traced() {
             .collect();
         let out = TempDir::new().unwrap();
         let (conn, stderr) = capture(&args, 1, || touch(&go), &out);
-        assert_eq!(counts(&conn, None), expected(), "{python}:\n{stderr}");
+        let mut got = counts(&conn, None);
+        // The command's own <module> shows when the probes are in before that
+        // runs, the race that the test of an exec allows for too.
+        got.remove(&("<module>".to_string(), "return".to_string()));
+        assert_eq!(got, expected(), "{python}:\n{stderr}");
     }
 }
 
