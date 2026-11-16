@@ -73,6 +73,38 @@ impl Drop for Workload {
     }
 }
 
+/// The most processes that one capture here traces.
+const MOST_TRACED: usize = 3;
+
+/// Keeps traced process `pid`, the capture's `place`th from 0, to CPUs that no
+/// other traced process has: every third of the CPUs that this test may use. A
+/// probe that misses the recorder's name cache while another on its CPU is at
+/// the same sends no event, and these tests count every call. The threads of
+/// one workload cannot meet so: it has one interpreter, whose lock a thread in
+/// a probe holds. A process has one thread when its probes go in, and later
+/// threads inherit its CPUs. With fewer CPUs than processes, the last processes
+/// stay as they are.
+fn keep_apart(pid: i32, place: usize) {
+    // SAFETY: the sets are plain data. The first call fills one in, and the
+    // second only reads the other.
+    unsafe {
+        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+        let size = std::mem::size_of_val(&allowed);
+        let got = libc::sched_getaffinity(0, size, &mut allowed);
+        assert_eq!(got, 0, "Failed to read this process's CPUs");
+        let mut own: libc::cpu_set_t = std::mem::zeroed();
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&cpu| libc::CPU_ISSET(cpu, &allowed))
+            .skip(place)
+            .step_by(MOST_TRACED)
+            .for_each(|cpu| libc::CPU_SET(cpu, &mut own));
+        if libc::CPU_COUNT(&own) > 0 {
+            // A process that has gone by now has no more calls to lose.
+            libc::sched_setaffinity(pid, size, &own);
+        }
+    }
+}
+
 /// A capture of `args`, which calls `on_probes` with the count each time the
 /// recorder says a process has its probes in. Returns the database it was
 /// converted into, and what it said.
@@ -93,6 +125,7 @@ fn capture_with(
     let lines = BufReader::new(child.stderr.take().unwrap()).lines();
     let mut stderr = String::new();
     let mut in_place = 0;
+    let mut traced: Vec<i32> = Vec::new();
     for line in lines {
         let line = line.expect("systing's stderr");
         stderr.push_str(&line);
@@ -101,7 +134,19 @@ fn capture_with(
         if line.starts_with("python-function-trace: ") {
             println!("{line}");
         }
-        if line.starts_with("python-function-trace: process ") {
+        if let Some(rest) = line.strip_prefix("python-function-trace: process ") {
+            let pid = rest.split(':').next().and_then(|pid| pid.parse().ok());
+            let pid: i32 = pid.expect("the process's id");
+            // One process has none to be kept from, and the image that a
+            // process execs is that process still.
+            if !traced.contains(&pid) {
+                traced.push(pid);
+                if traced.len() > 1 {
+                    for (place, &pid) in traced.iter().enumerate() {
+                        keep_apart(pid, place);
+                    }
+                }
+            }
             in_place += 1;
             on_probes(in_place);
         }
