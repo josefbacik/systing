@@ -294,6 +294,18 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.pid = vec![std::process::id()];
     });
 
+    // The perf counters, read on the sampler tick: on every other row there
+    // are none and the loop that reads them is rodata-dead, and with it the
+    // one reference to their ring family. A counter comes from --perf-counter
+    // or from a hardware:/software: trace event, and each has to bring the
+    // family by itself. Software events: every host has them.
+    add("perf-counter", &|c| {
+        c.perf_counter = vec!["software:migrations".to_string()]
+    });
+    add("trace-event-perf", &|c| {
+        c.trace_event = vec!["software:context-switches:1000".to_string()]
+    });
+
     // --include-task-context. On every other row the flag is off: none of
     // its three programs is selected, none of its maps is created, and the
     // one call site in the stack-emit path is rodata-dead - so those rows
@@ -961,6 +973,16 @@ R0 unbounded memory access\n\
                 "no trace-event row with collect_pystacks={walker}"
             );
         }
+        // The perf counters by each of the two ways to configure one, alone.
+        assert!(shapes
+            .iter()
+            .any(|s| !s.config.perf_counter.is_empty() && s.config.trace_event.is_empty()));
+        assert!(shapes.iter().any(|s| s.config.perf_counter.is_empty()
+            && s.config
+                .trace_event
+                .iter()
+                .all(|e| e.starts_with("software:"))
+            && !s.config.trace_event.is_empty()));
         // --include-task-context: loaded alone, beside the Python walker and
         // in the generic probe handlers; and off on every row that is not its
         // own, so that the rest of the table loads the object a capture
