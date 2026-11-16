@@ -1468,8 +1468,8 @@ impl TraceExtractor {
 
     fn extract_compact_sched(&mut self, compact: &CompactSched, cpu: i32) -> Result<()> {
         let mut switch_ts: i64 = 0;
-        for i in 0..compact.switch_timestamp.len() {
-            switch_ts += compact.switch_timestamp[i] as i64;
+        for (i, delta) in compact.switch_timestamp.iter().enumerate() {
+            switch_ts += *delta as i64;
             let next_pid = compact.switch_next_pid[i];
             let next_prio = compact.switch_next_prio.get(i).copied().unwrap_or_default();
             let comm_idx = compact
@@ -1500,8 +1500,8 @@ impl TraceExtractor {
         }
 
         let mut waking_ts: i64 = 0;
-        for i in 0..compact.waking_timestamp.len() {
-            waking_ts += compact.waking_timestamp[i] as i64;
+        for (i, delta) in compact.waking_timestamp.iter().enumerate() {
+            waking_ts += *delta as i64;
             let pid = compact.waking_pid[i];
             let target_cpu = compact
                 .waking_target_cpu
