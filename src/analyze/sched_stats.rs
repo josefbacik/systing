@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use serde::Serialize;
 
-use super::{trace_id_filter, AnalyzeDb};
+use super::{left_runnable_sql, trace_id_filter, AnalyzeDb};
 
 /// Parameters for sched stats analysis.
 #[derive(Debug, Clone)]
@@ -425,7 +425,7 @@ fn build_process_ranking_query(trace_id: Option<&str>, limit: usize) -> String {
          {d_sleep_sum} / 1e9 as d_sleep_s, \
          COUNT(*) as events, \
          AVG(sn.dur) / 1e3 as avg_slice_us, \
-         100.0 * SUM(CASE WHEN sn.end_state IS NULL THEN 1 ELSE 0 END) \
+         100.0 * SUM(CASE WHEN {left_runnable} THEN 1 ELSE 0 END) \
          / NULLIF(COUNT(*), 0) as preempt_pct \
          FROM sched_next sn \
          JOIN thread t ON sn.utid = t.utid AND sn.trace_id = t.trace_id{t_filter} \
@@ -435,6 +435,7 @@ fn build_process_ranking_query(trace_id: Option<&str>, limit: usize) -> String {
          LIMIT {limit}",
         sched_next_cte = build_sched_next_cte(&cte_filter),
         d_sleep_sum = D_SLEEP_SUM_EXPR,
+        left_runnable = left_runnable_sql("sn.end_state"),
     )
 }
 
@@ -472,7 +473,7 @@ fn build_thread_breakdown_query(pid: u32, trace_id: Option<&str>, limit: usize) 
          AVG(sn.dur) / 1e3 as avg_slice_us, \
          MIN(sn.dur) / 1e3 as min_slice_us, \
          MAX(sn.dur) / 1e3 as max_slice_us, \
-         100.0 * SUM(CASE WHEN sn.end_state IS NULL THEN 1 ELSE 0 END) \
+         100.0 * SUM(CASE WHEN {left_runnable} THEN 1 ELSE 0 END) \
          / NULLIF(COUNT(*), 0) as preempt_pct \
          FROM sched_next sn \
          JOIN thread t ON sn.utid = t.utid AND sn.trace_id = t.trace_id{t_filter} \
@@ -483,6 +484,7 @@ fn build_thread_breakdown_query(pid: u32, trace_id: Option<&str>, limit: usize) 
          LIMIT {limit}",
         sched_next_cte = build_sched_next_cte(&cte_filter),
         d_sleep_sum = D_SLEEP_SUM_EXPR,
+        left_runnable = left_runnable_sql("sn.end_state"),
     )
 }
 
@@ -521,7 +523,7 @@ fn build_end_state_query(tid: u32, trace_id: Option<&str>) -> String {
     let t_filter = trace_id_filter(trace_id, "t.");
     format!(
         "SELECT CASE \
-         WHEN ss.end_state IS NULL THEN 'Preempted (running)' \
+         WHEN {left_runnable} THEN 'Preempted (running)' \
          WHEN ss.end_state & 2 != 0 THEN 'Uninterruptible sleep (D)' \
          WHEN ss.end_state & 1 != 0 THEN 'Interruptible sleep (S)' \
          WHEN ss.end_state & 4 != 0 THEN 'Stopped' \
@@ -535,14 +537,92 @@ fn build_end_state_query(tid: u32, trace_id: Option<&str>) -> String {
          FROM sched_slice ss \
          JOIN thread t ON ss.utid = t.utid AND ss.trace_id = t.trace_id{t_filter} \
          WHERE t.tid = {tid} AND ss.dur > 0{ss_filter} \
-         GROUP BY ss.end_state \
-         ORDER BY count DESC"
+         GROUP BY state \
+         ORDER BY count DESC",
+        left_runnable = left_runnable_sql("ss.end_state"),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use duckdb::Connection;
+    use std::path::PathBuf;
+
+    /// One process (pid 100) with one thread (tid 101), which has one slice
+    /// for each of `end_states`.
+    fn db_with_end_states(end_states: &[Option<i32>]) -> AnalyzeDb {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sched_slice (trace_id VARCHAR, ts BIGINT, dur BIGINT, cpu INTEGER, utid BIGINT, end_state INTEGER, priority INTEGER); \
+             CREATE TABLE thread (trace_id VARCHAR, utid BIGINT, tid INTEGER, name VARCHAR, upid BIGINT); \
+             CREATE TABLE process (trace_id VARCHAR, upid BIGINT, pid INTEGER, name VARCHAR); \
+             INSERT INTO thread VALUES ('t', 1, 101, 'worker', 1); \
+             INSERT INTO process VALUES ('t', 1, 100, 'app');",
+        )
+        .unwrap();
+        for (i, end_state) in end_states.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO sched_slice VALUES ('t', ?, 1000, 0, 1, ?, 120)",
+                duckdb::params![i as i64 * 2000, end_state],
+            )
+            .unwrap();
+        }
+        AnalyzeDb {
+            conn,
+            path: PathBuf::new(),
+            mem_limit_mib: None,
+        }
+    }
+
+    #[test]
+    fn test_preempt_pct_counts_every_slice_that_left_its_thread_runnable() {
+        // Runnable: NULL, 0 and 256 (twice). Asleep: 1 (three times) and 2.
+        let db = db_with_end_states(&[
+            None,
+            Some(0),
+            Some(256),
+            Some(256),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(2),
+        ]);
+        let whole_trace = db.sched_stats(&SchedStatsParams::default()).unwrap();
+        assert_eq!(whole_trace.processes.unwrap()[0].preempt_pct, 50.0);
+        let process = db
+            .sched_stats(&SchedStatsParams {
+                pid: Some(100),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(process.threads.unwrap()[0].preempt_pct, 50.0);
+    }
+
+    #[test]
+    fn test_end_states_list_every_runnable_end_in_one_row() {
+        let db = db_with_end_states(&[None, Some(0), Some(256), Some(256), Some(1)]);
+        let detail = db
+            .sched_stats(&SchedStatsParams {
+                tid: Some(101),
+                ..Default::default()
+            })
+            .unwrap()
+            .thread_detail
+            .unwrap();
+        let rows: Vec<(&str, u64, f64)> = detail
+            .end_states
+            .iter()
+            .map(|s| (s.state.as_str(), s.count, s.percent))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Preempted (running)", 4, 80.0),
+                ("Interruptible sleep (S)", 1, 20.0)
+            ]
+        );
+    }
 
     #[test]
     fn test_build_sched_summary_query_no_trace_id() {

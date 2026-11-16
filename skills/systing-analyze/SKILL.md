@@ -160,7 +160,7 @@ GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20;
 ### Scheduling
 `sched_slice(ts, dur, cpu, utid, end_state, priority)`: one row per scheduled slice.
 - `end_state` is a **bitmask of the task state at slice end**, not an enum, and there is **no `end_state_str` column**:
-  - `NULL` → preempted (still runnable)
+  - `NULL` or `256` → still runnable, waiting for a CPU. `NULL`: the thread was TASK_RUNNING when it was switched out (a trace imported from Perfetto has `0` instead; on a CPU's last slice, `NULL` means still running when the trace ended). `256`: the kernel preempted it while it ran kernel code; never combined with other bits.
   - `& 1` → interruptible sleep (S)
   - `& 2` → uninterruptible sleep (D)
   - `& 4` stopped, `& 8` traced, `& 16` exit/dead, `& 32` exit/zombie

@@ -940,7 +940,9 @@ network activity, and performance counters. Traces are stored in DuckDB database
   time - use sched_slice for time, and cpu_info frequencies (or \
   sample_period / delta-ts between consecutive samples on a busy CPU) to \
   convert cycles to approximate time.
-- sched_slice.end_state: 1 = interruptible sleep (S), 2 = uninterruptible sleep (D).
+- sched_slice.end_state: 1 = interruptible sleep (S), 2 = uninterruptible sleep (D), \
+  NULL or 256 = still runnable (256: preempted while running kernel code; a trace \
+  imported from Perfetto has 0 where a recorded trace has NULL).
 - Tables are linked by trace_id (for multi-trace databases).
 
 # Recommended workflow

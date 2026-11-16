@@ -465,6 +465,7 @@ impl ValidationQueries for ParquetQueries {
                 // STACK_SLEEP_UNINTERRUPTIBLE/STACK_SLEEP_INTERRUPTIBLE: should be at/near the end of a sleep slice
                 (STACK_SLEEP_UNINTERRUPTIBLE | STACK_SLEEP_INTERRUPTIBLE, Some((slice, _))) => {
                     let slice_end = slice.ts + slice.dur;
+                    // 256 (preempted) must pass too: BPF takes a sleep stack by the raw task state, also at a preemption
                     let is_sleep_state = slice.end_state.is_some() && slice.end_state != Some(0);
                     let delta = sample.ts - slice_end;
                     let is_at_end = delta.abs() <= tolerance_ns;

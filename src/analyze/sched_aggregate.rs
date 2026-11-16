@@ -32,7 +32,8 @@
 //!   the previous CPU); `wakeups_ran` is where the thread then ran. Without
 //!   the table (older traces) woken threads are unplaced until they run, as
 //!   described under runqueue length.
-//! - **preempt wait**: a slice that ended with `end_state` NULL left the thread
+//! - **preempt wait**: a slice that ended with `end_state` NULL or 0 (the thread
+//!   was TASK_RUNNING) or 256 (the kernel preempted it) left the thread
 //!   runnable; the wait is until its next slice starts.
 //! - **run delay**: wakeup latency and preempt wait together (all
 //!   runnable-but-not-running time that ended inside the window).
@@ -148,7 +149,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::{trace_id_filter, AnalyzeDb};
+use super::{left_runnable, trace_id_filter, AnalyzeDb};
 
 /// Lowest octave of the histograms: bucket 0 covers everything below
 /// 2^HIST_BASE_LOG2 ns (256 ns).
@@ -974,10 +975,10 @@ impl Pass {
         if !is_idle {
             self.slices += 1;
             self.slice_len.record(dur.max(0) as u64);
-            if end_state.is_some() {
-                self.voluntary += 1;
-            } else {
+            if left_runnable(end_state) {
                 self.involuntary += 1;
+            } else {
+                self.voluntary += 1;
             }
             // Where was the thread waiting, if anywhere?
             match th.st {
@@ -1082,7 +1083,7 @@ impl Pass {
         // The recorder closes the slice of every thread still running at the
         // end of the trace with no end state; that is not a preemption.
         let at_end = end_state.is_none() && t >= self.window_end;
-        let preempted = end_state.is_none() && !at_end;
+        let preempted = left_runnable(end_state) && !at_end;
         if at_end {
             self.running_at_end += 1;
             self.involuntary = self.involuntary.saturating_sub(1);
@@ -3407,6 +3408,131 @@ mod tests {
         // and cpu 0 has rq 1 (B running) -> no violation.
         assert_eq!(r.imbalance.work_conservation_violation_ns, 300);
         assert_eq!(r.meta.migrate_mismatch, 0);
+    }
+
+    /// The trace of `migrate_while_runnable_moves_a_preempted_waiter`, with
+    /// A's first slice ending in `end_state`.
+    fn switched_out_with(end_state: Option<i32>) -> SchedAggregate {
+        let db = db_with_migrates(
+            &[
+                (0, 1000, 0, IDLE, None),
+                (1000, 500, 0, A, end_state),
+                (1500, 500, 0, B, Some(1)),
+                (2000, 1000, 0, IDLE, None),
+                (0, 2200, 1, IDLE, None),
+                (2200, 500, 1, A, Some(1)),
+                (2700, 300, 1, IDLE, None),
+            ],
+            &[(500, A, 0), (1400, B, 0)],
+            &threads(),
+            &[(1700, A, 0, 1)],
+        );
+        comparable(
+            db.sched_aggregate(&SchedAggregateParams::default())
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_slice_the_kernel_preempted_leaves_its_thread_runnable() {
+        let r = switched_out_with(Some(256));
+        assert_eq!(r.preempt_wait.count, 1);
+        assert_eq!(r.preempt_wait.sum_ns, 700);
+        // With the wakeup waits of A (500 ns) and B (100 ns).
+        assert_eq!(r.run_delay.count, 3);
+        assert_eq!(r.run_delay.sum_ns, 1300);
+        assert_eq!(r.switches.involuntary, 1);
+        assert_eq!(r.switches.voluntary, 2);
+        assert_eq!(r.switches.migrate_while_runnable, 1);
+        assert_eq!(r.switches.migrate_other, 0);
+        assert_eq!(r.per_cpu.runnable_wait_ns, vec![800, 500]);
+        assert_eq!(r.runqueue.hist, vec![3500, 2200, 300]);
+        assert_eq!(r.imbalance.work_conservation_violation_ns, 300);
+        // TASK_RUNNING gives the same figures throughout, whether stored as
+        // NULL (the recorder) or as 0 (a trace imported from Perfetto).
+        assert_eq!(r, switched_out_with(None));
+        assert_eq!(r, switched_out_with(Some(0)));
+    }
+
+    #[test]
+    fn a_sleep_with_no_wakeup_opens_no_wait() {
+        let r = switched_out_with(Some(1));
+        assert_eq!(r.preempt_wait.count, 0);
+        assert_eq!(r.run_delay.count, 2);
+        assert_eq!(r.run_delay.sum_ns, 600);
+        assert_eq!(r.switches.involuntary, 0);
+        assert_eq!(r.switches.voluntary, 3);
+        assert_eq!(r.switches.migrate_while_runnable, 0);
+        assert_eq!(r.switches.migrate_other, 1);
+        assert_eq!(r.per_cpu.runnable_wait_ns, vec![600, 0]);
+        assert_eq!(r.imbalance.work_conservation_violation_ns, 100);
+    }
+
+    #[test]
+    fn a_marker_does_not_restart_the_wait_of_a_preempted_thread() {
+        // A is preempted at 1500 having already set a sleep state, so the
+        // wakeup at 1800 finds it still queued; it runs again at 2000.
+        let db = db_with(
+            &[
+                (0, 1000, 0, IDLE, None),
+                (1000, 500, 0, A, Some(256)),
+                (1500, 500, 0, B, Some(1)),
+                (2000, 500, 0, A, Some(1)),
+                (2500, 500, 0, IDLE, None),
+            ],
+            &[(500, A, 0), (1000, B, 0), (1800, A, 0)],
+            &threads(),
+        );
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert_eq!(r.preempt_wait.count, 1);
+        assert_eq!(r.preempt_wait.sum_ns, 500);
+        assert_eq!(r.wakeup_latency.count, 2);
+        assert_eq!(r.wakeup_latency.sum_ns, 1000);
+        assert_eq!(r.meta.spurious_wakeups, 1);
+    }
+
+    #[test]
+    fn a_switch_out_at_the_window_end_is_not_running_at_end() {
+        // At the end of a trace the recorder closes the open slices with no
+        // end state, never with 256 or 0. A was switched out, and the window
+        // cuts its wait off.
+        for end_state in [Some(256), Some(0)] {
+            let db = db_with(
+                &[(0, 1000, 0, IDLE, None), (1000, 1000, 0, A, end_state)],
+                &[(500, A, 0)],
+                &threads(),
+            );
+            let r = db
+                .sched_aggregate(&SchedAggregateParams::default())
+                .unwrap();
+            assert_eq!(r.meta.running_at_end, 0, "{end_state:?}");
+            assert_eq!(r.meta.preempt_censored, 1, "{end_state:?}");
+            assert_eq!(r.switches.involuntary, 1, "{end_state:?}");
+            assert_eq!(r.switches.voluntary, 0, "{end_state:?}");
+        }
+    }
+
+    #[test]
+    fn a_workload_folds_alike_with_null_or_256_for_a_runnable_end() {
+        // B is switched out runnable in every step of the workload.
+        let (slices, markers, threads) = busy_workload();
+        let flagged: Vec<SliceRow> = slices
+            .iter()
+            .map(|&(ts, dur, cpu, utid, end_state)| {
+                let end_state = if utid == B { Some(256) } else { end_state };
+                (ts, dur, cpu, utid, end_state)
+            })
+            .collect();
+        let fold = |slices: &[SliceRow]| {
+            let db = db_with(slices, &markers, &threads);
+            comparable(
+                db.sched_aggregate(&SchedAggregateParams::default())
+                    .unwrap(),
+            )
+        };
+        assert_eq!(fold(&flagged), fold(&slices));
     }
 
     #[test]

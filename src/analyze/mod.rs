@@ -1192,6 +1192,25 @@ pub(crate) fn to_u64(val: i64) -> u64 {
     u64::try_from(val).unwrap_or(0)
 }
 
+/// `end_state` when the kernel preempted the thread: BPF sends this value when
+/// the `preempt` argument of `sched_switch` is set, as the kernel's own trace
+/// format does.
+const TASK_REPORT_MAX: i32 = 0x100;
+
+/// Whether a slice with this `sched_slice.end_state` left its thread runnable,
+/// waiting for a CPU, rather than asleep or dead: the thread was TASK_RUNNING
+/// (NULL, or 0 in a trace imported from Perfetto) or was preempted. The slices
+/// that the recorder closes at the end of a trace have NULL too.
+pub(crate) fn left_runnable(end_state: Option<i32>) -> bool {
+    matches!(end_state, None | Some(0 | TASK_REPORT_MAX))
+}
+
+/// [`left_runnable`] as a SQL condition on `column`, which is pasted in as it
+/// stands.
+pub(crate) fn left_runnable_sql(column: &str) -> String {
+    format!("({column} IS NULL OR {column} IN (0, {TASK_REPORT_MAX}))")
+}
+
 /// Build a trace_id SQL filter clause (e.g., ` AND ss.trace_id = '...'`).
 /// trace_id values are escaped via single-quote doubling for safe SQL interpolation.
 pub(crate) fn trace_id_filter(trace_id: Option<&str>, table_alias: &str) -> String {
@@ -1241,6 +1260,32 @@ fn get_trace_time_range(conn: &Connection, trace_id: Option<&str>) -> Result<(i6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_left_runnable_and_its_sql_form_agree() {
+        let conn = Connection::open_in_memory().unwrap();
+        let sql = format!(
+            "SELECT {} AS runnable FROM (SELECT ?::INTEGER AS end_state)",
+            left_runnable_sql("end_state")
+        );
+        for (end_state, runnable) in [
+            (None, true),
+            (Some(0), true),
+            (Some(256), true),
+            (Some(1), false),
+            (Some(2), false),
+            (Some(16), false),
+            (Some(32), false),
+            (Some(64), false),
+            (Some(128), false),
+        ] {
+            assert_eq!(left_runnable(end_state), runnable, "{end_state:?}");
+            let in_sql: bool = conn
+                .query_row(&sql, duckdb::params![end_state], |r| r.get("runnable"))
+                .unwrap();
+            assert_eq!(in_sql, runnable, "{end_state:?} in SQL");
+        }
+    }
 
     #[test]
     fn test_to_u64_positive() {
