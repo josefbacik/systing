@@ -156,15 +156,14 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
         let mut arg_data: Vec<(String, ArgValue)> = Vec::new();
 
         let num_args = event.num_args.min(event.args.len() as u8);
-        for i in 0..num_args as usize {
-            let config_idx = i;
-            if config_idx >= systing_event.args.len() {
-                break;
-            }
-
-            let bpf_arg = &event.args[i];
-            let event_key = &systing_event.args[config_idx];
-
+        // Pair each arg that BPF filled in with the arg at the same place in the
+        // event's config. The pairs end where the shorter list ends.
+        for (bpf_arg, event_key) in event
+            .args
+            .iter()
+            .take(num_args as usize)
+            .zip(&systing_event.args)
+        {
             match bpf_arg.r#type {
                 crate::systing_core::types::arg_type::ARG_LONG => {
                     let mut bytes: [u8; 8] = [0; 8];
