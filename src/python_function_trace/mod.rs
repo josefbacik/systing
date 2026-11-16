@@ -603,7 +603,7 @@ fn interpreter_of(
     let exe =
         process::read_exe_path(pid as i32).ok_or_else(|| anyhow!("cannot read /proc/{pid}/exe"))?;
     let exe = exe.to_string_lossy();
-    // The executable, then each libpython: where pystacks' discovery looks.
+    // The executable, then each libpython.
     // Each by the first mapping of its file.
     let is_libpython = |name: &str| {
         Path::new(name)

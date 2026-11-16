@@ -415,13 +415,17 @@ static CANDIDATES_SKIPPED: Limit =
 /// mapping order would reach them before the runtime. They are left out
 /// whatever their path contains.
 ///
+/// Only a private mapping of a `libpython*` at file offset 0 counts. A loader
+/// maps a library privately, so a `MAP_SHARED` mapping does not show that the
+/// process loaded the file.
+///
 /// At most [`MAX_LIBPYTHON_CANDIDATES`] shared objects are listed.
 fn runtime_candidates(exe: &str, maps: &[MemoryMapping]) -> Vec<String> {
     let mut candidates = vec![exe.to_string()];
     for mapping in maps {
-        // Only the first mapping of each module; later mappings carry a
-        // non-zero file offset.
-        if mapping.name.is_empty() || mapping.offset != 0 {
+        // Only a mapping at file offset 0: a module's later mappings carry a
+        // non-zero offset. And only a private one. Each line counts by itself.
+        if mapping.name.is_empty() || mapping.offset != 0 || mapping.perms.ends_with('s') {
             continue;
         }
         let is_libpython = Path::new(&mapping.name)
@@ -1366,6 +1370,64 @@ mod tests {
         // No libpython anywhere: only the exe is examined.
         let maps = vec![mapping(0x7f0100000000, 0, exe)];
         assert_eq!(runtime_candidates(exe, &maps), vec![exe.to_string()]);
+    }
+
+    #[test]
+    fn test_runtime_candidates_leave_out_a_libpython_that_is_mapped_shared() {
+        let (exe, lib) = ("/usr/bin/app", "/usr/lib/libpython3.13.so.1.0");
+        let candidates = |lines: &[(u64, &str)]| {
+            let line = |(i, &(offset, perms)): (usize, &(u64, &str))| MemoryMapping {
+                perms: perms.to_string(),
+                ..mapping(0x1000 * (i + 1), offset, lib)
+            };
+            let maps: Vec<MemoryMapping> = lines.iter().enumerate().map(line).collect();
+            runtime_candidates(exe, &maps)
+        };
+        let alone = vec![exe.to_string()];
+        let both = vec![exe.to_string(), lib.to_string()];
+
+        // Every mapping of the file is shared.
+        let lines = [(0, "r--s"), (0x1000, "r--s"), (0x2000, "r--s")];
+        assert_eq!(candidates(&lines), alone);
+        assert_eq!(candidates(&[(0x200000, "r--s"), (0, "r--s")]), alone);
+        // The other three letters do not count.
+        for perms in ["r--s", "rw-s", "r-xs", "rwxs"] {
+            assert_eq!(candidates(&[(0, perms)]), alone, "{perms}");
+        }
+        // A private mapping at another offset does not count.
+        assert_eq!(candidates(&[(0, "r--s"), (0x1000, "r--p")]), alone);
+        // A private mapping at offset 0 counts, whatever is shared beside it.
+        assert_eq!(candidates(&[(0, "r--s"), (0, "r--p")]), both);
+        assert_eq!(candidates(&[(0, "r--p"), (0, "r--s")]), both);
+        assert_eq!(candidates(&[(0, "r--p"), (0x1000, "r--s")]), both);
+
+        let shared = |i: usize| MemoryMapping {
+            perms: "r--s".to_string(),
+            ..mapping(0x1000 * (i + 1), 0, &format!("/usr/lib/libpython3.{i}.so"))
+        };
+        let mut maps: Vec<MemoryMapping> = (0..=MAX_LIBPYTHON_CANDIDATES).map(shared).collect();
+        maps.push(mapping(0x100000, 0, lib));
+        assert_eq!(runtime_candidates(exe, &maps), both);
+    }
+
+    #[test]
+    fn test_a_library_that_is_mapped_shared_is_not_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, app) = (dir.path().join("libpython3.12.so"), dir.path().join("app"));
+        let define = format!("-DLIB=\"{}\"", lib.display());
+        let maps_it_shared = MAPS_A_LIBRARY.replace("MAP_PRIVATE", "MAP_SHARED");
+        if !cc_builds(UNTAGGED_RUNTIME, &["-shared", "-fPIC"], &lib)
+            || !cc_builds(&maps_it_shared, &[&define], &app)
+        {
+            eprintln!("no C compiler on this host: skipping the shared-mapping check");
+            return;
+        }
+        let child = run(&app);
+
+        let maps = process::parse_proc_maps(child.0.id() as i32);
+        let of_lib = |m: &&MemoryMapping| Path::new(&m.name).file_name() == lib.file_name();
+        assert_eq!(maps.iter().find(of_lib).unwrap().perms, "r--s");
+        assert_eq!(version_of(child.0.id()), None);
     }
 
     /// A real CPython runtime on this host: the file that carries
