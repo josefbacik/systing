@@ -60,10 +60,36 @@ const LEAF_QUEUE: usize = 64;
 /// Column-encoder threads for one lane on this host: one per sixteen CPUs,
 /// two at least, eight at most (a table has a few dozen columns; past eight
 /// encoders the batch build is the longer half).
+///
+/// Must not read /proc/self/cgroup, as `std::thread::available_parallelism`
+/// does: a lane can start on a recorder's thread while a capture is recording,
+/// and that read can sleep for a long time (see `MAP_SHARDS` in `utid.rs`),
+/// which holds up the end of the capture.
 pub fn encode_workers() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| (n.get() / 16).clamp(2, 8))
-        .unwrap_or(2)
+    cpus_allowed().map_or(2, |cpus| (cpus / 16).clamp(2, 8))
+}
+
+/// One bit for each of 8,192 CPUs. `libc::cpu_set_t` has room for 1,024, and
+/// `sched_getaffinity` fails on a host with more possible CPUs than its mask
+/// holds.
+type CpuMask = [u64; 128];
+
+/// The CPUs that the calling thread may run on. `None` if the call fails.
+fn affinity() -> Option<CpuMask> {
+    let mut mask: CpuMask = [0; 128];
+    // SAFETY: `mask` is valid for the given number of bytes, and the call writes
+    // no more.
+    let rc = unsafe {
+        libc::sched_getaffinity(0, std::mem::size_of::<CpuMask>(), mask.as_mut_ptr().cast())
+    };
+    (rc == 0).then_some(mask)
+}
+
+/// How many CPUs the calling thread may run on. Unlike
+/// `available_parallelism`, this ignores a cgroup's CPU quota.
+fn cpus_allowed() -> Option<usize> {
+    let mask = affinity()?;
+    Some(mask.iter().map(|word| word.count_ones() as usize).sum())
 }
 
 /// One table's encode lane. Created on the table's first flush, finished
@@ -732,5 +758,98 @@ mod tests {
         let (n, ids, _) = read_back(&path);
         assert_eq!(n, 300);
         assert_eq!(ids, (0..300).collect::<Vec<i64>>());
+    }
+
+    /// How many read system calls the calling thread has made so far, or `None`
+    /// if that cannot be read.
+    fn reads_by_this_thread() -> Option<u64> {
+        let io = std::fs::read_to_string("/proc/thread-self/io").ok()?;
+        io.lines()
+            .find_map(|line| line.strip_prefix("syscr: ")?.parse().ok())
+    }
+
+    #[test]
+    fn encode_workers_reads_no_file() {
+        // Reading the counter is itself counted, so the first two readings
+        // show what one reading costs. A counter that stands still shows nothing.
+        let (first, second) = match (reads_by_this_thread(), reads_by_this_thread()) {
+            (Some(first), Some(second)) if second > first => (first, second),
+            _ => {
+                eprintln!(
+                    "encode_workers_reads_no_file skipped: no usable syscr count in /proc/thread-self/io"
+                );
+                return;
+            }
+        };
+        let workers = encode_workers();
+        let third = reads_by_this_thread().unwrap();
+        assert_eq!(
+            third - second,
+            second - first,
+            "encode_workers() made a read system call"
+        );
+        assert!(
+            (2..=8).contains(&workers),
+            "encode_workers() gave {workers}, outside 2 to 8"
+        );
+    }
+
+    #[test]
+    fn the_cpu_count_follows_the_threads_affinity() {
+        // On a thread of its own, so that no other test runs on one CPU.
+        std::thread::spawn(|| {
+            let allowed = affinity().expect("sched_getaffinity failed");
+            let bits = allowed.iter().map(|word| word.count_ones() as usize).sum();
+            assert_eq!(cpus_allowed(), Some(bits));
+            let word = allowed.iter().position(|word| *word != 0).unwrap();
+            let mut one: CpuMask = [0; 128];
+            one[word] = 1 << allowed[word].trailing_zeros();
+            // SAFETY: `one` is valid for the given number of bytes, and the call
+            // reads no more.
+            let rc = unsafe {
+                libc::sched_setaffinity(0, std::mem::size_of::<CpuMask>(), one.as_ptr().cast())
+            };
+            assert_eq!(
+                rc,
+                0,
+                "sched_setaffinity: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(cpus_allowed(), Some(1));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn only_the_listed_files_ask_std_for_the_cpu_count() {
+        // systing_util.rs is another program, and duckdb.rs runs after the
+        // recording has stopped.
+        const MAY_CALL: [&str; 2] = ["bin/systing_util.rs", "duckdb.rs"];
+        // In two parts, so that this file does not hold the text itself. The search
+        // finds direct calls under src/ alone, not one inside a dependency.
+        let call = concat!("available_", "parallelism()");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut dirs = vec![src.clone()];
+        let mut callers = Vec::new();
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && std::fs::read_to_string(&path).unwrap().contains(call)
+                {
+                    let file = path.strip_prefix(&src).unwrap();
+                    callers.push(file.to_string_lossy().into_owned());
+                }
+            }
+        }
+        callers.retain(|file| !MAY_CALL.contains(&file.as_str()));
+        callers.sort();
+        assert!(
+            callers.is_empty(),
+            "{callers:?} hold the text {call}, which opens /proc/self/cgroup and can sleep during a recording; see encode_workers"
+        );
     }
 }
