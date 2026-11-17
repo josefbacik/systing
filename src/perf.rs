@@ -31,6 +31,11 @@ pub struct PerfHwEvent {
     /// page-fault software event sets this so a fault at address 0 reads as 0
     /// rather than as whatever was on the stack.
     pub sample_addr: bool,
+    /// Take no sample while the CPU runs its idle task (exclude_idle), so that
+    /// idle firings of a software clock do not use up the kernel's sample limit.
+    /// The timer still fires, so an idle CPU wakes at the sampling rate.
+    /// Software clock events only: the arm64 PMU driver refuses the flag.
+    pub exclude_idle: bool,
     pub cpus: Vec<u32>,
 }
 
@@ -411,6 +416,9 @@ impl PerfOpenEvents {
             }
             if hwevent.exclude_kernel {
                 attr.flags.set_exclude_kernel(1);
+            }
+            if hwevent.exclude_idle {
+                attr.flags.set_exclude_idle(1);
             }
             if hwevent.sample_addr {
                 attr.sample_type |= PERF_SAMPLE_ADDR;

@@ -60,6 +60,14 @@ pub const DEFAULT_SAMPLE_FREQ_HZ: u64 = 1000;
 /// cpufreq data is available from sysfs.
 const FALLBACK_CPU_FREQ_HZ: u64 = 3_000_000_000;
 
+/// The highest `--sample-freq` at which the software clock sampler sets
+/// `PerfHwEvent::exclude_idle`. Above it the kernel's limit stays in place as a
+/// brake on idle wake-ups: at high rates, the flag kept every virtual CPU of
+/// an idle KVM guest busy on its host.
+const SW_CLOCK_EXCLUDE_IDLE_MAX_HZ: u64 = 1000;
+// A default rate above the bound would silently drop the flag.
+const _: () = assert!(DEFAULT_SAMPLE_FREQ_HZ <= SW_CLOCK_EXCLUDE_IDLE_MAX_HZ);
+
 /// Sleep duration before stopping in continuous mode (1 second)
 const CONTINUOUS_MODE_STOP_DELAY_SECS: u64 = 1;
 
@@ -810,7 +818,8 @@ pub(crate) struct RingShards {
 /// Collect ringbuf ARRAY_OF_MAPS families written by any enabled recorder or
 /// probe. Drives the inner rings in `create_ring_shards` and mmap/consume in
 /// `setup_ringbuffers`; derived from `RecorderInfo::ringbuf_families`.
-fn get_required_ringbuf_families(opts: &Config) -> HashSet<&'static str> {
+/// `perf_trace_events`: see `has_perf_trace_events`.
+fn get_required_ringbuf_families(opts: &Config, perf_trace_events: bool) -> HashSet<&'static str> {
     let mut required = HashSet::new();
     for recorder in get_available_recorders() {
         if is_recorder_enabled(recorder.name, opts) {
@@ -820,18 +829,31 @@ fn get_required_ringbuf_families(opts: &Config) -> HashSet<&'static str> {
     if !opts.trace_event.is_empty() || !opts.trace_event_config.is_empty() {
         required.insert("probe_ringbufs");
     }
-    if !opts.perf_counter.is_empty() {
+    if !opts.perf_counter.is_empty() || perf_trace_events {
         required.insert("perf_counter_ringbufs");
     }
     required
+}
+
+/// Whether any configured trace event is a hardware:/software: event. Each is
+/// a perf counter too, read on the same tick into the same rings as
+/// `--perf-counter`'s (see `perf_trace_events`), so it needs their family.
+/// Only the parsed events say: one may come from a `--trace-event-config`
+/// file.
+fn has_perf_trace_events(recorder: &Arc<SessionRecorder>) -> bool {
+    let probe_recorder = recorder.probe_recorder.lock().unwrap();
+    probe_recorder.config_events.values().any(|e| e.is_perf())
 }
 
 /// The families whose outer map is created: the written ones, plus `ringbufs`
 /// whenever `systing_sched_switch` loads, which references it even when
 /// nothing writes it (see `SCHED_SWITCH_FOR_STACKS`). Drives autocreate in
 /// `configure_bpf_skeleton`.
-fn get_autocreated_ringbuf_families(opts: &Config) -> HashSet<&'static str> {
-    let mut autocreated = get_required_ringbuf_families(opts);
+fn get_autocreated_ringbuf_families(
+    opts: &Config,
+    perf_trace_events: bool,
+) -> HashSet<&'static str> {
+    let mut autocreated = get_required_ringbuf_families(opts, perf_trace_events);
     let sched_switch_loaded = get_available_recorders().iter().any(|recorder| {
         is_recorder_enabled(recorder.name, opts)
             && recorder.bpf_programs.contains(&"systing_sched_switch")
@@ -2905,6 +2927,45 @@ fn setup_perf_counters(
     Ok(())
 }
 
+/// Tell the BPF object how many perf counters the capture reads on the
+/// sampler tick (`--perf-counter` and hardware:/software: trace events), and
+/// size the maps that hold them. The count is rodata: at zero the verifier
+/// prunes read_counters()'s loop, and with it the one reference to
+/// `perf_counter_ringbufs`.
+fn size_perf_counter_maps(
+    open_skel: &mut OpenSystingSystemSkel,
+    num_cpus: u32,
+    num_events: u32,
+) -> Result<()> {
+    open_skel
+        .maps
+        .rodata_data
+        .as_deref_mut()
+        .unwrap()
+        .tool_config
+        .num_perf_counters = num_events;
+    open_skel
+        .maps
+        .perf_counters
+        .set_max_entries(num_cpus * num_events)
+        .with_context(|| {
+            format!(
+                "Failed to set perf_counters map size to {} entries",
+                num_cpus * num_events
+            )
+        })?;
+    if num_events > 0 {
+        open_skel
+            .maps
+            .last_perf_counter_value
+            .set_max_entries(num_events)
+            .with_context(|| {
+                format!("Failed to set last_perf_counter_value map size to {num_events} entries")
+            })?;
+    }
+    Ok(())
+}
+
 fn set_ringbuf_duration(recorder: &Arc<SessionRecorder>, duration_nanos: u64) {
     for event_recorder in &recorder.event_recorders {
         event_recorder
@@ -3491,8 +3552,9 @@ fn create_ring_shards(
     skel: &SystingSystemSkel,
     opts: &Config,
     plan: RingbufPlan,
+    perf_trace_events: bool,
 ) -> Result<RingShards> {
-    let required = get_required_ringbuf_families(opts);
+    let required = get_required_ringbuf_families(opts, perf_trace_events);
     let mut families = Vec::new();
     let mut per_slot_fallback_reported = false;
     for map in skel.object().maps() {
@@ -3990,7 +4052,7 @@ fn configure_bpf_skeleton(
     //
     // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
-    let required = get_autocreated_ringbuf_families(opts);
+    let required = get_autocreated_ringbuf_families(opts, has_perf_trace_events(recorder));
     for mut map in open_skel.open_object_mut().maps_mut() {
         let name = map.name().to_str().unwrap().to_owned();
         if let Some((outer, _, always_on)) = RINGBUF_FAMILIES.iter().find(|(o, _, _)| *o == name) {
@@ -4148,8 +4210,6 @@ fn attach_clock_sampler(
     ClockSamplingConfig,
     Option<MemoryFaultLeg>,
 )> {
-    use crate::perf;
-
     let mut perf_links = Vec::new();
 
     // The hardware:/software: trace events' samplers ride this last slot
@@ -4183,24 +4243,7 @@ fn attach_clock_sampler(
     // Set up clock perf events with automatic VM detection and fallback
     let (clock_files, clock_sampling) = {
         let mut clock_files = PerfOpenEvents::default();
-        let mut clock_event = PerfHwEvent {
-            name: "clock".to_string(),
-            event_type: if opts.sw_event {
-                perf::PERF_TYPE_SOFTWARE
-            } else {
-                perf::PERF_TYPE_HARDWARE
-            },
-            event_config: if opts.sw_event {
-                perf::PERF_COUNT_SW_CPU_CLOCK
-            } else {
-                perf::PERF_COUNT_HW_CPU_CYCLES
-            },
-            disabled: false,
-            need_slots: false,
-            exclude_kernel: false,
-            sample_addr: false,
-            cpus: (0..num_cpus).collect(),
-        };
+        let mut clock_event = clock_sampler_event(opts.sw_event, target_hz, num_cpus);
         let mut clock_sampling = if opts.sw_event {
             sw_clock_sampling.clone()
         } else {
@@ -4220,8 +4263,7 @@ fn attach_clock_sampler(
                 eprintln!("Detected virtualized environment, automatically switching to software events (--sw-event)");
 
                 // Modify the event to use software events
-                clock_event.event_type = perf::PERF_TYPE_SOFTWARE;
-                clock_event.event_config = perf::PERF_COUNT_SW_CPU_CLOCK;
+                clock_event = clock_sampler_event(true, target_hz, num_cpus);
                 clock_sampling = sw_clock_sampling;
 
                 // Recreate clock_files with the modified event
@@ -4288,6 +4330,32 @@ fn attach_clock_sampler(
     };
 
     Ok((perf_links, clock_sampling, memory_fault_leg))
+}
+
+/// The perf event that drives the CPU stack sampler on every CPU: the software
+/// cpu-clock, or the hardware cpu-cycles counter.
+fn clock_sampler_event(software: bool, target_hz: u64, num_cpus: u32) -> PerfHwEvent {
+    use crate::perf;
+
+    PerfHwEvent {
+        name: "clock".to_string(),
+        event_type: if software {
+            perf::PERF_TYPE_SOFTWARE
+        } else {
+            perf::PERF_TYPE_HARDWARE
+        },
+        event_config: if software {
+            perf::PERF_COUNT_SW_CPU_CLOCK
+        } else {
+            perf::PERF_COUNT_HW_CPU_CYCLES
+        },
+        disabled: false,
+        need_slots: false,
+        exclude_kernel: false,
+        sample_addr: false,
+        exclude_idle: software && target_hz <= SW_CLOCK_EXCLUDE_IDLE_MAX_HZ,
+        cpus: (0..num_cpus).collect(),
+    }
 }
 
 /// Name the cause of a fault-leg open/attach failure for the sysinfo row:
@@ -4419,7 +4487,9 @@ fn setup_perf_counter_events(
             .with_context(|| {
                 if event_name.starts_with("hardware:") {
                     format!(
-                        "Failed to open perf event '{event_name}': a hardware event needs a PMU                          (bare metal, or a VM that exposes one); systing --list-events shows                          what this host supports"
+                        "Failed to open perf event '{event_name}': a hardware event needs a PMU \
+                         (bare metal, or a VM that exposes one); systing --list-events shows \
+                         what this host supports"
                     )
                 } else {
                     format!("Failed to open perf event '{event_name}'")
@@ -4489,6 +4559,7 @@ fn attach_page_fault_sw_events(
         need_slots: false,
         exclude_kernel: true,
         sample_addr: true,
+        exclude_idle: false,
         cpus: (0..num_cpus).collect(),
     })?;
     // 0 or 1 means every fault (the x86 path's convention for
@@ -6267,10 +6338,13 @@ pub fn systing(
     // the hard limit up front and say what the run is going to need.
     let fd_limits = raise_fd_soft_limit();
     // Families: the ones the enabled recorders and probes need, plus the
-    // always-on stack family (see RINGBUF_FAMILIES).
+    // always-on stack family (see RINGBUF_FAMILIES). The trace events are not
+    // parsed yet, so any of them counts as a perf counter here.
+    let may_have_perf_trace_events =
+        !opts.trace_event.is_empty() || !opts.trace_event_config.is_empty();
     let fd_need = projected_fd_need(
         ring_plan.nr_rings,
-        get_required_ringbuf_families(&opts).len() as u32 + 1,
+        get_required_ringbuf_families(&opts, may_have_perf_trace_events).len() as u32 + 1,
         num_cpus,
         is_recorder_enabled("memory", &opts),
     ) + if opts.python_function_trace {
@@ -6419,35 +6493,7 @@ pub fn systing(
                 .push(counter.clone());
         }
 
-        let num_events = perf_counter_names.len() as u32;
-        open_skel
-            .maps
-            .rodata_data
-            .as_deref_mut()
-            .unwrap()
-            .tool_config
-            .num_perf_counters = num_events;
-        open_skel
-            .maps
-            .perf_counters
-            .set_max_entries(num_cpus * num_events)
-            .with_context(|| {
-                format!(
-                    "Failed to set perf_counters map size to {} entries",
-                    num_cpus * num_events
-                )
-            })?;
-        if num_events > 0 {
-            open_skel
-                .maps
-                .last_perf_counter_value
-                .set_max_entries(num_events)
-                .with_context(|| {
-                    format!(
-                        "Failed to set last_perf_counter_value map size to {num_events} entries"
-                    )
-                })?;
-        }
+        size_perf_counter_maps(&mut open_skel, num_cpus, perf_counter_names.len() as u32)?;
 
         // missed_events keeps its declared size (MISSED_EVENT_MAX slots, one
         // per class; a per-CPU array already holds one value per CPU behind
@@ -6599,7 +6645,8 @@ pub fn systing(
         // attach (no program may find an empty slot in a family it writes). The
         // handles live in ThreadHandles until the poller threads are joined.
         let t_rings = std::time::Instant::now();
-        let ring_shards = create_ring_shards(&skel, &opts, ring_plan)?;
+        let ring_shards =
+            create_ring_shards(&skel, &opts, ring_plan, has_perf_trace_events(&recorder))?;
         if diag {
             eprintln!(
                 "[diag] create_ring_shards ({} rings x {} families) took {:?}",
@@ -7812,21 +7859,14 @@ pub fn bpf_load_probe(
     )?;
 
     // The map sizing systing() performs between configure and load, for the
-    // shapes without perf counters or cgroup targets (both are attach-time
-    // inputs a load-only probe does not take): perf_counters at zero events;
-    // missed_events stays at its declared size, as in systing().
-    open_skel
-        .maps
-        .rodata_data
-        .as_deref_mut()
-        .unwrap()
-        .tool_config
-        .num_perf_counters = 0;
-    open_skel
-        .maps
-        .perf_counters
-        .set_max_entries(0)
-        .with_context(|| "Failed to set perf_counters map size to 0 entries")?;
+    // shapes without cgroup targets (an attach-time input a load-only probe
+    // does not take): the perf counters counted as systing() counts them,
+    // none of them opened; missed_events stays at its declared size, as in
+    // systing().
+    let mut perf_counter_names = Vec::new();
+    setup_perf_counters(opts, &mut PerfCounters::default(), &mut perf_counter_names)?;
+    perf_trace_events(&recorder, &mut perf_counter_names)?;
+    size_perf_counter_maps(&mut open_skel, num_cpus, perf_counter_names.len() as u32)?;
 
     let mut required = get_required_bpf_programs(
         opts,
@@ -7891,6 +7931,26 @@ mod tests {
         let len = bytes.len().min(15);
         task.comm[..len].copy_from_slice(&bytes[..len]);
         task
+    }
+
+    #[test]
+    fn only_the_software_clock_excludes_idle_and_only_up_to_the_bound() {
+        use crate::perf;
+        let max = SW_CLOCK_EXCLUDE_IDLE_MAX_HZ;
+
+        for hz in [1, DEFAULT_SAMPLE_FREQ_HZ, max] {
+            let event = clock_sampler_event(true, hz, 2);
+            assert_eq!(event.event_type, perf::PERF_TYPE_SOFTWARE);
+            assert_eq!(event.event_config, perf::PERF_COUNT_SW_CPU_CLOCK);
+            assert!(event.exclude_idle, "{hz} Hz");
+        }
+        assert!(!clock_sampler_event(true, max + 1, 2).exclude_idle);
+        // The arm64 PMU driver refuses a hardware event that has the flag.
+        for hz in [1, max, max + 1] {
+            let event = clock_sampler_event(false, hz, 2);
+            assert_eq!(event.event_type, perf::PERF_TYPE_HARDWARE);
+            assert!(!event.exclude_idle, "{hz} Hz");
+        }
     }
 
     #[test]
@@ -8175,16 +8235,71 @@ mod tests {
                 .contains("systing_sched_switch");
             assert_eq!(sched_switch_loads, on(0) || on(2) || on(3) || on(4));
             assert_eq!(
-                get_required_ringbuf_families(&opts).contains("ringbufs"),
+                get_required_ringbuf_families(&opts, false).contains("ringbufs"),
                 rings,
                 "{opts:?}"
             );
             assert_eq!(
-                get_autocreated_ringbuf_families(&opts).contains("ringbufs"),
+                get_autocreated_ringbuf_families(&opts, false).contains("ringbufs"),
                 rings || sched_switch_loads,
                 "{opts:?}"
             );
         }
+    }
+
+    #[test]
+    fn perf_counter_rings_exist_for_every_kind_of_counter() {
+        let rings = |opts: &Config, events: &[&str], config: Option<&str>| {
+            let recorder = Arc::new(SessionRecorder::new(false, false, None, None, false));
+            {
+                let mut probes = recorder.probe_recorder.lock().unwrap();
+                for event in events {
+                    probes.add_event_from_str(event, &mut rand::rng()).unwrap();
+                }
+                if let Some(json) = config {
+                    let file = tempfile::NamedTempFile::new().unwrap();
+                    fs::write(file.path(), json).unwrap();
+                    probes
+                        .load_config(file.path().to_str().unwrap(), &mut rand::rng())
+                        .unwrap();
+                }
+            }
+            let perf = has_perf_trace_events(&recorder);
+            let required =
+                get_required_ringbuf_families(opts, perf).contains("perf_counter_ringbufs");
+            assert_eq!(
+                get_autocreated_ringbuf_families(opts, perf).contains("perf_counter_ringbufs"),
+                required
+            );
+            required
+        };
+        let none = Config::default();
+        assert!(!rings(&none, &[], None));
+        let perf_counter = Config {
+            perf_counter: vec!["instructions".to_string()],
+            ..Config::default()
+        };
+        assert!(rings(&perf_counter, &[], None));
+        // A hardware:/software: trace event is a counter with or without a
+        // period, and needs no --perf-counter beside it.
+        assert!(rings(&none, &["software:context-switches"], None));
+        assert!(rings(&none, &["hardware:cache-misses:100000"], None));
+        assert!(rings(&none, &["kprobe:do_exit", "software:cs:100"], None));
+        assert!(rings(
+            &none,
+            &[],
+            Some(r#"{"events": [{"name": "llc", "event": "hardware:cache-misses:100000"}]}"#)
+        ));
+        assert!(!rings(
+            &none,
+            &["tracepoint:sched:sched_process_exit"],
+            None
+        ));
+        assert!(!rings(
+            &none,
+            &[],
+            Some(r#"{"events": [{"name": "software", "event": "kprobe:do_exit"}]}"#)
+        ));
     }
 
     #[test]

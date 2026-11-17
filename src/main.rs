@@ -46,6 +46,8 @@ struct Command {
     /// Target CPU stack-sampling rate in Hz (samples per second per CPU). The
     /// perf clock event runs in fixed-period mode, so this is exact for
     /// --sw-event and the rate at max CPU frequency for cpu-cycles.
+    /// Above 1000 Hz, --sw-event can miss what runs first on a CPU that has
+    /// been idle: see docs/USAGE.adoc.
     #[arg(long, default_value_t = systing::DEFAULT_SAMPLE_FREQ_HZ,
           value_parser = clap::value_parser!(u64).range(1..))]
     sample_freq: u64,

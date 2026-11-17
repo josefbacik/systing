@@ -208,8 +208,10 @@ is why several processes, and sub-interpreters, are safe. On a host with more
 than 64 CPUs some CPUs share a ring, as they do for every recorder.
 
 These programs run with preemption on, so two can be under way on one CPU. The
-one path that writes per-CPU scratch or a cache entry runs alone on its CPU; a
-miss that meets another on its CPU goes without a name for that one event.
+one path that writes per-CPU scratch or a cache entry runs alone on its CPU. A
+miss that meets another on its CPU sends no event and writes no cache entry, so
+the same function misses again at its next call, until the first has finished.
+The closing line counts such misses among the probe hits with no name to give.
 
 Events reach the reader by CPU and a thread moves between CPUs, so a thread's
 events are not in order as they are read. The recorder keeps them and sorts and

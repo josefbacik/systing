@@ -69,8 +69,10 @@ pub struct ThreadRecord {
 /// - `cpu`: CPU core number where the thread ran
 /// - `utid`: Unique thread ID (references `ThreadRecord.utid`)
 /// - `end_state`: Raw kernel task state value when the thread stopped running.
-///   `None` means TASK_RUNNING (0), i.e., the thread was preempted while still runnable.
+///   `None` means TASK_RUNNING (0): the thread left the CPU still runnable, or was still
+///   running when the trace ended.
 ///   Common values: 1=TASK_INTERRUPTIBLE, 2=TASK_UNINTERRUPTIBLE, 4=__TASK_STOPPED.
+///   256 (TASK_REPORT_MAX) means the kernel preempted the thread, which is still runnable too.
 /// - `priority`: Thread priority (nice value)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SchedSliceRecord {

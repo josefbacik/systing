@@ -1547,6 +1547,43 @@ fn ids_of(mut recorder: SystingProbeRecorder, values: &[u64]) -> Vec<i64> {
 }
 
 #[test]
+fn test_args_are_paired_up_to_the_end_of_the_shorter_list() {
+    // (args that BPF says it filled in, args in the event's config, what is written)
+    for (filled, configured, written) in [
+        (0, 2, vec![]),
+        (1, 2, vec![("a0", 7)]),
+        (2, 2, vec![("a0", 7), ("a1", 8)]),
+        (2, 1, vec![("a0", 7)]),
+        // More than an event has room for.
+        (u8::MAX, 2, vec![("a0", 7), ("a1", 8)]),
+    ] {
+        let args: Vec<String> = (0..configured)
+            .map(|i| format!(r#"{{"arg_index": {i}, "arg_type": "long", "arg_name": "a{i}"}}"#))
+            .collect();
+        let mut recorder = recorder_with_instants(
+            &format!(
+                r#"{{"name": "e", "event": "kprobe:foo", "args": [{}]}}"#,
+                args.join(", ")
+            ),
+            &["e"],
+        )
+        .unwrap();
+        // Its first two args hold 7 and 8.
+        let mut event = create_syscall_exit_event(1, 2, 1000, 7, 8);
+        event.cookie = recorder.config_events["e"].cookie;
+        event.num_args = filled;
+        recorder.handle_event(event);
+        let data = recorder.finish_in_memory();
+        let got: Vec<(&str, i64)> = data
+            .instant_args
+            .iter()
+            .map(|arg| (arg.key.as_str(), arg.int_value.unwrap()))
+            .collect();
+        assert_eq!(got, written, "{filled} filled in, {configured} configured");
+    }
+}
+
+#[test]
 fn test_where_an_id_arg_is_valid() {
     let load = |event: &str, arg: &str| {
         recorder_with_instants(

@@ -28,8 +28,10 @@ pub(crate) const STREAMING_SCHED_FLUSH_THRESHOLD: usize = 10_000;
 
 /// Convert a kernel prev_state value to an Option<i32> for storage.
 ///
-/// Returns `None` for TASK_RUNNING (0), meaning the task was preempted while still runnable.
-/// Returns `Some(state)` for sleep states (1=TASK_INTERRUPTIBLE, 2=TASK_UNINTERRUPTIBLE, etc.).
+/// Returns `None` for TASK_RUNNING (0): the task left the CPU still runnable.
+/// Returns `Some(state)` for sleep states (1=TASK_INTERRUPTIBLE, 2=TASK_UNINTERRUPTIBLE, etc.)
+/// and for TASK_REPORT_MAX (256), which BPF sends when the kernel preempted the task: it is
+/// still runnable too.
 ///
 /// Note: Kernel task states are masked with TASK_REPORT in BPF, so values fit in i32.
 /// Compound states (e.g., TASK_UNINTERRUPTIBLE | TASK_NOLOAD = 130) are also possible.
@@ -812,6 +814,13 @@ mod tests {
         // Verify we can finish without errors
         let result = recorder.finish(3000);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_prev_state_to_end_state_keeps_the_preempt_flag() {
+        assert_eq!(prev_state_to_end_state(0), None);
+        assert_eq!(prev_state_to_end_state(2), Some(2));
+        assert_eq!(prev_state_to_end_state(0x100), Some(0x100));
     }
 
     #[test]

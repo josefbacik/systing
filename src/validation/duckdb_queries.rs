@@ -465,6 +465,7 @@ impl ValidationQueries for DuckDbQueries {
 
         // Find STACK_SLEEP violations (type=0 uninterruptible, type=2 interruptible)
         // Should be near the end of a sleep slice (end_state != 0)
+        // 256 (preempted) must pass too: BPF takes a sleep stack by the raw task state, also at a preemption
         let mut stmt = self.conn.prepare(&format!(
             "WITH first_sched AS (
                 SELECT utid, MIN(ts) as first_ts FROM sched_slice GROUP BY utid
